@@ -1,0 +1,47 @@
+Until Dawn native PC port - known issues (WIP 0.1.2, 23 October 2026)
+=====================================================================
+
+This is a work-in-progress test build. What is known so far:
+
+Stability
+---------
+  - Occasional crashes. In a full play-through on the developer's PC the game crashed twice and had to be
+    restarted; saves were kept. The cause is being investigated: some of the game's memory is occasionally
+    overwritten (characters' animation data, object tables). The program contains safeguards that catch most
+    of these cases, but not all.
+  - Characters can briefly deform ("explode") for a frame or two - the same memory problem as above.
+  - Collectibles: a totem has been seen to vanish, and a clue to reappear after it was picked up.
+
+Graphics
+--------
+  - The inside of mouths can render black in some close-ups.
+  - A red flash over the screen while moving through the Episodes menu.
+  - The text at the start of the end credits is smeared vertically.
+  - The "SKIP" text in the later "Previously on Until Dawn" clips can show as blocks.
+  - Small differences from the PS4 picture are possible elsewhere; please report anything that looks wrong.
+
+Performance
+-----------
+  - Frame-rate drops: the frame rate varies widely by scene. Many sections reach 30-60 fps on the developer's PC,
+    but some sections run well below 30 fps (10-20 fps measured in places), also on fast PCs. Performance is
+    not addressed in this test release; it will be improved in future releases. The 60 fps limit is a limit,
+    not a guaranteed frame rate.
+  - Shader compilation on the first play-through: stutters, and occasional freezes of 10-20 seconds, mostly in
+    the first minutes of each new area (a fresh install froze for about 12 and 17 seconds in the prologue on the
+    developer's PC). The game is not hung - wait for it. The shader cache (Cache\) removes most of these on
+    later runs.
+
+Hardware
+--------
+  - Tested only on: Intel Core i9-12900KF + NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01),
+    Windows 11, 64 GB.
+  - AMD Radeon and Intel Arc / integrated graphics are untested. AMD Ryzen CPUs are untested.
+    Please run compat\run_compat.bat on these and send the report even if the game runs fine.
+  - Vibration and the light bar of DualSense / DualShock 4 controllers are not supported yet (Xbox controllers
+    vibrate).
+
+Game version
+------------
+  - Only CUSA02636 with the 01.03 update is supported. Other regions or versions are refused at start.
+  - Online / PlayStation Network features are not available. Trophy unlocks are recorded locally (savedata\ and
+    the log); there is no on-screen trophy notification.

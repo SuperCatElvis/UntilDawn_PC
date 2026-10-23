@@ -1,0 +1,47 @@
+Until Dawn native PC port - controls (WIP 0.1.2)
+================================================
+
+Controllers
+-----------
+Controllers are read only while the game window has focus. Keyboard and mouse keep working alongside them.
+
+DualSense (PS5), DualSense Edge, DualShock 4 (PS4) - USB or Bluetooth, no extra software needed:
+  every button works as on the PS4, including the touch pad (swipes and click) and the motion sensors
+  (the "Don't move" moments: hold the controller still). Tested: DualSense.
+  Not supported yet: vibration and the light bar on these controllers.
+
+Xbox-style controllers (XInput; also DS4Windows / Steam virtual pads), vibration works:
+  A = Cross        B = Circle        X = Square        Y = Triangle
+  LB / RB = L1 / R1                  LT / RT = L2 / R2
+  Left / right stick = sticks        stick clicks = L3 / R3
+  D-pad = D-pad    Menu (Start) = Options              View (Back) = touch pad click
+  No touch pad swipes and no motion sensors on these controllers: use the keyboard keys F / G / R / V for swipes;
+  "Don't move" moments count the controller as held still.
+
+Keyboard and mouse
+------------------
+  Left stick           W A S D
+  Right stick (camera) I J K L
+  Cross                Enter or Space
+  Circle               Esc or Backspace
+  Square               Q
+  Triangle             E
+  L1 / R1              1 / 3
+  L2 / R2              Z / C
+  D-pad                Arrow keys
+  Options              Tab
+  Touch pad click      T
+  Touch pad swipes     F = left, G = right, R = up, V = down
+  Touch pad finger     hold the left mouse button inside the window and drag
+  L3 / R3              not available on the keyboard (use a controller)
+
+Mouse aiming (M turns it on and off):
+  mouse movement       right stick (camera / aim)
+  left click           R2 (shoot)
+  right click          L2 (aim)
+
+Skipping movies
+---------------
+The intro logos and the "Previously on Until Dawn" recaps can be skipped: press any button to show the Skip
+prompt in the bottom-right corner, then press Cross (Enter / Space) while it is shown. The rest of the recap is
+skipped with it.
