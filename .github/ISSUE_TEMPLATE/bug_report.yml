@@ -1,0 +1,76 @@
+name: Bug report
+description: A crash, graphical problem, freeze, wrong behaviour or anything else that doesn't work.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Please check [Known issues](https://github.com/SuperCatElvis/UntilDawn_PC/blob/main/docs/KNOWN_ISSUES.md) first.
+        **Do not ask for, share or link game files.** Such issues will be closed.
+        **Privacy:** logs and reports contain folder paths, which can include your Windows user name. Look through them and remove anything you don't want to post publicly.
+  - type: input
+    id: version
+    attributes:
+      label: Release version
+      placeholder: WIP 0.1.2
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of problem
+      options:
+        - Crash (the game closed)
+        - Freeze (the game stopped responding)
+        - Graphical problem
+        - Audio problem
+        - Controls / input
+        - Game files / startup message
+        - Performance
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: where
+    attributes:
+      label: Where in the game?
+      description: Chapter, scene, character, menu - and what you were doing just before.
+    validations:
+      required: true
+  - type: dropdown
+    id: repeat
+    attributes:
+      label: Does it happen again?
+      options:
+        - Every time at the same place
+        - Sometimes
+        - Only once so far
+        - Not tried yet
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file
+      description: |
+        Attach `Logs\UntilDawn.log` from the session with the problem.
+        If you started the game again since then, attach `Logs\UntilDawn.previous.log` instead.
+    validations:
+      required: true
+  - type: textarea
+    id: compat
+    attributes:
+      label: Compatibility report and system
+      description: |
+        Attach `compat\compat_report.zip` (run `compat\run_compat.bat` once), or at least list your CPU, GPU, driver version, memory and Windows version.
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots or video
+      description: Very helpful for graphical problems.

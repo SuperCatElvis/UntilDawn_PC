@@ -31,8 +31,10 @@ please [report it](../README.md#reporting-bugs).
   time each area loads. Expect stutters and occasional freezes of **10–20 seconds**, mostly in the first minutes
   of a new game (on the development PC, a fresh install froze for about 12 and 17 seconds during the prologue).
   The game is not hung; wait for it. The shader cache (`Cache\`) removes most of these on later runs.
-- About **30–60 FPS** depending on the scene, even on fast PCs. Performance work comes after stability and
-  correctness.
+- **Frame-rate drops.** Frame rate varies widely by scene. Many sections reach 30–60 FPS on the development PC,
+  but **some sections run well below 30 FPS** (10–20 FPS measured in places), even on fast PCs. Performance is
+  not addressed in this test release; it will be improved in future releases, after stability and correctness.
+  The 60 FPS cap is a limit, not a guaranteed frame rate.
 - Frame-rate limits above 60 work, but have not been checked in every scene.
 
 ## Controllers

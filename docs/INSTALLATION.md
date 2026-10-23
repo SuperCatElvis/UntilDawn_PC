@@ -11,7 +11,8 @@ copy of the original PS4 game**. The download does not contain the game.
 
 - Windows 10 or 11, 64-bit, and a PC that meets the [system requirements](../README.md#system-requirements).
 - A current graphics driver from NVIDIA, AMD or Intel (it provides Vulkan).
-- Your own decrypted dump of **Until Dawn for PS4, CUSA02636, with the 01.03 update applied**. Other regions
+- A decrypted dump of **Until Dawn for PS4, CUSA02636, with the 01.03 update applied**, made from your own
+  **legally obtained** copy of the game. Other regions
   (for example the European or Asian releases) and other versions are not supported; the program checks the
   game's executables and tells you if they don't match.
 - About 50 GB of free space for the game files, plus up to about 1 GB for the shader cache.

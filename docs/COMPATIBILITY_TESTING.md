@@ -54,7 +54,11 @@ It checks:
 3. Say whether you also played the game, and if so how far and what you saw.
 
 The report contains your Windows version, CPU and GPU models, driver versions, memory size and the folder paths
-you use. It contains no other personal information and no game data.
+you use. It contains no game data.
+
+**Privacy:** folder paths can include your Windows user name (for example `C:\Users\<name>\...`), and the
+included `UntilDawn.log` has the same kind of paths. Please look through the files and remove anything you don't
+want to post publicly before attaching them.
 
 ---
 

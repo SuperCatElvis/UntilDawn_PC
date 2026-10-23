@@ -1,24 +1,23 @@
-# Until Dawn — Native PC Recompilation
+# Until Dawn (2015) — Native PC Recompilation
 
-**PC recompilation of the original Until Dawn (2015), running natively on Windows with a custom Vulkan renderer.**
+**The original PlayStation 4 version of Until Dawn is now playable from start to finish on Windows — natively, without console emulation.**
+
+This project brings the original **Until Dawn (2015)** to PC using the game's original x86-64 code and our own custom Vulkan renderer. It aims to preserve the original game's visuals, lighting, soundtrack and atmosphere. **This is not the 2024 remake.**
+
+Development is ongoing. The current build has completed a full play-through on the development PC, but it is **not yet a polished or consistently smooth experience**.
 
 > [!WARNING]
-> **Early work-in-progress.** The game is playable from start to finish, but expect graphical bugs, crashes,
-> stutters and hardware compatibility problems. It has only been tested on one PC so far.
+> **Early work-in-progress.** Expect graphical glitches, crashes, shader-compilation pauses and significant frame-rate drops. Some sections of the game currently run **well below 30 FPS**, even on the development PC. Performance is **not addressed in this test release**; it will be improved in future releases, along with stability and hardware support, but there is no guaranteed timetable.
 
 > [!IMPORTANT]
-> **No game files are included.** You need your own decrypted dump of the original PS4 game
-> (**CUSA02636**) with the **01.03** update. Downloading this project does not give you the game.
+> **You must supply your own legally obtained game files.** This project does not provide the original PS4 game. The loader requires a decrypted dump of **Until Dawn (CUSA02636)** with update **01.03** applied, made from your own legally obtained copy of the game. See [Installation](#installation) and [Third-party notices](THIRD_PARTY_NOTICES.md) for details about the runtime package.
 
-This is an unofficial fan project for the **original 2015 PlayStation 4 release** of Until Dawn. It is not the
-2024 remake and is not affiliated with Sony Interactive Entertainment or Supermassive Games
-(see [Disclaimer](#disclaimer)).
+This is an unofficial fan project and is not affiliated with Sony Interactive Entertainment or Supermassive Games. See the [Disclaimer](#disclaimer).
 
 ---
 
 ## Contents
 
-- [How it works](#how-it-works)
 - [Download](#download)
 - [Features](#features)
 - [System requirements](#system-requirements)
@@ -27,30 +26,11 @@ This is an unofficial fan project for the **original 2015 PlayStation 4 release*
 - [Known issues](#known-issues)
 - [Compatibility testing](#compatibility-testing)
 - [Reporting bugs](#reporting-bugs)
+- [How it works](#how-it-works)
+- [Modding & technical documentation](#modding--technical-documentation)
 - [Future development](#future-development)
 - [License](#license)
 - [Disclaimer](#disclaimer)
-
----
-
-## How it works
-
-The PS4's processor uses the same x86-64 instruction set as a Windows PC, so the game's original program code
-does not need to be emulated: **it runs directly on your CPU**, natively on Windows. There is no console
-emulator and no CPU emulation.
-
-What this project provides is everything around that code:
-
-- **A loader** that reads the game's own executables (`eboot.bin`, `all_programs.prx`) from your game folder,
-  maps them into memory and starts them. Nothing is decrypted by this program, and the game files on disk are
-  never modified; small compatibility patches are applied in memory only.
-- **A replacement for the PS4 system libraries.** The game calls 748 PS4 system functions (threads, files,
-  memory, saves, audio, controllers, graphics). This project answers those calls with Windows equivalents.
-- **A custom Vulkan renderer.** The game's PS4 GPU command streams are translated to Vulkan, and its AMD GCN
-  GPU programs (shaders) are translated to SPIR-V on your PC and compiled by your graphics driver. Compiled
-  shaders are cached on disk so later runs stutter less.
-
-All of the game's code, art, audio and video are read at run time from **your own copy** of the game.
 
 ---
 
@@ -58,7 +38,7 @@ All of the game's code, art, audio and video are read at run time from **your ow
 
 **[Download the latest release from the Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases)**
 
-Current version: **WIP 0.1.2** (`v0.1.2-wip`), the first public test release.
+**Planned first public test release:** WIP 0.1.2 (`v0.1.2-wip`). If there is no download on the Releases page yet, the package has not been published.
 
 The download contains the program, a hardware compatibility tester and documentation, but **no game files**.
 
@@ -68,29 +48,28 @@ The download contains the program, a hardware compatibility tester and documenta
 
 What is implemented in WIP 0.1.2:
 
-**Game**
-- The whole game is playable from the prologue to the end credits (one full play-through on the development PC).
+### Game
+- A complete play-through from the prologue to the end credits has been achieved on the development PC.
 - Saves work and are kept next to the program in `savedata\`.
 - The pre-order bonus chapter **"The Road Not Taken"** (`UDAWNDLC00000001`) works if you have it: an extra
   section in Chapter 2 and two extra Mystery Man clues.
 - **Movie skipping:** the intro logos and the "Previously on Until Dawn" recaps can be skipped with an on-screen
   Skip prompt (press any button, then Cross / Enter).
 
-**Graphics**
+### Graphics
 - Custom Vulkan renderer; the game renders at the PS4's 1920×1080 and is shown in a resizable window.
 - Windowed or borderless display modes, configurable window size.
-- Frame-rate limit: 60 FPS by default (as on PS4), or 30, 120, 144, 165, any other value, or unlimited.
+- Configurable frame-rate cap (60 FPS by default). **A 60 FPS cap does not mean the game currently runs at 60 FPS consistently.**
 - On-disk shader cache (`Cache\`), with shaders compiled in parallel in the background.
 
-**Controls**
+### Controllers and input
 - **DualSense** (PS5), **DualSense Edge** and **DualShock 4** (PS4) over USB or Bluetooth, with no extra
   software: all buttons, touch pad (swipes and click) and motion sensors. Tested with a DualSense.
 - **Xbox-style controllers** (XInput, including DS4Windows / Steam virtual pads), with vibration.
 - **Keyboard and mouse**, including mouse aiming.
 
-**Usability**
-- Checks your game files at every start (all 7,634 files, plus the version of the two executables) and tells you
-  in plain words if something is missing or the wrong version.
+### Usability
+- Checks the required game files and executable versions at startup and reports missing or incompatible files.
 - Checks your CPU and graphics card at start and explains any missing requirement.
 - Settings in a simple `Config\settings.ini`, recreated with defaults if deleted.
 - Session logs in `Logs\` (the current session plus the five before it).
@@ -108,9 +87,9 @@ These are the requirements the program checks for. Only one PC has been tested s
 | **OS** | Windows 10 or 11, 64-bit |
 | **CPU** | x86-64 with AVX, F16C, BMI1, LZCNT, POPCNT, MOVBE and SSE4.2 — in practice Intel Core 4th generation (Haswell, 2013) or newer, or AMD Ryzen (or Excavator) or newer. Older Pentium/Celeron and pre-Ryzen AMD CPUs cannot run the game's code. |
 | **Memory** | 16 GB recommended. The program warns below 12 GB. |
-| **GPU** | A Vulkan 1.3 driver that supports `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`. Expected to work: NVIDIA GTX 900 series (Maxwell) or newer; AMD RX 400 (GCN 4) / RX 5000 (RDNA) or newer with a 2022+ driver; Intel Arc, or Gen9+ integrated graphics with a 2022+ driver. **Only NVIDIA has been tested.** |
+| **GPU** | A Vulkan 1.3 driver supporting `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`, plus the features and limits checked at startup. **Only the development NVIDIA GPU has been tested in gameplay.** Other GPU models and vendors are not yet confirmed compatible. |
 | **Disk** | About 50 GB for the game files, plus up to about 1 GB for the shader cache. |
-| **Game** | Your own decrypted dump of Until Dawn for PS4, **CUSA02636**, with the **01.03** update applied. Other regions and versions are refused. |
+| **Game** | A decrypted dump of Until Dawn for PS4, **CUSA02636**, with the **01.03** update applied, made from your own **legally obtained** copy. Other regions and versions are refused. |
 
 ### Tested hardware
 
@@ -143,7 +122,7 @@ UntilDawn_WIP_0.1.2\
 
 ### 2. Add your game files
 
-You need your own decrypted dump of **CUSA02636 with the 01.03 update applied** on top of the base game. The
+You need a decrypted dump of **CUSA02636 with the 01.03 update applied** on top of the base game, made from your own **legally obtained** copy of the game. The
 program uses these parts of it (other files can stay; they are ignored):
 
 ```
@@ -156,20 +135,13 @@ Movies\
 audio\
 ```
 
-Choose **one** of these:
+The simplest method is to **copy** your game files into the release's `Game` folder, so that `Game\eboot.bin` exists.
 
-- **Copy** the game into the release's `Game` folder, so that `Game\eboot.bin` exists.
-- **Point to it:** open `Config\settings.ini` and set `game_dir` to the folder that contains `eboot.bin`:
+To avoid copying the files, you can also **point the launcher at your existing game folder**: open `Config\settings.ini` and set `game_dir` to the folder containing `eboot.bin`:
   ```ini
   game_dir = D:\PS4\CUSA02636
   ```
-- **Link it** (saves disk space): delete the release's `Game` folder (it only holds a note), open a Command
-  Prompt in the release folder and run:
-  ```bat
-  mklink /J Game "D:\PS4\CUSA02636"
-  ```
-
-Replace `D:\PS4\CUSA02636` with your own game folder.
+Replace `D:\PS4\CUSA02636` with your own game folder. An optional directory-junction setup is documented in **[docs/INSTALLATION.md](docs/INSTALLATION.md)**.
 
 **Optional DLC:** if you own "The Road Not Taken", copy its `UDAWNDLC00000001` folder from your own copy into
 the game folder, next to `eboot.bin`.
@@ -185,9 +157,7 @@ Settings (frame-rate limit, windowed / borderless, window size) and troubleshoot
 **[docs/INSTALLATION.md](docs/INSTALLATION.md)**.
 
 > [!NOTE]
-> The first start of each new area compiles shaders for your graphics card. On the first play-through the game
-> can **freeze for 10–20 seconds** at a time while this happens, mostly in the first minutes. It is not a crash —
-> wait for it. Later runs use the shader cache and are much smoother.
+> The first visit to a new area may compile shaders for your graphics card. This can cause **pauses lasting 10–20 seconds** during the first play-through. Later runs can benefit from the shader cache, though other freezes and crashes are still possible.
 
 ---
 
@@ -225,7 +195,7 @@ The most important ones — full list in **[docs/KNOWN_ISSUES.md](docs/KNOWN_ISS
 - **Graphical bugs:** black mouths in some close-ups, a red flash in the Episodes menu, smeared text at the start
   of the end credits.
 - **Long freezes while shaders compile** on the first play-through (see the note under Installation).
-- **Performance:** about 30–60 FPS depending on the scene, even on fast PCs.
+- **Frame-rate drops:** frame rate varies widely by scene. Many sections reach 30–60 FPS on the development PC, but **some sections run well below 30 FPS** (10–20 FPS measured in places, and lower during shader-compilation pauses). Performance is not addressed in this test release; it will be improved in future releases. The default 60 FPS cap is a limit, not a guaranteed frame rate.
 - **No vibration or light bar** on DualSense / DualShock 4 yet (Xbox controllers vibrate).
 - **AMD and Intel graphics are untested.**
 - Online / PlayStation Network features are not available. Trophy unlocks are recorded locally (in
@@ -260,24 +230,67 @@ Please use **[GitHub Issues](https://github.com/SuperCatElvis/UntilDawn_PC/issue
 - `compat\compat_report.zip` (run `compat\run_compat.bat` once).
 - Your CPU, graphics card and driver version (the report contains these).
 
-The logs contain your hardware description and the folder paths you use; nothing else personal.
+**Privacy:** logs and compatibility reports can contain hardware details, file paths and potentially identifying information (such as a Windows username in a path). Please review and redact anything sensitive before posting them publicly.
 
 **Do not ask for, share or link game files** in issues. Such posts will be removed.
 
 ---
 
+## How it works
+
+The PS4's processor uses the same x86-64 instruction set as a Windows PC, so the game's original program code
+does not need to be emulated: **it runs directly on your CPU**, natively on Windows. There is no console
+emulator and no CPU emulation.
+
+What this project provides is everything around that code:
+
+- **A loader** that reads the game's own executables (`eboot.bin`, `all_programs.prx`) from your game folder,
+  maps them into memory and starts them. Nothing is decrypted by this program, and the game files on disk are
+  never modified; small compatibility patches are applied in memory only.
+- **A replacement for the PS4 system libraries.** The game calls 748 PS4 system functions (threads, files,
+  memory, saves, audio, controllers, graphics). This project answers those calls with Windows equivalents.
+- **A custom Vulkan renderer.** The game's PS4 GPU command streams are translated to Vulkan, and its AMD GCN
+  GPU programs (shaders) are translated to SPIR-V on your PC and compiled by your graphics driver. Compiled
+  shaders are cached on disk so later runs stutter less.
+
+All of the game's code, art, audio and video are read at run time from **your own copy** of the game.
+
+For an in-depth look at the internals (for modders and the curious), see
+**[docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md)**.
+
+---
+
+## Modding & technical documentation
+
+Interested in modding the original Until Dawn on PC?
+
+The **[Technical Overview](docs/TECHNICAL_OVERVIEW.md)** explains how the native recompilation works, including
+the game's memory, file formats, rendering, shaders, input systems and in-memory modifications.
+
+The documentation is intended to help anyone interested in understanding the game's internals or exploring the
+possibility of creating mods for the native PC version.
+
+Modding support is still in its early stages, and there is currently **no dedicated mod loader**. We hope to
+expand the documentation and make the game more accessible to modders as development progresses.
+
+---
+
 ## Future development
 
-Priorities, in order:
+Our immediate priorities are:
 
-1. **Stability** — finding the source of the memory corruption behind the remaining crashes and character
-   distortions, rather than only containing its effects.
-2. **Graphical correctness** — fixing the known rendering bugs and remaining differences from the PS4 picture.
-3. **Hardware compatibility** — AMD and Intel GPUs and AMD CPUs, based on your compatibility reports.
-4. **Performance** — fewer shader-compile freezes and a steadier frame rate.
+1. **Stability** — identify and fix the underlying memory corruption behind remaining crashes and occasional character distortions.
+2. **Graphical accuracy** — address known rendering bugs and bring the picture closer to the original PS4 version.
+3. **Hardware compatibility** — verify and improve support for AMD and Intel GPUs and AMD CPUs, using reports from other PCs.
+4. **Performance** — reduce shader-compilation stalls and severe FPS drops, then work toward consistently smooth gameplay.
 
-Later, this repository may also hold technical documentation for people interested in how the port works or in
-modding the game.
+**Long-term performance goal:** render the original game at **4K resolution with a smooth, consistent 60 FPS**, and ideally support higher frame rates where hardware allows. This is an ambition for future development, **not a capability of WIP 0.1.2**. The current renderer still renders internally at 1920×1080; achieving native 4K output and stable performance will require further work.
+
+**Planned quality-of-life improvements:** a proper **in-game settings menu** for graphics, frame-rate limits, controls, input bindings and other configurable options, rather than relying mainly on `Config\settings.ini`.
+
+**Localisation:** support for additional languages is planned closer to a more complete release. It is **not a current development priority**, and language availability will depend on the relevant game resources and implementation work.
+
+More documentation for people interested in the internals and in creating mods may follow (see [Modding & technical documentation](#modding--technical-documentation)).
 
 ---
 
@@ -295,8 +308,6 @@ This is an unofficial, non-commercial fan project. It is **not affiliated with, 
 Interactive Entertainment or Supermassive Games**. "Until Dawn" is a trademark of Sony Interactive
 Entertainment. "PlayStation", "DualSense" and "DualShock" are trademarks of Sony Interactive Entertainment.
 
-No game files are included in this repository or its releases. You must provide your own copy of the game.
-The small amount of game information the program needs to work with your copy (and its icon) is listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Do not ask for, share or upload game files.
+The original game installation is **not provided**; users must supply their own legally obtained copy. Any game-derived material identified in the runtime package is documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Do not ask for, share or upload game files.
 
 The software is provided as-is, without any warranty.

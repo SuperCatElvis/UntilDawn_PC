@@ -1,0 +1,63 @@
+name: Compatibility report
+description: Results of compat\run_compat.bat on your PC - useful even when everything passes, especially on AMD and Intel hardware.
+title: "[Compat] <CPU> + <GPU>"
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run `compat\run_compat.bat` from the release folder, then attach the `compat\compat_report.zip` it creates.
+        See [Compatibility testing](https://github.com/SuperCatElvis/UntilDawn_PC/blob/main/docs/COMPATIBILITY_TESTING.md).
+        **Privacy:** the report and log contain folder paths, which can include your Windows user name. Look through them and remove anything you don't want to post publicly.
+  - type: input
+    id: version
+    attributes:
+      label: Release version
+      placeholder: WIP 0.1.2
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      placeholder: e.g. AMD Ryzen 7 5800X3D
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: e.g. AMD Radeon RX 7800 XT, Adrenalin 26.x
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Tester result
+      options:
+        - ALL CHECKS PASSED
+        - Some checks FAILED
+        - The tester did not finish
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: compat_report.zip
+      description: Attach the ZIP here (drag and drop). If it was not created, attach ud_compat_report.txt and ud_compat_console.txt from the compat folder.
+    validations:
+      required: true
+  - type: dropdown
+    id: played
+    attributes:
+      label: Did you also play the game?
+      options:
+        - "No"
+        - Yes - it started and played normally
+        - Yes - with problems (describe below)
+        - It did not start
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: How far you played, anything that looked or behaved wrong.
