@@ -2,7 +2,7 @@
 
 **The original PlayStation 4 version of Until Dawn is now playable from start to finish on Windows — natively, without console emulation.**
 
-This project brings the original **Until Dawn (2015)** to PC using the game's original x86-64 code and our own custom Vulkan renderer. It aims to preserve the original game's visuals, lighting, soundtrack and atmosphere. **This is not the 2024 remake.**
+This project aims to bring the original **Until Dawn (2015)** to PC, running natively on Windows with its original x86-64 code and our own custom Vulkan renderer.
 
 Development is ongoing. The current build has completed a full play-through on the development PC, but it is **not yet a polished or consistently smooth experience**.
 
