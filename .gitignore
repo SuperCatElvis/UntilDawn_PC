@@ -53,3 +53,49 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# ---- Until Dawn native PC port: never commit game files, release builds or local run data ----
+# Original game files (users supply their own copy)
+eboot.bin
+*.prx
+*.sprx
+*.self
+*.pkg
+*.bk2
+*.core
+*.stream
+param.sfo
+sce_sys/
+sce_module/
+localcachepink/
+Movies/
+audio/
+Game/
+CUSA*/
+UDAWNDLC*/
+
+# Release packages (attach to GitHub Releases instead)
+*.zip
+*.7z
+*.rar
+
+# Files the program creates when it runs
+Config/
+Logs/
+Cache/
+savedata/
+temp0/
+*.log
+*.pm4
+*.bmp
+compat_report.zip
+ud_compat_report.txt
+ud_compat_console.txt
+vulkan_pipelines.bin
+e6_pipeline_cache.bin
+
+# Analysis / development material (never public)
+*.dis
+*.disasm
+ghidra*/
+captures/
