@@ -64,6 +64,7 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 - **Episodes menu.** A red flash can appear across the screen when navigating the Episodes menu.
 - **End credits.** Text at the beginning of the end credits may appear vertically smeared.
 - **Previously on Until Dawn recaps.** The on-screen **SKIP** text may appear as blocks during later recap videos.
+- **Cross (X) button and subtitles** can occasionally appear with a glitchy appearance
 - Small graphical differences from the original PS4 version may occur elsewhere. Please report anything unusual with a screenshot.
 
 ## Audio
