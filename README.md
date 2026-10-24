@@ -198,7 +198,7 @@ The most important ones — full list in **[docs/KNOWN_ISSUES.md](docs/KNOWN_ISS
 - **Occasional crashes.** In a full play-through on the development PC the game crashed twice; saves were kept.
   The cause (some game memory is occasionally overwritten) is being investigated.
 - **Characters occasionally deform ("explode") for a frame or two**, and a collectible can vanish or reappear.
-- **Graphical bugs:** black mouths in some close-ups, a red flash in the Episodes menu, smeared text at the start
+- **Graphical bugs:** totem visions that lose their background or UI, black mouths in some close-ups, a red flash in the Episodes menu, smeared text at the start
   of the end credits.
 - **Long freezes while shaders compile** on the first play-through (see the note under Installation).
 - **Frame-rate drops:** frame rate varies widely by scene. Many sections reach 30–60 FPS on the development PC, but **some sections run well below 30 FPS** (10–20 FPS measured in places, and lower during shader-compilation pauses). Performance is not addressed in this test release; it will be improved in future releases. The default 60 FPS cap is a limit, not a guaranteed frame rate.

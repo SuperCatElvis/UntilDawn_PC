@@ -17,6 +17,9 @@ Graphics
   - The inside of mouths can render black in some close-ups.
   - A red flash over the screen while moving through the Episodes menu.
   - The text at the start of the end credits is smeared vertically.
+  - Totem visions: the video can play without the rest of the totem screen (its background and UI), e.g. when a
+    totem is rewatched after it played correctly the first time; sometimes the whole UI disappears and only
+    the character and the background remain.
   - The "SKIP" text in the later "Previously on Until Dawn" clips can show as blocks.
   - Small differences from the PS4 picture are possible elsewhere; please report anything that looks wrong.
 

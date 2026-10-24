@@ -63,6 +63,9 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 - **Character mouths.** The inside of mouths can render black in some close-ups.
 - **Episodes menu.** A red flash can appear across the screen when navigating the Episodes menu.
 - **End credits.** Text at the beginning of the end credits may appear vertically smeared.
+- **Totem visions.** Watching a totem's vision does not always draw everything around the video:
+  - the video plays but the rest of the totem screen (its background and UI) is missing, for example when a totem is rewatched from the menu after it played correctly the first time;
+  - sometimes the whole UI disappears and only the character and the background remain.
 - **Previously on Until Dawn recaps.** The on-screen **SKIP** text may appear as blocks during later recap videos.
 - Small graphical differences from the original PS4 version may occur elsewhere. Please report anything unusual with a screenshot.
 
