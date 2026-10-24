@@ -38,7 +38,7 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release from the Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases)**
 
-**Current version:** [WIP 0.1.2](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.1.2-wip) (`v0.1.2-wip`), the first public test release. Download **`UntilDawn_WIP_0.1.2.zip`** from the release's Assets list (the "Source code" archives only contain this repository's documentation).
+**Current version:** [WIP 0.1.3](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.1.3-wip) (`v0.1.3-wip`): long folder paths fixed, AMD graphics fixed (confirmed on an RX 9070 XT). Download **`UntilDawn_WIP_0.1.3.zip`** from the release's Assets list (the "Source code" archives only contain this repository's documentation). Release notes: [docs/releases/v0.1.3-wip.md](docs/releases/v0.1.3-wip.md).
 
 The download contains the program, a hardware compatibility tester and documentation, but **no game files**.
 
@@ -46,7 +46,7 @@ The download contains the program, a hardware compatibility tester and documenta
 
 ## Features
 
-What is implemented in WIP 0.1.2:
+What is implemented in WIP 0.1.3:
 
 ### Game
 - A complete play-through from the prologue to the end credits has been achieved on the development PC.
