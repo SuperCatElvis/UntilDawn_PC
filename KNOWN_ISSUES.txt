@@ -18,6 +18,7 @@ Graphics
   - A red flash over the screen while moving through the Episodes menu.
   - The text at the start of the end credits is smeared vertically.
   - The "SKIP" text in the later "Previously on Until Dawn" clips can show as blocks.
+  - Cross (X) button and subtitles and occasionally appear glitchy
   - Small differences from the PS4 picture are possible elsewhere; please report anything that looks wrong.
 
 Performance
