@@ -64,7 +64,7 @@ What is implemented in WIP 0.1.2:
 
 ### Controllers and input
 - **DualSense** (PS5), **DualSense Edge** and **DualShock 4** (PS4) over USB or Bluetooth, with no extra
-  software: all buttons, touch pad (swipes and click) and motion sensors. Tested with a DualSense.
+  software: buttons, touch pad (swipes and click) and motion sensors. **DualSense and DualShock 4 have both been gameplay-tested** (DualShock 4 confirmed by Mocca). Motion-control drift during some “Don't Move” sequences remains a known issue.
 - **Xbox-style controllers** (XInput, including DS4Windows / Steam virtual pads), with vibration.
 - **Keyboard and mouse**, including mouse aiming.
 
@@ -79,26 +79,32 @@ What is implemented in WIP 0.1.2:
 
 ## System requirements
 
-These are the requirements the program checks for. Only one PC has been tested so far (see
-[Tested hardware](#tested-hardware)); there are no verified minimum specs yet.
+These are the requirements the program checks for. Compatibility reports have now been received from several different PCs (see [Tested hardware](#tested-hardware)), but there are still no verified minimum specifications. A passing compatibility test does not guarantee that gameplay is free of bugs.
 
 | | Requirement |
 | --- | --- |
 | **OS** | Windows 10 or 11, 64-bit |
 | **CPU** | x86-64 with AVX, F16C, BMI1, LZCNT, POPCNT, MOVBE and SSE4.2 — in practice Intel Core 4th generation (Haswell, 2013) or newer, or AMD Ryzen (or Excavator) or newer. Older Pentium/Celeron and pre-Ryzen AMD CPUs cannot run the game's code. |
 | **Memory** | 16 GB recommended. The program warns below 12 GB. |
-| **GPU** | A Vulkan 1.3 driver supporting `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`, plus the features and limits checked at startup. **Only the development NVIDIA GPU has been tested in gameplay.** Other GPU models and vendors are not yet confirmed compatible. |
+| **GPU** | A Vulkan 1.3 driver supporting `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`, plus the features and limits checked at startup. **Gameplay has been verified on the development NVIDIA GPU; compatibility tests have also been run on additional NVIDIA and AMD GPUs.** Gameplay and rendering compatibility remain under investigation across hardware. |
 | **Disk** | About 50 GB for the game files, plus up to about 1 GB for the shader cache. |
 | **Game** | A decrypted dump of Until Dawn for PS4, **CUSA02636**, with the **01.03** update applied, made from your own **legally obtained** copy. Other regions and versions are refused. |
 
 ### Tested hardware
 
-| CPU | GPU | Driver | OS | Memory | Result |
-| --- | --- | --- | --- | --- | --- |
-| Intel Core i9-12900KF | NVIDIA GeForce RTX 3090 Ti | 617.42, 621.01 | Windows 11 | 64 GB | Full play-through; compatibility test 66/66 passed |
+The table distinguishes **full gameplay verification** from a **hardware compatibility test**. A compatibility test checks CPU features, Vulkan support and shader behaviour; passing it does not mean that the entire game has been played or that all scenes render correctly.
 
-AMD Radeon, Intel Arc / integrated graphics and AMD Ryzen CPUs are **untested**. Reports from these systems are
-especially welcome — see [Compatibility testing](#compatibility-testing).
+| CPU | GPU used for compatibility test | Driver | OS | Memory | Result |
+| --- | --- | --- | --- | --- | --- |
+| Intel Core i9-12900KF | NVIDIA GeForce RTX 3090 Ti | 617.42, 621.01 | Windows 11 | 64 GB | Full play-through; 66/66 compatibility checks passed |
+| Intel Core Ultra 9 275HX | NVIDIA GeForce RTX 5070 Laptop GPU | 617.42 | Windows 11 | 32 GB | 66/66 compatibility checks passed |
+| AMD Ryzen 7 5700G | NVIDIA GeForce RTX 3060 Ti | 610.88 | Windows 11 | 24 GB | 67/67 compatibility checks passed |
+| AMD Ryzen 5 7500F | NVIDIA GeForce RTX 3080 | 617.42 | Windows 11 | 32 GB | 67/67 compatibility checks passed |
+| AMD Ryzen 7 5700X | NVIDIA GeForce RTX 5070 | 596.49 | Windows 11 | 16 GB | 63/63 compatibility checks passed |
+| AMD Ryzen 5 9600X | AMD Radeon RX 9070 XT | 26.8.1 | Windows 11 | 32 GB | 70 passed, 1 failed; graphical corruption reported in WIP 0.1.2 |
+| AMD Ryzen 7 5800X | NVIDIA GeForce RTX 3090 | 617.14 | Windows 11 | 32 GB | 67/67 compatibility checks passed |
+
+The Core Ultra 9 system also detected **Intel integrated graphics** as usable, but the compatibility test ran on the **RTX 5070 Laptop GPU**, so this does not verify gameplay on Intel graphics. AMD Radeon testing has identified issues under investigation; see [Known issues](#known-issues). Reports from additional AMD and Intel systems are especially welcome — see [Compatibility testing](#compatibility-testing).
 
 ---
 
