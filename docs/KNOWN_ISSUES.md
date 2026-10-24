@@ -67,6 +67,7 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
   - the video plays but the rest of the totem screen (its background and UI) is missing, for example when a totem is rewatched from the menu after it played correctly the first time;
   - sometimes the whole UI disappears and only the character and the background remain.
 - **Previously on Until Dawn recaps.** The on-screen **SKIP** text may appear as blocks during later recap videos.
+- **Cross (X) button and subtitles** can occasionally appear with a glitchy appearance
 - Small graphical differences from the original PS4 version may occur elsewhere. Please report anything unusual with a screenshot.
 
 ## Audio

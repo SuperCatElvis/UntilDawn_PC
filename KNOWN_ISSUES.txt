@@ -21,6 +21,7 @@ Graphics
     totem is rewatched after it played correctly the first time; sometimes the whole UI disappears and only
     the character and the background remain.
   - The "SKIP" text in the later "Previously on Until Dawn" clips can show as blocks.
+  - Cross (X) button and subtitles and occasionally appear glitchy
   - Small differences from the PS4 picture are possible elsewhere; please report anything that looks wrong.
 
 Performance
