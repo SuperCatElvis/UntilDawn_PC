@@ -38,7 +38,7 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release from the Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases)**
 
-**Planned first public test release:** WIP 0.1.2 (`v0.1.2-wip`). If there is no download on the Releases page yet, the package has not been published.
+**Current version:** [WIP 0.1.2](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.1.2-wip) (`v0.1.2-wip`), the first public test release. Download **`UntilDawn_WIP_0.1.2.zip`** from the release's Assets list (the "Source code" archives only contain this repository's documentation).
 
 The download contains the program, a hardware compatibility tester and documentation, but **no game files**.
 
@@ -197,7 +197,11 @@ The most important ones — full list in **[docs/KNOWN_ISSUES.md](docs/KNOWN_ISS
 - **Long freezes while shaders compile** on the first play-through (see the note under Installation).
 - **Frame-rate drops:** frame rate varies widely by scene. Many sections reach 30–60 FPS on the development PC, but **some sections run well below 30 FPS** (10–20 FPS measured in places, and lower during shader-compilation pauses). Performance is not addressed in this test release; it will be improved in future releases. The default 60 FPS cap is a limit, not a guaranteed frame rate.
 - **No vibration or light bar** on DualSense / DualShock 4 yet (Xbox controllers vibrate).
-- **AMD and Intel graphics are untested.**
+- **False "missing files" message when the folder path is long** (cause confirmed): move the release to a shorter
+  folder, so the path to its `Game` folder is 62 characters or fewer, e.g. `C:\Games\UntilDawn_WIP_0.1.2`. A fix is
+  verified in a test build and planned for the next release.
+- **Corrupted textures and black blocks on some AMD GPUs** (under investigation): a potential fix is being tested on
+  an affected PC; not confirmed yet. Intel graphics are untested.
 - Online / PlayStation Network features are not available. Trophy unlocks are recorded locally (in
   `savedata\` and the log), but there is no on-screen trophy notification.
 

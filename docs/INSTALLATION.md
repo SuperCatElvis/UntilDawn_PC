@@ -156,6 +156,7 @@ The game itself renders at 1920×1080, as on the PS4, and is scaled to the windo
 
 | Problem | What to do |
 | --- | --- |
+| A file is reported missing although it is there (often a very long `localcachepink/streams/...` name) | The folder path is too long for WIP 0.1.2 (260-character Windows limit). Move the release to a shorter folder so the path to `Game\` is 62 characters or fewer, e.g. `C:\Games\UntilDawn_WIP_0.1.2`. See [Known issues](KNOWN_ISSUES.md#false-missing-files-message-with-a-long-folder-path). |
 | "The game folder was not found" or "eboot.bin is missing from the game folder" | The `Game` folder (or `game_dir`) does not point at the folder that contains `eboot.bin`. Check section 3. |
 | A message says the version or region does not match | You need CUSA02636 with the 01.03 update applied. Base-game files without the update, or another region, are refused. |
 | A message says a file is missing or has the wrong size | Your copy is incomplete, or the update was not applied over the base game. Re-copy the files. |
