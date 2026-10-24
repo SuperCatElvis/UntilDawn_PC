@@ -1,4 +1,4 @@
-Until Dawn native PC port - known issues (WIP 0.1.2, 23 October 2026)
+Until Dawn native PC port - known issues (WIP 0.1.3, 24 October 2026)
 =====================================================================
 
 This is a work-in-progress test build. What is known so far:
@@ -33,10 +33,18 @@ Performance
 
 Hardware
 --------
-  - Tested only on: Intel Core i9-12900KF + NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01),
+  - Full play-through: Intel Core i9-12900KF + NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01),
     Windows 11, 64 GB.
-  - AMD Radeon and Intel Arc / integrated graphics are untested. AMD Ryzen CPUs are untested.
-    Please run compat\run_compat.bat on these and send the report even if the game runs fine.
+  - Compatibility test passed: NVIDIA RTX 3090, NVIDIA RTX 5070 Laptop GPU, AMD Radeon RX 9070 XT
+    (with Ryzen 5 9600X).
+  - AMD Radeon: 0.1.2 rendered badly on an RX 9070 XT (noisy textures, black blocks, missing foliage, stepped
+    lighting). Fixed in 0.1.3 and confirmed on that card: it now looks the same as on NVIDIA. If something
+    still looks wrong on your AMD card, please report it with a screenshot.
+  - Intel Arc / integrated graphics are untested. Please run compat\run_compat.bat on these and send the report
+    even if the game runs fine.
+  - Game files reported "missing" although they are there: fixed in 0.1.3 for long folder paths. If one file is
+    still missing, it usually was not copied: the copy (or unzip) of your game skipped it because the folder you
+    copied FROM had a long path. Copy that file again, e.g. with robocopy, from a short folder.
   - Vibration and the light bar of DualSense / DualShock 4 controllers are not supported yet (Xbox controllers
     vibrate).
 

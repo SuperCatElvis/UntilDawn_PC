@@ -1,5 +1,5 @@
 
-# Known issues — WIP 0.1.2
+# Known issues — WIP 0.1.3
 
 [← Back to README](../README.md)
 
@@ -11,42 +11,43 @@ This is an early test release, and several issues are still being investigated. 
 
 | Issue | Status |
 | --- | --- |
-| False "missing files" message with a long folder path | **Cause confirmed, workaround available.** Fix verified in a test build; planned for the next release. |
-| Corrupted textures and black blocks on some AMD GPUs | **Under investigation.** A potential fix is being tested; not confirmed yet. |
+| False "missing files" message with a long folder path | **Fixed in WIP 0.1.3** (verified). |
+| Corrupted textures, black blocks, missing foliage and stepped lighting on AMD GPUs | **Fixed in WIP 0.1.3** (confirmed on an RX 9070 XT by the player who reported it). |
+| One game file reported missing although the game was copied | Not a port bug: the copy skipped the file. See below. |
 
-### False "missing files" message with a long folder path
+### False "missing files" message with a long folder path — fixed in WIP 0.1.3
 
-WIP 0.1.2 can incorrectly report game files as missing when the path to the game folder is too long, even though the files are present.
+WIP 0.1.2 could incorrectly report game files as missing when the path to the game folder was too long, even though the files were present.
 
-Windows' standard file functions, which WIP 0.1.2 uses, cannot open paths longer than 260 characters. The game's longest filename is approximately 197 characters on its own, so placing the game inside several nested folders can cause the full path to exceed this limit.
+Windows' standard file functions, which WIP 0.1.2 used, cannot open paths longer than 260 characters. The game's longest filename is approximately 197 characters on its own, so a game folder path of more than about 62 characters (for example a ZIP extracted into a folder of the same name, `...\Downloads\UntilDawn_WIP_0.1.2\UntilDawn_WIP_0.1.2\Game\`) pushed the full path over the limit.
 
-**Workaround:** Move the release or game folder to a shorter location. The path to the `Game` folder, including the final `\`, should be **62 characters or fewer**.
+**Fix (WIP 0.1.3):** long paths are now opened with Windows' extended-length path support. The same folder that reported 40 missing files with WIP 0.1.2 passed the file check and ran the game normally.
 
-For example:
+**If you stay on WIP 0.1.2:** move the release or game folder so that the path to the `Game` folder, including the final `\`, is **62 characters or fewer**, e.g. `C:\Games\UntilDawn_WIP_0.1.2\Game\`. The same limit applies to `game_dir` in `Config\settings.ini`.
 
-`C:\Games\UntilDawn_WIP_0.1.2\Game\`
+### One game file reported missing although the game was copied
 
-A common cause is extracting the ZIP into a folder of the same name, resulting in a doubled directory structure:
+If the message names **one** file (often the very long `...mainlodge_garage_mountainbikeyellow_b001_c002_mat_0_textureset.corestream`), check whether it is really in your `Game\localcachepink\streams` folder. Windows Explorer shortens long names, and a similar-looking file with a shorter name sits next to it.
 
-`...\Downloads\UntilDawn_WIP_0.1.2\UntilDawn_WIP_0.1.2\Game\`
+The usual cause is the **copy**: when the folder you copied the game *from* has a long path, Explorer or an unzip tool can skip the game's longest file names. Copy the game again with `robocopy` (it handles long paths and copies only what is missing), from a short folder:
 
-If you've configured `game_dir` in `Config\settings.ini`, the same path-length restriction applies to that folder.
+```
+robocopy "D:\path\to\your\CUSA02636 dump" "C:\Games\UntilDawn_WIP_0.1.3\Game" /E
+```
 
-**Fix:** Long-path support has been implemented and verified in a separate test build. The same directory that previously reported 40 missing files successfully passed the file checks and ran the game normally. This fix is planned for the next release.
+### AMD GPUs: corrupted textures, black blocks, missing foliage and stepped lighting — fixed in WIP 0.1.3
 
-### Corrupted textures and black blocks on some AMD GPUs
+A player using an **AMD Radeon RX 9070 XT** reported graphical corruption in WIP 0.1.2: noisy or speckled textures on clothing, black square blocks around characters and objects, trees and bushes partly missing, and lighting that ended in square steps (for example along a character's sleeve or tree edges). Performance was otherwise good.
 
-A player using an **AMD Radeon RX 9070 XT** reported graphical corruption in WIP 0.1.2, including noisy or speckled textures on clothing and black square blocks around the edges of characters and objects. Performance was otherwise good.
+**What was found** (with test builds and frame captures from that PC, replayed and compared on the development PC):
 
-**Likely cause (not yet confirmed):** Some translated pixel shaders allow neighbouring 2×2 pixel groups to follow different execution paths before texture sampling. The original PS4 shader behaviour keeps these groups together. On some GPUs, the translated behaviour can produce incorrect texture-detail calculations and graphical artefacts.
+- One compute shader of the game could not be compiled on GPUs with 32 KB of shared memory (it needed 12 bytes more). It now fits exactly.
+- Pixel shaders now keep each 2×2 pixel group together when they branch before texture sampling, as on the PS4.
+- **Main cause:** the translated pixel shaders emulated a PS4 detail for every shader — the extra "helper" pixels a GPU runs next to the real ones (for texture detail calculations) started switched off and were tracked separately. On the NVIDIA development GPU this was harmless; on the AMD driver, whole 8×8-pixel blocks of alpha-tested pixels (leaves, needles, branches) were lost. The missing foliage then also put the per-tile lighting out of step. WIP 0.1.3 keeps that emulation only in the few shaders where it matters (95 of about 3,900) and runs the helper pixels normally everywhere else.
 
-This has not been observed on the NVIDIA development GPU.
+This is a change in the shader translation itself, not an AMD-only switch. On NVIDIA it changes only a few pixels on outlines.
 
-**Status:** A test build has been prepared that preserves the 2×2 pixel groups on AMD and Intel GPUs, alongside additional AMD compatibility corrections.
-
-The fix is still awaiting confirmation from the affected AMD hardware. This issue will only be marked resolved once the results have been verified.
-
-If you're using an AMD GPU and encounter similar graphical problems, please submit screenshots and a [compatibility report](COMPATIBILITY_TESTING.md).
+**Status: confirmed.** On the same RX 9070 XT, WIP 0.1.3 now renders the same as NVIDIA — including the same remaining known issues listed below. If you have a different AMD GPU, reports with screenshots and a [compatibility report](COMPATIBILITY_TESTING.md) are still very welcome.
 
 ## Stability
 
@@ -90,8 +91,9 @@ If you're using an AMD GPU and encounter similar graphical problems, please subm
 ## Hardware
 
 - **Tested development configuration:** Intel Core i9-12900KF, NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01), Windows 11, 64 GB RAM.
-- **AMD Radeon:** Initial player reports have been received. An AMD Radeon RX 9070 XT has demonstrated graphical corruption in WIP 0.1.2 (see [Reported by players](#reported-by-players)).
-- **AMD Ryzen:** The game has been run on a Ryzen 5 9600X, while a Ryzen 7 5700X has passed the CPU portion of the compatibility test. Wider AMD CPU compatibility has not yet been established.
+- **AMD Radeon:** an AMD Radeon RX 9070 XT showed graphical corruption in WIP 0.1.2; it is fixed in WIP 0.1.3 and confirmed on that card, where all compatibility checks pass (see [Reported by players](#reported-by-players)).
+- **Other NVIDIA GPUs:** compatibility tests passed on the RTX 5070 Laptop GPU, RTX 3060 Ti, RTX 3080, RTX 5070 and RTX 3090 (see the [tested hardware](../README.md#tested-hardware) table).
+- **AMD Ryzen:** The game has been run on a Ryzen 5 9600X, and the compatibility test has passed on Ryzen 7 5700G, Ryzen 5 7500F, Ryzen 7 5700X and Ryzen 7 5800X systems.
 - **Intel GPUs:** Intel Arc and Intel integrated graphics remain untested.
 
 Please run the [compatibility tester](COMPATIBILITY_TESTING.md) on AMD and Intel systems and send your results, even if the game runs correctly.

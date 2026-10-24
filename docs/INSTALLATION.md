@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This guide covers WIP 0.1.2. You need two things: **the release download** from this project, and **your own
+This guide covers WIP 0.1.3. You need two things: **the release download** from this project, and **your own
 copy of the original PS4 game**. The download does not contain the game.
 
 ---
@@ -23,7 +23,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 
 ## 2. Download and extract the release
 
-1. Download `UntilDawn_WIP_0.1.2.zip` from the
+1. Download `UntilDawn_WIP_0.1.3.zip` from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder **you can write to**, for example `D:\Games\UntilDawn_WIP`.
    Don't use `C:\Program Files`: the program keeps its settings, logs, shader cache and saves in its own folder.
@@ -31,7 +31,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 After extracting you have:
 
 ```
-UntilDawn_WIP_0.1.2\
+UntilDawn_WIP_0.1.3\
   UntilDawn.exe                     the game
   Config\settings.ini               settings (see section 5)
   Game\                             empty: your game files go here
@@ -45,6 +45,13 @@ UntilDawn_WIP_0.1.2\
   KNOWN_ISSUES.txt
   THIRD_PARTY_NOTICES.txt
 ```
+
+### Updating from WIP 0.1.2
+
+Copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files into your 0.1.2 folder. **Do not
+overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.1.3 to a
+new folder and copy your `settings.ini`, `savedata` and game files over. Shaders are translated anew, so the
+first-run shader-compilation pauses return once.
 
 ---
 
@@ -72,7 +79,7 @@ Choose **one** of these three ways:
 Copy the contents of your game folder into the release's `Game` folder, so that this file exists:
 
 ```
-UntilDawn_WIP_0.1.2\Game\eboot.bin
+UntilDawn_WIP_0.1.3\Game\eboot.bin
 ```
 
 ### Option B — point `settings.ini` at your game
@@ -156,7 +163,8 @@ The game itself renders at 1920×1080, as on the PS4, and is scaled to the windo
 
 | Problem | What to do |
 | --- | --- |
-| A file is reported missing although it is there (often a very long `localcachepink/streams/...` name) | The folder path is too long for WIP 0.1.2 (260-character Windows limit). Move the release to a shorter folder so the path to `Game\` is 62 characters or fewer, e.g. `C:\Games\UntilDawn_WIP_0.1.2`. See [Known issues](KNOWN_ISSUES.md#false-missing-files-message-with-a-long-folder-path). |
+| A file is reported missing although it is there (often a very long `localcachepink/streams/...` name) | With WIP 0.1.2 the folder path was too long (260-character Windows limit); WIP 0.1.3 fixes this, so update. On 0.1.2, move the release so the path to `Game\` is 62 characters or fewer. See [Known issues](KNOWN_ISSUES.md#false-missing-files-message-with-a-long-folder-path--fixed-in-wip-013). |
+| **One** long-named file is reported missing and it really is not in `Game\localcachepink\streams` | The copy skipped it (common when copying from a long path). Copy the game again with `robocopy "<your dump>" "<release>\Game" /E`. See [Known issues](KNOWN_ISSUES.md#one-game-file-reported-missing-although-the-game-was-copied). |
 | "The game folder was not found" or "eboot.bin is missing from the game folder" | The `Game` folder (or `game_dir`) does not point at the folder that contains `eboot.bin`. Check section 3. |
 | A message says the version or region does not match | You need CUSA02636 with the 01.03 update applied. Base-game files without the update, or another region, are refused. |
 | A message says a file is missing or has the wrong size | Your copy is incomplete, or the update was not applied over the base game. Re-copy the files. |

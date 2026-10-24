@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This document explains how the Until Dawn native PC port (WIP 0.1.2) runs the original PS4 game on Windows. It
+This document explains how the Until Dawn native PC port (WIP 0.1.3) runs the original PS4 game on Windows. It
 is written for modders, tinkerers and anyone curious about the internals. It describes the design and the
 behaviour of the released program; the port's source code is not published yet.
 
@@ -63,7 +63,7 @@ flowchart TB
     gpu --> vk
 ```
 
-In numbers (WIP 0.1.2):
+In numbers (WIP 0.1.3):
 
 | | |
 | --- | --- |
@@ -140,7 +140,7 @@ more) are **not** used or shipped. The port provides its own implementation of e
 | Dialogs (message, error) | Answered automatically ("OK") |
 
 When the game calls a function that has no implementation, it gets a neutral answer, and the call is listed at
-the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.2 that
+the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 that
 list holds 36 functions, all of them networking, font, camera, live-streaming or start-up initialisation calls
 the game does not depend on.
 
@@ -157,7 +157,7 @@ the game does not depend on.
 - **Change tracking.** Windows' write-watch feature reports which 4 KB pages the CPU wrote since the last check.
   The renderer uses it to know which textures and buffers must be refreshed, instead of re-reading everything
   every frame.
-- **Safeguards.** A known problem in WIP 0.1.2 is that a few bytes of game memory are occasionally overwritten
+- **Safeguards.** A known problem in WIP 0.1.3 is that a few bytes of game memory are occasionally overwritten
   (see Known issues). The port scans for the known damage patterns and repairs the ones it can recognise; those
   repairs are counted at the end of the log (`watch-heap`, `skin-table check`).
 
@@ -372,7 +372,7 @@ Captures go to `Logs\captures\` and contain data from your game; don't post them
 
 ## 14. Modding: what is possible today
 
-The port is not yet built for modding, and WIP 0.1.2 has **no mod loader or plugin interface**. What a modder
+The port is not yet built for modding, and WIP 0.1.3 has **no mod loader or plugin interface**. What a modder
 should know about the current behaviour:
 
 - **Changed game files are refused if their size changes.** The start-up check compares the size of every one of

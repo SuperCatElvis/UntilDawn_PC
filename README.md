@@ -86,7 +86,7 @@ These are the requirements the program checks for. Compatibility reports have no
 | **OS** | Windows 10 or 11, 64-bit |
 | **CPU** | x86-64 with AVX, F16C, BMI1, LZCNT, POPCNT, MOVBE and SSE4.2 — in practice Intel Core 4th generation (Haswell, 2013) or newer, or AMD Ryzen (or Excavator) or newer. Older Pentium/Celeron and pre-Ryzen AMD CPUs cannot run the game's code. |
 | **Memory** | 16 GB recommended. The program warns below 12 GB. |
-| **GPU** | A Vulkan 1.3 driver supporting `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`, plus the features and limits checked at startup. **Gameplay has been verified on the development NVIDIA GPU; compatibility tests have also been run on additional NVIDIA and AMD GPUs.** Gameplay and rendering compatibility remain under investigation across hardware. |
+| **GPU** | A Vulkan 1.3 driver supporting `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`, plus the features and limits checked at startup. **Gameplay has been verified on the development NVIDIA GPU, and WIP 0.1.3 renders the same on an AMD Radeon RX 9070 XT; compatibility tests have also been run on additional NVIDIA GPUs.** Intel graphics are untested. |
 | **Disk** | About 50 GB for the game files, plus up to about 1 GB for the shader cache. |
 | **Game** | A decrypted dump of Until Dawn for PS4, **CUSA02636**, with the **01.03** update applied, made from your own **legally obtained** copy. Other regions and versions are refused. |
 
@@ -104,7 +104,7 @@ The table distinguishes **full gameplay verification** from a **hardware compati
 | AMD Ryzen 5 9600X | AMD Radeon RX 9070 XT | 26.8.1 | Windows 11 | 32 GB | All compatibility checks passed with WIP 0.1.3; graphical corruption in WIP 0.1.2 fixed in WIP 0.1.3 (confirmed) |
 | AMD Ryzen 7 5800X | NVIDIA GeForce RTX 3090 | 617.14 | Windows 11 | 32 GB | 67/67 compatibility checks passed |
 
-The Core Ultra 9 system also detected **Intel integrated graphics** as usable, but the compatibility test ran on the **RTX 5070 Laptop GPU**, so this does not verify gameplay on Intel graphics. AMD Radeon testing has identified issues under investigation; see [Known issues](#known-issues). Reports from additional AMD and Intel systems are especially welcome — see [Compatibility testing](#compatibility-testing).
+The Core Ultra 9 system also detected **Intel integrated graphics** as usable, but the compatibility test ran on the **RTX 5070 Laptop GPU**, so this does not verify gameplay on Intel graphics. The AMD Radeon graphical corruption reported in WIP 0.1.2 is fixed in WIP 0.1.3 (confirmed on the RX 9070 XT); see [Known issues](#known-issues). Reports from additional AMD and Intel systems are especially welcome — see [Compatibility testing](#compatibility-testing).
 
 ---
 
@@ -112,13 +112,13 @@ The Core Ultra 9 system also detected **Intel integrated graphics** as usable, b
 
 ### 1. Download and extract
 
-1. Download **`UntilDawn_WIP_0.1.2.zip`** from the
+1. Download **`UntilDawn_WIP_0.1.3.zip`** from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder you can write to, for example `D:\Games\UntilDawn_WIP`. Don't use `Program Files`:
    the program keeps its settings, logs, shader cache and saves in its own folder.
 
 ```
-UntilDawn_WIP_0.1.2\
+UntilDawn_WIP_0.1.3\
   UntilDawn.exe            <- start the game
   Config\settings.ini      <- settings
   Game\                    <- put your game files here (or set game_dir)
@@ -203,11 +203,9 @@ The most important ones — full list in **[docs/KNOWN_ISSUES.md](docs/KNOWN_ISS
 - **Long freezes while shaders compile** on the first play-through (see the note under Installation).
 - **Frame-rate drops:** frame rate varies widely by scene. Many sections reach 30–60 FPS on the development PC, but **some sections run well below 30 FPS** (10–20 FPS measured in places, and lower during shader-compilation pauses). Performance is not addressed in this test release; it will be improved in future releases. The default 60 FPS cap is a limit, not a guaranteed frame rate.
 - **No vibration or light bar** on DualSense / DualShock 4 yet (Xbox controllers vibrate).
-- **False "missing files" message when the folder path is long** (cause confirmed): move the release to a shorter
-  folder, so the path to its `Game` folder is 62 characters or fewer, e.g. `C:\Games\UntilDawn_WIP_0.1.2`. A fix is
-  verified in a test build and planned for the next release.
-- **Corrupted textures and black blocks on some AMD GPUs** (under investigation): a potential fix is being tested on
-  an affected PC; not confirmed yet. Intel graphics are untested.
+- **Fixed in WIP 0.1.3:** the false "missing files" message when the folder path was long, and the graphical
+  corruption on AMD GPUs in WIP 0.1.2 (noisy textures, black blocks, missing foliage, stepped lighting) —
+  confirmed on an AMD RX 9070 XT. More AMD reports are welcome. Intel graphics are untested.
 - Online / PlayStation Network features are not available. Trophy unlocks are recorded locally (in
   `savedata\` and the log), but there is no on-screen trophy notification.
 
@@ -294,7 +292,7 @@ Our immediate priorities are:
 3. **Hardware compatibility** — verify and improve support for AMD and Intel GPUs and AMD CPUs, using reports from other PCs.
 4. **Performance** — reduce shader-compilation stalls and severe FPS drops, then work toward consistently smooth gameplay.
 
-**Long-term performance goal:** render the original game at **4K resolution with a smooth, consistent 60 FPS**, and ideally support higher frame rates where hardware allows. This is an ambition for future development, **not a capability of WIP 0.1.2**. The current renderer still renders internally at 1920×1080; achieving native 4K output and stable performance will require further work.
+**Long-term performance goal:** render the original game at **4K resolution with a smooth, consistent 60 FPS**, and ideally support higher frame rates where hardware allows. This is an ambition for future development, **not a capability of WIP 0.1.3**. The current renderer still renders internally at 1920×1080; achieving native 4K output and stable performance will require further work.
 
 **Planned quality-of-life improvements:** a proper **in-game settings menu** for graphics, frame-rate limits, controls, input bindings and other configurable options, rather than relying mainly on `Config\settings.ini`.
 
