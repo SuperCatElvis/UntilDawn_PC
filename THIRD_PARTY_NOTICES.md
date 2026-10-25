@@ -55,7 +55,10 @@ To work with that copy, `UntilDawn.exe` contains a small amount of information a
   the in-memory compatibility patches are applied;
 - the names of the game engine's object classes, used only for a developer diagnostic;
 - three very small GPU programs from the game (228 bytes in total), used to recognise those programs and replace
-  them with faster Vulkan copy operations.
+  them with faster Vulkan copy operations;
+- the sizes and checksums of three of the game's UI movies and the locations of two button pictures in the game
+  data, so that the Skip prompt (this project's own code) can be added to those movies in memory, using the
+  pictures and text from your copy of the game.
 
 The program icon is the game's own icon (`sce_sys/icon0.png` of CUSA02636), © Sony Interactive Entertainment,
 used only to identify the game the program runs.

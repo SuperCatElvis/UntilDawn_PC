@@ -1,14 +1,22 @@
-Until Dawn native PC port - known issues (WIP 0.1.3, 24 October 2026)
+Until Dawn native PC port - known issues (WIP 0.1.4, 25 October 2026)
 =====================================================================
 
 This is a work-in-progress test build. What is known so far:
 
+New in 0.1.4: the renderer thread
+---------------------------------
+  - The renderer now runs on its own thread, alongside the game (a large part of 0.1.4's speed-up). So far it
+    has only been played on the developer's PC (NVIDIA RTX 3090 Ti, Intel Core i9-12900KF). If 0.1.4 crashes,
+    freezes or stutters on your PC where 0.1.3 did not, set  renderer_thread = 0  in Config\settings.ini: the
+    renderer then runs on the game's thread as in 0.1.3. Please report whether that helped.
+
 Stability
 ---------
-  - Occasional crashes. In a full play-through on the developer's PC the game crashed twice and had to be
+  - Occasional crashes. In a full play-through on the developer's PC (0.1.3) the game crashed twice and had to be
     restarted; saves were kept. The cause is being investigated: some of the game's memory is occasionally
     overwritten (characters' animation data, object tables). The program contains safeguards that catch most
-    of these cases, but not all.
+    of these cases, but not all. 0.1.4 changes two things that may be involved; whether crashes became rarer
+    still has to be confirmed.
   - Characters can briefly deform ("explode") for a frame or two - the same memory problem as above.
   - Collectibles: a totem has been seen to vanish, and a clue to reappear after it was picked up.
 
@@ -20,35 +28,42 @@ Graphics
   - Totem visions: the video can play without the rest of the totem screen (its background and UI), e.g. when a
     totem is rewatched after it played correctly the first time; sometimes the whole UI disappears and only
     the character and the background remain.
-  - The "SKIP" text in the later "Previously on Until Dawn" clips can show as blocks.
-  - Cross (X) button and subtitles and occasionally appear glitchy
+  - In the second "stranger" shot of the prologue, fog and haze can disappear for a frame or two just after the
+    stranger walks past.
+  - The Skip prompt's "Skip" text shows as white boxes on the butterfly-effect tutorial and the movie that opens
+    the prologue, and can in the later "Previously on Until Dawn" clips (the Cross button is right and skipping
+    works). The game's own text in the same overlay movie is drawn in pieces then too: a renderer fault, being
+    investigated.
+  - The Cross (X) button and subtitles can occasionally look glitchy.
   - Small differences from the PS4 picture are possible elsewhere; please report anything that looks wrong.
+  - Fixed in 0.1.4: hair that looked hazy or see-through (fog and light shafts behind characters were drawn
+    over it).
 
 Performance
 -----------
-  - Frame-rate drops: the frame rate varies widely by scene. Many sections reach 30-60 fps on the developer's PC,
-    but some sections run well below 30 fps (10-20 fps measured in places), also on fast PCs. Performance is
-    not addressed in this test release; it will be improved in future releases. The 60 fps limit is a limit,
-    not a guaranteed frame rate.
+  - Much better than in 0.1.3, but the frame rate still varies by scene. On the developer's PC (RTX 3090 Ti,
+    Core i9-12900KF): light scenes often reach 60 fps, busy scenes about 35-45 fps, and the heaviest scenes
+    measured (the prologue's "stranger" shots) about 21-25 fps (about 5 fps with 0.1.3). Slower PCs will see
+    lower numbers. The 60 fps limit is a limit, not a guaranteed frame rate.
   - Shader compilation on the first play-through: stutters, and occasional freezes of 10-20 seconds, mostly in
     the first minutes of each new area (a fresh install froze for about 12 and 17 seconds in the prologue on the
     developer's PC). The game is not hung - wait for it. The shader cache (Cache\) removes most of these on
-    later runs.
+    later runs; a cache from 0.1.3 stays valid.
 
 Hardware
 --------
-  - Full play-through: Intel Core i9-12900KF + NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01),
-    Windows 11, 64 GB.
-  - Compatibility test passed: NVIDIA RTX 3090, NVIDIA RTX 5070 Laptop GPU, AMD Radeon RX 9070 XT
-    (with Ryzen 5 9600X).
+  - Full play-through (0.1.3): Intel Core i9-12900KF + NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01),
+    Windows 11, 64 GB. 0.1.4 has been played on the same PC.
+  - Compatibility test passed (0.1.2 / 0.1.3): NVIDIA RTX 3060 Ti, 3080, 3090, 5070 and 5070 Laptop GPU,
+    AMD Radeon RX 9070 XT, with Intel and AMD Ryzen CPUs.
   - AMD Radeon: 0.1.2 rendered badly on an RX 9070 XT (noisy textures, black blocks, missing foliage, stepped
-    lighting). Fixed in 0.1.3 and confirmed on that card: it now looks the same as on NVIDIA. If something
-    still looks wrong on your AMD card, please report it with a screenshot.
+    lighting). Fixed in 0.1.3 and confirmed on that card. 0.1.4 translates the shaders exactly as 0.1.3 does,
+    but 0.1.4 itself has not been played on an AMD card yet - reports are welcome.
   - Intel Arc / integrated graphics are untested. Please run compat\run_compat.bat on these and send the report
     even if the game runs fine.
-  - Game files reported "missing" although they are there: fixed in 0.1.3 for long folder paths. If one file is
-    still missing, it usually was not copied: the copy (or unzip) of your game skipped it because the folder you
-    copied FROM had a long path. Copy that file again, e.g. with robocopy, from a short folder.
+  - Game files reported "missing" although they are there: fixed since 0.1.3 for long folder paths. If one file
+    is still missing, it usually was not copied: the copy (or unzip) of your game skipped it because the folder
+    you copied FROM had a long path. Copy that file again, e.g. with robocopy, from a short folder.
   - Vibration and the light bar of DualSense / DualShock 4 controllers are not supported yet (Xbox controllers
     vibrate).
 

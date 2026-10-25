@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This guide covers WIP 0.1.3. You need two things: **the release download** from this project, and **your own
+This guide covers WIP 0.1.4. You need two things: **the release download** from this project, and **your own
 copy of the original PS4 game**. The download does not contain the game.
 
 ---
@@ -23,7 +23,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 
 ## 2. Download and extract the release
 
-1. Download `UntilDawn_WIP_0.1.3.zip` from the
+1. Download `UntilDawn_WIP_0.1.4.zip` from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder **you can write to**, for example `D:\Games\UntilDawn_WIP`.
    Don't use `C:\Program Files`: the program keeps its settings, logs, shader cache and saves in its own folder.
@@ -31,7 +31,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 After extracting you have:
 
 ```
-UntilDawn_WIP_0.1.3\
+UntilDawn_WIP_0.1.4\
   UntilDawn.exe                     the game
   Config\settings.ini               settings (see section 5)
   Game\                             empty: your game files go here
@@ -46,12 +46,16 @@ UntilDawn_WIP_0.1.3\
   THIRD_PARTY_NOTICES.txt
 ```
 
-### Updating from WIP 0.1.2
+### Updating from WIP 0.1.3 (or 0.1.2)
 
-Copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files into your 0.1.2 folder. **Do not
-overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.1.3 to a
-new folder and copy your `settings.ini`, `savedata` and game files over. Shaders are translated anew, so the
-first-run shader-compilation pauses return once.
+Copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files into your old folder. **Do not
+overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.1.4 to a
+new folder and copy your `settings.ini`, `savedata` and game files over.
+
+- Saves and settings from 0.1.3 and 0.1.2 work as they are. Your `settings.ini` does not need the new
+  `renderer_thread` line; without it the default (1) is used.
+- From 0.1.3, the shader cache (`Cache\`) stays valid: 0.1.4 translates the shaders exactly as 0.1.3 does.
+- From 0.1.2, shaders are translated anew, so the first-run shader-compilation pauses return once.
 
 ---
 
@@ -79,7 +83,7 @@ Choose **one** of these three ways:
 Copy the contents of your game folder into the release's `Game` folder, so that this file exists:
 
 ```
-UntilDawn_WIP_0.1.3\Game\eboot.bin
+UntilDawn_WIP_0.1.4\Game\eboot.bin
 ```
 
 ### Option B — point `settings.ini` at your game
@@ -153,6 +157,7 @@ The file is created with these defaults if it is missing. Delete it to restore t
 | `frame_rate_limit` | `60` | `30`, `60` (like the PS4), `120`, `144`, `165`, any other number, or `0` for no limit. Limits above 60 work but have not been checked in every scene. |
 | `display_mode` | `windowed` | `windowed`, or `borderless` (a window covering the whole primary monitor). |
 | `window_width` / `window_height` | `1280` / `720` | Window size in windowed mode. The window can also be resized with the mouse. |
+| `renderer_thread` | `1` | `1` = the renderer runs on its own thread, alongside the game (new in 0.1.4; faster). `0` = the renderer runs on the game's thread, as in 0.1.3. Try `0` if 0.1.4 crashes or stutters where 0.1.3 did not. Not present in settings files from older versions; the default then applies. |
 | `developer` | `0` | `1` turns on developer capture keys that write multi-gigabyte diagnostic files. Leave it at `0` unless asked. |
 
 The game itself renders at 1920×1080, as on the PS4, and is scaled to the window.
@@ -163,7 +168,7 @@ The game itself renders at 1920×1080, as on the PS4, and is scaled to the windo
 
 | Problem | What to do |
 | --- | --- |
-| A file is reported missing although it is there (often a very long `localcachepink/streams/...` name) | With WIP 0.1.2 the folder path was too long (260-character Windows limit); WIP 0.1.3 fixes this, so update. On 0.1.2, move the release so the path to `Game\` is 62 characters or fewer. See [Known issues](KNOWN_ISSUES.md#false-missing-files-message-with-a-long-folder-path--fixed-in-wip-013). |
+| A file is reported missing although it is there (often a very long `localcachepink/streams/...` name) | With WIP 0.1.2 the folder path was too long (260-character Windows limit); WIP 0.1.3 and later fix this, so update. On 0.1.2, move the release so the path to `Game\` is 62 characters or fewer. See [Known issues](KNOWN_ISSUES.md#false-missing-files-message-with-a-long-folder-path--fixed-in-wip-013). |
 | **One** long-named file is reported missing and it really is not in `Game\localcachepink\streams` | The copy skipped it (common when copying from a long path). Copy the game again with `robocopy "<your dump>" "<release>\Game" /E`. See [Known issues](KNOWN_ISSUES.md#one-game-file-reported-missing-although-the-game-was-copied). |
 | "The game folder was not found" or "eboot.bin is missing from the game folder" | The `Game` folder (or `game_dir`) does not point at the folder that contains `eboot.bin`. Check section 3. |
 | A message says the version or region does not match | You need CUSA02636 with the 01.03 update applied. Base-game files without the update, or another region, are refused. |
@@ -171,4 +176,5 @@ The game itself renders at 1920×1080, as on the PS4, and is scaled to the windo
 | A message about the CPU | Your CPU lacks an instruction set the game's code uses (see the [requirements](../README.md#system-requirements)). This cannot be worked around. |
 | A message about the graphics card or Vulkan | Update your graphics driver. If it still fails, run the [compatibility tester](COMPATIBILITY_TESTING.md) and report the result. |
 | The game freezes for several seconds | Usually shader compilation on the first play-through; wait. If it lasts more than a minute, report it with the log. |
+| 0.1.4 crashes, freezes or stutters where 0.1.3 did not | Set `renderer_thread = 0` in `Config\settings.ini` (see section 5) and [report](../README.md#reporting-bugs) whether that helps, with `Logs\UntilDawn.log`. |
 | The game crashed | Start it again (saves are kept), then [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.previous.log`. |

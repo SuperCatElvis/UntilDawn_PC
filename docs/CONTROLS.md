@@ -81,7 +81,8 @@ XInput controllers have no touch pad and no motion sensors:
 
 ## Skipping movies
 
-The intro logos and the "Previously on Until Dawn" recaps can be skipped:
+The intro logos, the "Previously on Until Dawn" recaps, the butterfly-effect tutorial, the movie that opens the
+prologue and the Chapter 1 bus ride can be skipped:
 
 1. Press any button. A **Skip** prompt appears in the bottom-right corner.
 2. Press **Cross** (Enter / Space) while it is shown.

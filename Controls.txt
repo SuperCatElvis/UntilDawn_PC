@@ -1,4 +1,4 @@
-Until Dawn native PC port - controls (WIP 0.1.3)
+Until Dawn native PC port - controls (WIP 0.1.4)
 ================================================
 
 Controllers
@@ -42,6 +42,6 @@ Mouse aiming (M turns it on and off):
 
 Skipping movies
 ---------------
-The intro logos and the "Previously on Until Dawn" recaps can be skipped: press any button to show the Skip
-prompt in the bottom-right corner, then press Cross (Enter / Space) while it is shown. The rest of the recap is
-skipped with it.
+The intro logos, the "Previously on Until Dawn" recaps, the butterfly-effect tutorial, the movie that opens the
+prologue and the Chapter 1 bus ride can be skipped: press any button to show the Skip prompt in the bottom-right
+corner, then press Cross (Enter / Space) while it is shown. The rest of the recap is skipped with it.
