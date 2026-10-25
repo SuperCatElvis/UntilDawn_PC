@@ -64,7 +64,7 @@ What is implemented in WIP 0.1.3:
 
 ### Controllers and input
 - **DualSense** (PS5), **DualSense Edge** and **DualShock 4** (PS4) over USB or Bluetooth, with no extra
-  software: buttons, touch pad (swipes and click) and motion sensors. **DualSense and DualShock 4 have both been gameplay-tested** (DualShock 4 confirmed by Mocca). Motion-control drift during some “Don't Move” sequences remains a known issue.
+  software: buttons, touch pad (swipes and click) and motion sensors. **DualSense and DualShock 4 have both been gameplay-tested**. Motion-control drift during some “Don't Move” sequences remains a known issue.
 - **Xbox-style controllers** (XInput, including DS4Windows / Steam virtual pads), with vibration.
 - **Keyboard and mouse**, including mouse aiming.
 
