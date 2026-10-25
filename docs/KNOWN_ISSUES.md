@@ -84,6 +84,7 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 ## Graphics
 
 - **Prologue snow effects.** The falling snow effect may stop if the player remains stationary for an extended period.
+- **Prologue icicles.** Icicles on the lodge during stranger cutscene appear solid black
 - **Character introduction sequences.** Some lighting and camera effects do not render correctly.
 - **Prologue — second "stranger" shot.** Fog and haze can disappear for a frame or two just after the stranger walks past.
 - **Character mouths.** The inside of mouths can render black in some close-ups.
