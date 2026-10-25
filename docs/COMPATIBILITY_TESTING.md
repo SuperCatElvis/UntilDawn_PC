@@ -2,9 +2,11 @@
 
 [← Back to README](../README.md)
 
-The port has only been tested on one PC (Intel CPU, NVIDIA GPU). The included tester tells us quickly whether
-other hardware behaves the same way. **Reports from AMD and Intel graphics, and from AMD Ryzen CPUs, are the
-most useful right now — even when everything passes.**
+The game has been played in full on the development PC (Intel CPU, NVIDIA GPU), and players have sent
+compatibility reports from several other NVIDIA and AMD systems (see the [tested hardware](../README.md#tested-hardware)
+table). The included tester tells us quickly whether other hardware behaves the same way. **Reports from AMD and
+Intel graphics are the most useful right now — even when everything passes.** For WIP 0.1.4, please also say
+whether the game itself ran well, and whether you changed `renderer_thread` in `Config\settings.ini`.
 
 ---
 

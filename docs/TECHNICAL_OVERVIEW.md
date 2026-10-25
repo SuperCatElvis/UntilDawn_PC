@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This document explains how the Until Dawn native PC port (WIP 0.1.3) runs the original PS4 game on Windows. It
+This document explains how the Until Dawn native PC port (WIP 0.1.4) runs the original PS4 game on Windows. It
 is written for modders, tinkerers and anyone curious about the internals. It describes the design and the
 behaviour of the released program; the port's source code is not published yet.
 
@@ -63,7 +63,7 @@ flowchart TB
     gpu --> vk
 ```
 
-In numbers (WIP 0.1.3):
+In numbers (WIP 0.1.4):
 
 | | |
 | --- | --- |
@@ -140,7 +140,7 @@ more) are **not** used or shipped. The port provides its own implementation of e
 | Dialogs (message, error) | Answered automatically ("OK") |
 
 When the game calls a function that has no implementation, it gets a neutral answer, and the call is listed at
-the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 that
+the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 and 0.1.4 that
 list holds 36 functions, all of them networking, font, camera, live-streaming or start-up initialisation calls
 the game does not depend on.
 
@@ -157,7 +157,7 @@ the game does not depend on.
 - **Change tracking.** Windows' write-watch feature reports which 4 KB pages the CPU wrote since the last check.
   The renderer uses it to know which textures and buffers must be refreshed, instead of re-reading everything
   every frame.
-- **Safeguards.** A known problem in WIP 0.1.3 is that a few bytes of game memory are occasionally overwritten
+- **Safeguards.** A known problem in WIP 0.1.4 (as in 0.1.3) is that a few bytes of game memory are occasionally overwritten
   (see Known issues). The port scans for the known damage patterns and repairs the ones it can recognise; those
   repairs are counted at the end of the log (`watch-heap`, `skin-table check`).
 
@@ -232,7 +232,14 @@ Key points:
   implementation of AMD's public addressing equations) and uploads them. Block-compressed formats (BC1–BC7) are
   passed to the GPU as they are.
 - **Synchronisation.** The game's cache-flush, wait and end-of-pipe requests become Vulkan barriers and waits, so
-  draws that depend on earlier GPU work see its results.
+  draws that depend on earlier GPU work see its results. Since 0.1.4 the renderer also tracks which image was last
+  written by what, and places a barrier only where a later draw, copy or dispatch actually reads it.
+- **The renderer thread** (since 0.1.4). On the PS4, `sceGnmSubmitAndFlipCommandBuffers` only hands the command
+  buffers to the GPU and returns. The port's submit calls now do the same: they queue the work for a dedicated
+  renderer thread, which parses, translates, records and submits it to Vulkan while the game prepares its next
+  frame. Calls are processed in order, and the game can be at most one frame ahead. The game itself waits for each
+  frame to finish on the GPU (it polls a frame counter), so the renderer sets the pace in heavy scenes.
+  `renderer_thread = 0` in `settings.ini` runs everything on the game's thread instead, as in 0.1.3.
 - **Features in use:** dynamic rendering, push descriptors, buffer device addresses, conditional rendering (for
   the game's occlusion-query predication), geometry shaders and tessellation, and a parallel pipeline compiler
   (logical processors minus 2, at least 2, at most 12 threads).
@@ -267,6 +274,10 @@ first uses it:
 - Resources (buffers, textures, constants) are read the way the PS4 reads them: from descriptors in memory, with
   the same address arithmetic.
 - Translations are cached in memory per shader and per set of inputs; compiled pipelines are cached on disk.
+  Since 0.1.4 a cached translation is also reused when only the addresses its inputs come from have changed (the
+  game rebuilds its per-frame data at new addresses every frame): about 97% of the shader set-ups in a heavy scene
+  reuse an earlier translation. The translator itself is about three times faster than in 0.1.3 and produces
+  byte-identical SPIR-V.
 
 Translating takes milliseconds; the driver's pipeline compilation is what causes the first-play-through stalls.
 
@@ -337,10 +348,12 @@ location are exactly what it expects, and is skipped otherwise. The patches, and
 | `malloc` / `free` routing | The game supplies its own allocator to the system libraries; the port uses it the same way the PS4's libc does |
 
 **The Skip prompt** is a good example of how the port can change the game's UI without shipping game assets: the
-game's menus are Scaleform movies. When the engine loads the small movie that shows the legal line over the intro
-and recap movies, the port inserts its own ActionScript classes (written for this project) into that movie in
-memory. The prompt reuses the game's own button pictures and its own "Skip" text from your game files, so it
-looks like part of the original UI.
+game's menus are Scaleform movies. When the engine loads one of three small movies that are on screen over
+full-screen video (the one that shows the legal line, the overlay-caption movie and, since 0.1.4, the subtitle
+movie), the port inserts its own ActionScript classes (written for this project) into that movie in memory. The
+prompt reuses the game's own button pictures (the end-credits Skip prompt's) and its own "Skip" text from your game
+files, so it looks like part of the original UI. Since 0.1.4 each copy of the prompt reports which engine object
+it lives in, and the prompt is shown by whichever of these movies the game is drawing at that moment.
 
 ---
 
@@ -356,15 +369,16 @@ investigation and can write very large files (gigabytes for some of them):
 
 | Key | Captures |
 | --- | --- |
-| **P** (or F9 / F12) | A screenshot and a draw-by-draw description of the next frame |
-| **O** | The same, plus every image the frame used |
-| **N** | Four consecutive frames with their render targets (for flicker) |
-| **H** | A full replay capture of the next frame (all GPU-visible memory and state); the game pauses for a few seconds |
-| **T** | A trace of every system call for the next 600 frames |
+| **Ctrl+P** (or F9 / F12) | A screenshot and a draw-by-draw description of the next frame |
+| **Ctrl+O** | The same, plus every image the frame used |
+| **Ctrl+N** | Four consecutive frames with their render targets (for flicker) |
+| **Ctrl+H** (or F6) | A full replay capture of the next frame (all GPU-visible memory and state); the game pauses for a few seconds |
+| **Ctrl+T** | A trace of every system call for the next 600 frames |
+| **F10** | A shader-translation trace of the next 60 frames (slow while it runs) |
+| **F11** | Saves the last 90 frames as small pictures (for glitches that last a frame or two) |
 
-> [!WARNING]
-> In developer mode the **T** key both clicks the touch pad (as always) and starts a call trace. Leave developer
-> mode off for normal play.
+The keys work only while the game window has focus; since 0.1.4 the letter keys need Ctrl, so the plain T (touch
+pad click) and the other game keys no longer start a capture.
 
 Captures go to `Logs\captures\` and contain data from your game; don't post them publicly.
 
@@ -372,7 +386,7 @@ Captures go to `Logs\captures\` and contain data from your game; don't post them
 
 ## 14. Modding: what is possible today
 
-The port is not yet built for modding, and WIP 0.1.3 has **no mod loader or plugin interface**. What a modder
+The port is not yet built for modding, and WIP 0.1.4 has **no mod loader or plugin interface**. What a modder
 should know about the current behaviour:
 
 - **Changed game files are refused if their size changes.** The start-up check compares the size of every one of
