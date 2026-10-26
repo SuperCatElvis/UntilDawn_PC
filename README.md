@@ -106,6 +106,7 @@ The results are from WIP 0.1.2 and 0.1.3 unless noted. The table distinguishes *
 | AMD Ryzen 5 9600X | AMD Radeon RX 9070 XT | 26.8.1 | Windows 11 | 32 GB | All compatibility checks passed with WIP 0.1.3; graphical corruption in WIP 0.1.2 fixed in WIP 0.1.3 (confirmed); WIP 0.1.4 not yet tested |
 | AMD Ryzen 7 5800X | NVIDIA GeForce RTX 3090 | 617.14 | Windows 11 | 32 GB | 67/67 compatibility checks passed |
 | AMD Ryzen (model not reported) | NVIDIA GeForce RTX 5080 | 617.42 | Windows 11 | 56 GB | 67/67 compatibility checks passed |
+| Intel Core i5-9400F | NVIDIA GeForce GTX 1660 Ti | 616.92 | Windows 11 | 16 GB | 66/66 compatibility checks passed (WIP 0.1.4); gameplay confirmed, with shader compilation freezes |
 
 The Core Ultra 9 system also detected **Intel integrated graphics** as usable, but the compatibility test ran on the **RTX 5070 Laptop GPU**, so this does not verify gameplay on Intel graphics. The AMD Radeon graphical corruption reported in WIP 0.1.2 is fixed in WIP 0.1.3 (confirmed on the RX 9070 XT); see [Known issues](#known-issues). Reports from additional AMD and Intel systems are especially welcome — see [Compatibility testing](#compatibility-testing).
 
