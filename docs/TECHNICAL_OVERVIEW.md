@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This document explains how the Until Dawn native PC port (WIP 0.1.4) runs the original PS4 game on Windows. It
+This document explains how the Until Dawn native PC port (WIP 0.1.5) runs the original PS4 game on Windows. It
 is written for modders, tinkerers and anyone curious about the internals. It describes the design and the
 behaviour of the released program; the port's source code is not published yet.
 
@@ -63,7 +63,7 @@ flowchart TB
     gpu --> vk
 ```
 
-In numbers (WIP 0.1.4):
+In numbers (WIP 0.1.5):
 
 | | |
 | --- | --- |
@@ -140,7 +140,7 @@ more) are **not** used or shipped. The port provides its own implementation of e
 | Dialogs (message, error) | Answered automatically ("OK") |
 
 When the game calls a function that has no implementation, it gets a neutral answer, and the call is listed at
-the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 and 0.1.4 that
+the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 to 0.1.5 that
 list holds 36 functions, all of them networking, font, camera, live-streaming or start-up initialisation calls
 the game does not depend on.
 
@@ -153,12 +153,26 @@ the game does not depend on.
   (for example the direct-memory area starting at `0x200000000`), so pointers inside the game stay valid.
 - **CPU and GPU share memory on the PS4.** On a PC they don't. The renderer imports the game's memory regions
   directly into Vulkan (`VK_EXT_external_memory_host`), so the GPU reads vertex data, constants and textures from
-  the same memory the game writes. Data the GPU reads very often is mirrored into video memory.
+  the same memory the game writes. Data the GPU reads very often is mirrored into video memory. Since 0.1.5 those
+  video-memory copies are sized to the GPU (at most a quarter of its video memory for buffer copies and an eighth
+  for the mirror; before, a fixed 6 GB and 3 GB on every card).
+- **Committed as used** (since 0.1.5). The game creates many small heaps (256 KB mappings at 2 GB-spaced
+  addresses). Each heap's address range is reserved up front, as before, but memory is committed and imported into
+  Vulkan in steps (4–16 MB) as the game actually maps into it, instead of 64 MB or more at once. Mapping pools grow
+  in 64 MB chunks instead of 512 MB. The game's own large regions stay committed in one piece: the renderer's
+  fast paths need large contiguous imported regions, and committing those piece by piece was tried and made the
+  renderer much slower (test build t111).
 - **Change tracking.** Windows' write-watch feature reports which 4 KB pages the CPU wrote since the last check.
   The renderer uses it to know which textures and buffers must be refreshed, instead of re-reading everything
-  every frame.
-- **Safeguards.** A known problem in WIP 0.1.4 (as in 0.1.3) is that a few bytes of game memory are occasionally overwritten
-  (see Known issues). The port scans for the known damage patterns and repairs the ones it can recognise; those
+  every frame. Since 0.1.5 each range is first queried without resetting; only ranges that were written are then
+  queried with reset, which saves most of the reset calls (a write in between stays marked and is found at the
+  next check, so nothing is missed).
+- **Memory report.** Since 0.1.5 the log contains a memory report every 60 seconds and at exit: this program's
+  committed memory and RAM, the game's memory by kind, the renderer's pools, the graphics driver's heaps
+  (`VK_EXT_memory_budget`) and the largest other allocations.
+- **Safeguards.** A known, still unresolved problem (WIP 0.1.3 to 0.1.5) is that a byte of game memory is
+  occasionally overwritten — in the cases examined, the lowest byte of a pointer at the start of a 4 KB page (see
+  Known issues). The port scans for the known damage patterns and repairs the ones it can recognise; those
   repairs are counted at the end of the log (`watch-heap`, `skin-table check`).
 
 ---
@@ -230,7 +244,13 @@ Key points:
   game reads back), they are written back to memory.
 - **Textures.** PS4 textures are stored in AMD's tiled layouts. The port de-tiles them on the CPU (its own
   implementation of AMD's public addressing equations) and uploads them. Block-compressed formats (BC1–BC7) are
-  passed to the GPU as they are.
+  passed to the GPU as they are. Up to 4,096 textures are kept as Vulkan images (within half of the video memory);
+  the least recently used ones that have not been needed for two frames are evicted.
+- **Moved textures** (since 0.1.5). The game now and then moves textures to new addresses (most likely when it
+  compacts its texture memory). To the renderer a moved texture used to be a new texture (created and uploaded again). Now a content
+  index (a hash of every byte plus the tiling, pitch, size, format and detail levels) finds an image with exactly
+  the same contents that has not been used for two frames, and that image is moved to the new address instead —
+  no new image, no upload (about 1,300–1,700 per test route through the prologue, 1.1–1.3 GB of uploads saved).
 - **Synchronisation.** The game's cache-flush, wait and end-of-pipe requests become Vulkan barriers and waits, so
   draws that depend on earlier GPU work see its results. Since 0.1.4 the renderer also tracks which image was last
   written by what, and places a barrier only where a later draw, copy or dispatch actually reads it.
@@ -240,9 +260,16 @@ Key points:
   frame. Calls are processed in order, and the game can be at most one frame ahead. The game itself waits for each
   frame to finish on the GPU (it polls a frame counter), so the renderer sets the pace in heavy scenes.
   `renderer_thread = 0` in `settings.ini` runs everything on the game's thread instead, as in 0.1.3.
+- **Redundant state left out** (since 0.1.5). Within one Vulkan command buffer the pipeline, viewport, scissor,
+  blend constants, push constants (the shaders' user data) and index buffer are only set when they differ from
+  the previous draw's. In heavy scenes about four driver calls per draw are left out (about 3% of the renderer's
+  time). Vulkan keeps that state for the life of a command buffer, all pipelines use the same push-constant range
+  and dynamic viewport / scissor / blend state, and a compute dispatch resets the remembered push constants.
 - **Features in use:** dynamic rendering, push descriptors, buffer device addresses, conditional rendering (for
   the game's occlusion-query predication), geometry shaders and tessellation, and a parallel pipeline compiler
-  (logical processors minus 2, at least 2, at most 12 threads).
+  (logical processors minus 2, at least 2, at most 12 threads). Since 0.1.5 compute pipelines are compiled there
+  too: the batch of draws that needs them is recorded and replayed once its compiles are done, and a compute
+  pipeline that fails drops exactly the work that depended on it.
 - **Resolution.** The game renders at the PS4's 1920×1080; the result is scaled to the window.
 - **Shader / pipeline cache.** Compiled pipelines are saved to `Cache\vulkan_pipelines.bin` at the end of each
   run and loaded at the next start. This is what removes most first-play-through stalls on later runs.
@@ -278,6 +305,10 @@ first uses it:
   game rebuilds its per-frame data at new addresses every frame): about 97% of the shader set-ups in a heavy scene
   reuse an earlier translation. The translator itself is about three times faster than in 0.1.3 and produces
   byte-identical SPIR-V.
+- Since 0.1.5 the translator's memory is smaller: a cached translation keeps its results packed, the SPIR-V words
+  are freed once the driver has made a shader module (which holds its own copy), and modules not used for a while
+  are destroyed and made again when needed from a compressed copy of the words (LZ77-style, about 2.6 times
+  smaller). Pipelines are found by translation key, so none of this changes what is compiled.
 
 Translating takes milliseconds; the driver's pipeline compilation is what causes the first-play-through stalls.
 
@@ -386,7 +417,7 @@ Captures go to `Logs\captures\` and contain data from your game; don't post them
 
 ## 14. Modding: what is possible today
 
-The port is not yet built for modding, and WIP 0.1.4 has **no mod loader or plugin interface**. What a modder
+The port is not yet built for modding, and WIP 0.1.5 has **no mod loader or plugin interface**. What a modder
 should know about the current behaviour:
 
 - **Changed game files are refused if their size changes.** The start-up check compares the size of every one of

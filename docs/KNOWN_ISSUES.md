@@ -1,43 +1,83 @@
 
-# Known issues — WIP 0.1.4
+# Known issues — WIP 0.1.5
 
 [← Back to README](../README.md)
 
-This is an early test release, and several issues are still being investigated. Known problems are listed below. If you find something that isn't here, please [report it](../README.md#reporting-bugs).
+This is still an early, work-in-progress test release, and several issues are still being investigated. Known problems are listed below. If you find something that isn't here, please [report it](../README.md#reporting-bugs).
 
 ---
 
-## New in WIP 0.1.4: the renderer thread
+## Not fixed yet: game memory that is occasionally overwritten
 
-The renderer (which turns the game's PS4 graphics commands into Vulkan) now runs on its own thread, alongside the
-game, instead of inside the game's frame. This is a large part of the frame-rate gain in 0.1.4. It has so far been
-played on the development PC only (NVIDIA RTX 3090 Ti, Intel Core i9-12900KF). The change is not specific to one GPU
-make, and the shader programs are the same as in 0.1.3, but other PCs have not been tested yet.
+This is the main cause of the remaining crashes, and it is **not fixed in WIP 0.1.5**.
 
-**If WIP 0.1.4 crashes, freezes or stutters on your PC where 0.1.3 did not**, open `Config\settings.ini` and set:
+- Now and then a single byte of the game's memory is set to zero. In the cases examined it is the **lowest byte of
+  a pointer at the start of a 4 KB memory page** — often an object's type (vtable) pointer, for example
+  `…5fab0` becoming `…5fa00`. The game crashes later, when it uses that pointer: typical crash reports name the
+  "Lump Loader" or a "JobSched" thread, or a character's animation data is damaged.
+- It has been seen on the development PC and on players' PCs (Intel and AMD CPUs, NVIDIA GPUs), with WIP 0.1.3
+  and 0.1.4, and again in the final test of 0.1.5 (twice in one session, detected by the safeguards, no crash).
+  One recent case was in game memory that is not shared with the graphics driver, which rules out one of the
+  earlier suspects (the way game memory is imported into Vulkan).
+- The program's safeguards detect the known kinds of damage and repair some of them. The log then contains lines
+  such as `EBOOT POINTER LOW BYTE CLEARED`. Please include `Logs\UntilDawn.log` (or `UntilDawn.previous.log` after a
+  restart) when you report a crash — these lines help find the cause.
+- Saves are kept; start the game again.
 
-```ini
-renderer_thread = 0
-```
+## Laptops with two GPUs
 
-The renderer then runs on the game's thread, exactly as in 0.1.3 (with the rest of 0.1.4's speed-ups). Please
-[report](../README.md#reporting-bugs) whether that helped, with `Logs\UntilDawn.log` from both runs. The first
-line of the log starting with `settings:` shows which mode was used.
+On a laptop with an **NVIDIA GeForce RTX 5050 Laptop GPU and AMD Radeon 740M integrated graphics**, where the
+integrated GPU drives the screen, WIP 0.1.4 showed ([issue #2](https://github.com/SuperCatElvis/UntilDawn_PC/issues/2)):
 
-## Fixed in WIP 0.1.4
+- presenting a frame sometimes took 0.5–1 second;
+- in several runs, a hang of about 8–10 seconds while presenting, after which the graphics driver reported
+  "device lost" and the game ended (the GPU itself had no unfinished work: the hang is in passing frames between
+  the two GPUs);
+- flickering UI in the Status, Collectibles and character status menus.
+
+This is not fixed yet. Things to try:
+
+1. **Windows Settings → System → Display → Graphics:** add `UntilDawn.exe` and choose **High performance** (the
+   NVIDIA GPU).
+2. If the laptop has a **MUX switch / "discrete GPU only" mode** (in the NVIDIA Control Panel or the laptop maker's
+   app), switch it on, so the NVIDIA GPU drives the screen directly.
+
+Please report whether either helped, with `Logs\UntilDawn.log`.
+
+## New in WIP 0.1.5
+
+WIP 0.1.5 changes how the program uses memory, compiles compute shaders in parallel, sends less redundant state to
+the graphics driver, checks game memory for changes more cheaply and reuses textures the game moves in memory (see
+the [release notes](releases/v0.1.5-wip.md)). Every shader is translated exactly as in 0.1.4, and test frames give
+the same images within the small run-to-run differences the GPU itself shows. These changes have so far been
+**played on the development PC only** (NVIDIA RTX 3090 Ti, Intel Core i9-12900KF). Nothing in them is written for
+one GPU make, but they are untested on AMD and Intel graphics. If WIP 0.1.5 crashes, freezes or stutters on your PC
+where 0.1.4 did not, please [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.log`.
+
+The setting `renderer_thread = 0` in `Config\settings.ini` (since 0.1.4) runs the renderer on the game's thread
+instead of its own; it is still available if the game freezes or stutters. It does not prevent the crashes from
+overwritten game memory (both players who reported them used it). The first line of the log starting with
+`settings:` shows which mode was used.
+
+## Fixed and improved
 
 | Issue | Status |
 | --- | --- |
-| Hair looked hazy or see-through (fog and light shafts behind characters were drawn over it, e.g. Hannah in the prologue) | **Fixed in WIP 0.1.4** (confirmed in play). On the PS4 a compute shader writes the hair's depth into the depth buffer; the renderer now keeps that depth. |
+| High memory use (about 12.7 GB in RAM and 22 GB committed in the prologue on the development PC; the game's memory grew during play; PCs with 16 GB could run out) | **Improved in WIP 0.1.5:** at most about 8.2 GB in RAM and 17 GB committed on the same route; the game's memory grows by about 44 MB instead of 640 MB in ten minutes. |
+| Shader-compilation freezes of 30 seconds and more on CPUs with few cores (compute shaders were compiled one after another) | **Improved in WIP 0.1.5:** compute shaders are compiled in parallel like the others. Freezes on the first play-through remain (see [Performance](#performance)). |
+| Fixed video-memory budgets (6 GB of buffer copies and a 3 GB mirror on every GPU) | **Changed in WIP 0.1.5:** sized to the GPU (a quarter and an eighth of its video memory). |
+| Hair looked hazy or see-through (fog and light shafts behind characters were drawn over it, e.g. Hannah in the prologue) | **Fixed in WIP 0.1.4** (confirmed in play). |
 | The butterfly-effect tutorial, the movie that opens the prologue and the Chapter 1 bus ride could not be skipped | **Added in WIP 0.1.4**, with the same Skip prompt as the intro logos and the end credits (press any button, then Cross / Enter / Space). On the first two the prompt's "Skip" text shows as boxes (see Graphics). |
-| Very low frame rate in demanding scenes (single digits in the prologue's "stranger" shots) | **Much improved in WIP 0.1.4:** about 21–25 FPS in those shots on the development PC (about 5 FPS in 0.1.3). See [Performance](#performance). |
+| Very low frame rate in demanding scenes (single digits in the prologue's "stranger" shots) | **Much improved in WIP 0.1.4:** about 21–25 FPS in those shots on the development PC (about 5 FPS in 0.1.3); about 22–27 FPS with 0.1.5. See [Performance](#performance). |
 
 ## Reported by players
 
 | Issue | Status |
 | --- | --- |
-| False "missing files" message with a long folder path | **Fixed in WIP 0.1.3** (verified); still fixed in 0.1.4. |
-| Corrupted textures, black blocks, missing foliage and stepped lighting on AMD GPUs | **Fixed in WIP 0.1.3** (confirmed on an RX 9070 XT by the player who reported it). 0.1.4 translates the shaders exactly as 0.1.3 does; 0.1.4 itself has not yet been played on AMD. |
+| False "missing files" message with a long folder path | **Fixed in WIP 0.1.3** (verified); still fixed in 0.1.5. |
+| Corrupted textures, black blocks, missing foliage and stepped lighting on AMD GPUs | **Fixed in WIP 0.1.3** (confirmed on an RX 9070 XT by the player who reported it). 0.1.4 and 0.1.5 translate the shaders exactly as 0.1.3 does; they have not yet been played on AMD. |
+| Very slow frame presentation, "device lost" and flickering menus on a laptop with two GPUs | **Open** — see [Laptops with two GPUs](#laptops-with-two-gpus). |
+| Character's arm and the inspected item invisible during item inspection (GTX 1660 Ti, WIP 0.1.4) | **Open** — not reproduced yet ([issue #3](https://github.com/SuperCatElvis/UntilDawn_PC/issues/3)). |
 | One game file reported missing although the game was copied | Not a port bug: the copy skipped the file. See below. |
 
 ### False "missing files" message with a long folder path — fixed in WIP 0.1.3
@@ -57,7 +97,7 @@ If the message names **one** file (often the very long `...mainlodge_garage_moun
 The usual cause is the **copy**: when the folder you copied the game *from* has a long path, Explorer or an unzip tool can skip the game's longest file names. Copy the game again with `robocopy` (it handles long paths and copies only what is missing), from a short folder:
 
 ```
-robocopy "D:\path\to\your\CUSA02636 dump" "C:\Games\UntilDawn_WIP_0.1.4\Game" /E
+robocopy "D:\path\to\your\CUSA02636 dump" "C:\Games\UntilDawn_WIP_0.1.5\Game" /E
 ```
 
 ### AMD GPUs: corrupted textures, black blocks, missing foliage and stepped lighting — fixed in WIP 0.1.3
@@ -76,8 +116,8 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 
 ## Stability
 
-- **Occasional crashes.** During a full play-through on the development PC (WIP 0.1.3), the game crashed twice and had to be restarted; saves were kept. The cause is being investigated: some of the game's memory is occasionally overwritten (for example, character animation data and object tables). The program contains safeguards that detect and repair the most common cases, but not all of them. WIP 0.1.4 changes two things that may be involved (new game memory is registered with the graphics driver before the game uses it; game file reads go through the program's own buffers); whether this makes crashes rarer still has to be confirmed.
-- **Character deformation and vertex glitches.** Characters may briefly deform or have their geometry distort when the shader table overfills. Closing and reopening the game resolves this issue most of the time.
+- **Occasional crashes.** During a full play-through on the development PC (WIP 0.1.3), the game crashed twice and had to be restarted; saves were kept. Players have reported similar crashes with WIP 0.1.4. The cause is game memory that is occasionally overwritten — see [Not fixed yet](#not-fixed-yet-game-memory-that-is-occasionally-overwritten). The two changes WIP 0.1.4 made for it did not stop it.
+- **Character deformation and vertex glitches.** Characters may briefly deform or have their geometry distort for a frame or two (seen, for example, on Sam in the prologue). This is most likely the same overwritten-memory problem as the crashes.
 - **Collectibles disappearing.** Clues and totems may become invisible when picked up. A previously collected clue has also been observed reappearing.
 - **Chapter 5 — Mike's lantern.** Mike's arm holding the lantern can become detached.
 
@@ -85,7 +125,10 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 
 - **Prologue snow effects.** The falling snow effect may stop if the player remains stationary for an extended period.
 - **Character introduction sequences.** Some lighting and camera effects do not render correctly.
-- **Prologue — second "stranger" shot.** Fog and haze can disappear for a frame or two just after the stranger walks past.
+- **Prologue — second "stranger" shot.** Fog and haze can disappear for a frame or two just after the stranger walks past. Rarely, lighting looks wrong for a frame or two elsewhere.
+- **Prologue — Emily's eyes and the kitchen wall.** Emily's eyes can show light squares for a couple of seconds, and the wall on the right as the friends leave the kitchen for the prank can show dark square shadows (also in 0.1.4).
+- **Item inspection.** On one PC (GTX 1660 Ti) the character's arm and the inspected item were invisible.
+- **Menus on a laptop with two GPUs.** Flickering UI in the Status, Collectibles and character status menus (see [Laptops with two GPUs](#laptops-with-two-gpus)).
 - **Character mouths.** The inside of mouths can render black in some close-ups.
 - **Episodes menu.** A red flash can appear across the screen when navigating the Episodes menu.
 - **End credits.** Text at the beginning of the end credits may appear vertically smeared.
@@ -108,8 +151,9 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 ## Performance
 
 - **Initial loading black screens.** When first launching the game, a black screen may appear before the main menu. A similar delay can occur when starting a new story after the opening lodge shots. These are caused by shaders being generated and compiled. Loading the same scene again, or selecting New Story after the shaders have been generated, is generally much faster. Improvements are planned for future releases.
-- **Shader compilation freezes.** Shaders are compiled for your graphics card when an area is first loaded. Expect stutters and occasional freezes lasting **10–20 seconds**, particularly during the beginning of a new game. On the development PC, a fresh installation produced freezes of approximately 12 and 17 seconds during the prologue. The game may not be frozen permanently, so allow additional time for shader compilation. Subsequent runs benefit from the shader cache (`Cache\`).
-- **Frame-rate drops.** WIP 0.1.4 is much faster than 0.1.3, but frame rates still vary with the scene. Measured on the development PC (RTX 3090 Ti, Core i9-12900KF) with WIP 0.1.4: light scenes often reach 60 FPS, busy scenes (2,000–3,000 draws) about 35–45 FPS, and the heaviest scenes measured, the prologue's "stranger" shots, about 21–25 FPS (about 5 FPS with 0.1.3 in the same scene). Slower PCs will see lower numbers. In the heaviest scenes the renderer's own work on the CPU is now the limit; spreading that work over several CPU cores is the next planned step.
+- **Shader compilation freezes.** Shaders are compiled for your graphics card when an area is first loaded. Expect stutters and freezes of several seconds, particularly during the beginning of a new game. WIP 0.1.5 compiles compute shaders in parallel too (before, one after another: a 38-second freeze reported with 0.1.4 on a 6-thread CPU held 30 seconds of them; with no shader cache the time spent waiting for compiles in two test scenes on the development PC fell by 16% and 24%). On CPUs with few cores freezes can still last 10–20 seconds or more. The game is not frozen permanently, so allow additional time for shader compilation. Subsequent runs benefit from the shader cache (`Cache\`); a cache from 0.1.4 stays valid.
+- **Frame-rate drops.** Frame rates still vary with the scene; WIP 0.1.5 is similar to 0.1.4 (about 3% less renderer time per frame in test scenes, and memory checks that cost 0.3–0.4 ms less per frame). Measured on the development PC (RTX 3090 Ti, Core i9-12900KF): light scenes often reach 60 FPS, busy scenes (2,000–3,000 draws) about 35–45 FPS, and the heaviest scenes measured, the prologue's "stranger" shots, about 22–27 FPS (about 5 FPS with 0.1.3 in the same scene). Slower PCs will see lower numbers. In the heaviest scenes the renderer's own work on the CPU is the limit; spreading that work over several CPU cores is the next planned step.
+- **Memory.** On the development PC the program uses at most about 8.2 GB of RAM in the prologue and commits up to about 17 GB. Much of the committed memory is reserved by the graphics driver and not in RAM, but Windows needs room for it: keep the page file switched on ("System managed"). 16 GB of RAM is recommended.
 - **Higher frame-rate limits.** Frame-rate limits above 60 FPS are available but have not been thoroughly tested across all scenes. The default 60 FPS cap does not guarantee a consistent 60 FPS.
 
 ## Controllers
@@ -120,7 +164,8 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 
 ## Hardware
 
-- **Tested development configuration:** Intel Core i9-12900KF, NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01), Windows 11, 64 GB RAM. WIP 0.1.4 has so far been played only on this PC.
+- **Tested development configuration:** Intel Core i9-12900KF, NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01), Windows 11, 64 GB RAM. WIP 0.1.5 has so far been played only on this PC.
+- **Played by players with WIP 0.1.4:** Intel Core i5-9400F + GeForce GTX 1660 Ti (occasional crashes, see above); AMD Ryzen 5 220 + GeForce RTX 5050 Laptop GPU with Radeon 740M (see [Laptops with two GPUs](#laptops-with-two-gpus)).
 - **AMD Radeon:** an AMD Radeon RX 9070 XT showed graphical corruption in WIP 0.1.2; it is fixed in WIP 0.1.3 and confirmed on that card, where all compatibility checks pass (see [Reported by players](#reported-by-players)).
 - **Other NVIDIA GPUs:** compatibility tests passed on the RTX 5070 Laptop GPU, RTX 3060 Ti, RTX 3080, RTX 5070 and RTX 3090 (see the [tested hardware](../README.md#tested-hardware) table).
 - **AMD Ryzen:** The game has been run on a Ryzen 5 9600X, and the compatibility test has passed on Ryzen 7 5700G, Ryzen 5 7500F, Ryzen 7 5700X and Ryzen 7 5800X systems.

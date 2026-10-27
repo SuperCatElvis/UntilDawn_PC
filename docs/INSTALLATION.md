@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This guide covers WIP 0.1.4. You need two things: **the release download** from this project, and **your own
+This guide covers WIP 0.1.5 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
 copy of the original PS4 game**. The download does not contain the game.
 
 ---
@@ -23,7 +23,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 
 ## 2. Download and extract the release
 
-1. Download `UntilDawn_WIP_0.1.4.zip` from the
+1. Download `UntilDawn_WIP_0.1.5.zip` from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder **you can write to**, for example `D:\Games\UntilDawn_WIP`.
    Don't use `C:\Program Files`: the program keeps its settings, logs, shader cache and saves in its own folder.
@@ -31,7 +31,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 After extracting you have:
 
 ```
-UntilDawn_WIP_0.1.4\
+UntilDawn_WIP_0.1.5\
   UntilDawn.exe                     the game
   Config\settings.ini               settings (see section 5)
   Game\                             empty: your game files go here
@@ -41,20 +41,23 @@ UntilDawn_WIP_0.1.4\
     ud_compat.exe
     README_COMPAT.txt
   README.txt
+  CHANGELOG.txt
   Controls.txt
   KNOWN_ISSUES.txt
   THIRD_PARTY_NOTICES.txt
 ```
 
-### Updating from WIP 0.1.3 (or 0.1.2)
+### Updating from an earlier WIP release
 
-Copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files into your old folder. **Do not
-overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.1.4 to a
-new folder and copy your `settings.ini`, `savedata` and game files over.
+Copy the new `UntilDawn.exe` and the text files into your old folder (from 0.1.3 or 0.1.2, also
+`compat\ud_compat.exe`). **Do not overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings,
+saves and game). Or extract 0.1.5 to a new folder and copy your `settings.ini`, `savedata` and game files over.
 
-- Saves and settings from 0.1.3 and 0.1.2 work as they are. Your `settings.ini` does not need the new
-  `renderer_thread` line; without it the default (1) is used.
-- From 0.1.3, the shader cache (`Cache\`) stays valid: 0.1.4 translates the shaders exactly as 0.1.3 does.
+- Saves and settings from 0.1.4, 0.1.3 and 0.1.2 work as they are. WIP 0.1.5 has no new settings. A
+  `settings.ini` from 0.1.3 or 0.1.2 does not need the `renderer_thread` line; without it the default (1) is used.
+- `compat\` in 0.1.5 is the same as in 0.1.4.
+- From 0.1.4 or 0.1.3, the shader cache (`Cache\`) stays valid: 0.1.5 translates the shaders exactly as 0.1.3
+  and 0.1.4 do.
 - From 0.1.2, shaders are translated anew, so the first-run shader-compilation pauses return once.
 
 ---
@@ -83,7 +86,7 @@ Choose **one** of these three ways:
 Copy the contents of your game folder into the release's `Game` folder, so that this file exists:
 
 ```
-UntilDawn_WIP_0.1.4\Game\eboot.bin
+UntilDawn_WIP_0.1.5\Game\eboot.bin
 ```
 
 ### Option B — point `settings.ini` at your game
@@ -130,9 +133,9 @@ Double-click **`UntilDawn.exe`**.
   If something is wrong, a message says which file is missing or which version was found, and the game does
   not start.
 - It also checks your CPU and graphics card. If a requirement is missing, a message explains what it is.
-- **The first play-through compiles shaders** for your graphics card as new areas load. Expect stutters, and
-  occasional **freezes of 10–20 seconds**, mostly in the first minutes. This is not a crash. Later runs use the
-  shader cache and are much smoother.
+- **The first play-through compiles shaders** for your graphics card as new areas load. Expect stutters and
+  freezes of several seconds (**10–20 seconds or more** on CPUs with few cores), mostly in the first minutes. This
+  is not a crash. Later runs use the shader cache and are much smoother.
 
 The program creates these folders next to `UntilDawn.exe` when it runs:
 
@@ -157,7 +160,7 @@ The file is created with these defaults if it is missing. Delete it to restore t
 | `frame_rate_limit` | `60` | `30`, `60` (like the PS4), `120`, `144`, `165`, any other number, or `0` for no limit. Limits above 60 work but have not been checked in every scene. |
 | `display_mode` | `windowed` | `windowed`, or `borderless` (a window covering the whole primary monitor). |
 | `window_width` / `window_height` | `1280` / `720` | Window size in windowed mode. The window can also be resized with the mouse. |
-| `renderer_thread` | `1` | `1` = the renderer runs on its own thread, alongside the game (new in 0.1.4; faster). `0` = the renderer runs on the game's thread, as in 0.1.3. Try `0` if 0.1.4 crashes or stutters where 0.1.3 did not. Not present in settings files from older versions; the default then applies. |
+| `renderer_thread` | `1` | `1` = the renderer runs on its own thread, alongside the game (since 0.1.4; faster). `0` = the renderer runs on the game's thread, as in 0.1.3. Try `0` if the game freezes or stutters, and report whether it helped. It does not prevent the crashes caused by overwritten game memory. Not present in settings files from 0.1.3 and older; the default then applies. |
 | `developer` | `0` | `1` turns on developer capture keys that write multi-gigabyte diagnostic files. Leave it at `0` unless asked. |
 
 The game itself renders at 1920×1080, as on the PS4, and is scaled to the window.
@@ -176,5 +179,7 @@ The game itself renders at 1920×1080, as on the PS4, and is scaled to the windo
 | A message about the CPU | Your CPU lacks an instruction set the game's code uses (see the [requirements](../README.md#system-requirements)). This cannot be worked around. |
 | A message about the graphics card or Vulkan | Update your graphics driver. If it still fails, run the [compatibility tester](COMPATIBILITY_TESTING.md) and report the result. |
 | The game freezes for several seconds | Usually shader compilation on the first play-through; wait. If it lasts more than a minute, report it with the log. |
-| 0.1.4 crashes, freezes or stutters where 0.1.3 did not | Set `renderer_thread = 0` in `Config\settings.ini` (see section 5) and [report](../README.md#reporting-bugs) whether that helps, with `Logs\UntilDawn.log`. |
+| 0.1.5 crashes, freezes or stutters where 0.1.4 did not | [Report it](../README.md#reporting-bugs) with `Logs\UntilDawn.log`. You can also try `renderer_thread = 0` in `Config\settings.ini` (see section 5) and say whether that helps. |
+| Laptop with two GPUs: frames take up to a second to appear, the game hangs for several seconds and ends with "device lost", or menus flicker | Windows Settings → System → Display → Graphics: add `UntilDawn.exe` and choose **High performance**. If the laptop has a MUX switch / "discrete GPU only" mode, switch it on. See [Known issues](KNOWN_ISSUES.md#laptops-with-two-gpus). |
+| The game runs out of memory or Windows warns about low memory | Keep the page file on ("System managed"); close other large programs. 16 GB of RAM is recommended. |
 | The game crashed | Start it again (saves are kept), then [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.previous.log`. |
