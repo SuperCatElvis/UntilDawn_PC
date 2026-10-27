@@ -77,7 +77,7 @@ overwritten game memory (both players who reported them used it). The first line
 | False "missing files" message with a long folder path | **Fixed in WIP 0.1.3** (verified); still fixed in 0.1.5. |
 | Corrupted textures, black blocks, missing foliage and stepped lighting on AMD GPUs | **Fixed in WIP 0.1.3** (confirmed on an RX 9070 XT by the player who reported it). 0.1.4 and 0.1.5 translate the shaders exactly as 0.1.3 does; they have not yet been played on AMD. |
 | Very slow frame presentation, "device lost" and flickering menus on a laptop with two GPUs | **Open** — see [Laptops with two GPUs](#laptops-with-two-gpus). |
-| Character's arm and the inspected item invisible during item inspection (GTX 1660 Ti, WIP 0.1.4) | **Open** — not reproduced yet ([issue #3](https://github.com/SuperCatElvis/UntilDawn_PC/issues/3)). |
+| Character's arm and the inspected item invisible during item inspection (all devices) | **Open** — cause separate collectible rig invisible |
 | One game file reported missing although the game was copied | Not a port bug: the copy skipped the file. See below. |
 
 ### False "missing files" message with a long folder path — fixed in WIP 0.1.3
