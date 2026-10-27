@@ -5,8 +5,9 @@
 The game has been played in full on the development PC (Intel CPU, NVIDIA GPU), and players have sent
 compatibility reports from several other NVIDIA and AMD systems (see the [tested hardware](../README.md#tested-hardware)
 table). The included tester tells us quickly whether other hardware behaves the same way. **Reports from AMD and
-Intel graphics are the most useful right now — even when everything passes.** For WIP 0.1.4, please also say
+Intel graphics are the most useful right now — even when everything passes.** For WIP 0.1.5, please also say
 whether the game itself ran well, and whether you changed `renderer_thread` in `Config\settings.ini`.
+On a laptop, please also say whether it has two GPUs (for example NVIDIA plus integrated graphics).
 
 ---
 

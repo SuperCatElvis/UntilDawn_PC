@@ -1,64 +1,98 @@
-Until Dawn native PC port - known issues (WIP 0.1.4, 25 October 2026)
+Until Dawn native PC port - known issues (WIP 0.1.5, 27 October 2026)
 =====================================================================
 
-This is a work-in-progress test build. What is known so far:
+This is still a work-in-progress test build. What is known so far:
 
-New in 0.1.4: the renderer thread
----------------------------------
-  - The renderer now runs on its own thread, alongside the game (a large part of 0.1.4's speed-up). So far it
-    has only been played on the developer's PC (NVIDIA RTX 3090 Ti, Intel Core i9-12900KF). If 0.1.4 crashes,
-    freezes or stutters on your PC where 0.1.3 did not, set  renderer_thread = 0  in Config\settings.ini: the
-    renderer then runs on the game's thread as in 0.1.3. Please report whether that helped.
+Not fixed yet: game memory that is occasionally overwritten (the main cause of crashes)
+----------------------------------------------------------------------------------------
+  - Now and then a single byte of the game's memory is set to zero - in the cases examined, the lowest byte of
+    a pointer at the start of a 4 KB memory page (often an object's type pointer). The game then follows a wrong
+    pointer and crashes, for example in the "Lump Loader" or a "JobSched" thread, or a character's animation
+    data is damaged. It has been seen on the developer's PC and on players' PCs, with 0.1.3 and 0.1.4, and
+    again while testing 0.1.5. The cause is still being investigated; 0.1.5 does NOT fix it. Saves are kept;
+    start the game again.
+  - The program contains safeguards that detect the known kinds of damage and repair some of them. The log then
+    contains lines such as "EBOOT POINTER LOW BYTE CLEARED" - those reports are very useful, please include the
+    log (Logs\UntilDawn.log, or UntilDawn.previous.log after a restart) when you report a crash.
+  - Characters can briefly deform ("explode") for a frame or two - most likely the same problem (seen, for
+    example, on Sam in the prologue).
+  - Collectibles: a totem has been seen to vanish, and a clue to reappear after it was picked up.
+
+Laptops with two graphics chips
+-------------------------------
+  - On a laptop with an NVIDIA GPU and AMD integrated graphics (RTX 5050 Laptop GPU + Radeon 740M), where the
+    screen is driven by the integrated chip, showing a frame sometimes took 0.5-1 second, and in several runs it
+    hung for about 8-10 seconds and the graphics driver reported "device lost", ending the game. The same laptop
+    showed flickering UI in the Status, Collectibles and character status menus. Not fixed yet (GitHub issue #2).
+    Things to try:
+      * Windows Settings > System > Display > Graphics: add UntilDawn.exe and choose "High performance" (the
+        NVIDIA GPU).
+      * If the laptop has a MUX switch / "discrete GPU only" mode (in the NVIDIA Control Panel or the laptop
+        maker's app), switch it on, so the NVIDIA GPU drives the screen directly.
+    Please report whether either helped, with Logs\UntilDawn.log.
 
 Stability
 ---------
-  - Occasional crashes. In a full play-through on the developer's PC (0.1.3) the game crashed twice and had to be
-    restarted; saves were kept. The cause is being investigated: some of the game's memory is occasionally
-    overwritten (characters' animation data, object tables). The program contains safeguards that catch most
-    of these cases, but not all. 0.1.4 changes two things that may be involved; whether crashes became rarer
-    still has to be confirmed.
-  - Characters can briefly deform ("explode") for a frame or two - the same memory problem as above.
-  - Collectibles: a totem has been seen to vanish, and a clue to reappear after it was picked up.
+  - Occasional crashes: see the first section. In a full play-through on the developer's PC (0.1.3) the game
+    crashed twice and had to be restarted; players have reported similar crashes with 0.1.4.
+  - The changes in 0.1.5 (memory use, compute shaders compiled in parallel, less renderer work, reuse of moved
+    textures) have only been played on the developer's PC (NVIDIA RTX 3090 Ti, Intel Core i9-12900KF). If 0.1.5
+    crashes, freezes or stutters on your PC where 0.1.4 did not, please report it. renderer_thread = 0 in
+    Config\settings.ini (the renderer on the game's thread, as in 0.1.3) is still available for freezes and
+    stutters; it does not prevent the crashes from overwritten game memory.
 
 Graphics
 --------
+  - Emily's eyes can show light squares for a couple of seconds, and the wall on the right as the friends leave
+    the kitchen for the prank in the prologue can show dark square shadows (also in 0.1.4).
   - The inside of mouths can render black in some close-ups.
   - A red flash over the screen while moving through the Episodes menu.
   - The text at the start of the end credits is smeared vertically.
   - Totem visions: the video can play without the rest of the totem screen (its background and UI), e.g. when a
     totem is rewatched after it played correctly the first time; sometimes the whole UI disappears and only
     the character and the background remain.
+  - Item inspection: on one PC (GTX 1660 Ti) the character's arm and the inspected item were invisible.
   - In the second "stranger" shot of the prologue, fog and haze can disappear for a frame or two just after the
-    stranger walks past.
+    stranger walks past. Rarely, lighting looks wrong for a frame or two elsewhere.
   - The Skip prompt's "Skip" text shows as white boxes on the butterfly-effect tutorial and the movie that opens
     the prologue, and can in the later "Previously on Until Dawn" clips (the Cross button is right and skipping
     works). The game's own text in the same overlay movie is drawn in pieces then too: a renderer fault, being
     investigated.
   - The Cross (X) button and subtitles can occasionally look glitchy.
   - Small differences from the PS4 picture are possible elsewhere; please report anything that looks wrong.
-  - Fixed in 0.1.4: hair that looked hazy or see-through (fog and light shafts behind characters were drawn
-    over it).
 
 Performance
 -----------
-  - Much better than in 0.1.3, but the frame rate still varies by scene. On the developer's PC (RTX 3090 Ti,
-    Core i9-12900KF): light scenes often reach 60 fps, busy scenes about 35-45 fps, and the heaviest scenes
-    measured (the prologue's "stranger" shots) about 21-25 fps (about 5 fps with 0.1.3). Slower PCs will see
-    lower numbers. The 60 fps limit is a limit, not a guaranteed frame rate.
-  - Shader compilation on the first play-through: stutters, and occasional freezes of 10-20 seconds, mostly in
-    the first minutes of each new area (a fresh install froze for about 12 and 17 seconds in the prologue on the
-    developer's PC). The game is not hung - wait for it. The shader cache (Cache\) removes most of these on
-    later runs; a cache from 0.1.3 stays valid.
+  - The frame rate still varies by scene; 0.1.5 is similar to 0.1.4, slightly better in places. On the
+    developer's PC (RTX 3090 Ti, Core i9-12900KF): light scenes often reach 60 fps, busy scenes about 35-45 fps,
+    and the heaviest scenes measured (the prologue's "stranger" shots) about 22-27 fps. Slower PCs will see lower
+    numbers. The 60 fps limit is a limit, not a guaranteed frame rate. In the heaviest scenes the renderer's own
+    work on the CPU is the limit; spreading it over several CPU cores is planned.
+  - Shader compilation on the first play-through: stutters and freezes of several seconds, mostly in the first
+    minutes of each new area. 0.1.5 compiles compute shaders in parallel too, which shortens the longest freezes,
+    but on CPUs with few cores (for example 6 threads) they can still last 10-20 seconds or more. The game is not
+    hung - wait for it. The shader cache (Cache\) removes most of these on later runs; a cache from 0.1.4 stays
+    valid.
+  - Long frames when the game loads a new scene (a second or two) are normal for now.
+
+Memory
+------
+  - On the developer's PC the program uses at most about 8.2 GB of RAM in the prologue (12.7 GB with 0.1.4), and
+    commits up to about 17 GB (22 GB with 0.1.4). Much of the committed memory is reserved by the graphics
+    driver and not in RAM, but Windows needs room for it: keep the page file switched on ("System managed").
+    16 GB of RAM is recommended (the program warns below 12 GB).
 
 Hardware
 --------
   - Full play-through (0.1.3): Intel Core i9-12900KF + NVIDIA GeForce RTX 3090 Ti (drivers 617.42 and 621.01),
-    Windows 11, 64 GB. 0.1.4 has been played on the same PC.
+    Windows 11, 64 GB. 0.1.4 and 0.1.5 have been played on the same PC.
+  - Played by players with 0.1.4: Intel Core i5-9400F + GTX 1660 Ti (occasional crashes, see above), AMD Ryzen 5
+    220 + RTX 5050 Laptop GPU / Radeon 740M (see "Laptops with two graphics chips").
   - Compatibility test passed (0.1.2 / 0.1.3): NVIDIA RTX 3060 Ti, 3080, 3090, 5070 and 5070 Laptop GPU,
     AMD Radeon RX 9070 XT, with Intel and AMD Ryzen CPUs.
   - AMD Radeon: 0.1.2 rendered badly on an RX 9070 XT (noisy textures, black blocks, missing foliage, stepped
-    lighting). Fixed in 0.1.3 and confirmed on that card. 0.1.4 translates the shaders exactly as 0.1.3 does,
-    but 0.1.4 itself has not been played on an AMD card yet - reports are welcome.
+    lighting). Fixed in 0.1.3 and confirmed on that card. 0.1.5 translates the shaders exactly as 0.1.3 and
+    0.1.4 do, but 0.1.4 and 0.1.5 have not been played on an AMD card yet - reports are welcome.
   - Intel Arc / integrated graphics are untested. Please run compat\run_compat.bat on these and send the report
     even if the game runs fine.
   - Game files reported "missing" although they are there: fixed since 0.1.3 for long folder paths. If one file
