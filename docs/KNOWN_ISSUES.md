@@ -108,6 +108,7 @@ where 0.1.5 did not, please [report it](../README.md#reporting-bugs) with `Logs\
 | Very slow frame presentation, "device lost" and flickering menus on a laptop with two GPUs | **Partly addressed in WIP 0.2.0, untested there** — see [Laptops with two GPUs](#laptops-with-two-gpus). |
 | Character's arm and the inspected item invisible during item inspection (all devices; [issue #3](https://github.com/SuperCatElvis/UntilDawn_PC/issues/3)) | **Fixed in WIP 0.2.0** — the cause was the separate collectible rig turning invisible (its arm bones became invalid numbers); see [Fixed and improved](#fixed-and-improved). |
 | One game file reported missing although the game was copied | Not a port bug: the copy skipped the file. See below. |
+| Totem screen flashes red when totem plays | This is thought to be tied to the episode selector doing the same thing|
 
 ### False "missing files" message with a long folder path — fixed in WIP 0.1.3
 
