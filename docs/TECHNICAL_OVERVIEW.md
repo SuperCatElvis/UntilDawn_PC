@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This document explains how the Until Dawn native PC port (WIP 0.1.5) runs the original PS4 game on Windows. It
+This document explains how the Until Dawn native PC port (WIP 0.2.0) runs the original PS4 game on Windows. It
 is written for modders, tinkerers and anyone curious about the internals. It describes the design and the
 behaviour of the released program; the port's source code is not published yet.
 
@@ -63,7 +63,7 @@ flowchart TB
     gpu --> vk
 ```
 
-In numbers (WIP 0.1.5):
+In numbers (WIP 0.2.0):
 
 | | |
 | --- | --- |
@@ -129,7 +129,7 @@ more) are **not** used or shipped. The port provides its own implementation of e
 | --- | --- |
 | Kernel: memory, files, time, events | Windows virtual memory, files and timers (sections 5–7) |
 | Threads and synchronisation (pthreads, semaphores, event flags, event queues) | Real Windows threads and locks (section 6) |
-| libc / C++ runtime | Own implementations of the functions the game imports (strings, numbers, time, character tables, setjmp/longjmp) |
+| libc / C++ runtime | Own implementations of the functions the game imports (strings, numbers, time, character tables, setjmp/longjmp), and the data the game reads directly, such as the floating-point limit tables `_Flt` / `_Dbl` (smallest, largest and epsilon values; since 0.2.0 — before, they read as zeros, which broke a check in the arm animation's IK) |
 | Fibers | Native Windows fibers |
 | Save data | Folders under `savedata\` (section 7) |
 | Gnm (graphics driver) | The GPU layer (section 8) |
@@ -140,8 +140,8 @@ more) are **not** used or shipped. The port provides its own implementation of e
 | Dialogs (message, error) | Answered automatically ("OK") |
 
 When the game calls a function that has no implementation, it gets a neutral answer, and the call is listed at
-the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 to 0.1.5 that
-list holds 36 functions, all of them networking, font, camera, live-streaming or start-up initialisation calls
+the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 to 0.2.0 that
+list holds 36 functions, mostly networking, font, camera, live-streaming or start-up initialisation calls
 the game does not depend on.
 
 ---
@@ -156,12 +156,22 @@ the game does not depend on.
   the same memory the game writes. Data the GPU reads very often is mirrored into video memory. Since 0.1.5 those
   video-memory copies are sized to the GPU (at most a quarter of its video memory for buffer copies and an eighth
   for the mirror; before, a fixed 6 GB and 3 GB on every card).
-- **Committed as used** (since 0.1.5). The game creates many small heaps (256 KB mappings at 2 GB-spaced
-  addresses). Each heap's address range is reserved up front, as before, but memory is committed and imported into
+- **Committed as used** (since 0.1.5). The game creates many small heaps (256 KB mappings in fixed address
+  slots). Each heap's address range is reserved up front, as before, but memory is committed and imported into
   Vulkan in steps (4–16 MB) as the game actually maps into it, instead of 64 MB or more at once. Mapping pools grow
   in 64 MB chunks instead of 512 MB. The game's own large regions stay committed in one piece: the renderer's
   fast paths need large contiguous imported regions, and committing those piece by piece was tried and made the
   renderer much slower (test build t111).
+- **Heap address slots** (since 0.2.0). The game places its heaps in a table of 468 address slots starting at
+  72 GB, originally 2 GB apart and handed out round-robin, so over a session the heaps march upwards. After about
+  25–30 minutes they passed the range the translated shaders can address (they read memory through a page table
+  covering a fixed window), and the GPU read newly loaded data as zeros. The port now patches the slot spacing to
+  512 MB (all 468 slots then end at 306 GB, inside the window, which was widened to 308 GB) and makes the game reuse
+  a released slot at once (first fit), so the heaps stay in the lowest slots and the memory committed for them
+  stays at the level of the heaps in use. No game code derives a
+  slot from an address, so the spacing is free to change; `heap_slot_mb = 2048` / `heap_slot_reuse = 0` restore the
+  game's own layout. The whole slot range is reserved at start-up before anything else runs, so Windows cannot place
+  a thread stack or other allocation there (which once made a fixed mapping fail at start).
 - **Change tracking.** Windows' write-watch feature reports which 4 KB pages the CPU wrote since the last check.
   The renderer uses it to know which textures and buffers must be refreshed, instead of re-reading everything
   every frame. Since 0.1.5 each range is first queried without resetting; only ranges that were written are then
@@ -170,10 +180,12 @@ the game does not depend on.
 - **Memory report.** Since 0.1.5 the log contains a memory report every 60 seconds and at exit: this program's
   committed memory and RAM, the game's memory by kind, the renderer's pools, the graphics driver's heaps
   (`VK_EXT_memory_budget`) and the largest other allocations.
-- **Safeguards.** A known, still unresolved problem (WIP 0.1.3 to 0.1.5) is that a byte of game memory is
-  occasionally overwritten — in the cases examined, the lowest byte of a pointer at the start of a 4 KB page (see
-  Known issues). The port scans for the known damage patterns and repairs the ones it can recognise; those
-  repairs are counted at the end of the log (`watch-heap`, `skin-table check`).
+- **Safeguards.** A known, still unresolved problem (every version so far) is that a byte of game memory is
+  occasionally overwritten — the lowest byte of a pointer (see Known issues). Hardware watchpoints showed the
+  writer to be the game's own code finishing a new object whose memory overlaps a live one, i.e. two allocations
+  that overlap. Since 0.2.0 the game's lock-free arena allocator, where one such race was seen, runs under a lock.
+  The port scans for the known damage patterns and repairs the ones it can recognise; those repairs are counted at
+  the end of the log (`watch-heap`, `skin-table check`).
 
 ---
 
@@ -244,8 +256,10 @@ Key points:
   game reads back), they are written back to memory.
 - **Textures.** PS4 textures are stored in AMD's tiled layouts. The port de-tiles them on the CPU (its own
   implementation of AMD's public addressing equations) and uploads them. Block-compressed formats (BC1–BC7) are
-  passed to the GPU as they are. Up to 4,096 textures are kept as Vulkan images (within half of the video memory);
-  the least recently used ones that have not been needed for two frames are evicted.
+  passed to the GPU as they are. Since 0.2.0 large textures are de-tiled in parts on helper threads, and images
+  take their memory from shared 256 MB blocks (very large images keep their own). Up to 4,096 textures are kept as
+  Vulkan images (within half of the video memory); the least recently used ones that have not been needed for two
+  frames are evicted.
 - **Moved textures** (since 0.1.5). The game now and then moves textures to new addresses (most likely when it
   compacts its texture memory). To the renderer a moved texture used to be a new texture (created and uploaded again). Now a content
   index (a hash of every byte plus the tiling, pitch, size, format and detail levels) finds an image with exactly
@@ -271,6 +285,10 @@ Key points:
   too: the batch of draws that needs them is recorded and replayed once its compiles are done, and a compute
   pipeline that fails drops exactly the work that depended on it.
 - **Resolution.** The game renders at the PS4's 1920×1080; the result is scaled to the window.
+- **Presentation** (since 0.2.0). If the display does not hand back an image within 250 ms, that frame is not
+  presented (before, the frame was drawn into an image the program did not own, and the GPU then waited for ever —
+  the "device lost" seen on a laptop with two GPUs). With `present_mode = auto`, repeated slow presents switch the
+  swapchain from `mailbox` to `fifo` once. `gpu` selects the graphics card by number or name.
 - **Shader / pipeline cache.** Compiled pipelines are saved to `Cache\vulkan_pipelines.bin` at the end of each
   run and loaded at the next start. This is what removes most first-play-through stalls on later runs.
 
@@ -309,6 +327,11 @@ first uses it:
   are freed once the driver has made a shader module (which holds its own copy), and modules not used for a while
   are destroyed and made again when needed from a compressed copy of the words (LZ77-style, about 2.6 times
   smaller). Pipelines are found by translation key, so none of this changes what is compiled.
+- Some character shaders read a constant table inside their own code, using the GCN instruction that returns the
+  program counter (`S_GETPC_B64`). Since 0.2.0 that value is read from the per-draw data instead of being written
+  into the SPIR-V, so every copy of such a shader shares one translation and still reads its own table. (Before,
+  identical copies at different addresses shared the first copy's translation and its address — the black mouths
+  after the prologue.)
 
 Translating takes milliseconds; the driver's pipeline compilation is what causes the first-play-through stalls.
 
@@ -375,7 +398,9 @@ location are exactly what it expects, and is skipped otherwise. The patches, and
 | `EXTRQ` (96 sites) | An AMD-only instruction (SSE4a) the PS4's CPU has; replaced by equivalent integer code so the game also runs on Intel CPUs |
 | Iteration cap on one physics shape-cast loop | Intel and AMD CPUs round the approximate reciprocal instructions slightly differently, which can make one loop endless on Intel |
 | Skinning-table check | Detects and repairs one of the memory-corruption patterns (character "explosions") |
-| Movie skip | Adds the Skip prompt to the intro and recap movies (below) |
+| Movie skip | Adds the Skip prompt to the intro and recap movies (below); since 0.2.0 a skip also stops, with a short fade, the music and other unplaced sounds posted since the movie started (a probe on the Wwise event call records them) |
+| Heap address slots (4 instructions, 2 stores) | Spacing 512 MB instead of 2 GB, and a released slot reused at once (section 5) |
+| Arena allocator lock | A lock around one lock-free allocator of the game, where two threads were seen allocating at once (section 5) |
 | `malloc` / `free` routing | The game supplies its own allocator to the system libraries; the port uses it the same way the PS4's libc does |
 
 **The Skip prompt** is a good example of how the port can change the game's UI without shipping game assets: the
@@ -392,7 +417,9 @@ it lives in, and the prompt is shown by whichever of these movies the game is dr
 
 **Logs.** `Logs\UntilDawn.log` records the start-up checks, hardware, renderer setup, per-minute frame-rate
 statistics, long frames (with what caused them), stall reports (where every game thread is if no frame arrives for
-8 seconds), the memory safeguard counters and a summary at exit. The previous five sessions are kept.
+8 seconds), the memory safeguard counters and a summary at exit. The previous five sessions are kept. Since 0.2.0
+log lines are queued in memory and written by a separate thread, so a slow disk write can no longer hold up the
+game or the renderer (it used to cause freezes of a second or more).
 `Logs\captures\` holds the renderer's own log and small diagnostic files.
 
 **Developer mode** (`developer = 1` in `Config\settings.ini`) turns on capture keys. They are meant for bug
@@ -417,7 +444,7 @@ Captures go to `Logs\captures\` and contain data from your game; don't post them
 
 ## 14. Modding: what is possible today
 
-The port is not yet built for modding, and WIP 0.1.5 has **no mod loader or plugin interface**. What a modder
+The port is not yet built for modding, and WIP 0.2.0 has **no mod loader or plugin interface**. What a modder
 should know about the current behaviour:
 
 - **Changed game files are refused if their size changes.** The start-up check compares the size of every one of

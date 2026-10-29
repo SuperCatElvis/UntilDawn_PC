@@ -1,4 +1,4 @@
-Until Dawn native PC port - controls (WIP 0.1.5)
+Until Dawn native PC port - controls (WIP 0.2.0)
 ================================================
 
 Controllers
@@ -34,6 +34,7 @@ Keyboard and mouse
   Touch pad swipes     F = left, G = right, R = up, V = down
   Touch pad finger     hold the left mouse button inside the window and drag
   L3 / R3              not available on the keyboard (use a controller)
+  The keys cannot be remapped yet.
 
 Mouse aiming (M turns it on and off):
   mouse movement       right stick (camera / aim)

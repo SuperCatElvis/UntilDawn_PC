@@ -7,7 +7,7 @@ This project aims to bring the original **Until Dawn (2015)** to PC, running nat
 Development is ongoing. A full play-through was completed on the development PC with WIP 0.1.3 (later versions have so far been tested in shorter sessions), but the port is **not yet a polished or consistently smooth experience**.
 
 > [!WARNING]
-> **Still an early work-in-progress.** Expect graphical glitches, crashes, shader-compilation pauses and frame-rate drops. WIP 0.1.5 uses much less memory than 0.1.4 and has shorter shader-compilation freezes, but the heaviest scenes still run **below 30 FPS**, even on the development PC, and the memory corruption behind most crashes is **not fixed yet**. Performance, stability and hardware support will keep improving in future releases, but there is no guaranteed timetable.
+> **Still an early work-in-progress.** Expect graphical glitches, crashes, shader-compilation pauses and frame-rate drops. WIP 0.2.0 fixes several long-standing problems — the disappearing arm and collectibles during item inspection, black mouths after the prologue, freezes caused by log writes and a random start-up crash — and contains fixes for long sessions and laptops with two GPUs that still need testing, but the memory corruption behind most crashes is **not fixed yet**, and the heaviest scenes still run **below 30 FPS**, even on the development PC. Performance, stability and hardware support will keep improving in future releases, but there is no guaranteed timetable.
 
 > [!IMPORTANT]
 > **You must supply your own legally obtained game files.** This project does not provide the original PS4 game. The loader requires a decrypted dump of **Until Dawn (CUSA02636)** with update **01.03** applied, made from your own legally obtained copy of the game. See [Installation](#installation) and [Third-party notices](THIRD_PARTY_NOTICES.md) for details about the runtime package.
@@ -38,7 +38,7 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release from the Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases)**
 
-**Current version:** [WIP 0.1.5](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.1.5-wip) (`v0.1.5-wip`, work in progress): about a third less RAM, shorter shader-compilation freezes, less renderer work per frame. Download **`UntilDawn_WIP_0.1.5.zip`** from the release's Assets list (the "Source code" archives only contain this repository's documentation). Release notes: [docs/releases/v0.1.5-wip.md](docs/releases/v0.1.5-wip.md) · previous: [0.1.4](docs/releases/v0.1.4-wip.md), [0.1.3](docs/releases/v0.1.3-wip.md).
+**Current version:** [WIP 0.2.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.2.0-wip) (`v0.2.0-wip`, work in progress): collectibles and the arm during item inspection fixed, black mouths and garbled X prompts fixed, no more freezes from log writes, plus changes for long sessions and laptops with two GPUs that are not yet confirmed. Download **`UntilDawn_WIP_0.2.0.zip`** from the release's Assets list (the "Source code" archives only contain this repository's documentation). Release notes: [docs/releases/v0.2.0-wip.md](docs/releases/v0.2.0-wip.md) · previous: [0.1.5](docs/releases/v0.1.5-wip.md), [0.1.4](docs/releases/v0.1.4-wip.md), [0.1.3](docs/releases/v0.1.3-wip.md).
 
 The download contains the program, a hardware compatibility tester and documentation, but **no game files**.
 
@@ -46,7 +46,7 @@ The download contains the program, a hardware compatibility tester and documenta
 
 ## Features
 
-What is implemented in WIP 0.1.5:
+What is implemented in WIP 0.2.0:
 
 ### Game
 - A complete play-through from the prologue to the end credits has been achieved on the development PC (with WIP 0.1.3).
@@ -56,10 +56,14 @@ What is implemented in WIP 0.1.5:
 - **Movie skipping:** the intro logos, the "Previously on Until Dawn" recaps, the butterfly-effect tutorial, the
   movie that opens the prologue and the Chapter 1 bus ride can be skipped with the game's own Skip prompt (press
   any button, then Cross / Enter). On the tutorial and the prologue movie the prompt's text still shows as boxes.
+  Since 0.2.0 a skip also stops the sounds posted since the movie started (meant for music that kept playing; not
+  yet confirmed in play).
 
 ### Graphics
 - Custom Vulkan renderer; the game renders at the PS4's 1920×1080 and is shown in a resizable window.
 - Windowed or borderless display modes, configurable window size.
+- Choice of graphics card (`gpu`) and presentation mode (`present_mode`, since 0.2.0); in `auto` mode the program
+  switches to a safer mode by itself if frames take very long to reach the screen.
 - Configurable frame-rate cap (60 FPS by default). **A 60 FPS cap does not mean the game currently runs at 60 FPS consistently.**
 - The renderer runs on its own thread alongside the game (since 0.1.4; `renderer_thread = 0` switches back).
 - On-disk shader cache (`Cache\`), with shaders (graphics and, since 0.1.5, compute) compiled in parallel in the background.
@@ -90,7 +94,7 @@ These are the requirements the program checks for. Compatibility reports have no
 | **OS** | Windows 10 or 11, 64-bit |
 | **CPU** | x86-64 with AVX, F16C, BMI1, LZCNT, POPCNT, MOVBE and SSE4.2 — in practice Intel Core 4th generation (Haswell, 2013) or newer, or AMD Ryzen (or Excavator) or newer. Older Pentium/Celeron and pre-Ryzen AMD CPUs cannot run the game's code. |
 | **Memory** | 16 GB recommended. The program warns below 12 GB. Keep Windows' page file on (the default). |
-| **GPU** | A Vulkan 1.3 driver supporting `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`, plus the features and limits checked at startup. **Gameplay has been verified on the development NVIDIA GPU, and WIP 0.1.3 renders the same on an AMD Radeon RX 9070 XT; compatibility tests have also been run on additional NVIDIA GPUs.** Players have run WIP 0.1.4 on a GTX 1660 Ti and an RTX 5050 Laptop GPU; WIP 0.1.5 has so far been played on the development NVIDIA GPU only. Laptops with two GPUs can have problems (see [Known issues](#known-issues)). Intel graphics are untested. |
+| **GPU** | A Vulkan 1.3 driver supporting `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`, plus the features and limits checked at startup. **Gameplay has been verified on the development NVIDIA GPU, and WIP 0.1.3 renders the same on an AMD Radeon RX 9070 XT; compatibility tests have also been run on additional NVIDIA GPUs.** Players have run WIP 0.1.4 on a GTX 1660 Ti and an RTX 5050 Laptop GPU; WIP 0.1.5 and 0.2.0 have so far been played on the development NVIDIA GPU only. Laptops with two GPUs can have problems (see [Known issues](#known-issues)). Intel graphics are untested. |
 | **Disk** | About 50 GB for the game files, plus up to about 1 GB for the shader cache. |
 | **Game** | A decrypted dump of Until Dawn for PS4, **CUSA02636**, with the **01.03** update applied, made from your own **legally obtained** copy. Other regions and versions are refused. |
 
@@ -105,12 +109,12 @@ The results are from WIP 0.1.2 and 0.1.3 unless noted. The table distinguishes *
 | AMD Ryzen 7 5700G | NVIDIA GeForce RTX 3060 Ti | 610.88 | Windows 11 | 24 GB | 67/67 compatibility checks passed |
 | AMD Ryzen 5 7500F | NVIDIA GeForce RTX 3080 | 617.42 | Windows 11 | 32 GB | 67/67 compatibility checks passed |
 | AMD Ryzen 7 5700X | NVIDIA GeForce RTX 5070 | 596.49 | Windows 11 | 16 GB | 63/63 compatibility checks passed |
-| AMD Ryzen 5 9600X | AMD Radeon RX 9070 XT | 26.8.1 | Windows 11 | 32 GB | All compatibility checks passed with WIP 0.1.3; graphical corruption in WIP 0.1.2 fixed in WIP 0.1.3 (confirmed); WIP 0.1.4 and 0.1.5 not yet tested |
+| AMD Ryzen 5 9600X | AMD Radeon RX 9070 XT | 26.8.1 | Windows 11 | 32 GB | All compatibility checks passed with WIP 0.1.3; graphical corruption in WIP 0.1.2 fixed in WIP 0.1.3 (confirmed); WIP 0.1.4, 0.1.5 and 0.2.0 not yet tested |
 | AMD Ryzen 7 5800X | NVIDIA GeForce RTX 3090 | 617.14 | Windows 11 | 32 GB | 67/67 compatibility checks passed |
 | AMD Ryzen (model not reported) | NVIDIA GeForce RTX 5080 | 617.42 | Windows 11 | 56 GB | 67/67 compatibility checks passed |
 | Intel Core i5-9400F | NVIDIA GeForce GTX 1660 Ti | 616.92 | Windows 11 | 16 GB | 66/66 compatibility checks passed (WIP 0.1.4); gameplay confirmed, with shader compilation freezes |
 
-**Gameplay reports with WIP 0.1.4:** Intel Core i5-9400F + GeForce GTX 1660 Ti (playable, with occasional crashes from the memory corruption described under [Known issues](#known-issues)); AMD Ryzen 5 220 + GeForce RTX 5050 Laptop GPU with Radeon 740M integrated graphics (long presents and "device lost" crashes when the integrated GPU drives the screen; see Known issues).
+**Gameplay reports with WIP 0.1.4:** Intel Core i5-9400F + GeForce GTX 1660 Ti (playable, with occasional crashes from the memory corruption described under [Known issues](#known-issues)); AMD Ryzen 5 220 + GeForce RTX 5050 Laptop GPU with Radeon 740M integrated graphics (long presents and "device lost" crashes when the integrated GPU drives the screen; WIP 0.2.0 contains a fix for the "device lost" part that has not been tested on that laptop yet — see Known issues).
 
 The Core Ultra 9 system also detected **Intel integrated graphics** as usable, but the compatibility test ran on the **RTX 5070 Laptop GPU**, so this does not verify gameplay on Intel graphics. The AMD Radeon graphical corruption reported in WIP 0.1.2 is fixed in WIP 0.1.3 (confirmed on the RX 9070 XT); see [Known issues](#known-issues). Reports from additional AMD and Intel systems are especially welcome — see [Compatibility testing](#compatibility-testing).
 
@@ -120,13 +124,13 @@ The Core Ultra 9 system also detected **Intel integrated graphics** as usable, b
 
 ### 1. Download and extract
 
-1. Download **`UntilDawn_WIP_0.1.5.zip`** from the
+1. Download **`UntilDawn_WIP_0.2.0.zip`** from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder you can write to, for example `D:\Games\UntilDawn_WIP`. Don't use `Program Files`:
    the program keeps its settings, logs, shader cache and saves in its own folder.
 
 ```
-UntilDawn_WIP_0.1.5\
+UntilDawn_WIP_0.2.0\
   UntilDawn.exe            <- start the game
   Config\settings.ini      <- settings
   Game\                    <- put your game files here (or set game_dir)
@@ -167,15 +171,17 @@ and your CPU and graphics card, and tells you in plain words if something is mis
 
 The program creates `Logs\`, `Cache\`, `savedata\` (your saves) and `temp0\` itself when it runs.
 
-Settings (frame-rate limit, windowed / borderless, window size, renderer thread) and troubleshooting:
+Settings (frame-rate limit, windowed / borderless, window size, renderer thread, GPU choice, presentation mode) and troubleshooting:
 **[docs/INSTALLATION.md](docs/INSTALLATION.md)**.
 
-**Updating from 0.1.4:** copy the new `UntilDawn.exe` and the text files over your 0.1.4 folder, but **do not
-overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves, settings and the shader cache carry over; there
-are no new settings, and `compat\` is unchanged. From 0.1.3 or 0.1.2, also copy `compat\ud_compat.exe`.
+**Updating from 0.1.5 (or earlier):** copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files over
+your old folder, but **do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves and settings carry
+over; the new settings (`gpu`, `present_mode`, `heap_slot_mb`, `heap_slot_reuse`) use their defaults when they are
+not in your file. Every shader is translated anew in 0.2.0, so the old `Cache\` no longer matches (you can delete it)
+and the first-play-through shader pauses return once.
 
 > [!NOTE]
-> The first visit to a new area may compile shaders for your graphics card. This can cause **pauses of several seconds (10–20 seconds or more on CPUs with few cores)** during the first play-through. WIP 0.1.5 shortens the longest ones. Later runs can benefit from the shader cache, though other freezes and crashes are still possible.
+> The first time new content appears, your graphics driver compiles its shaders. With an empty shader cache (a new install), even the development PC (Core i9-12900KF, 24 threads) paused **once for about 12 seconds and a few times for 3–8 seconds** in the first minutes; once the cache holds an area, new content costs up to about 2 seconds. CPUs with fewer cores pause longer (**10–20 seconds or more** have been reported). Each pause happens once: later runs load the result from the shader cache (`Cache\`), though other freezes and crashes are still possible.
 
 ---
 
@@ -208,20 +214,35 @@ moments.
 The most important ones — full list in **[docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)**:
 
 - **Occasional crashes — not fixed yet.** Now and then the lowest byte of a pointer in the game's memory is set to
-  zero (in the cases examined, at the start of a 4 KB page), and the game crashes later when it follows that
-  pointer. It happens on the development PC and on players' PCs, with 0.1.3, 0.1.4 and in testing of 0.1.5; WIP 0.1.5 does not fix it.
-  Saves are kept. Finding the cause is the top stability priority.
-- **Characters occasionally deform ("explode") for a frame or two**, and a collectible can vanish or reappear.
+  zero, and the game crashes later when it follows that pointer. It happens on the development PC and on players'
+  PCs with every version so far, including in testing of 0.2.0; WIP 0.2.0 does not fix it. The writer has now been
+  caught: it is the game's own code finishing an object whose memory overlaps another object still in use (two of
+  the game's allocations overlap). Saves are kept. Fixing it is the top stability priority.
+- **Characters occasionally deform ("explode") for a frame or two** (most likely the same problem).
 - **Laptops with two GPUs** (an NVIDIA GPU plus integrated graphics that drive the screen): very slow frame
-  presentation, "device lost" crashes and flickering UI in some menus have been reported
-  ([issue #2](https://github.com/SuperCatElvis/UntilDawn_PC/issues/2)). Try Windows' Graphics settings →
-  UntilDawn.exe → "High performance", or the laptop's discrete-GPU (MUX) mode.
-- **Graphical bugs:** light squares on Emily's eyes and dark squares on a wall in the prologue, totem visions that lose their background or UI, black mouths in some close-ups, a red flash in the Episodes menu, smeared text at the start
-  of the end credits, an invisible arm / item during item inspection (one report), and the Skip prompt's "Skip" text as white boxes on the butterfly tutorial, the prologue's opening movie and later recap clips.
-- **Freezes while shaders compile** on the first play-through (see the note under Installation); shorter in 0.1.5, but still present.
-- **Frame-rate drops:** the frame rate still varies by scene, and 0.1.5 is similar to 0.1.4 here (slightly better in places). On the development PC (RTX 3090 Ti) light scenes often reach 60 FPS, busy scenes run at about 35–45 FPS, and the heaviest scenes (the "stranger" shots in the prologue) at about 22–27 FPS, lower during shader-compilation pauses. The default 60 FPS cap is a limit, not a guaranteed frame rate.
-- **WIP 0.1.5's changes have only been played on the development PC (NVIDIA).** If 0.1.5 crashes or stutters where 0.1.4 did not, please report it. `renderer_thread = 0` in `Config\settings.ini` (the renderer on the game's thread) is still available for freezes and stutters; it does not prevent the memory-corruption crashes.
-- **No vibration or light bar** on DualSense / DualShock 4 yet (Xbox controllers vibrate).
+  presentation, "device lost" crashes and flickering UI in some menus were reported with 0.1.4
+  ([issue #2](https://github.com/SuperCatElvis/UntilDawn_PC/issues/2)). WIP 0.2.0 contains a fix for the program's part
+  of the "device lost" hang and can switch to a safer presentation mode by itself, but it has **not been tested on such a
+  laptop yet**. Also try Windows' Graphics settings → UntilDawn.exe → "High performance", or the laptop's
+  discrete-GPU (MUX) mode.
+- **Graphical bugs:** flickering spots on the R2 choice cards, flickering subtitles, a see-through strip in the black
+  bar of the character introductions for a few frames, a slight lighting effect on Chris's glasses (not yet checked),
+  the main-menu character animating too fast, light squares on Emily's eyes and dark squares on a wall in the
+  prologue, totem visions that lose their background or UI, a red flash in the Episodes menu, smeared text at the
+  start of the end credits, and the Skip prompt's "Skip" text as white boxes on the butterfly tutorial, the
+  prologue's opening movie and later recap clips.
+- **Shader-compilation pauses** the first time new content appears (see the note under Installation): on a new
+  install up to about 12 seconds even on the development PC, longer on CPUs with few cores; once per content.
+- **Frame-rate drops:** the frame rate still varies by scene, and is similar to 0.1.5. On the development PC (RTX 3090 Ti) light scenes often reach 60 FPS, busy scenes run at about 30–45 FPS, and the heaviest scenes (the "stranger" shots in the prologue) at about 22–29 FPS, lower during shader-compilation pauses. The default 60 FPS cap is a limit, not a guaranteed frame rate.
+- **WIP 0.2.0's changes have only been played on the development PC (NVIDIA).** If 0.2.0 crashes or stutters where 0.1.5 did not, please report it. `renderer_thread = 0` in `Config\settings.ini` (the renderer on the game's thread) is still available for freezes and stutters; it does not prevent the memory-corruption crashes.
+- **No vibration or light bar** on DualSense / DualShock 4 yet (Xbox controllers vibrate). **Keys cannot be remapped** yet.
+- **Fixed in WIP 0.2.0:** the character's arm and the picked-up clue or totem vanishing during item inspection
+  ([issue #3](https://github.com/SuperCatElvis/UntilDawn_PC/issues/3)) and, by the same fix, Mike's lantern arm coming
+  apart in Chapter 5; black mouths in Chapter 2 and later after the
+  prologue; striped / garbled X button prompts; a white flash on the character introduction cards; freezes of a
+  second or more caused by log writes; a random crash at start-up. **Changed in WIP 0.2.0, not yet confirmed in
+  play:** game data loaded after about 25–30 minutes invisible to the GPU; the aiming reticle shown as a red square;
+  music that kept playing after a skipped movie; the "device lost" hang on laptops with two GPUs.
 - **Improved in WIP 0.1.5:** memory use (about 8.2 GB in RAM instead of 12.7 GB on the development PC's test route). **Fixed in WIP 0.1.4:** hair that looked hazy or see-through.
 - **Fixed in WIP 0.1.3 (still fixed):** the false "missing files" message when the folder path was long, and the
   graphical corruption on AMD GPUs in WIP 0.1.2 (noisy textures, black blocks, missing foliage, stepped lighting) —
@@ -310,9 +331,9 @@ Our immediate priorities are:
 1. **Stability** — identify and fix the underlying memory corruption behind remaining crashes and occasional character distortions, and the problems on laptops with two GPUs.
 2. **Graphical accuracy** — address known rendering bugs and bring the picture closer to the original PS4 version.
 3. **Hardware compatibility** — verify and improve support for AMD and Intel GPUs and AMD CPUs, using reports from other PCs.
-4. **Performance** — WIP 0.1.4 roughly quadrupled the frame rate in the heaviest scenes on the development PC, and WIP 0.1.5 cut memory use and shader-compilation freezes; next is a redesign of the renderer so that its work is spread over several CPU cores, plus fewer shader-compilation stalls, working toward consistently smooth gameplay.
+4. **Performance** — WIP 0.1.4 roughly quadrupled the frame rate in the heaviest scenes on the development PC, WIP 0.1.5 cut memory use and shader-compilation freezes, and WIP 0.2.0 removed the freezes caused by log writes; next is a redesign of the renderer so that its work is spread over several CPU cores, plus fewer shader-compilation stalls, working toward consistently smooth gameplay.
 
-**Long-term performance goal:** render the original game at **4K resolution with a smooth, consistent 60 FPS**, and ideally support higher frame rates where hardware allows. This is an ambition for future development, **not a capability of WIP 0.1.5**. The current renderer still renders internally at 1920×1080; achieving native 4K output and stable performance will require further work.
+**Long-term performance goal:** render the original game at **4K resolution with a smooth, consistent 60 FPS**, and ideally support higher frame rates where hardware allows. This is an ambition for future development, **not a capability of WIP 0.2.0**. The current renderer still renders internally at 1920×1080; achieving native 4K output and stable performance will require further work.
 
 **Planned quality-of-life improvements:** a proper **in-game settings menu** for graphics, frame-rate limits, controls, input bindings and other configurable options, rather than relying mainly on `Config\settings.ini`.
 

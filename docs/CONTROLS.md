@@ -64,6 +64,8 @@ XInput controllers have no touch pad and no motion sensors:
 | Touch pad swipe left / right / up / down | F / G / R / V |
 | L3 / R3 | Not available on the keyboard (use a controller) |
 
+The keys cannot be remapped yet.
+
 ---
 
 ## Mouse
