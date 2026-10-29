@@ -28,6 +28,7 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 - [Reporting bugs](#reporting-bugs)
 - [How it works](#how-it-works)
 - [Modding & technical documentation](#modding--technical-documentation)
+- [Source code](#source-code)
 - [Future development](#future-development)
 - [License](#license)
 - [Disclaimer](#disclaimer)
@@ -38,7 +39,7 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release from the Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases)**
 
-**Current version:** [WIP 0.2.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.2.0-wip) (`v0.2.0-wip`, work in progress): collectibles and the arm during item inspection fixed, black mouths and garbled X prompts fixed, no more freezes from log writes, plus changes for long sessions and laptops with two GPUs that are not yet confirmed. Download **`UntilDawn_WIP_0.2.0.zip`** from the release's Assets list (the "Source code" archives only contain this repository's documentation). Release notes: [docs/releases/v0.2.0-wip.md](docs/releases/v0.2.0-wip.md) · previous: [0.1.5](docs/releases/v0.1.5-wip.md), [0.1.4](docs/releases/v0.1.4-wip.md), [0.1.3](docs/releases/v0.1.3-wip.md).
+**Current version:** [WIP 0.2.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.2.0) (`v0.2.0`, work in progress): collectibles and the arm during item inspection fixed, black mouths and garbled X prompts fixed, no more freezes from log writes, plus changes for long sessions and laptops with two GPUs that are not yet confirmed. Download **`UntilDawn_0.2.0.zip`** from the release's Assets list (the "Source code" archives hold this repository — documentation and source code — not the program). Release notes: [docs/releases/v0.2.0-wip.md](docs/releases/v0.2.0-wip.md) · previous: [0.1.5](docs/releases/v0.1.5-wip.md), [0.1.4](docs/releases/v0.1.4-wip.md), [0.1.3](docs/releases/v0.1.3-wip.md).
 
 The download contains the program, a hardware compatibility tester and documentation, but **no game files**.
 
@@ -124,13 +125,13 @@ The Core Ultra 9 system also detected **Intel integrated graphics** as usable, b
 
 ### 1. Download and extract
 
-1. Download **`UntilDawn_WIP_0.2.0.zip`** from the
+1. Download **`UntilDawn_0.2.0.zip`** from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder you can write to, for example `D:\Games\UntilDawn_WIP`. Don't use `Program Files`:
    the program keeps its settings, logs, shader cache and saves in its own folder.
 
 ```
-UntilDawn_WIP_0.2.0\
+UntilDawn_0.2.0\
   UntilDawn.exe            <- start the game
   Config\settings.ini      <- settings
   Game\                    <- put your game files here (or set game_dir)
@@ -321,6 +322,16 @@ possibility of creating mods for the native PC version.
 
 Modding support is still in its early stages, and there is currently **no dedicated mod loader**. We hope to
 expand the documentation and make the game more accessible to modders as development progresses.
+
+---
+
+## Source code
+
+The complete source of the port — the Windows runtime and PS4 compatibility layer, the Vulkan renderer, the
+GCN → SPIR-V shader translator, the hardware compatibility tester, the build scripts, tests and supporting tools —
+is in **[source/](source/README.md)**, with instructions for building it on Linux with LLVM. It contains no game
+code, data or assets; see [Third-party notices](THIRD_PARTY_NOTICES.md). It is the source of the releases from WIP
+0.2.1 on; for earlier releases see [Third-party notices](THIRD_PARTY_NOTICES.md#earlier-releases-wip-012--020).
 
 ---
 

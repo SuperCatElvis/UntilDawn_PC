@@ -1,0 +1,25 @@
+LIBRARY user32.dll
+EXPORTS
+RegisterClassExA
+CreateWindowExA
+DefWindowProcA
+PeekMessageA
+TranslateMessage
+DispatchMessageA
+GetDC
+ReleaseDC
+GetClientRect
+SetWindowTextA
+LoadCursorA
+GetAsyncKeyState
+GetCursorPos
+ScreenToClient
+MessageBoxA
+GetSystemMetrics
+AdjustWindowRect
+LoadIconA
+SetCursorPos
+ClientToScreen
+ClipCursor
+ShowCursor
+SetCursor

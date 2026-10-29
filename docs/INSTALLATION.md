@@ -23,7 +23,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 
 ## 2. Download and extract the release
 
-1. Download `UntilDawn_WIP_0.2.0.zip` from the
+1. Download `UntilDawn_0.2.0.zip` from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder **you can write to**, for example `D:\Games\UntilDawn_WIP`.
    Don't use `C:\Program Files`: the program keeps its settings, logs, shader cache and saves in its own folder.
@@ -31,7 +31,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 After extracting you have:
 
 ```
-UntilDawn_WIP_0.2.0\
+UntilDawn_0.2.0\
   UntilDawn.exe                     the game
   Config\settings.ini               settings (see section 5)
   Game\                             empty: your game files go here
@@ -87,7 +87,7 @@ Choose **one** of these three ways:
 Copy the contents of your game folder into the release's `Game` folder, so that this file exists:
 
 ```
-UntilDawn_WIP_0.2.0\Game\eboot.bin
+UntilDawn_0.2.0\Game\eboot.bin
 ```
 
 ### Option B — point `settings.ini` at your game

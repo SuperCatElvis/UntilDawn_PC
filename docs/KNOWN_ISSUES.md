@@ -126,7 +126,7 @@ If the message names **one** file (often the very long `...mainlodge_garage_moun
 The usual cause is the **copy**: when the folder you copied the game *from* has a long path, Explorer or an unzip tool can skip the game's longest file names. Copy the game again with `robocopy` (it handles long paths and copies only what is missing), from a short folder:
 
 ```
-robocopy "D:\path\to\your\CUSA02636 dump" "C:\Games\UntilDawn_WIP_0.2.0\Game" /E
+robocopy "D:\path\to\your\CUSA02636 dump" "C:\Games\UntilDawn_0.2.0\Game" /E
 ```
 
 ### AMD GPUs: corrupted textures, black blocks, missing foliage and stepped lighting — fixed in WIP 0.1.3

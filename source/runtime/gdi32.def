@@ -1,0 +1,8 @@
+LIBRARY gdi32.dll
+EXPORTS
+StretchDIBits
+TextOutA
+SetTextColor
+SetBkMode
+SetBkColor
+PatBlt

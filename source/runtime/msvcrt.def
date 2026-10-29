@@ -1,0 +1,20 @@
+LIBRARY msvcrt.dll
+EXPORTS
+malloc
+free
+calloc
+realloc
+sin
+cos
+tan
+asin
+acos
+atan
+atan2
+exp
+log
+pow
+fmod
+sqrt
+ldexp
+modf

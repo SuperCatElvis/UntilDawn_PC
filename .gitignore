@@ -99,3 +99,56 @@ e6_pipeline_cache.bin
 *.disasm
 ghidra*/
 captures/
+
+# More game data and files extracted from it (GPU program dumps, function lists, unpacked ELFs, textures, audio)
+*.corestream
+*.sfo
+*.bin
+*.csv
+*.gnf
+*.dds
+*.at9
+*.bnk
+*.wem
+*.ps4shader
+icon0.png
+extracted/
+analysis/
+corpus/
+out/
+SaveData/
+savedata*/
+
+# Captures, screenshots and test runs (stay in your private run folder, outside the repository)
+*.png
+*.jpg
+!docs/**/*.png
+!docs/**/*.jpg
+*.cap
+*.trace
+run_*.bat
+!/compat/run_compat.bat
+test_*/
+User Reports/
+STATUS*.md
+REPORT.md
+RENDERER_PLAN.md
+
+# Build output of source/: build/ (see source/README.md); the program icon is made from your own copy of the game
+build/
+*.ico
+*.res
+*.spv
+
+# Editor, Python and scratch files
+__pycache__/
+*.pyc
+*.bak
+*.bak*
+*.orig
+*.rej
+*.tmp
+*.swp
+*~
+.vscode/
+.idea/

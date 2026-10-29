@@ -1,0 +1,13 @@
+# Line endings: the build runs on Linux, so source and scripts keep LF even in a Windows checkout;
+# Windows batch files get CRLF.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.as text eol=lf
+*.spvasm text eol=lf
+*.def text eol=lf
+*.rc text eol=lf
+*.json text eol=lf
+*.bat text eol=crlf

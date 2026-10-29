@@ -4,7 +4,7 @@
 
 This document explains how the Until Dawn native PC port (WIP 0.2.0) runs the original PS4 game on Windows. It
 is written for modders, tinkerers and anyone curious about the internals. It describes the design and the
-behaviour of the released program; the port's source code is not published yet.
+behaviour of the released program; the complete source is in [source/](../source/README.md).
 
 > [!NOTE]
 > Nothing here describes or includes the game's own code or assets. Everything below is about this project's
@@ -92,7 +92,8 @@ When you double-click `UntilDawn.exe` (no command-line arguments):
    missing requirement is explained in plain words.
 4. **Loading the game code.** `eboot.bin` is parsed (a plain ELF or a fake-signed SELF; encrypted files are
    refused — the program has no decryption code) and its segments are mapped into memory. Relocations are applied
-   (about 174,000), and each of the 748 imported system functions is linked to this project's implementation.
+   (about 174,000), and each of the 748 imported system functions is linked to this project's implementation (441) or to a stub that logs
+   the call and returns "success".
 5. **In-memory patches** are applied to the loaded code (see [section 12](#12-in-memory-patches)). The file on disk
    is never modified.
 6. **Static constructors** (736 of them) run, `all_programs.prx` is loaded when the game asks for it, and the
@@ -140,9 +141,13 @@ more) are **not** used or shipped. The port provides its own implementation of e
 | Dialogs (message, error) | Answered automatically ("OK") |
 
 When the game calls a function that has no implementation, it gets a neutral answer, and the call is listed at
-the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 to 0.2.0 that
-list holds 36 functions, mostly networking, font, camera, live-streaming or start-up initialisation calls
+the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the game called"). In WIP 0.1.3 to
+0.2.0 that list holds 36 functions, mostly networking, font, camera, live-streaming or start-up initialisation calls
 the game does not depend on.
+
+From WIP 0.2.1 the program reads the list of imports from the game's executable at start. Each import is identified by a hash of
+its name (NID); it is named after the function this program implements or knows with that NID, otherwise it is shown
+as `nid:<NID>`.
 
 ---
 

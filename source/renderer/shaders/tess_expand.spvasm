@@ -1,0 +1,289 @@
+; tess_expand.spvasm - the PS4's integer-partitioned triangle tessellation, expanded on the GPU from a pattern table. Ours.
+; One invocation per patch p (udr_prod.c tess_gpu):
+;   the factors f[0..3] = TF buffer dwords 4p .. 4p+3 (outer u==0, v==0, w==0, inside), clamped and rounded exactly as
+;   udr_tess.c does for integer partitioning: max(hos_min) (NaN -> hos_min), min(hos_max), max(1), min(64), ceil;
+;   culled (an outer factor not > 0, NaN too): one point (0, 0) and only degenerate triangles;
+;   else pattern k = (((a-1)*M + (b-1))*M + (c-1))*M + (d-1) of the table built by udr_tess_tri for integers 1..M:
+;   points -> point buffer slots p*max_pts + j as (u, v, p, 0); triangles -> index buffer slots p*max_tris*3 + t as
+;   p*max_pts + local index; the unused triangle slots are degenerate (p*max_pts three times).
+; Table (binding 1, dwords): for each k: npts, ntris, point offset (dwords; 2 per point: u, v bits), index offset.
+; Push constants (dwords): 0 npatch, 1 hos_min bits, 2 hos_max bits, 3 M, 4 max_pts, 5 max_tris.
+; Every table read stays inside the table: a degenerate slot reads its pattern's first index (every pattern has one).
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %rau ArrayStride 4
+               OpMemberDecorate %SB 0 Offset 0
+               OpDecorate %SB Block
+               OpDecorate %tf DescriptorSet 0
+               OpDecorate %tf Binding 0
+               OpDecorate %tab DescriptorSet 0
+               OpDecorate %tab Binding 1
+               OpDecorate %pts DescriptorSet 0
+               OpDecorate %pts Binding 2
+               OpDecorate %idx DescriptorSet 0
+               OpDecorate %idx Binding 3
+               OpMemberDecorate %PC 0 Offset 0
+               OpMemberDecorate %PC 1 Offset 4
+               OpMemberDecorate %PC 2 Offset 8
+               OpMemberDecorate %PC 3 Offset 12
+               OpMemberDecorate %PC 4 Offset 16
+               OpMemberDecorate %PC 5 Offset 20
+               OpDecorate %PC Block
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+       %bool = OpTypeBool
+      %v3u = OpTypeVector %uint 3
+   %p_in_v3u = OpTypePointer Input %v3u
+        %gid = OpVariable %p_in_v3u Input
+        %rau = OpTypeRuntimeArray %uint
+         %SB = OpTypeStruct %rau
+       %p_sb = OpTypePointer StorageBuffer %SB
+         %tf = OpVariable %p_sb StorageBuffer
+        %tab = OpVariable %p_sb StorageBuffer
+        %pts = OpVariable %p_sb StorageBuffer
+        %idx = OpVariable %p_sb StorageBuffer
+  %p_sb_uint = OpTypePointer StorageBuffer %uint
+         %PC = OpTypeStruct %uint %uint %uint %uint %uint %uint
+       %p_pc = OpTypePointer PushConstant %PC
+         %pc = OpVariable %p_pc PushConstant
+  %p_pc_uint = OpTypePointer PushConstant %uint
+  %p_fn_uint = OpTypePointer Function %uint
+         %i0 = OpConstant %int 0
+         %i1 = OpConstant %int 1
+         %i2 = OpConstant %int 2
+         %i3 = OpConstant %int 3
+         %i4 = OpConstant %int 4
+         %i5 = OpConstant %int 5
+         %u0 = OpConstant %uint 0
+         %u1 = OpConstant %uint 1
+         %u2 = OpConstant %uint 2
+         %u3 = OpConstant %uint 3
+         %u4 = OpConstant %uint 4
+         %si1 = OpConstant %int 1
+         %f0 = OpConstant %float 0
+         %f1 = OpConstant %float 1
+        %f64 = OpConstant %float 64
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %j = OpVariable %p_fn_uint Function
+          %t = OpVariable %p_fn_uint Function
+       %gidv = OpLoad %v3u %gid
+          %p = OpCompositeExtract %uint %gidv 0
+       %pnp = OpAccessChain %p_pc_uint %pc %i0
+     %npatch = OpLoad %uint %pnp
+       %pmin = OpAccessChain %p_pc_uint %pc %i1
+      %hminb = OpLoad %uint %pmin
+       %hmin = OpBitcast %float %hminb
+       %pmax = OpAccessChain %p_pc_uint %pc %i2
+      %hmaxb = OpLoad %uint %pmax
+       %hmax = OpBitcast %float %hmaxb
+        %pmm = OpAccessChain %p_pc_uint %pc %i3
+          %M = OpLoad %uint %pmm
+        %pmp = OpAccessChain %p_pc_uint %pc %i4
+     %maxpts = OpLoad %uint %pmp
+        %pmt = OpAccessChain %p_pc_uint %pc %i5
+    %maxtris = OpLoad %uint %pmt
+     %inside = OpULessThan %bool %p %npatch
+               OpSelectionMerge %done None
+               OpBranchConditional %inside %work %done
+       %work = OpLabel
+      %tfb = OpIMul %uint %p %u4
+      %a0 = OpAccessChain %p_sb_uint %tf %i0 %tfb
+      %w0 = OpLoad %uint %a0
+     %tfb1 = OpIAdd %uint %tfb %u1
+      %a1 = OpAccessChain %p_sb_uint %tf %i0 %tfb1
+      %w1 = OpLoad %uint %a1
+     %tfb2 = OpIAdd %uint %tfb %u2
+      %a2 = OpAccessChain %p_sb_uint %tf %i0 %tfb2
+      %w2 = OpLoad %uint %a2
+     %tfb3 = OpIAdd %uint %tfb %u3
+      %a3 = OpAccessChain %p_sb_uint %tf %i0 %tfb3
+      %w3 = OpLoad %uint %a3
+      %g0 = OpBitcast %float %w0
+      %g1 = OpBitcast %float %w1
+      %g2 = OpBitcast %float %w2
+      %g3 = OpBitcast %float %w3
+; culling: an outer factor not > 0 (NaN too)
+     %c0 = OpFOrdGreaterThan %bool %g0 %f0
+     %c1 = OpFOrdGreaterThan %bool %g1 %f0
+     %c2 = OpFOrdGreaterThan %bool %g2 %f0
+    %c01 = OpLogicalAnd %bool %c0 %c1
+   %live = OpLogicalAnd %bool %c01 %c2
+; the integer factors (clamp and ceil as udr_tess.c: fmaxn(a, b) = b > a ? b : a; fminn(a, b) = b < a ? b : a)
+%x0a_c = OpFOrdGreaterThan %bool %g0 %hmin
+  %x0a = OpSelect %float %x0a_c %g0 %hmin
+%x0b_c = OpFOrdLessThan %bool %x0a %hmax
+  %x0b = OpSelect %float %x0b_c %x0a %hmax
+%x0c_c = OpFOrdGreaterThan %bool %x0b %f1
+  %x0c = OpSelect %float %x0c_c %x0b %f1
+%x0d_c = OpFOrdLessThan %bool %x0c %f64
+  %x0d = OpSelect %float %x0d_c %x0c %f64
+  %x0i = OpConvertFToS %int %x0d
+  %x0f = OpConvertSToF %float %x0i
+%x0u_c = OpFOrdGreaterThan %bool %x0d %x0f
+  %x0p = OpIAdd %int %x0i %si1
+  %n0 = OpSelect %int %x0u_c %x0p %x0i
+%x1a_c = OpFOrdGreaterThan %bool %g1 %hmin
+  %x1a = OpSelect %float %x1a_c %g1 %hmin
+%x1b_c = OpFOrdLessThan %bool %x1a %hmax
+  %x1b = OpSelect %float %x1b_c %x1a %hmax
+%x1c_c = OpFOrdGreaterThan %bool %x1b %f1
+  %x1c = OpSelect %float %x1c_c %x1b %f1
+%x1d_c = OpFOrdLessThan %bool %x1c %f64
+  %x1d = OpSelect %float %x1d_c %x1c %f64
+  %x1i = OpConvertFToS %int %x1d
+  %x1f = OpConvertSToF %float %x1i
+%x1u_c = OpFOrdGreaterThan %bool %x1d %x1f
+  %x1p = OpIAdd %int %x1i %si1
+  %n1 = OpSelect %int %x1u_c %x1p %x1i
+%x2a_c = OpFOrdGreaterThan %bool %g2 %hmin
+  %x2a = OpSelect %float %x2a_c %g2 %hmin
+%x2b_c = OpFOrdLessThan %bool %x2a %hmax
+  %x2b = OpSelect %float %x2b_c %x2a %hmax
+%x2c_c = OpFOrdGreaterThan %bool %x2b %f1
+  %x2c = OpSelect %float %x2c_c %x2b %f1
+%x2d_c = OpFOrdLessThan %bool %x2c %f64
+  %x2d = OpSelect %float %x2d_c %x2c %f64
+  %x2i = OpConvertFToS %int %x2d
+  %x2f = OpConvertSToF %float %x2i
+%x2u_c = OpFOrdGreaterThan %bool %x2d %x2f
+  %x2p = OpIAdd %int %x2i %si1
+  %n2 = OpSelect %int %x2u_c %x2p %x2i
+%x3a_c = OpFOrdGreaterThan %bool %g3 %hmin
+  %x3a = OpSelect %float %x3a_c %g3 %hmin
+%x3b_c = OpFOrdLessThan %bool %x3a %hmax
+  %x3b = OpSelect %float %x3b_c %x3a %hmax
+%x3c_c = OpFOrdGreaterThan %bool %x3b %f1
+  %x3c = OpSelect %float %x3c_c %x3b %f1
+%x3d_c = OpFOrdLessThan %bool %x3c %f64
+  %x3d = OpSelect %float %x3d_c %x3c %f64
+  %x3i = OpConvertFToS %int %x3d
+  %x3f = OpConvertSToF %float %x3i
+%x3u_c = OpFOrdGreaterThan %bool %x3d %x3f
+  %x3p = OpIAdd %int %x3i %si1
+  %n3 = OpSelect %int %x3u_c %x3p %x3i
+; pattern index (the factors are in 1..M by construction: M = ceil(min(hos_max, 64)), at least 1)
+  %m0 = OpBitcast %uint %n0
+  %m1 = OpBitcast %uint %n1
+  %m2 = OpBitcast %uint %n2
+  %m3 = OpBitcast %uint %n3
+  %d0 = OpISub %uint %m0 %u1
+  %d1 = OpISub %uint %m1 %u1
+  %d2 = OpISub %uint %m2 %u1
+  %d3 = OpISub %uint %m3 %u1
+  %k0 = OpIMul %uint %d0 %M
+  %k1 = OpIAdd %uint %k0 %d1
+  %k2 = OpIMul %uint %k1 %M
+  %k3 = OpIAdd %uint %k2 %d2
+  %k4 = OpIMul %uint %k3 %M
+  %k  = OpIAdd %uint %k4 %d3
+  %h  = OpIMul %uint %k %u4
+  %ha = OpAccessChain %p_sb_uint %tab %i0 %h
+  %np_t = OpLoad %uint %ha
+  %h1 = OpIAdd %uint %h %u1
+  %hb = OpAccessChain %p_sb_uint %tab %i0 %h1
+  %nt_t = OpLoad %uint %hb
+  %h2 = OpIAdd %uint %h %u2
+  %hc = OpAccessChain %p_sb_uint %tab %i0 %h2
+  %po = OpLoad %uint %hc
+  %h3 = OpIAdd %uint %h %u3
+  %hd = OpAccessChain %p_sb_uint %tab %i0 %h3
+  %io = OpLoad %uint %hd
+  %np = OpSelect %uint %live %np_t %u0
+  %nt = OpSelect %uint %live %nt_t %u0
+  %pbase = OpIMul %uint %p %maxpts
+  %ibase0 = OpIMul %uint %p %maxtris
+  %ibase = OpIMul %uint %ibase0 %u3
+  %nidx = OpIMul %uint %nt %u3
+  %maxidx = OpIMul %uint %maxtris %u3
+; slot 0 always holds a point (a culled patch's degenerate triangles refer to it)
+  %s0 = OpIMul %uint %pbase %u4
+  %s0a = OpAccessChain %p_sb_uint %pts %i0 %s0
+         OpStore %s0a %u0
+  %s0p1 = OpIAdd %uint %s0 %u1
+  %s0b = OpAccessChain %p_sb_uint %pts %i0 %s0p1
+         OpStore %s0b %u0
+  %s0p2 = OpIAdd %uint %s0 %u2
+  %s0c = OpAccessChain %p_sb_uint %pts %i0 %s0p2
+         OpStore %s0c %p
+  %s0p3 = OpIAdd %uint %s0 %u3
+  %s0d = OpAccessChain %p_sb_uint %pts %i0 %s0p3
+         OpStore %s0d %u0
+; the points
+         OpStore %j %u0
+         OpBranch %ph
+   %ph = OpLabel
+         OpLoopMerge %pm %pc_ None
+         OpBranch %pt
+   %pt = OpLabel
+   %jv = OpLoad %uint %j
+   %jl = OpULessThan %bool %jv %np
+         OpBranchConditional %jl %pb %pm
+   %pb = OpLabel
+   %jj = OpLoad %uint %j
+   %q2 = OpIMul %uint %jj %u2
+   %qo = OpIAdd %uint %po %q2
+   %qa = OpAccessChain %p_sb_uint %tab %i0 %qo
+   %qu = OpLoad %uint %qa
+   %qo1 = OpIAdd %uint %qo %u1
+   %qb = OpAccessChain %p_sb_uint %tab %i0 %qo1
+   %qv = OpLoad %uint %qb
+   %sl = OpIAdd %uint %pbase %jj
+   %sd = OpIMul %uint %sl %u4
+   %w_a = OpAccessChain %p_sb_uint %pts %i0 %sd
+         OpStore %w_a %qu
+   %sd1 = OpIAdd %uint %sd %u1
+   %w_b = OpAccessChain %p_sb_uint %pts %i0 %sd1
+         OpStore %w_b %qv
+   %sd2 = OpIAdd %uint %sd %u2
+   %w_c = OpAccessChain %p_sb_uint %pts %i0 %sd2
+         OpStore %w_c %p
+   %sd3 = OpIAdd %uint %sd %u3
+   %w_d = OpAccessChain %p_sb_uint %pts %i0 %sd3
+         OpStore %w_d %u0
+         OpBranch %pc_
+  %pc_ = OpLabel
+   %jn = OpLoad %uint %j
+   %jn1 = OpIAdd %uint %jn %u1
+         OpStore %j %jn1
+         OpBranch %ph
+   %pm = OpLabel
+; the triangles: every slot of the patch, degenerate past the pattern's own
+         OpStore %t %u0
+         OpBranch %th
+   %th = OpLabel
+         OpLoopMerge %tm %tc None
+         OpBranch %tt
+   %tt = OpLabel
+   %tv = OpLoad %uint %t
+   %tl = OpULessThan %bool %tv %maxidx
+         OpBranchConditional %tl %tb %tm
+   %tb = OpLabel
+   %tx = OpLoad %uint %t
+   %real = OpULessThan %bool %tx %nidx
+   %txs = OpSelect %uint %real %tx %u0
+   %ro = OpIAdd %uint %io %txs
+   %ra = OpAccessChain %p_sb_uint %tab %i0 %ro
+   %rl = OpLoad %uint %ra
+   %rsel = OpSelect %uint %real %rl %u0
+   %rv = OpIAdd %uint %pbase %rsel
+   %ri = OpIAdd %uint %ibase %tx
+   %rw = OpAccessChain %p_sb_uint %idx %i0 %ri
+         OpStore %rw %rv
+         OpBranch %tc
+   %tc = OpLabel
+   %tn = OpLoad %uint %t
+   %tn1 = OpIAdd %uint %tn %u1
+         OpStore %t %tn1
+         OpBranch %th
+   %tm = OpLabel
+         OpBranch %done
+   %done = OpLabel
+         OpReturn
+         OpFunctionEnd
