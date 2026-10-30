@@ -207,7 +207,7 @@ static G2SIn g_hlast_in[2]; static G2SOut g_hlast_out[2]; static int g_hlast_kin
 static u32 g_xs_wait; static int g_xs_step = -1, g_xs_pipe; static u64 g_xs_res[9], g_xs_sum;
 typedef struct { u64 h1, h2; u32 extra[48]; VkPipeline p; VkPipelineLayout pl; volatile int pend; } VPipe;
 typedef struct { u32 sig[72]; VkDescriptorSetLayout dsl; VkPipelineLayout pl; } VLayout;
-typedef struct { u64 key; VkShaderModule m; u8 xlane; u32 last; u64 wh; u32 made, nmade; u64 pair1; u32 pair1_flip, npairs_other; } VMod;   /* t140: pair1 the partner stage's key of the first pipeline made with it */   /* t138: wh hash of the words it was made from, made: flip, nmade: times made */   /* t114: m 0 = destroyed (made again when needed); last: flip of its last use */   /* t112: found by the translation key (the SPIR-V words may be freed once the module exists) */   /* xlane: declares GroupNonUniformShuffle / Ballot (lanes beyond a quad) */
+typedef struct { u64 key; VkShaderModule m; u8 xlane; u32 last; u64 wh; u32 made, nmade; u64 pair1; u32 pair1_flip, npairs_other; u64 wh2; } VMod;   /* t154: wh, wh2 two hashes of the words, always set (pipelines found by content) */   /* t140: pair1 the partner stage's key of the first pipeline made with it */   /* t138: wh hash of the words it was made from, made: flip, nmade: times made */   /* t114: m 0 = destroyed (made again when needed); last: flip of its last use */   /* t112: found by the translation key (the SPIR-V words may be freed once the module exists) */   /* xlane: declares GroupNonUniformShuffle / Ballot (lanes beyond a quad) */
 typedef struct { VkImage img; VkImageView v; u32 sw; } VView;
 
 static struct {
@@ -330,17 +330,45 @@ static u64 g_t_slotw, g_t_import;   /* t107b: waits for a free batch slot (the G
 /* crash reports (vkr_crash_note): what the draw thread was doing */
 static const char *volatile g_rstep; static volatile u64 g_rstep_a, g_rstep_b; static volatile u32 g_main_tid;
 #define RSTEP(w, a, b) (g_rstep = (w), g_rstep_a = (u64)(a), g_rstep_b = (u64)(b))
-#define T0() u64 t0_ = plat_ticks()
-#define TADD(v) (v += plat_ticks() - t0_)
+/* t155: the renderer's own time accounting (T0 / TADD around every draw, shader setup and texture binding, and the
+   slow-binding / slow-translation checks: ~25 clock reads per draw, ~130,000 per frame in the stranger scene) reads the
+   CPU's invariant time-stamp counter instead of QueryPerformanceCounter (a call into Windows each time), converted to
+   performance-counter units: calibrated once against it over the first 200 ms (until then, and on a CPU without an
+   invariant TSC, it is QueryPerformanceCounter). plat_ticks itself (game clock, waits) is unchanged. --qpc-timers: off. */
+static u64 g_rt_mul, g_rt_q0, g_rt_t0, g_rt_cq, g_rt_ct; static int g_rt_state, g_opt_qpc_timers;   /* state: 0 not started, 1 calibrating, 2 on, 3 off */
+static u64 g_qpf_ms = 1;   /* plat_ticks_per_sec() / 1000 (set with the calibration) */
+static __attribute__((noinline, cold)) u64 rt_ticks_slow(void) {   /* (t158: out of line, so rt_ticks itself is inlined at every site) */
+    u64 q = plat_ticks(), t = __builtin_ia32_rdtsc();
+    if (g_rt_state == 0) {
+        u32 a, b, c, d; __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u), "c"(0));
+        int inv = 0; if (a >= 0x80000007u) { __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000007u), "c"(0)); inv = (d >> 8) & 1; }
+        g_qpf_ms = plat_ticks_per_sec() / 1000; if (!g_qpf_ms) g_qpf_ms = 1;
+        g_rt_state = inv && !g_opt_qpc_timers ? 1 : 3; g_rt_cq = q; g_rt_ct = t; return q; }
+    if (g_rt_state == 1 && q - g_rt_cq >= (1ull << 31)) { g_rt_cq = q; g_rt_ct = t; return q; }   /* (not called for minutes: start again, (q - cq) << 32 must fit) */
+    if (g_rt_state == 1 && q - g_rt_cq >= 200 * g_qpf_ms && t > g_rt_ct) {
+        g_rt_mul = ((q - g_rt_cq) << 32) / (t - g_rt_ct);
+        g_rt_q0 = q; g_rt_t0 = t; __atomic_store_n(&g_rt_state, g_rt_mul ? 2 : 3, __ATOMIC_RELEASE); }
+    return q;
+}
+static inline __attribute__((always_inline)) u64 rt_ticks(void) {
+    if (__atomic_load_n(&g_rt_state, __ATOMIC_ACQUIRE) != 2) return rt_ticks_slow();
+    u64 d = __builtin_ia32_rdtsc() - g_rt_t0;
+    return g_rt_q0 + (d >> 32) * g_rt_mul + (((d & 0xFFFFFFFFull) * g_rt_mul) >> 32);
+}
+#define T0() u64 t0_ = rt_ticks()
+#define TADD(v) (v += rt_ticks() - t0_)
+#define TADD1(v) u64 t1_ = rt_ticks(); v += t1_ - t0_   /* t158: TADD that keeps its clock reading (t1_) for a check after it */
 static u64 g_n_slow_pipes, g_slow_pipe_ms;
-static void slow_pipe_note(const char *kind, u64 a, u64 b, u64 ms) {   /* t107b: pipeline compiles of 250 ms and more (driver time) */
+static void slow_pipe_note(const char *kind, u64 a, u64 b, u64 ms, u64 ka, u64 kb) {   /* t107b: pipeline compiles of 250 ms and more (driver time); t154: with the translation keys */
     g_n_slow_pipes++; g_slow_pipe_ms += ms;
     if (g_n_slow_pipes > 200) return;
-    char l[200]; Sb t = {l, 0, sizeof l};
+    char l[260]; Sb t = {l, 0, sizeof l};
     sb_s(&t, "    slow pipeline compile: "); sb_d(&t, (i64)ms); sb_s(&t, " ms, "); sb_s(&t, kind); sb_s(&t, b ? " VS " : " CS "); sb_x(&t, a);
-    if (b) { sb_s(&t, " PS "); sb_x(&t, b); } sb_s(&t, " (flip "); sb_d(&t, (i64)g_flips); sb_s(&t, ")\n"); say(l);
+    if (b) { sb_s(&t, " PS "); sb_x(&t, b); } sb_s(&t, " (flip "); sb_d(&t, (i64)g_flips); sb_s(&t, ", keys "); sb_x(&t, ka); if (b) { sb_s(&t, " / "); sb_x(&t, kb); } sb_s(&t, ")\n"); say(l);
 }
 #include "e6_defer.c"    /* parallel pipeline compilation (records the batch while its pipelines compile) */
+static void prep_init(void); static void prep_run(void); static void prep_save(void); static u64 g_prep_new_bytes; static int prep_pcc, g_prep_pcc_req = 1;   /* t159 (e6_prep.c) */
+static void prep_tnote(const G2SIn *in, const G2SOut *out);   /* t160 (e6_prep.c) */
 /* ---- GPU crash diagnostics: a checkpoint marker before every draw / dispatch (VK_NV_device_diagnostic_checkpoints)
    and the driver's fault report (VK_EXT_device_fault). After VK_ERROR_DEVICE_LOST the draws the GPU had started but
    not finished are printed with their shaders. */
@@ -791,6 +819,7 @@ static void vkr_init(void) {
     VkPhysicalDeviceVulkan13Features e13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, fchain}; e13.dynamicRendering = 1;
     /* subgroup size control (STATUS 88): shaders with cross-lane shuffles ask for 32-lane subgroups where the GPU could use fewer (Intel) */
     e13.subgroupSizeControl = f13.subgroupSizeControl; e13.computeFullSubgroups = f13.computeFullSubgroups;
+    if (g_prep_pcc_req) { e13.pipelineCreationCacheControl = f13.pipelineCreationCacheControl; prep_pcc = (int)f13.pipelineCreationCacheControl; }   /* t159: shader preparation asks the cache first (FAIL_ON_PIPELINE_COMPILE_REQUIRED); t160: on again by default (bench\\results_t159e: the driver's cache keys do not change with it); --no-prep-cache-check: off */
     /* t103: a GPU whose subgroup size varies and includes 32 (Intel 8..32, AMD RDNA 32..64). Before t103 the test was
        sg_min < 32, which left out AMD (min 32): 239 cross-lane modules ran with 64 lanes there. Fixed-size GPUs (NVIDIA 32..32) as before. */
     g_dev.sg_ctl = f13.subgroupSizeControl && g_dev.sg_min <= 32 && g_dev.sg_max >= 32 && g_dev.sg_min != g_dev.sg_max;
@@ -965,6 +994,7 @@ static void vkr_init(void) {
     g_mem_import_hook = vk_preimport_r;   /* t111: lazily committed granules are imported while still read-only */
     vk_scale_budgets();
     say("    Vulkan renderer ready ("); say_dec(V.nreg); say(" game memory regions imported)\n");
+    prep_init();   /* t159: the shader preparation records (e6_prep.c) */
 }
 static int vkr_on(void) { return g_vk_on; }
 
@@ -1036,7 +1066,7 @@ static void vk_begin_cb(void) {
     if (g_nmem != g_vk_nmem_seen) { g_vk_nmem_seen = g_nmem; T0(); vk_import_regions(); TADD(g_t_import); }
     vk_lz_traps();   /* t111 */
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, 0, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    if (g_slot[g_slot_cur].pending) { T0(); slot_wait_idle(g_slot_cur); TADD(g_t_wait); g_t_slotw += plat_ticks() - t0_; }   /* normally free already: the other slot is the one in flight */
+    if (g_slot[g_slot_cur].pending) { T0(); slot_wait_idle(g_slot_cur); TADD1(g_t_wait); g_t_slotw += t1_ - t0_; }   /* normally free already: the other slot is the one in flight */
     V.cb = g_slot[g_slot_cur].cb;
     vkResetCommandBuffer(V.cb, 0); vkBeginCommandBuffer(V.cb, &bi); V.recording = 1;
     if (g_nstmp) stage_tmp_reap(0);   /* t111 */
@@ -1145,25 +1175,30 @@ static PendFill g_pf[NSLOT][PF_N]; static int g_npf[NSLOT];
    threads and the renderer thread together (each 8-row tile band is independent). --no-par-detile: the old way. */
 static int g_opt_par_detile = 1; static int g_par_n;   /* helper threads */
 typedef struct { const u8 *src; u64 srclen; u8 *dst; u32 w, h, depth; const TileInfo *t; u32 rows; } ParDet;
-static ParDet g_par_job; static volatile u32 g_par_gen, g_par_next, g_par_done, g_par_parts; static PMutex g_par_m; static PCond g_par_c;
+static ParDet g_par_job; static volatile u32 g_par_gen, g_par_done; static PMutex g_par_m; static PCond g_par_c;
+#include "par_claim.h"   /* t161: the parts of a job handed out by generation (the t128 hand-out could hang) */
+static volatile u64 g_par_claim;
+static int par_claim(u32 gen, u32 *k) { return par_claim_take(&g_par_claim, gen, k); }
 static u64 g_n_par_lv, g_n_par_parts, g_t_par;
 static void par_detile_part(u32 k) { u32 y0 = k * g_par_job.rows, y1 = y0 + g_par_job.rows; if (y0 < g_par_job.h) detile_t_rows(g_par_job.src, g_par_job.srclen, g_par_job.dst, g_par_job.w, g_par_job.h, g_par_job.depth, g_par_job.t, y0, y1 > g_par_job.h ? g_par_job.h : y1); }
 static void (*g_par_fn)(u32 part) = par_detile_part;   /* the work of the current job */
 static void par_do_part(u32 k) { g_par_fn(k); }
 /* run fn(0..parts-1) on the helpers and this thread; returns when all parts are done */
 static void par_run(void (*fn)(u32), u32 parts) {
+    if (parts > PAR_CLAIM_MAX) { for (u32 q = 0; q < parts; q++) fn(q); return; }   /* (never: a handful of parts) */
     g_par_fn = fn;
-    __atomic_store_n(&g_par_next, 0, __ATOMIC_RELAXED); __atomic_store_n(&g_par_done, 0, __ATOMIC_RELAXED); __atomic_store_n(&g_par_parts, parts, __ATOMIC_RELEASE);
-    pm_lock(&g_par_m); g_par_gen++; pc_broadcast(&g_par_c); pm_unlock(&g_par_m);
-    for (;;) { u32 k = __atomic_fetch_add(&g_par_next, 1, __ATOMIC_RELAXED); if (k >= parts) break; par_do_part(k); __atomic_add_fetch(&g_par_done, 1, __ATOMIC_RELEASE); }
-    while (__atomic_load_n(&g_par_done, __ATOMIC_ACQUIRE) < parts) { for (volatile int k = 0; k < 32; k++) {} }
-    __atomic_store_n(&g_par_parts, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_par_done, 0, __ATOMIC_RELAXED);
+    pm_lock(&g_par_m); g_par_gen++; u32 gen = g_par_gen;
+    __atomic_store_n(&g_par_claim, par_claim_word(gen, parts), __ATOMIC_RELEASE);   /* (the job and g_par_fn are visible with it) */
+    pc_broadcast(&g_par_c); pm_unlock(&g_par_m);
+    u32 k; while (par_claim(gen, &k)) { par_do_part(k); __atomic_add_fetch(&g_par_done, 1, __ATOMIC_RELEASE); }
+    while (__atomic_load_n(&g_par_done, __ATOMIC_ACQUIRE) < parts) { for (volatile int q = 0; q < 32; q++) {} }
 }
 static void par_thread(void *arg) {
     (void)arg; u32 seen = 0;
     for (;;) {
         pm_lock(&g_par_m); while (g_par_gen == seen) pc_wait(&g_par_c, &g_par_m, -1); seen = g_par_gen; pm_unlock(&g_par_m);
-        for (;;) { u32 k = __atomic_fetch_add(&g_par_next, 1, __ATOMIC_RELAXED); if (k >= g_par_parts) break; par_do_part(k); __atomic_add_fetch(&g_par_done, 1, __ATOMIC_RELEASE); }
+        u32 k; while (par_claim(seen, &k)) { par_do_part(k); __atomic_add_fetch(&g_par_done, 1, __ATOMIC_RELEASE); }   /* (a later job's parts are not taken: t161) */
     }
 }
 static void par_init(void) {
@@ -1254,8 +1289,8 @@ static void vk_submit_wait_at(int line) {
     T0();
     vk_submit_async(0, 0);
     vk_wait_all();
-    TADD(g_t_wait);
-    g_n_full_waits++; if (line > 0 && line < 16384) { g_wait_line[line]++; g_wait_ticks_line[line] += plat_ticks() - t0_; }
+    TADD1(g_t_wait);
+    g_n_full_waits++; if (line > 0 && line < 16384) { g_wait_line[line]++; g_wait_ticks_line[line] += t1_ - t0_; }
 }
 #define vk_submit_wait() vk_submit_wait_at(__LINE__)
 /* the batch's share of the staging buffer or the per-draw ring is used up: hand the batch to the GPU and go on in the
@@ -1987,9 +2022,13 @@ static void vk_shadow_for(const G2SOut *o) {
 }
 
 /* ---------------------------------------------------------------- images */
+/* t156: bumped whenever an image is linked / unlinked (created, freed, moved) or starts / stops being GPU-written: the
+   texture-binding cache (vk_bind_stage) holds results only while it is unchanged */
+static u64 g_img_gen = 1;
 /* images by address: img_ix maps an address to the first image, anext links the others with that address */
 #define FOR_ADDR(i, a) for (int i = (hix_init(&V.img_ix, 16384), hix_get(&V.img_ix, (a))); i >= 0; i = V.img[i].anext)
 static void img_link(int slot) {
+    g_img_gen++;   /* t156 */
     hix_init(&V.img_ix, 16384);
     u64 a = V.img[slot].addr; int h = hix_get(&V.img_ix, a);
     V.img[slot].anext = h;
@@ -1997,6 +2036,7 @@ static void img_link(int slot) {
     hix_put(&V.img_ix, a, slot);
 }
 static void img_unlink(int slot) {
+    g_img_gen++;   /* t156 */
     u64 a = V.img[slot].addr; int h = hix_get(&V.img_ix, a);
     if (h == slot) { hix_del(&V.img_ix, a, slot); if (V.img[slot].anext >= 0) hix_put(&V.img_ix, a, V.img[slot].anext); return; }
     for (int i = h; i >= 0; i = V.img[i].anext) if (V.img[i].anext == slot) { V.img[i].anext = V.img[slot].anext; return; }
@@ -2718,7 +2758,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
     FOR_ADDR(i, addr) { VImg *m = &V.img[i];
         if (!m->img || m->addr != addr || !m->gpu_written || m->w < w || m->h < h) continue;
         if (!storage && rt_stale(m)) {   /* the game has put new data in that memory since: the image becomes an ordinary texture of it */
-            if (!m->depth && m->levels <= 1) { m->gpu_written = 0; m->hash = 0; m->watched = 0; m->frame_uploaded = 0; m->copy_seq = 0; }
+            if (!m->depth && m->levels <= 1) { m->gpu_written = 0; m->hash = 0; m->watched = 0; m->frame_uploaded = 0; m->copy_seq = 0; g_img_gen++; }
             continue; }
         if (!any || m->wseq > any->wseq) any = m;
         if (m->bpe == want_bpe && !m->depth && (!best || m->wseq > best->wseq)) best = m; }
@@ -2800,6 +2840,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
         if (!g_opt_copy_barriers && (m->w_ep == V.bar_ep + 1 || m->r_ep == V.bar_ep + 1)) vk_barrier();   /* t107b: an upload / copy into it (or a read of it) whose barrier after was left to a sampler */
         m->lay_tm = tm + 1; m->lay_pitch = pitch;   /* t107e: see depth_pair_ok */
         if (!is3d && !arrayed) vk_sync_newer(m);
+        if (!m->gpu_written) g_img_gen++;   /* t156 */
         m->gpu_written = 1; m->wseq = ++V.wseq; rt_mark(m);
         if (g_natt < 9) g_att[g_natt++] = m;   /* written by this draw / dispatch: a sampled read of it gets a snapshot (no in-place race) */
         if (tm == 8 && !is3d && !arrayed && !g_opt_nowb) wb_add(m, addr, pitch, w, h, fmt_bpe(dfmt));
@@ -2998,7 +3039,7 @@ static VkSampler vk_sampler(const u32 *S) {
 static void vk_dummy(void) {
     if (V.dummy_img) return;
     VImg *m = vimg_create(1, 1, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0);
-    if (m) { V.dummy_img = m->img; V.dummy_view = m->view; m->gpu_written = 1; }
+    if (m) { V.dummy_img = m->img; V.dummy_view = m->view; m->gpu_written = 1; g_img_gen++; }
     u32 S[4] = {0, 0, 0, 0}; V.dummy_samp = vk_sampler(S);
 }
 
@@ -3032,6 +3073,9 @@ static void vk_module_probe(const u32 *spv, u32 n) {
 enum { MOD_IDLE = 120, MOD_LIVE = 1024 };
 static int g_mod_live, g_mod_live_peak; static u32 g_mod_evict_at; static u64 g_mod_destroyed, g_mod_remade, g_mod_remade_ticks, g_mod_remade_fail;
 static u64 words_hash(const u32 *w, u32 n) { u64 h = 1469598103934665603ull ^ n; for (u32 i = 0; i < n; i++) { h ^= w[i]; h *= 1099511628211ull; } return h; }
+/* t154: words_hash and a second, independent hash in one pass (the two multiply chains run side by side) */
+static u64 words_hash2(const u32 *w, u32 n, u64 *h2) { u64 h = 1469598103934665603ull ^ n, g = 0x9E3779B97F4A7C15ull ^ ((u64)n << 32);
+    for (u32 i = 0; i < n; i++) { h ^= w[i]; h *= 1099511628211ull; g += w[i]; g *= 0xC2B2AE3D27D4EB4Full; g ^= g >> 31; } *h2 = g; return h; }
 static VkShaderModule vk_module(u64 key, u32 *spv, u32 n) {
     hix_init(&V.mod_ix, 131072);
     { int q = hix_get(&V.mod_ix, key);
@@ -3061,10 +3105,33 @@ static VkShaderModule vk_module(u64 key, u32 *spv, u32 n) {
     g_mod_xlane_last = (u8)spv_xlane(spv, n); if (g_mod_xlane_last) g_n_xlane_mods++;
     g_mod_spv_bytes += 4ull * n;
     if (g_opt_module_probe && !g_module_probed && 4ull * n >= (16u << 10)) { g_module_probed = 1; vk_module_probe(spv, n); }
-    if (V.nmod < 65536) { hix_put(&V.mod_ix, key, V.nmod); V.mods[V.nmod].key = key; V.mods[V.nmod].m = m; V.mods[V.nmod].xlane = g_mod_xlane_last; V.mods[V.nmod].last = (u32)g_flips; V.mods[V.nmod].wh = g_opt_nan_hunt ? words_hash(spv, n) : 0; V.mods[V.nmod].made = (u32)g_flips; V.mods[V.nmod].nmade = 1; V.nmod++;
+    if (V.nmod < 65536) { hix_put(&V.mod_ix, key, V.nmod); V.mods[V.nmod].key = key; V.mods[V.nmod].m = m; V.mods[V.nmod].xlane = g_mod_xlane_last; V.mods[V.nmod].last = (u32)g_flips; V.mods[V.nmod].wh = words_hash2(spv, n, &V.mods[V.nmod].wh2); V.mods[V.nmod].made = (u32)g_flips; V.mods[V.nmod].nmade = 1; V.nmod++;
         if (++g_mod_live > g_mod_live_peak) g_mod_live_peak = g_mod_live;
         g2s_spv_release(key); }   /* t112: the words are freed at the next g2s_spv_flush (t114: kept compressed first, unless --keep-modules) */
     return m;
+}
+/* t154: pipelines found by content. Pipelines are found by the translation keys of their stages; two keys can give the
+   same SPIR-V words (the key also covers inputs that do not always change the result), and the cold-install logs showed
+   the same compute program compiled twice at once under two keys (one of the slow geometry passes, seconds each). A new
+   pipeline whose stages' words (two hashes each) and state equal an existing pipeline's is not compiled again: its keys
+   lead to that pipeline (graphics: an alias entry; compute: its index entry). --no-pipe-dedupe: off (each key compiles
+   its own, as before). Logged: "pipeline not compiled again (t154)". */
+static int g_opt_no_pipe_dedupe;
+static u64 g_n_dup_g, g_n_dup_c; static int g_dup_logged;
+static HIdx g_pipe_cix; static u64 g_pipe_c2[65536];            /* graphics: content key -> V.pipe index; its second hash */
+typedef struct { u32 vs_lo, ps_lo, flip; } VPMeta; static VPMeta g_pipe_meta[65536], g_cpipe_meta[16384];   /* shader addresses (>> 8), flip made */
+typedef struct { u64 h1, h2; int to; } VPAlias; static VPAlias g_palias[16384]; static int g_npalias; static HIdx g_palias_ix;
+static HIdx g_cpipe_cix; static u64 g_cpipe_c2[16384];          /* compute: content key -> g_cpipe index */
+static int mod_words(u64 key, u64 *a, u64 *b) {   /* the two words hashes of the module made for this translation key */
+    int mi = hix_get(&V.mod_ix, key);
+    if (mi < 0 || V.mods[mi].key != key || !V.mods[mi].wh) return 0;
+    *a = V.mods[mi].wh; *b = V.mods[mi].wh2; return 1;
+}
+static void dup_log(const char *kind, u64 a, u64 b, u64 ka, u64 kb, const VPMeta *o, int oi) {
+    if (g_dup_logged++ >= 200) return;
+    vl("  pipeline not compiled again (t154): "); vl(kind); vl(b ? " VS " : " CS "); vl_x(a); if (b) { vl(" PS "); vl_x(b); }
+    vl(" keys "); vl_x(ka); if (b) { vl(" / "); vl_x(kb); } vl(", flip "); vl_d((i64)g_flips); vl(": the same SPIR-V and state as pipeline "); vl_d(oi);
+    vl(" ("); vl(b ? "VS " : "CS "); vl_x((u64)o->vs_lo << 8); if (b) { vl(" PS "); vl_x((u64)o->ps_lo << 8); } vl(", made at flip "); vl_d(o->flip); vl(")\n");
 }
 /* t114: at a flip (renderer thread): destroy the modules not used for MOD_IDLE flips, every 30 flips, and the least
    recently used ones beyond MOD_LIVE - only while no pipeline is compiling (the compile jobs hold module handles) */
@@ -3181,13 +3248,78 @@ static void memo_bad_note(const char *what, u64 code_addr) { vl("  MEMO SELF-CHE
    surge had thousands, at steps of 0xB400 bytes. For each one: which shader setup produced its T# (a full translation,
    an exact memo reuse or a relocated memo reuse) and whether a fresh translation of the same setup now gives the same
    T# (if not, the memo produced it). The last translations' inputs are kept for that check. */
+/* t154: shaders translated under more than one key. For each shader (address, stage, tessellation / geometry role) the
+   renderer keeps its last keys and, for the newest, the translator's per-group hashes of the inputs (g2s_kp); a new key
+   is logged with the groups that differ ("shader translated under another key (t154)"), so the inputs that split one
+   program into several SPIR-V modules and pipelines can be found. Only at full translations (exact memo reuses give known
+   keys); --no-key-notes: off. */
+static int g_opt_keep_unused_in;   /* t155: --keep-unused-inputs */
+typedef struct { u64 id, key[4], kp[G2S_KP_N]; u32 cnt[3], nkeys, flip; } KDRec;
+static KDRec *g_kd; static int g_nkd, g_kd_logged, g_opt_no_key_notes; static HIdx g_kd_ix; static u64 g_kd_new, g_kd_multi, g_kd_why[G2S_KP_N];
+static const char *const g_kd_names[G2S_KP_N] = {"stage registers (RSRC, binding base, user SGPRs)", "options", "tessellation / geometry setup", "per-draw slots of scalar loads",
+    "instruction words", "texture bindings", "buffer formats", "texture kinds", "other", "pixel-shader input registers", "compute thread counts"};
+static void kd_note(const G2SIn *in, const G2SOut *out) {
+    if (!g_kd) { g_kd = (KDRec *)calloc(16384, sizeof(KDRec)); if (!g_kd) return; hix_init(&g_kd_ix, 32768); }
+    u64 id = in->code_addr ^ ((u64)in->stage << 56) ^ ((u64)in->tess_mode << 52) ^ ((u64)in->gs_mode << 48);
+    int q = hix_get(&g_kd_ix, id);
+    if (q < 0) {
+        if (g_nkd >= 16384) return;
+        q = g_nkd++; hix_put(&g_kd_ix, id, q); KDRec *R = &g_kd[q];
+        R->id = id; R->key[0] = out->key; R->nkeys = 1; R->flip = (u32)g_flips;
+        for (int g = 0; g < G2S_KP_N; g++) R->kp[g] = g2s_kp[g];
+        for (int k = 0; k < 3; k++) R->cnt[k] = g2s_kp_cnt[k];
+        return;
+    }
+    KDRec *R = &g_kd[q];
+    for (u32 k = 0; k < R->nkeys && k < 4; k++) if (R->key[k] == out->key) return;
+    u32 diff = 0; for (int g = 0; g < G2S_KP_N; g++) if (R->kp[g] != g2s_kp[g]) { diff |= 1u << g; g_kd_why[g]++; }
+    g_kd_new++; if (R->nkeys == 1) g_kd_multi++;
+    if (g_kd_logged++ < 300) {
+        static const char *sn[] = {"VS", "PS", "CS"};
+        vl("  shader translated under another key (t154): "); vl(in->stage < 3 ? sn[in->stage] : "?"); vl(" "); vl_x(in->code_addr);
+        if (in->tess_mode) { vl(" tessellation mode "); vl_d(in->tess_mode); } if (in->gs_mode) { vl(" geometry mode "); vl_d(in->gs_mode); }
+        vl(" key "); vl_x(R->key[(R->nkeys - 1) & 3]); vl(" -> "); vl_x(out->key); vl(" (keys "); vl_d(R->nkeys + 1); vl(", first at flip "); vl_d(R->flip); vl(", now flip "); vl_d((i64)g_flips); vl("); differs in:");
+        for (int g = 0; g < G2S_KP_N; g++) if (diff >> g & 1) { vl(" "); vl(g_kd_names[g]); vl(";"); }
+        if (!diff) vl(" (nothing the key groups show: a hash collision?)");
+        vl(" instructions "); vl_d(R->cnt[0]); vl(" -> "); vl_d(g2s_kp_cnt[0]); vl(", textures "); vl_d(R->cnt[1]); vl(" -> "); vl_d(g2s_kp_cnt[1]);
+        vl(", per-draw scalar loads "); vl_d(R->cnt[2]); vl(" -> "); vl_d(g2s_kp_cnt[2]); vl("\n");
+    }
+    R->key[R->nkeys & 3] = out->key; R->nkeys++;
+    for (int g = 0; g < G2S_KP_N; g++) R->kp[g] = g2s_kp[g];
+    for (int k = 0; k < 3; k++) R->cnt[k] = g2s_kp_cnt[k];
+}
+/* t161: the translator inputs that depend on the GPU (its features and limits) - the renderer's own translations and the
+   shipped pipeline manifest's (recorded on another PC: these are set again here, so a first start makes the SPIR-V this
+   PC's renderer will ask for) */
+static void vk_tr_device(G2SIn *in) {
+    in->no_tex_offsets = g_opt_no_tex_offsets || !g_gather_ext_ok;
+    in->fp_ctl = 0;
+    if (g_opt_float_controls) {   /* STATUS 88: the shader's own FLOAT_MODE (RSRC1 bits 19:12), declared where the device can honour it */
+        u32 fm = (in->rsrc1 >> 12) & 0xFF, rnd = fm & 3, den = (fm >> 4) & 3;
+        if (den == 3 && g_dev.fc_den_pres32) in->fp_ctl |= 1; else if (den == 0 && g_dev.fc_den_ftz32) in->fp_ctl |= 2;
+        if (rnd == 0 && g_dev.fc_rte32) in->fp_ctl |= 4; else if (rnd == 3 && g_dev.fc_rtz32) in->fp_ctl |= 8;
+        if (g_dev.fc_szinf32) in->fp_ctl |= 16;
+    }
+    in->max_shared = g_opt_force_borrow ? 1 : g_dev.max_shared;   /* t104: wave-vote slots must fit the device's shared memory */
+    if (in->tess_mode == 3) in->tess_shared_max = g_opt_no_tess_shared ? 0 : g_max_shared;
+}
 static int vk_tr(int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 base, int fixz, G2SOut *out) {
     G2SIn in; h_memset(&in, 0, sizeof in);
     in.stage = stage; in.code_addr = (u64)lo << 8; in.rsrc1 = rsrc1; in.rsrc2 = rsrc2; in.fix_z = fixz; in.tex_binding_base = base;
-    in.n_user = (rsrc2 >> 1) & 0x1F; for (u32 i = 0; i < 16; i++) in.user_data[i] = ud[i];
+    in.n_user = (rsrc2 >> 1) & 0x1F; for (u32 i = 0; i < 16 && i < in.n_user; i++) in.user_data[i] = ud[i];   /* t155: only the words the shader gets (g2s_translate zeroed the rest, copying G2SIn to do it) */
     in.ps_input_ena = g_ctx[CTX_SPI_PS_INPUT_ENA]; in.ps_input_addr = g_ctx[CTX_SPI_PS_INPUT_ADDR]; in.ps_in_control = g_ctx[CTX_SPI_PS_IN_CONTROL];
     for (int i = 0; i < 32; i++) in.ps_input_cntl[i] = g_ctx[CTX_SPI_PS_INPUT_CNTL_0 + i];
     for (int i = 0; i < 3; i++) in.cs_threads[i] = g_shr[SH_COMPUTE_NUM_THREAD_X + i] & 0xFFFF;
+    /* t155: inputs the translation of this stage never reads are left 0, so they do not split one program into several
+       translation keys, memo entries, shader modules and pipelines: the pixel-shader input registers for other stages (a
+       vertex shader got a key per pixel shader it was drawn with), the compute thread counts for vertex / pixel shaders
+       (they held the last dispatch's), PS_INPUT_ADDR and PS_IN_CONTROL for every stage. Checked over the shader corpus:
+       the SPIR-V is the same word for word (so the driver's pipeline cache still matches). --keep-unused-inputs: as before. */
+    if (!g_opt_keep_unused_in) {
+        if (stage != G2S_PS) { in.ps_input_ena = 0; for (int i = 0; i < 32; i++) in.ps_input_cntl[i] = 0; }
+        in.ps_input_addr = 0; in.ps_in_control = 0;
+        if (stage != G2S_CS) { in.cs_threads[0] = 0; in.cs_threads[1] = 0; in.cs_threads[2] = 0; }
+    }
     in.read = lw_rd; in.gpu_written = g2s_gpu_written;   /* (t107g: g2s_reader, noting what a translation read) */
     if (!g_opt_nofold) in.sdata_binding = stage == G2S_PS ? 101 : 100;
     if (g_tess.mode) {
@@ -3205,16 +3337,9 @@ static int vk_tr(int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 bas
         u32 dsc = g_ctx[CTX_DB_SHADER_CONTROL], zo = (dsc >> 4) & 3, kill = (dsc >> 6) & 1, zexp = dsc & 1, zw = (g_ctx[CTX_DB_DEPTH_CONTROL] >> 2) & 1;
         in.ps_early_z = (zo == 1 || zo == 3) && !zexp && !(kill && zw);
     }
-    in.no_tex_offsets = g_opt_no_tex_offsets || !g_gather_ext_ok;
-    if (g_opt_float_controls) {   /* STATUS 88: the shader's own FLOAT_MODE (RSRC1 bits 19:12), declared where the device can honour it */
-        u32 fm = (rsrc1 >> 12) & 0xFF, rnd = fm & 3, den = (fm >> 4) & 3;
-        if (den == 3 && g_dev.fc_den_pres32) in.fp_ctl |= 1; else if (den == 0 && g_dev.fc_den_ftz32) in.fp_ctl |= 2;
-        if (rnd == 0 && g_dev.fc_rte32) in.fp_ctl |= 4; else if (rnd == 3 && g_dev.fc_rtz32) in.fp_ctl |= 8;
-        if (g_dev.fc_szinf32) in.fp_ctl |= 16;
-    }
+    vk_tr_device(&in);   /* (t161: the inputs that depend on this GPU, also for the pipeline manifest's translations) */
     in.exact_mad = g_opt_exact_mad;
     in.quad_branch_all = g_opt_quad_branch_all > 0;
-    in.max_shared = g_opt_force_borrow ? 1 : g_dev.max_shared;   /* t104: wave-vote slots must fit the device's shared memory */
     in.ps_helpers_on = g_opt_ps_helpers_on;
     in.helpers_auto = g_opt_helpers_auto;   /* t106: live-mask EXEC only where a pixel shader can observe it */
     in.mem_slow_count = g_opt_mem_slow;
@@ -3233,7 +3358,9 @@ static int vk_tr(int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 bas
     u64 trh0 = 0, trm0, trc0; if (g_trc_f) g2s_memo_stats(&trh0, &trm0, &trc0);
     u64 lwh0 = 0, lwm0 = 0, lwc0; if (lw_init()) { g2s_memo_stats(&lwh0, &lwm0, &lwc0); g_lw_ntmp = 0; }
     u64 ph0 = 0, pm0 = 0, pc0, pr0 = 0, px_; if (g_opt_phantom) { g2s_memo_stats(&ph0, &pm0, &pc0); g2s_memo_reloc_stats(&pr0, &px_, &px_, &px_, &px_, &px_, &px_, &px_, &px_); }
-    T0(); int ok = g2s_translate(&in, out); TADD(g_t_tr);
+    g2s_kp_fresh = 0;
+    T0(); int ok = g2s_translate(&in, out); TADD1(g_t_tr);
+    if (ok) prep_tnote(&in, out);   /* t160: translation records for the pipeline manifest (new SPIR-V only) */
     if (ok && g_hunt_state == 1 && (u32)V.frame == g_hunt_frame && (stage == G2S_VS || stage == G2S_PS)) { int q_ = stage == G2S_PS;
         g_hlast_in[q_] = in; g_hlast_out[q_] = *out; g_hlast_kind[q_] = g2s_memo_last_kind; g_hlast_born[q_] = g2s_memo_last_born;   /* t141 */
         xc_check(q_, &in, out); }   /* t138 */
@@ -3244,7 +3371,7 @@ static int vk_tr(int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 bas
     g_memrep_cur = in.code_addr;
     if (ok && out->wr_unknown) { static u64 seen[32]; static int ns; int k = 0; while (k < ns && seen[k] != in.code_addr) k++;
         if (k == ns && ns < 32) { seen[ns++] = in.code_addr; vl("  shader stores through a descriptor unknown at translation (not covered by the read mirror's GPU-write rule): "); vl_x(in.code_addr); vl(g_gs.mode ? " (GS pass)\n" : g_tess.mode ? " (tessellation pass)\n" : "\n"); } }
-    { u64 ms = (plat_ticks() - t0_) * 1000 / plat_ticks_per_sec();   /* slow translations are what make the game hang for seconds */
+    { u64 ms = (t1_ - t0_) / g_qpf_ms;   /* slow translations are what make the game hang for seconds (t158: the reading of TADD1) */
       if (ms >= 150) { static int nl; if (nl++ < 40) {
           static const char *sn[] = {"VS", "PS", "CS", "?", "?", "?", "?"};
           vl("  slow shader translation: "); vl(sn[stage < 7 ? stage : 3]); vl(" "); vl_x(in.code_addr); vl(" took "); vl_d((i64)ms); vl(" ms, "); vl_d(ok ? (i64)out->n_inst : -1); vl(" instructions\n");
@@ -3254,6 +3381,7 @@ static int vk_tr(int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 bas
         vk_skip("shader translation failed"); return 0;
     }
     if (!out->cached) { g2s_free(out); vk_skip("translation cache full"); return 0; }
+    if (g2s_kp_fresh) { g2s_kp_fresh = 0; if (g2s_kp_key == out->key && !g_opt_no_key_notes) kd_note(&in, out); }   /* t154 */
     return 1;
 }
 
@@ -3525,17 +3653,38 @@ static void hunt_tex_note(const G2STex *x, const VImg *m, VkFormat vf) {
     sb_s(&t, "\n");
     if (g_hunt_tln + (u32)t.n < sizeof g_hunt_tl) { mem_copy(g_hunt_tl + g_hunt_tln, b, (u64)t.n); g_hunt_tln += (u32)t.n; }
 }
+/* t156: texture bindings. A memory texture (not GPU-written) already checked in this frame resolves to the same image
+   and view for the same T# words until an image is created, freed, moved or starts / stops being GPU-written
+   (g_img_gen): those bindings take the result kept here instead of the image lookups by address (vk_texture) and the
+   view lookup (vimg_view). --no-tex-cache: every binding looked up. */
+typedef struct { u32 T[8]; VImg *m; VkImageView view; u64 gen; VkFormat vf; u32 lb; } TBEnt;
+enum { TB_N = 4096 };
+static TBEnt *g_tb; static int g_opt_no_tbcache; static u64 g_n_tb_hit, g_n_tb_put;
+static u32 tb_slot(const u32 *T) { u64 h = ((u64)T[0] | ((u64)T[1] << 32)) * 0x9E3779B97F4A7C15ull ^ ((u64)T[2] | ((u64)T[3] << 32)) * 0xC2B2AE3D27D4EB4Full ^ ((u64)T[4] | ((u64)T[5] << 32)); h ^= h >> 29; h *= 0xff51afd7ed558ccdull; return (u32)(h >> 52) & (TB_N - 1); }
+static int tb_same(const u32 *a, const u32 *b) { u32 d = 0; for (int i = 0; i < 8; i++) d |= a[i] ^ b[i]; return d == 0; }
 static int vk_bind_stage(VBind *B, const G2SOut *o, u32 base) {
+    int tb_on = !g_opt_no_tbcache && !g_opt_phantom && g_hunt_state != 1 && !g_nrdt && !g_rtl_hi && !g_csck_on;   /* (off while a diagnostic looks at each binding) */
+    if (tb_on && !g_tb) { g_tb = (TBEnt *)calloc(TB_N, sizeof(TBEnt)); if (!g_tb) tb_on = 0; }
     for (int t = 0; t < o->ntex; t++) {
         const G2STex *x = &o->tex[t];
         VkFormat vf = VK_FORMAT_UNDEFINED; u32 lb = 0;
+        if (tb_on && !x->storage) {   /* t156 */
+            TBEnt *c = &g_tb[tb_slot(x->tsharp)]; VImg *cm = c->m;
+            if (cm && c->gen == g_img_gen && tb_same(c->T, x->tsharp) && cm->img && !cm->gpu_written && cm->frame_uploaded == V.frame + 1) {
+                cm->last_use = V.frame; cm->use_seq = g_sub_seq + 1; g_n_tb_hit++;
+                if (g_nrd_img < 64) g_rd_img[g_nrd_img++] = cm;   /* sampled (lazy barriers) */
+                u32 k = B->n++;
+                B->ii[k] = (VkDescriptorImageInfo){vk_sampler(x->ssharp), c->view, VK_IMAGE_LAYOUT_GENERAL};
+                B->wr[1 + k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, 0, base + (u32)t, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &B->ii[k], 0, 0};
+                B->sig[1 + k] = (base + (u32)t) << 8;
+                continue; } }
         u64 lc_c = g_n_vcreate, lc_tc = g_t_vcreate, lc_e = g_n_vevict, lc_te = g_t_vevict, lc_w = g_n_full_waits, lc_tw = g_t_wait, lc_u = V.n_uploads, lc_tx3 = g_t_tx[3];
         g_bind_o = o; g_bind_t = t;   /* t118b */
         int hunting = g_hunt_state == 1 && V.frame == g_hunt_frame; g_hunt_audit_now = hunting; g_tex_audit_res = -1;   /* t135 */
-        T0(); VImg *m = vk_texture(x->tsharp, x->storage, &vf, &lb); TADD(g_t_tex);
+        T0(); VImg *m = vk_texture(x->tsharp, x->storage, &vf, &lb); TADD1(g_t_tex);
         g_bind_o = 0; g_bind_t = -1; g_hunt_audit_now = 0;
         if (hunting) hunt_tex_note(x, m, vf);
-        { u64 dt = plat_ticks() - t0_, fq = plat_ticks_per_sec() / 1000; if (!fq) fq = 1;   /* t107f: one texture binding that took 20 ms or more */
+        { u64 dt = t1_ - t0_, fq = g_qpf_ms;   /* t107f: one texture binding that took 20 ms or more (t158: the reading of TADD1) */
           if (dt >= 20 * fq) { static int nlt; if (nlt++ < 60) { const u32 *T = x->tsharp;
             vl("  slow texture binding (t107f): "); vl_d((i64)(dt / fq)); vl(" ms, frame "); vl_d((i64)V.frame); vl(", T# "); vl_x(((u64)T[0] << 8) | ((u64)(T[1] & 0x3F) << 40)); vl(" ");
             vl_d((T[2] & 0x3FFF) + 1); vl("x"); vl_d(((T[2] >> 14) & 0x3FFF) + 1); vl(" dfmt "); vl_d((T[1] >> 20) & 0x3F); vl(" type "); vl_d(T[3] >> 28); vl(" tiling "); vl_d((T[3] >> 20) & 0x1F); vl(x->storage ? " storage" : "");
@@ -3568,6 +3717,10 @@ static int vk_bind_stage(VBind *B, const G2SOut *o, u32 base) {
         } else {
             u32 swz = x->tsharp[3] & 0xFFF; if (swz == 0xFAC) swz = 0;
             view = vimg_view(m, vf, swz, lb, m->gpu_written);
+            u32 tty_ = x->tsharp[3] >> 28;
+            if (tb_on && !m->gpu_written && m->frame_uploaded == V.frame + 1 && tty_ != 11 && tty_ != 12 && tty_ != 13 && tty_ != 15) {   /* t156: kept for the next bindings of this T# (not cubes / arrays: their layers may be composed from render targets again) */
+                TBEnt *c = &g_tb[tb_slot(x->tsharp)]; for (int q = 0; q < 8; q++) c->T[q] = x->tsharp[q];
+                c->m = m; c->view = view; c->gen = g_img_gen; c->vf = vf; c->lb = lb; g_n_tb_put++; }
         }
         if (!x->storage) smp = vk_sampler(x->ssharp);
     bound:;
@@ -3596,6 +3749,7 @@ static VImg *vk_target(u64 addr, u32 w, u32 h, VkFormat f, u32 bpe, int depth, u
     if (!m) { m = vimg_create(addr, w, h, 1, f, 0, depth, 0); if (!m) return 0; m->bpe = bpe; }
     if (lay_tm) { m->lay_tm = lay_tm; m->lay_pitch = w; }   /* t107e: the surface's tile mode index + 1 (w is its pitch) */
     vk_sync_newer(m);   /* another image over this memory (compute storage / other format) was written later */
+    if (!m->gpu_written) g_img_gen++;   /* t156 */
     m->gpu_written = 1; m->wseq = ++V.wseq; m->last_use = V.frame; m->use_seq = g_sub_seq + 1; rt_mark(m);
     return m;
 }
@@ -3658,13 +3812,33 @@ static void vk_cpipe_make(VPipe *P, VkShaderModule m, int m_x, VkPipelineLayout 
     static PJob sj; PJob *j = (sync || g_opt_sync_compute) ? 0 : pj_new(); int async = j != 0; if (!j) { j = &sj; h_memset(j, 0, sizeof *j); }
     j->P = P; j->compute = 1; j->what = what; j->vs_addr = cs_addr; j->ntex = ntex;
     j->cci = (VkComputePipelineCreateInfo){VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, 0, 0,
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, stage_sgs(&j->sgs[0], m_x, VK_SHADER_STAGE_COMPUTE_BIT), 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", g_opt_cold_pipes ? &g_cold_si : 0}, pl, 0, -1};
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, stage_sgs(&j->sgs[0], m_x, VK_SHADER_STAGE_COMPUTE_BIT), 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", g_opt_cold_pipes || g_opt_salt ? &g_cold_si : 0}, pl, 0, -1};
     if (async) { pj_queue(j); return; }
+    prep_note(j);   /* t159 (pj_queue notes the parallel ones) */
     T0(); VkResult r = vkCreateComputePipelines(V.dev, V.pcache, 1, &j->cci, 0, &P->p); TADD(g_t_pipe);
     if (!r && cfail_pick(P)) { vkDestroyPipeline(V.dev, P->p, 0); P->p = 0; r = VK_ERROR_INITIALIZATION_FAILED; g_cfail_n++; }   /* t116 test */
-    { u64 ms_ = (plat_ticks() - t0_) / (plat_ticks_per_sec() / 1000 ? plat_ticks_per_sec() / 1000 : 1); if (ms_ >= 250) slow_pipe_note("compute (synchronous)", cs_addr, 0, ms_); }
+    { u64 ms_ = (rt_ticks() - t0_) / g_qpf_ms; if (ms_ >= 250) slow_pipe_note("compute (synchronous)", cs_addr, 0, ms_, P->h1, 0); if (!r) prep_cov_done(j, ms_); }
     if (r) { P->p = 0; vl("  "); vl(what); vl(pass ? " (tessellation / geometry pass)" : ""); vl(" pipeline failed: CS "); vl_x(cs_addr); vl(" err "); vl_d(r); vl("\n"); }
     else { V.n_pipes++; vl("  "); vl(what); vl(pass ? " (tessellation / geometry pass)" : ""); vl(" pipeline: CS "); vl_x(cs_addr); vl(" textures "); vl_d(ntex); vl("\n"); }
+}
+/* t154: a new compute pipeline entry (the last one, under index key ixkey) with the same words and layout as an existing
+   one: the entry is removed, ixkey leads to the existing pipeline, which is returned; otherwise 0 (and the new entry is
+   recorded by its content) */
+static VPipe *cpipe_dedupe(u64 ixkey, u64 cskey, VkPipelineLayout pl, u64 cs_addr) {
+    int me = g_ncpipe - 1; u64 wa, wb;
+    if (!g_opt_no_pipe_dedupe && !g_opt_nan_hunt && mod_words(cskey, &wa, &wb)) {
+        u64 c1 = hmix(hmix(0x6370697065ull, wa), (u64)pl), c2 = hmix(hmix(0xC2B2AE3D27D4EB4Full, wb), (u64)pl);
+        hix_init(&g_cpipe_cix, 32768);
+        int t = hix_get(&g_cpipe_cix, c1);
+        if (t >= 0 && t != me && g_cpipe_c2[t] == c2) {
+            hix_del(&g_cpipe_ix, ixkey, me); g_ncpipe--; hix_put(&g_cpipe_ix, ixkey, t); g_n_dup_c++;
+            dup_log("compute", cs_addr, 0, cskey, 0, &g_cpipe_meta[t], t);
+            return &g_cpipe[t];
+        }
+        if (t < 0) { hix_put(&g_cpipe_cix, c1, me); g_cpipe_c2[me] = c2; }
+    }
+    g_cpipe_meta[me].vs_lo = (u32)(cs_addr >> 8); g_cpipe_meta[me].ps_lo = 0; g_cpipe_meta[me].flip = (u32)g_flips;
+    return 0;
 }
 static u64 g_n_hs_pass, g_n_hs_fail;
 /* translate (g_tess set by the caller), bind and dispatch one tessellation compute pass; 1 = recorded */
@@ -3694,7 +3868,9 @@ static int vk_tess_pass(u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 ntg, co
         P = &g_cpipe[g_ncpipe++]; P->h1 = cs.key; P->pl = L->pl; P->p = 0;
         VkShaderModule m = vk_module(cs.key, cs.spv, cs.n); int m_x = g_mod_xlane_last;
         if (!m) { hix_del(&g_cpipe_ix, cs.key ^ (u64)L->pl * 0x9E3779B97F4A7C15ull, g_ncpipe - 1); g_ncpipe--; return 0; }   /* t114: no module now: no pipeline entry, tried again next time */
-        vk_cpipe_make(P, m, m_x, L->pl, (u64)lo << 8, what, B.n, 0, 1);   /* t116 (one slow-compile note, with this pass's address) */
+        VPipe *D_ = cpipe_dedupe(cs.key ^ (u64)L->pl * 0x9E3779B97F4A7C15ull, cs.key, L->pl, (u64)lo << 8);   /* t154 */
+        if (D_) P = D_;
+        else vk_cpipe_make(P, m, m_x, L->pl, (u64)lo << 8, what, B.n, 0, 1);   /* t116 (one slow-compile note, with this pass's address) */
     }
     if (!P->p && !P->pend) { vk_skip("tessellation pipeline creation failed"); return 0; }
     if (vk_guard_failed(g)) { vk_skip("tessellation / geometry pass after a failed pass"); return 0; }   /* (again: nothing between here and the check above hands a batch over, but cheap) */
@@ -4067,7 +4243,8 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     VPipe *P = 0;
     hix_init(&V.pipe_ix, 262144);
     { int q = hix_get(&V.pipe_ix, h1); if (q >= 0 && V.pipe[q].h2 == h2) P = &V.pipe[q];
-      else if (q >= 0) for (int i = 0; i < V.npipe; i++) if (V.pipe[i].h1 == h1 && V.pipe[i].h2 == h2) { P = &V.pipe[i]; break; } }
+      else if (q >= 0) for (int i = 0; i < V.npipe; i++) if (V.pipe[i].h1 == h1 && V.pipe[i].h2 == h2) { P = &V.pipe[i]; break; }
+      if (!P && g_npalias) { int a = hix_get(&g_palias_ix, h1); if (a >= 0 && g_palias[a].h1 == h1 && g_palias[a].h2 == h2) P = &V.pipe[g_palias[a].to]; } }   /* t154 */
     if (!P) {
         if (V.npipe >= 65536) { vk_skip("pipeline cache full"); return; }
         hix_put(&V.pipe_ix, h1, V.npipe);
@@ -4082,7 +4259,26 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
                 if (w && wn && !vkCreateShaderModule(V.dev, &ci, 0, &nm)) { g_xs_mod = nm; g_xs_modkey = ps.key; vl("  NaN hunt (t140): new module object for PS key "); vl_x(ps.key); vl(", words "); vl_x(words_hash(w, wn)); vl("\n"); } }   /* (kept alive: one per hunt) */
             if (g_xs_mod && g_xs_modkey == ps.key) pm = g_xs_mod; }
         if (!vm || !pm) { hix_del(&V.pipe_ix, h1, V.npipe - 1); V.npipe--; return; }   /* t114: no module now: no pipeline entry, tried again next time */
-        if (vm && pm) {
+        int dup = 0;
+        if (!g_opt_no_pipe_dedupe && !g_opt_nan_hunt && !g_xs_pipe) {   /* t154: the same words and state as an existing pipeline: use it */
+            u64 va, vb, pa, pb;
+            if (mod_words(vs.key, &va, &vb) && mod_words(ps.key, &pa, &pb)) {
+                u64 c1 = 0x6770697065ull, c2 = 0x9E3779B97F4A7C15ull;
+                parts[0] = va; parts[1] = pa;   /* (parts is not used after this) */
+                for (u32 i = 0; i < sizeof parts / sizeof parts[0]; i++) { c1 = hmix(c1, parts[i]); c2 = hmix(c2 ^ (i * 0x100000001b3ull), parts[i]); }
+                c2 = hmix(hmix(c2, vb), pb);
+                int me = V.npipe - 1; hix_init(&g_pipe_cix, 131072);
+                int t = hix_get(&g_pipe_cix, c1);
+                if (t >= 0 && t != me && g_pipe_c2[t] == c2 && g_npalias < 16384) {
+                    hix_del(&V.pipe_ix, h1, me); V.npipe--;
+                    hix_init(&g_palias_ix, 32768); hix_put(&g_palias_ix, h1, g_npalias); g_palias[g_npalias].h1 = h1; g_palias[g_npalias].h2 = h2; g_palias[g_npalias].to = t; g_npalias++;
+                    P = &V.pipe[t]; dup = 1; g_n_dup_g++;
+                    dup_log("graphics", (u64)g_shr[SH_PGM_LO_VS] << 8, (u64)g_shr[SH_PGM_LO_PS] << 8, vs.key, ps.key, &g_pipe_meta[t], t);
+                } else if (t < 0) { hix_put(&g_pipe_cix, c1, me); g_pipe_c2[me] = c2; }
+            }
+            if (!dup) { VPMeta *M = &g_pipe_meta[V.npipe - 1]; M->vs_lo = g_shr[SH_PGM_LO_VS]; M->ps_lo = g_shr[SH_PGM_LO_PS]; M->flip = (u32)g_flips; }
+        }
+        if (vm && pm && !dup) {
             /* the create info is built inside a job: compiled by the compiler threads (e6_defer.c), or here when
                parallel compilation is off / the batch already has PJOB_MAX jobs */
             static PJob sj; PJob *j = pj_new(); int async = j != 0; if (!j) { j = &sj; h_memset(j, 0, sizeof *j); }
@@ -4134,12 +4330,13 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
             for (u32 rt = 0; rt < 8; rt++) j->cf[rt] = cf[rt];
             j->pri = (VkPipelineRenderingCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, 0, 0, ncol, 0, dfmt, dstencil ? dfmt : VK_FORMAT_UNDEFINED};
             j->gci = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, L->pl, 0, 0, 0, -1};
+            j->vs_key = vs.key; j->ps_key = ps.key;   /* t154 */
             j->vs_addr = (u64)g_shr[SH_PGM_LO_VS] << 8; j->ps_addr = (u64)g_shr[SH_PGM_LO_PS] << 8; j->ncol = ncol; j->topo = topo; j->ntex = B.n; j->depth = dv != 0;
             if (async) pj_queue(j);
             else {
-                pj_fix(j);
+                pj_fix(j); prep_note(j);   /* t159 */
                 T0(); VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &j->gci, 0, &P->p); TADD(g_t_pipe);
-                { u64 ms_ = (plat_ticks() - t0_) / (plat_ticks_per_sec() / 1000 ? plat_ticks_per_sec() / 1000 : 1); if (ms_ >= 250) slow_pipe_note("graphics (synchronous)", (u64)g_shr[SH_PGM_LO_VS] << 8, (u64)g_shr[SH_PGM_LO_PS] << 8, ms_); }
+                { u64 ms_ = (rt_ticks() - t0_) / g_qpf_ms; if (ms_ >= 250) slow_pipe_note("graphics (synchronous)", (u64)g_shr[SH_PGM_LO_VS] << 8, (u64)g_shr[SH_PGM_LO_PS] << 8, ms_, vs.key, ps.key); if (!r) prep_cov_done(j, ms_); }
                 if (r) { P->p = 0; vl("  graphics pipeline failed: VS "); vl_x(j->vs_addr); vl(" PS "); vl_x(j->ps_addr); vl(" err "); vl_d(r); vl("\n"); }
                 else { V.n_pipes++; vl("  pipeline "); vl_d(V.npipe); vl(": VS "); vl_x(j->vs_addr); vl(" PS "); vl_x(j->ps_addr);
                        vl(" targets "); vl_d(ncol); vl(dv ? " +depth" : ""); vl(" topology "); vl_d(topo); vl(" textures "); vl_d(B.n); vl("\n"); }
@@ -4580,7 +4777,9 @@ static void vkr_dispatch_body(u32 x, u32 y, u32 z) {
         P = &g_cpipe[g_ncpipe++]; P->h1 = cs.key; P->pl = L->pl; P->p = 0;
         VkShaderModule m = vk_module(cs.key, cs.spv, cs.n); int m_x = g_mod_xlane_last;
         if (!m) { hix_del(&g_cpipe_ix, cs.key ^ (u64)L->pl * 0x9E3779B97F4A7C15ull, g_ncpipe - 1); g_ncpipe--; return; }   /* t114: no module now: no pipeline entry, tried again next time */
-        vk_cpipe_make(P, m, m_x, L->pl, (u64)g_shr[SH_COMPUTE_PGM_LO] << 8, "compute", B.n, ck, 0);   /* t116 */
+        VPipe *D_ = cpipe_dedupe(cs.key ^ (u64)L->pl * 0x9E3779B97F4A7C15ull, cs.key, L->pl, (u64)g_shr[SH_COMPUTE_PGM_LO] << 8);   /* t154 */
+        if (D_) P = D_;
+        else vk_cpipe_make(P, m, m_x, L->pl, (u64)g_shr[SH_COMPUTE_PGM_LO] << 8, "compute", B.n, ck, 0);   /* t116 */
     }
     if (!P->p && !P->pend) { vk_skip("compute pipeline creation failed"); return; }
     if (ck && P->pend) ck = 0;   /* t116: the compute check only for a dispatch whose pipeline exists (a parallel compile may still fail) */
@@ -5575,7 +5774,7 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
       lt = now; ltr = g_t_tr; ltex = g_t_tex; lwait = g_t_wait; lpipe = g_t_pipe; ldraw = g_t_draw; lpres = g_t_present;
       lsub = g_t_submit; lqs = g_t_qsub; lsw = g_t_slotw; laqw = g_t_aqwait; laqi = g_t_aqidle; llzf = g_lz_faults; lmr = g_mod_remade;
       lpwn = g_pw_slow_n; lpwt = g_pw_slow_ticks; lion = g_io_n; liob = g_io_bytes; liot = g_io_ticks; g_io_max = 0; lvc = g_n_vcreate; lvct = g_t_vcreate; lve = g_n_vevict; lvet = g_t_vevict; }
-    if (V.n_pipes >= g_pc_saved_at + 1000) vk_save_pcache_bg();
+    if (V.n_pipes >= g_pc_saved_at + 1000 || g_prep_new_bytes > (128ull << 20)) vk_save_pcache_bg();   /* (t159: also when the new modules of the preparation records add up) */
     if (g_pcs_report && !__atomic_load_n(&g_pc_busy, __ATOMIC_ACQUIRE)) { u64 fm = plat_ticks_per_sec() / 1000; if (!fm) fm = 1; g_pcs_report = 0;   /* t145 */
         say("    (t145) background pipeline-cache save: frames "); say_dec((i64)g_pcs_frame0); say(" to "); say_dec((i64)V.frame); say(", "); say_dec((i64)(g_pcs_bytes >> 20));
         say(" MB, reading it from the driver "); say_dec((i64)(g_pcs_get / fm)); say(" ms, writing the file "); say_dec((i64)(g_pcs_write / fm)); say(" ms\n"); }
@@ -5735,6 +5934,7 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
     V.frame++;
     pm_unlock(&g_gpu_lock);
 }
+#include "e6_prep.c"   /* t159: shader preparation (records of the pipelines made; prepared at start-up) */
 /* the pipeline cache is written at the end of a run, every 300 new pipelines, and when the game crashes, so a crash
    does not throw away the compile work (a rerun then skips most of the first-time stall) */
 /* Saving the pipeline cache (160+ MB, read out of the driver and written to disk) took 2..7 s. It ran inside the flip
@@ -5755,6 +5955,7 @@ static void vk_save_pcache(void) {   /* at exit: wait for a background save, the
 }
 static void vk_save_pcache_now(void) {
     if (!V.pcache || g_opt_cold_pipes) return;
+    prep_save();   /* t159: new pipeline records and their modules first */
     u64 n = 0, t0 = plat_ticks(), t1 = t0;
     if (!vkGetPipelineCacheData(V.dev, V.pcache, &n, 0) && n) {
         void *buf = malloc(n);
@@ -5863,6 +6064,7 @@ static void vkr_report(void) {
     lw_report();
     { u64 tf = plat_ticks_per_sec() / 1000; if (!tf) tf = 1;
       say("    pipeline compiles of 250 ms and more (t107b): "); say_dec((i64)g_n_slow_pipes); say(", "); say_dec((i64)g_slow_pipe_ms); say(" ms in all\n");
+      prep_report();   /* t161 */
       say("    parallel pipeline compiles: "); say_dec((i64)g_pj_total); say(" on "); say_dec(g_pj_threads); say(" threads (compute "); say_dec((i64)g_pj_compute);
       say(g_opt_sync_compute ? ", --sync-compute" : ""); say("; failed "); say_dec((i64)g_pj_failed);
       if (g_opt_cfail) { say(", --compute-fail-test: "); say_dec((i64)g_cfail_n); say(" treated as failed"); }
@@ -5954,8 +6156,20 @@ static void vkr_report(void) {
         say("    GPU: "); say(g_dev.name); say(" ("); say(dev_vendor_name(g_dev.vendor_id)); say(", driver "); say(g_dev.driver_name); say(" "); say(g_dev.driver_info); say("); subgroup size "); say_dec(g_dev.sg_size);
         say("; most push descriptors a shader needed "); say_dec(g_max_bindings_seen); say(" (limit "); say_dec(g_dev.max_push_desc); say("); cross-lane shader modules "); say_dec((i64)g_n_xlane_mods);
         say(", pipeline stages given 32-lane subgroups "); say_dec((i64)g_n_sgs_stages); say(g_opt_float_controls ? "; fp32 float controls declared" : "; fp32 behaviour left to the driver"); say(g_opt_exact_mad ? "; exact MAD rounding\n" : "; MAD contraction left to the driver\n");
-        { u64 mh, mm, mc; g2s_memo_stats(&mh, &mm, &mc); say("    shader setups reused: "); say_dec((i64)mh); say(", translated/re-checked in full: "); say_dec((i64)mm); say(" (memo entries compared "); say_dec((i64)mc); say(")\n");
-          u64 wn, wg, wm, we; g2s_memo_why(&wn, &wg, &wm, &we); say("      translated in full because: new inputs "); say_dec((i64)wn); say(", GPU-write state changed "); say_dec((i64)wg); say(", memory changed "); say_dec((i64)wm); say("; memo entries evicted "); say_dec((i64)we); say("\n");
+        { u64 mh, mm, mc; g2s_memo_stats(&mh, &mm, &mc); { u64 rl_, x_; g2s_memo_reloc_stats(&rl_, &x_, &x_, &x_, &x_, &x_, &x_, &x_, &x_);
+            say("    shader setups reused: "); say_dec((i64)mh); say(" (relocated "); say_dec((i64)rl_); say("), translated in full: "); say_dec((i64)g2s_memo_full()); say(" (t155); lookups without an exact match: "); say_dec((i64)mm); say(" (memo entries compared "); say_dec((i64)mc); say(")\n"); }
+          u64 wn, wg, wm, we; g2s_memo_why(&wn, &wg, &wm, &we); say("      lookups without an exact match because: new inputs "); say_dec((i64)wn); say(", GPU-write state changed "); say_dec((i64)wg); say(", memory changed "); say_dec((i64)wm); say("; memo entries evicted "); say_dec((i64)we); say("\n");
+          { u64 nk[6]; g2s_memo_nokeep(nk); say("      full translations not kept for reuse (t154): failed "); say_dec((i64)nk[0]); say(", translation cache full "); say_dec((i64)nk[1]); say(", recorder out of memory "); say_dec((i64)nk[2]);
+            say(", memory not re-readable "); say_dec((i64)nk[3]); say(", code hash failed "); say_dec((i64)nk[4]); say(", no memory to keep "); say_dec((i64)nk[5]); say("\n"); }
+          say("      shaders translated under more than one key (t154): "); say_dec((i64)g_kd_multi); say(" of "); say_dec(g_nkd); say(", extra keys "); say_dec((i64)g_kd_new); say(g_kd_new ? "; inputs that differed:" : "");
+          for (int g = 0; g < G2S_KP_N; g++) if (g_kd_why[g]) { say(" "); say(g_kd_names[g]); say(" "); say_dec((i64)g_kd_why[g]); say(";"); } say("\n");
+          say("    pipelines not compiled again (t154, the same SPIR-V and state under other keys): graphics "); say_dec((i64)g_n_dup_g); say(", compute "); say_dec((i64)g_n_dup_c); say(g_opt_no_pipe_dedupe ? " (--no-pipe-dedupe: off)\n" : "\n");
+          { u64 m_[8]; g2s_memo_path_stats(m_); say("    memo paths (t155): exact-input entries found "); say_dec((i64)m_[0]); say(", with other memory "); say_dec((i64)m_[1]); say(", relocated from them "); say_dec((i64)m_[2]);
+            say("; relocation attempts from other inputs "); say_dec((i64)m_[3]); say(", reused "); say_dec((i64)m_[4]); say(g_opt_keep_unused_in ? "; unused inputs kept (--keep-unused-inputs)" : "; unused inputs zeroed"); say(g2s_memo_nodups ? "; repeated ranges read again (--memo-reread)\n" : "; repeated ranges read once\n"); }
+          say(g_rt_state == 2 ? "    renderer time accounting (t155): CPU time-stamp counter\n" : "    renderer time accounting (t155): QueryPerformanceCounter\n");
+          say(g2s_movrel_sel ? "    V_MOVREL*: select chains\n" : "    V_MOVREL*: register array (--movrel-array)\n");
+          say("    texture bindings from the binding cache (t156): "); say_dec((i64)g_n_tb_hit); say(", kept "); say_dec((i64)g_n_tb_put); say(g_opt_no_tbcache ? " (--no-tex-cache: off)\n" : "\n");
+          if (g2s_gs_fc || g2s_gs_hoist) { say("    geometry-pass experiments (t154):"); say(g2s_gs_fc ? " memory helpers DontInline (--gs-noinline)" : ""); say(g2s_gs_hoist ? " ring base read once per pass (--gs-hoist)" : ""); say("\n"); }
           u64 csk, cew, cep; g2s_memo_code_stats(&csk, &cew, &cep); say("      code checks skipped (already checked in the same submit): "); say_dec((i64)csk); say("; epochs "); say_dec((i64)cep); say(", ended by writes over code "); say_dec((i64)cew); say("\n");
           { u64 rh, rn, rr, rc, rg, re, rcd, nr, ro; g2s_memo_reloc_stats(&rh, &rn, &rr, &rc, &rg, &re, &rcd, &nr, &ro);
             say("      relocated reuses (STATUS 78): "); say_dec((i64)rh); say("; relocation refused: readability "); say_dec((i64)rr); say(", content "); say_dec((i64)rc); say(", GPU-written state "); say_dec((i64)rg);
@@ -5984,6 +6198,12 @@ static void vkr_report(void) {
                 say("  ["); say(g_exp_names[v - 1]); say("]: "); say_dec((i64)(P->ms * 1000.0 / P->n)); say(" us x "); say_dec((i64)P->n); say("\n");
             }
         }
+        {   /* t156: every compute shader's GPU time (microseconds; the table below rounds to milliseconds) */
+            int any = 0;
+            for (int i = 0; i < g_nprof; i++) { VProf *P = &g_prof[i]; if (P->b || !P->n || P->ms < 0) continue;
+                if (!any++) vl("GPU time of each compute shader (t156; us in all, us per dispatch, dispatches, groups per dispatch):\n");
+                vl("  CS "); vl_x(P->a & 0xFFFFFFFFFFFFull); vl("  "); vl_d((i64)(P->ms * 1000.0)); vl(" us  "); vl_d((i64)(P->ms * 1000.0 / P->n)); vl(" us each  x"); vl_d((i64)P->n);
+                vl("  "); vl_d((i64)(P->verts / P->n)); vl(" groups\n"); } }
         say("    GPU time measured: "); say_dec((i64)tot); say(" ms in total");
         if (g_prof_reps) { say(" (last "); say_dec(g_prof_reps); say(" repeats)"); } say("; most expensive shaders:\n");
         for (int k = 0; k < 15; k++) {

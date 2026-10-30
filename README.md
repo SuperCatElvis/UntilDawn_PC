@@ -7,7 +7,7 @@ This project aims to bring the original **Until Dawn (2015)** to PC, running nat
 Development is ongoing. A full play-through was completed on the development PC with WIP 0.1.3 (later versions have so far been tested in shorter sessions), but the port is **not yet a polished or consistently smooth experience**.
 
 > [!WARNING]
-> **Still an early work-in-progress.** Expect graphical glitches, crashes, shader-compilation pauses and frame-rate drops. WIP 0.2.0 fixes several long-standing problems — the disappearing arm and collectibles during item inspection, black mouths after the prologue, freezes caused by log writes and a random start-up crash — and contains fixes for long sessions and laptops with two GPUs that still need testing, but the memory corruption behind most crashes is **not fixed yet**, and the heaviest scenes still run **below 30 FPS**, even on the development PC. Performance, stability and hardware support will keep improving in future releases, but there is no guaranteed timetable.
+> **Still an early work-in-progress.** Expect graphical glitches, crashes, shader-compilation pauses and frame-rate drops. v0.2.1 prepares the game's shaders before it starts, so the scenes it covers no longer pause to compile them during play. WIP 0.2.0 fixed several long-standing problems — the disappearing arm and collectibles during item inspection, black mouths after the prologue, freezes caused by log writes and a random start-up crash — and added fixes for long sessions and laptops with two GPUs that still need testing. The memory corruption behind most crashes is **not fixed yet**, and the heaviest scenes still run **below 30 FPS**, even on the development PC. Performance, stability and hardware support will keep improving in future releases, but there is no guaranteed timetable.
 
 > [!IMPORTANT]
 > **You must supply your own legally obtained game files.** This project does not provide the original PS4 game. The loader requires a decrypted dump of **Until Dawn (CUSA02636)** with update **01.03** applied, made from your own legally obtained copy of the game. See [Installation](#installation) and [Third-party notices](THIRD_PARTY_NOTICES.md) for details about the runtime package.
@@ -39,7 +39,7 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release from the Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases)**
 
-**Current version:** [WIP 0.2.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.2.0) (`v0.2.0`, work in progress): collectibles and the arm during item inspection fixed, black mouths and garbled X prompts fixed, no more freezes from log writes, plus changes for long sessions and laptops with two GPUs that are not yet confirmed. Download **`UntilDawn_0.2.0.zip`** from the release's Assets list (the "Source code" archives hold this repository — documentation and source code — not the program). Release notes: [docs/releases/v0.2.0-wip.md](docs/releases/v0.2.0-wip.md) · previous: [0.1.5](docs/releases/v0.1.5-wip.md), [0.1.4](docs/releases/v0.1.4-wip.md), [0.1.3](docs/releases/v0.1.3-wip.md).
+**Current version:** [v0.2.1](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.2.1) (`v0.2.1`, work in progress): shaders prepared before the game starts (a progress screen on the first start, from a shader list that comes with the program and your own game files), a renderer hang while textures load fixed, faster shader handling. Download **`UntilDawn_0.2.1.zip`** from the release's Assets list (the "Source code" archives hold this repository — documentation and source code — not the program). Release notes: [docs/releases/v0.2.1.md](docs/releases/v0.2.1.md) · previous: [0.2.0](docs/releases/v0.2.0-wip.md) (collectibles and the arm during item inspection, black mouths, garbled X prompts, freezes from log writes), [0.1.5](docs/releases/v0.1.5-wip.md), [0.1.4](docs/releases/v0.1.4-wip.md), [0.1.3](docs/releases/v0.1.3-wip.md).
 
 The download contains the program, a hardware compatibility tester and documentation, but **no game files**.
 
@@ -47,7 +47,7 @@ The download contains the program, a hardware compatibility tester and documenta
 
 ## Features
 
-What is implemented in WIP 0.2.0:
+What is implemented in v0.2.1:
 
 ### Game
 - A complete play-through from the prologue to the end credits has been achieved on the development PC (with WIP 0.1.3).
@@ -68,6 +68,10 @@ What is implemented in WIP 0.2.0:
 - Configurable frame-rate cap (60 FPS by default). **A 60 FPS cap does not mean the game currently runs at 60 FPS consistently.**
 - The renderer runs on its own thread alongside the game (since 0.1.4; `renderer_thread = 0` switches back).
 - On-disk shader cache (`Cache\`), with shaders (graphics and, since 0.1.5, compute) compiled in parallel in the background.
+- Shader preparation (**new in v0.2.1**): before the brightness screen, the shaders the game will need are compiled behind a
+  progress screen (Esc / Circle skips it): on the first start those in `pipelines.udm` (a list of shader locations and
+  settings, read together with your own game files; no game code is included), later also everything earlier
+  sessions needed.
 - Lower memory use (since 0.1.5): the game's many small memory heaps are committed in steps as the game uses
   them, and the renderer's video-memory copies are sized to your graphics card.
 
@@ -125,18 +129,19 @@ The Core Ultra 9 system also detected **Intel integrated graphics** as usable, b
 
 ### 1. Download and extract
 
-1. Download **`UntilDawn_0.2.0.zip`** from the
+1. Download **`UntilDawn_0.2.1.zip`** from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder you can write to, for example `D:\Games\UntilDawn_WIP`. Don't use `Program Files`:
    the program keeps its settings, logs, shader cache and saves in its own folder.
 
 ```
-UntilDawn_0.2.0\
+UntilDawn_0.2.1\
   UntilDawn.exe            <- start the game
+  pipelines.udm            <- the shader list for the first start (v0.2.1; keep it next to UntilDawn.exe)
   Config\settings.ini      <- settings
   Game\                    <- put your game files here (or set game_dir)
   compat\                  <- hardware compatibility tester
-  README.txt  CHANGELOG.txt  Controls.txt  KNOWN_ISSUES.txt  THIRD_PARTY_NOTICES.txt
+  README.txt  INSTALLATION.txt  CHANGELOG.txt  Controls.txt  KNOWN_ISSUES.txt  THIRD_PARTY_NOTICES.txt
 ```
 
 ### 2. Add your game files
@@ -175,6 +180,11 @@ The program creates `Logs\`, `Cache\`, `savedata\` (your saves) and `temp0\` its
 Settings (frame-rate limit, windowed / borderless, window size, renderer thread, GPU choice, presentation mode) and troubleshooting:
 **[docs/INSTALLATION.md](docs/INSTALLATION.md)**.
 
+**Updating from 0.2.0:** copy the new `UntilDawn.exe`, the new `pipelines.udm`, `compat\ud_compat.exe` and the
+text files over your old folder, but **do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves,
+settings and `Cache\` carry over; the new setting `shader_preparation` uses its default (on) when it is not in your
+file. The first start shows a "Preparing shaders" screen while the shaders are compiled (Esc or Circle skips it).
+
 **Updating from 0.1.5 (or earlier):** copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files over
 your old folder, but **do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves and settings carry
 over; the new settings (`gpu`, `present_mode`, `heap_slot_mb`, `heap_slot_reuse`) use their defaults when they are
@@ -182,7 +192,7 @@ not in your file. Every shader is translated anew in 0.2.0, so the old `Cache\` 
 and the first-play-through shader pauses return once.
 
 > [!NOTE]
-> The first time new content appears, your graphics driver compiles its shaders. With an empty shader cache (a new install), even the development PC (Core i9-12900KF, 24 threads) paused **once for about 12 seconds and a few times for 3–8 seconds** in the first minutes; once the cache holds an area, new content costs up to about 2 seconds. CPUs with fewer cores pause longer (**10–20 seconds or more** have been reported). Each pause happens once: later runs load the result from the shader cache (`Cache\`), though other freezes and crashes are still possible.
+> From v0.2.1 the shaders are compiled **before the game starts**, behind a "Preparing shaders" screen: on the first start those in `pipelines.udm` (about 30–40 seconds on the development PC, Core i9-12900KF, 24 threads; longer on CPUs with fewer cores), later also those earlier sessions needed (under a second when nothing changed). On the development PC the first-start sequence (brightness, controls, intro, menu) then compiled no shaders during play. Scenes that are not in the list yet still compile their shaders the first time they appear — with 0.2.0 and an empty cache that meant one pause of about 12 seconds and a few of 3–8 seconds in the first minutes, and 10–20 seconds or more on CPUs with fewer cores — and are prepared from the next start on. Other freezes and crashes are still possible.
 
 ---
 
@@ -330,8 +340,10 @@ expand the documentation and make the game more accessible to modders as develop
 The complete source of the port — the Windows runtime and PS4 compatibility layer, the Vulkan renderer, the
 GCN → SPIR-V shader translator, the hardware compatibility tester, the build scripts, tests and supporting tools —
 is in **[source/](source/README.md)**, with instructions for building it on Linux with LLVM. It contains no game
-code, data or assets; see [Third-party notices](THIRD_PARTY_NOTICES.md). It is the source of the releases from WIP
-0.2.1 on; for earlier releases see [Third-party notices](THIRD_PARTY_NOTICES.md#earlier-releases-wip-012--020).
+code, data or assets; see [Third-party notices](THIRD_PARTY_NOTICES.md). `data/pipelines.udm` (the shader preparation
+manifest, v0.2.1) holds only locations in the game's files, translator inputs and pipeline state, checked to contain no
+shader code. It is the source of the releases from
+v0.2.1 on; for earlier releases see [Third-party notices](THIRD_PARTY_NOTICES.md#earlier-releases-wip-012--020).
 
 ---
 

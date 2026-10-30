@@ -95,8 +95,9 @@ typedef struct {
     int present_mode;        /* t121: 0 auto, 1 fifo, 2 mailbox, 3 immediate */
     int heap_slot_mb;        /* t130: distance between the game's heap address slots: 512 (default), 64..512, or 2048 = the game's own */
     int heap_slot_reuse;     /* t131: 1 = a released heap slot is reused at once (first fit); 0 = the game's round-robin */
+    int shader_prep;         /* t159: 1 = shaders of earlier sessions prepared before the game starts (e6_prep.c); 0 = off */
 } UdSettings;
-static UdSettings g_uds = {"", 60, 0, 1280, 720, 0, 1, "", 0, 512, 1};
+static UdSettings g_uds = {"", 60, 0, 1280, 720, 0, 1, "", 0, 512, 1, 1};
 static int g_ud_release;     /* started as the player-facing program (no command-line arguments) */
 
 static int ud_key_is(const char *a, const char *b) { while (*b) { if ((*a | 0x20) != (*b | 0x20)) return 0; a++; b++; } return *a == 0; }
@@ -142,6 +143,11 @@ static const char *k_ud_ini_default =
     "; order (each new heap takes the next slot; memory use grows for about two hours of play).\r\n"
     "heap_slot_reuse = 1\r\n"
     "\r\n"
+    "; 1 = shaders are prepared before the game starts: on the first start those listed in pipelines.udm (read\r\n"
+    "; from your own game files), later also those the game needed in earlier sessions. A progress screen appears\r\n"
+    "; when that takes a while (first start, graphics driver update); Esc or Circle skips it. 0 = off.\r\n"
+    "shader_preparation = 1\r\n"
+    "\r\n"
     "; 1 = developer mode: capture keys (Ctrl+P, Ctrl+O, Ctrl+N, F6, F11), status text, diagnostic files in Logs\\captures\r\n"
     "developer = 0\r\n";
 
@@ -162,6 +168,7 @@ static void ud_parse_ini(char *t) {
         else if (ud_key_is(line, "gpu")) { int n = str_len(v); if (n >= (int)sizeof g_uds.gpu) n = sizeof g_uds.gpu - 1; mem_copy(g_uds.gpu, v, (u64)n); g_uds.gpu[n] = 0; }
         else if (ud_key_is(line, "present_mode")) g_uds.present_mode = ud_key_is(v, "fifo") ? 1 : ud_key_is(v, "mailbox") ? 2 : ud_key_is(v, "immediate") ? 3 : 0;
         else if (ud_key_is(line, "heap_slot_reuse")) g_uds.heap_slot_reuse = ud_atoi(v) != 0;   /* t131 */
+        else if (ud_key_is(line, "shader_preparation")) g_uds.shader_prep = ud_atoi(v) != 0;   /* t159 */
         else if (ud_key_is(line, "heap_slot_mb")) { int x = ud_atoi(v); g_uds.heap_slot_mb = x == 2048 ? 2048 : x < 64 ? 64 : x > 512 ? 512 : x; }   /* t130 */
     }
 }

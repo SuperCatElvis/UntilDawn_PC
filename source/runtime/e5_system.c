@@ -82,6 +82,11 @@ static u32 press_due(void) {
 }
 static u32 g_pad_last;
 static SYSV int pad_open(int user, int type, int index, void *param) { TRACE("scePadOpen", user, type, index); (void)param; return 1; }
+/* t159: the shader preparation screen's skip (e6_prep.c): Esc or Backspace with the window in front, or Circle on a controller */
+static int prep_skip_pressed(void) {
+    if (g_win.focused && (plat_key(0x1B) || plat_key(0x08))) return 1;
+    PlatPad P; return plat_pad_poll(&P) && (P.buttons & PAD_CIRCLE) != 0;
+}
 static SYSV int pad_read_state(int h, u8 *d) {
     if (h != 1 || !d) return (int)0x80920003;
     g_pad_reads++;

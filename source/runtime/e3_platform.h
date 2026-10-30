@@ -139,6 +139,7 @@ __declspec(dllimport) u32 WINAPI GetLastError(void);
 __declspec(dllimport) int WINAPI SetThreadPriority(void *, int);
 __declspec(dllimport) u32 WINAPI GetWriteWatch(u32, void *, u64, void **, u64 *, u32 *);
 __declspec(dllimport) void WINAPI ExitProcess(u32);
+__declspec(dllimport) int WINAPI TerminateProcess(void *, u32);
 __declspec(dllimport) void *WINAPI AddVectoredExceptionHandler(u32, void *);
 __declspec(dllimport) u32 WINAPI TlsAlloc(void);
 __declspec(dllimport) int WINAPI TlsSetValue(u32, void *);

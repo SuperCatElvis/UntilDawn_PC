@@ -182,6 +182,10 @@ typedef struct {
     u32 sg[128], vg[256];     /* register variables (0 = unused) */
     u32 interface[512]; int nif;
     u32 fn_ld32, fn_st32;     /* helper functions */
+    u32 helper_fc;            /* t154 experiment (g2s_gs_fc): SPIR-V function control of the E6 memory helpers */
+    int vrel_lo1, vrel_n; u32 vrel_arr;   /* t156: VGPRs vrel_lo1 - 1 .. that V_MOVREL* may address live in one array (vrel_arr, vrel_n + 1 entries: the last is a sink) */
+    u32 gs_hl, gs_hh;         /* t154 experiment (g2s_gs_hoist): the ring base noted in the geometry header, loaded once at the start of main */
+    u32 gsn_var[4]; int gsn_on, gsn_n;   /* t158: the ring V# last noted in the geometry header (its SGPR variables), valid until a label or a write to them / EXEC */
     u32 regions_var, t_regions_ptr_u64, t_ub_u32;
     u32 tex_var[G2S_MAX_TEX], tex_type[G2S_MAX_TEX], img_type[G2S_MAX_TEX];
     u32 in_pos, in_vid, in_iid, in_fragcoord, in_lid, in_wgid, in_frontface;
@@ -202,6 +206,28 @@ typedef struct {
     int no_contract;   /* native, nat_no_contract: every OpFMul gets NoContraction (GCN multiplies and adds round separately) */
     int count_slow;    /* E6 mem_slow_count */
 } SB;
+/* t154 experiments (both 0 = off, the SPIR-V as before; set once before any translation): g2s_gs_fc = function control of
+   the memory helpers in E6 ES / GS passes (2 = DontInline: are the slow geometry-pass compiles the helpers inlined at every
+   ring access?); g2s_gs_hoist = 1: the ring base in the geometry header is read once at the start of a GS pass / copy VS
+   instead of at every ring load (two helper calls less per load).
+   t159: g2s_gs_hoist is on by default (bench\results_t158gs: slowest geometry compiles 1.1-1.4 s -> 0.73-0.88 s, the passes'
+   GPU time 30-60% less, pictures unchanged; --gs-no-hoist: off). DontInline (--gs-noinline) stays off: compiles 0.3-0.4 s,
+   but the passes take 40% more GPU time than without it (60-130% more than with the hoist alone). */
+int g2s_gs_fc, g2s_gs_hoist = 1;
+/* t158: in ES / GS passes a ring store notes its V# in the geometry header; consecutive stores with unchanged V# registers
+   and EXEC note it once (the same words: 304 of the 386 memory-helper stores in the stranger scene's GS passes).
+   g2s_gs_notes_all = 1: every store (as before). */
+int g2s_gs_notes_all;
+/* t156: V_MOVRELS / V_MOVRELD (VGPR index + M0) through an array of the registers they may address, one access each.
+   Before, a read selected among and a write wrote every VGPR from the base up (the stranger scene's light-list compute
+   shader: 87 of them over up to 183 registers, 654,000 SPIR-V words, the slowest pipeline compile at 4.2 s).
+   g2s_movrel_sel = 1: the select chains (as before).
+   t157: the select chains are the default again. The array gives the same results on the CPU (tests/movrel_test.c), but
+   on the NVIDIA driver the replays' pictures changed slightly and the same way in every run (8 to 29 images in five of the
+   six captures, e.g. 8042's 0x234e68000 matched the PS4 with the chains and differed in 707 bytes with the array):
+   the driver compiles the two forms of the arithmetic differently. --movrel-array turns the array on (cold compile of
+   that shader 3.5 s less, same GPU time). */
+int g2s_movrel_sel = 1;
 
 static u32 nid(SB *s) { return ++s->id; }
 /* a variable with an initial value (t105 zero_regs); the constant is made first, so it precedes the variable */
@@ -270,12 +296,15 @@ static u32 gvar(SB *s, u32 ptrtype, u32 sc, int add_if) {
 }
 static void deco(SB *s, u32 id, u32 d, int n, const u32 *a) { u32 t[8]; t[0] = id; t[1] = d; for (int i = 0; i < n; i++) t[2 + i] = a[i]; sb_op(&s->deco, 71, n + 2, t); }
 static void mdeco(SB *s, u32 id, u32 m, u32 d, u32 v) { sb_op(&s->deco, 72, 4, (u32[]){id, m, d, v}); }
-static u32 label(SB *s) { u32 r = nid(s); sb_op(&s->code, 248, 1, (u32[]){r}); return r; }
-static void label_id(SB *s, u32 r) { sb_op(&s->code, 248, 1, (u32[]){r}); }
+static u32 label(SB *s) { u32 r = nid(s); sb_op(&s->code, 248, 1, (u32[]){r}); s->gsn_on = 0; return r; }
+static void label_id(SB *s, u32 r) { sb_op(&s->code, 248, 1, (u32[]){r}); s->gsn_on = 0; }
 static void br(SB *s, u32 t) { sb_op(&s->code, 249, 1, (u32[]){t}); }
 static void brc(SB *s, u32 c, u32 t, u32 f) { sb_op(&s->code, 250, 3, (u32[]){c, t, f}); }
 static u32 ld(SB *s, u32 type, u32 var) { return E1(61, type, var); }
-static void st(SB *s, u32 var, u32 val) { sb_op(&s->code, 62, 2, (u32[]){var, val}); }
+static void st(SB *s, u32 var, u32 val) {
+    sb_op(&s->code, 62, 2, (u32[]){var, val});
+    if (s->gsn_on && (var == s->gsn_var[0] || var == s->gsn_var[1] || var == s->gsn_var[2] || var == s->gsn_var[3] || var == s->sg[126] || var == s->sg[127])) s->gsn_on = 0;   /* t158 */
+}
 static u32 bc(SB *s, u32 type, u32 v) { return E1(124, type, v); }
 
 static void sb_init(SB *s, int native) {
@@ -300,6 +329,8 @@ static u32 sreg_var(SB *s, int r) {
 }
 static u32 vreg_var(SB *s, int r) {
     if (r < 0 || r >= 256) return 0;
+    if (s->vrel_lo1 && r >= s->vrel_lo1 - 1 && r - (s->vrel_lo1 - 1) < s->vrel_n)   /* t156: an element of the MOVREL array (a pointer made where it is used) */
+        return op1(s, &s->code, 65, s->t_pp_u32, 2, (u32[]){s->vrel_arr, cu(s, (u32)(r - (s->vrel_lo1 - 1)))});
     if (!s->vg[r]) s->vg[r] = s->zero_regs ? gvar_init(s, s->t_pp_u32, SC_Private, cu(s, 0)) : gvar(s, s->t_pp_u32, SC_Private, 1);
     return s->vg[r];
 }
@@ -408,7 +439,7 @@ static void emit_mem_helpers(SB *s) {
     /* u32 ld32(u64 addr): translate through the region table, then load */
     u32 t_fn_ld = ty(s, 33, 2, (u32[]){s->t_u32, s->t_u64});
     s->fn_ld32 = nid(s);
-    sb_op(&s->code, 54, 4, (u32[]){s->t_u32, s->fn_ld32, 0, t_fn_ld});
+    sb_op(&s->code, 54, 4, (u32[]){s->t_u32, s->fn_ld32, s->helper_fc, t_fn_ld});
     u32 p_addr = nid(s); sb_op(&s->code, 55, 2, (u32[]){s->t_u64, p_addr});
     label(s);
     u32 v_i = nid(s); sb_op(&s->code, 59, 3, (u32[]){t_pf_u32, v_i, SC_Function});
@@ -451,7 +482,7 @@ static void emit_mem_helpers(SB *s) {
     /* void st32(u64 addr, u32 v) */
     u32 t_fn_st = ty(s, 33, 4, (u32[]){s->t_void, s->t_u64, s->t_u32, s->t_u32});
     s->fn_st32 = nid(s);
-    sb_op(&s->code, 54, 4, (u32[]){s->t_void, s->fn_st32, 0, t_fn_st});
+    sb_op(&s->code, 54, 4, (u32[]){s->t_void, s->fn_st32, s->helper_fc, t_fn_st});
     u32 q_addr = nid(s); sb_op(&s->code, 55, 2, (u32[]){s->t_u64, q_addr});
     u32 q_val = nid(s); sb_op(&s->code, 55, 2, (u32[]){s->t_u32, q_val});
     u32 q_act = nid(s); sb_op(&s->code, 55, 2, (u32[]){s->t_u32, q_act});
@@ -610,7 +641,7 @@ static u32 atom_helper(SB *s, u32 spvop) {
     if (!s->t_fn_atom) s->t_fn_atom = ty(s, 33, 4, (u32[]){s->t_u32, s->t_u64, s->t_u32, s->t_u32});
     u32 t_fn = s->t_fn_atom;
     u32 fn = nid(s);
-    sb_op(&s->code, 54, 4, (u32[]){s->t_u32, fn, 0, t_fn});
+    sb_op(&s->code, 54, 4, (u32[]){s->t_u32, fn, s->helper_fc, t_fn});
     u32 pa = nid(s); sb_op(&s->code, 55, 2, (u32[]){s->t_u64, pa});
     u32 pv = nid(s); sb_op(&s->code, 55, 2, (u32[]){s->t_u32, pv});
     u32 pact = nid(s); sb_op(&s->code, 55, 2, (u32[]){s->t_u32, pact});
@@ -749,6 +780,10 @@ static void rec_addr_use(const SState *t, int lo, const AExp *a);   /* a relocat
 static void rec_set_aexp(const AExp *a); static int g_ss_last_ev = -1;   /* the read event the recorder just made */
 static Prov prov_mem(int ev, int d) { Prov p = {PK_MEM, 0, 0, 0}; if (ev < 0 || ev > 0xFFFF || d > 15) return PROV_T; p.b = (u16)ev; p.d = (u16)d; return p; }
 static int ss_read(const G2SIn *in, u64 a, u32 *out, u32 n) { return in->read && in->read(in->ctx, a, out, n); }
+/* t160: reads of shader code (the program and its fetch shader) are flagged for the caller's reader (g2s_rd_code): the
+   pipeline manifest records code by its location in the game's files, everything else by value */
+int g2s_rd_code;
+static int ss_read_code(const G2SIn *in, u64 a, u32 *out, u32 n) { g2s_rd_code = 1; int r = ss_read(in, a, out, n); g2s_rd_code = 0; return r; }
 /* executes scalar instruction I on t (only what is needed to know descriptors / fetch shader addresses) */
 static void ss_exec(const G2SIn *in, SState *t, const GInst *I) {
     u32 d = I->w0;
@@ -956,7 +991,7 @@ static const CodeEnt *code_get(const G2SIn *in) {
         if (!C->ins || C->addr != in->code_addr) continue;
         u32 nw = C->len / 4;
         if (nw > cap) { free(buf); cap = nw + 4096; buf = (u32 *)malloc(4ull * cap); if (!buf) { cap = 0; return 0; } }
-        if (ss_read(in, in->code_addr, buf, nw) && code_hash(buf, nw) == C->h) return C;
+        if (ss_read_code(in, in->code_addr, buf, nw) && code_hash(buf, nw) == C->h) return C;
         free(C->ins); C->ins = 0;   /* other code at this address now */
     }
     /* decode once (instruction by instruction, as the code length is only known at the end) */
@@ -967,7 +1002,7 @@ static const CodeEnt *code_get(const G2SIn *in) {
     if (C->ins) { free(C->ins); C->ins = 0; }
     C->nlp = 0;
     while (np < G2S_MAX_INST - 600) {
-        if (!ss_read(in, in->code_addr + ppc, w2, 2)) { if (!ss_read(in, in->code_addr + ppc, w2, 1)) break; w2[1] = 0; }
+        if (!ss_read_code(in, in->code_addr + ppc, w2, 2)) { if (!ss_read_code(in, in->code_addr + ppc, w2, 1)) break; w2[1] = 0; }
         GInst P; if (!g2s_decode1(w2, 2, ppc, &P)) break;
         P.desc = -1; P.fold = -1; P.ssx = (u8)ss_may_change(&P);
         ppc += 4u * P.n; pre[np++] = P;
@@ -995,7 +1030,7 @@ static const CodeEnt *code_get(const G2SIn *in) {
     C->n = np; C->len = ppc; C->addr = in->code_addr;
     u32 nw = ppc / 4;
     if (nw > cap) { free(buf); cap = nw + 4096; buf = (u32 *)malloc(4ull * cap); if (!buf) { cap = 0; free(C->ins); C->ins = 0; return 0; } }
-    if (!ss_read(in, in->code_addr, buf, nw)) { free(C->ins); C->ins = 0; return 0; }
+    if (!ss_read_code(in, in->code_addr, buf, nw)) { free(C->ins); C->ins = 0; return 0; }
     C->h = code_hash(buf, nw);
     return C;
 }
@@ -1071,7 +1106,7 @@ static int g2s_load(const G2SIn *in, G2SOut *out, GInst *ins, GDesc *descs, int 
                     if (fpc + 4 > in->fetch_bytes) { g2s_seterr(out, "native: fetch shader ended without S_SETPC_B64 at", fpc); return 0; }
                     buf[0] = in->fetch_code[fpc / 4]; buf[1] = fpc + 8 <= in->fetch_bytes ? in->fetch_code[fpc / 4 + 1] : 0;
                 } else
-                if (!ss_read(in, fa + fpc, buf, 2)) { g2s_seterr(out, "fetch shader not readable at", (u32)(fa + fpc)); return 0; }
+                if (!ss_read_code(in, fa + fpc, buf, 2)) { g2s_seterr(out, "fetch shader not readable at", (u32)(fa + fpc)); return 0; }
                 GInst F;
                 if (!g2s_decode1(buf, 2, 0x100000 + fpc, &F)) { g2s_seterr(out, "undecodable fetch instruction", buf[0]); return 0; }
                 F.desc = -1; F.fold = -1;
@@ -1608,6 +1643,19 @@ static int em_valu(EM *e, const GInst *I) {
         int nv = (int)(((e->in->rsrc1 & 0x3F) + 1) * 4); if (nv > 256) nv = 256;
         u32 m0 = ld(s, U, sreg_var(s, 124));
         u32 val;
+        if (s->vrel_lo1) {   /* t156: one array access (an index past the registers reads the base register / writes the sink) */
+            int lo = s->vrel_lo1 - 1;
+            if (rs && o.src[0] >= 256) { int b = (int)o.src[0] - 256;
+                u32 ix = E3(169, U, E2(176, s->t_bool, m0, cu(s, (u32)(nv - b))), E2(128, U, m0, cu(s, (u32)(b - lo))), cu(s, (u32)(b - lo)));
+                val = ld(s, U, op1(s, &s->code, 65, s->t_pp_u32, 2, (u32[]){s->vrel_arr, ix})); }
+            else val = vu(e, I, &o, 0);
+            if (rdst) { int b = (int)o.vdst;
+                u32 ix = E3(169, U, E2(176, s->t_bool, m0, cu(s, (u32)(nv - b))), E2(128, U, m0, cu(s, (u32)(b - lo))), cu(s, (u32)s->vrel_n));
+                u32 p = op1(s, &s->code, 65, s->t_pp_u32, 2, (u32[]){s->vrel_arr, ix});
+                u32 old = ld(s, U, p), act = E2(171, s->t_bool, rd_exec(s), cu(s, 0));
+                st(s, p, E3(169, U, act, val, old)); }
+            else vwrite_u(e, &o, val);
+            return 1; }
         if (rs && o.src[0] >= 256) {
             int b = (int)o.src[0] - 256; val = ld(s, U, vreg_var(s, b));
             for (int k = 1; b + k < nv; k++) val = E3(169, U, E2(170, s->t_bool, m0, cu(s, (u32)k)), ld(s, U, vreg_var(s, b + k)), val);
@@ -1717,7 +1765,7 @@ static int em_gs_ring(EM *e, const GInst *I, int store, int cnt) {
         if (mode == 1) ring_es = sw; else if (mode == 2) ring_gs = sw;
     } else if (mode == 2 || mode == 3) {
         u32 o = mode == 2 ? 0 : 8;
-        u32 hl = ld32(s, add64c(s, hb, cu(s, o))), hh = ld32(s, add64c(s, hb, cu(s, o + 4)));
+        u32 hl = s->gs_hl ? s->gs_hl : ld32(s, add64c(s, hb, cu(s, o))), hh = s->gs_hh ? s->gs_hh : ld32(s, add64c(s, hb, cu(s, o + 4)));   /* (t154: hoisted with g2s_gs_hoist) */
         u32 m = E2(167, B, E2(167, B, E2(170, B, w0, hl), E2(170, B, hi, hh)), E2(171, B, E2(197, U, hl, hh), cu(s, 0)));
         if (mode == 2) ring_es = m; else ring_gs = m;
     }
@@ -1728,11 +1776,17 @@ static int em_gs_ring(EM *e, const GInst *I, int store, int cnt) {
     u32 nroff = E2(128, U, voff, idxen ? E2(132, U, vidx, stride) : cu(s, 0));
     u32 structured = E2(171, B, stride, cu(s, 0)), in_idx = E2(176, B, vidx, nrec);
     u32 ex = rd_exec(s);
-    if (store) {   /* note the ring's base (and the GSVS V#'s shape for the copy VS) */
+    /* t158: a store right after another one with the same V# registers - no label (so the same path), no write to those
+       registers or to EXEC in between - would note the same words for the same lanes again: left out (g2s_gs_notes_all:
+       every store notes them, as before) */
+    int noted = store && !g2s_gs_notes_all && s->gsn_on && s->gsn_n == mode && s->gsn_var[0] == sreg_var(s, rs) && s->gsn_var[1] == sreg_var(s, rs + 1)
+                && s->gsn_var[2] == sreg_var(s, rs + 2) && s->gsn_var[3] == sreg_var(s, rs + 3);
+    if (store && !noted) {   /* note the ring's base (and the GSVS V#'s shape for the copy VS) */
         u32 nb = E3(169, U, isr, ex, cu(s, 0));
         if (mode == 1) { st32a(s, hb, w0, nb); st32a(s, add64c(s, hb, cu(s, 4)), hi, nb); }
         if (mode == 2) { st32a(s, add64c(s, hb, cu(s, 8)), w0, nb); st32a(s, add64c(s, hb, cu(s, 12)), hi, nb);
                          st32a(s, add64c(s, hb, cu(s, 16)), w1, nb); st32a(s, add64c(s, hb, cu(s, 20)), w3, nb); }
+        if (mode == 1 || mode == 2) { s->gsn_on = 1; s->gsn_n = mode; for (int q = 0; q < 4; q++) s->gsn_var[q] = sreg_var(s, rs + q); }
     }
     for (int k = 0; k < cnt; k++) {
         u32 ok_ = E2(128, U, voff, cu(s, (u32)(4 * k)));
@@ -2844,14 +2898,22 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
     /* translation cache: key = instruction words + resource shapes + stage parameters */
     {
         u64 h = 1469598103934665603ull;
-#define HM(v) do { h ^= (u64)(v); h *= 1099511628211ull; } while (0)
-        HM(in->stage); HM(in->rsrc1); HM(in->rsrc2); HM(in->ps_input_ena); HM(in->ps_input_addr); HM(in->ps_in_control);
-        HM(in->cs_threads[0]); HM(in->cs_threads[1]); HM(in->cs_threads[2]); HM(in->tex_binding_base); HM(in->fix_z); HM(in->n_user);
-        for (int i = 0; i < 32; i++) HM(in->ps_input_cntl[i]);
-        HM(in->exp_flags); HM(in->quad_branch_all); HM(in->max_shared); HM(in->zero_regs); HM(in->diag_salt); HM(in->helpers_auto); HM(in->no_tex_offsets); HM(in->fp_ctl); HM(in->exact_mad); HM(in->ps_early_z); HM(in->tess_mode); HM(in->tess_stride); HM(in->tess_ppt); HM(in->tess_cp); HM(in->tess_base); HM(in->tess_ocp); HM(in->tess_shared_max); HM(in->tess_tf_bytes); HM(in->sdata_binding); HM(in->allow_append); HM(in->no_bounds); HM(in->no_wave_sync); HM(in->no_structure); HM(in->dbg_pc); HM(in->dbg_regs); HM(in->nan_probe); HM(in->gs_mode); HM(in->gs_vpp); HM(in->gs_esgs_itemsize); HM(in->gs_maxv); HM(in->gs_wave_bytes); HM(in->gs_out_prim); HM(in->gs_base); HM(in->gs_ring_is); HM(in->gs_ring_es); HM(in->gs_ring_stride); for (int i = 0; i < nins; i++) HM(ins[i].fold);
-        for (int i = 0; i < nins; i++) { HM(ins[i].w0); HM(ins[i].enc == E_VOP3 || ins[i].n == 2 ? ins[i].w1 : 0); HM(ins[i].desc >= 0 ? e->bind_of_desc[ins[i].desc] : -1);
-            if (ins[i].desc >= 0 && (ins[i].enc == E_MUBUF)) { HM(descs[ins[i].desc].r[3] & 0x7FFFF); } }
-        for (int b = 0; b < out->ntex; b++) { HM(out->tex[b].tsharp[3] >> 28); HM(out->tex[b].is_int); HM(out->tex[b].storage); }
+        /* t154: the same key, and per group of inputs a hash of its own (g2s_key_parts: which inputs made two keys of one
+           shader differ) */
+        u64 kp[G2S_KP_N]; int kpi = 0; for (int q = 0; q < G2S_KP_N; q++) kp[q] = 1469598103934665603ull;
+#define HM(v) do { u64 v_ = (u64)(v); h ^= v_; h *= 1099511628211ull; kp[kpi] ^= v_; kp[kpi] *= 1099511628211ull; } while (0)
+        kpi = 0; HM(in->stage); HM(in->rsrc1); HM(in->rsrc2); kpi = 9; HM(in->ps_input_ena); HM(in->ps_input_addr); HM(in->ps_in_control);
+        kpi = 10; HM(in->cs_threads[0]); HM(in->cs_threads[1]); HM(in->cs_threads[2]); kpi = 0; HM(in->tex_binding_base); HM(in->fix_z); HM(in->n_user);
+        kpi = 9; for (int i = 0; i < 32; i++) HM(in->ps_input_cntl[i]);
+        kpi = 1; HM(in->exp_flags); HM(in->quad_branch_all); HM(in->max_shared); HM(in->zero_regs); HM(in->diag_salt); HM(in->helpers_auto); HM(in->no_tex_offsets); HM(in->fp_ctl); HM(in->exact_mad); HM(in->ps_early_z);
+        kpi = 2; HM(in->tess_mode); HM(in->tess_stride); HM(in->tess_ppt); HM(in->tess_cp); HM(in->tess_base); HM(in->tess_ocp); HM(in->tess_shared_max); HM(in->tess_tf_bytes);
+        kpi = 1; HM(in->sdata_binding); HM(in->allow_append); HM(in->no_bounds); HM(in->no_wave_sync); HM(in->no_structure); HM(in->dbg_pc); HM(in->dbg_regs); HM(in->nan_probe);
+        kpi = 2; HM(in->gs_mode); HM(in->gs_vpp); HM(in->gs_esgs_itemsize); HM(in->gs_maxv); HM(in->gs_wave_bytes); HM(in->gs_out_prim); HM(in->gs_base); HM(in->gs_ring_is); HM(in->gs_ring_es); HM(in->gs_ring_stride);
+        kpi = 3; u32 nfold_ = 0; for (int i = 0; i < nins; i++) { HM(ins[i].fold); if (ins[i].fold >= 0) nfold_++; }
+        for (int i = 0; i < nins; i++) { kpi = 4; HM(ins[i].w0); HM(ins[i].enc == E_VOP3 || ins[i].n == 2 ? ins[i].w1 : 0); kpi = 5; HM(ins[i].desc >= 0 ? e->bind_of_desc[ins[i].desc] : -1);
+            if (ins[i].desc >= 0 && (ins[i].enc == E_MUBUF)) { kpi = 6; HM(descs[ins[i].desc].r[3] & 0x7FFFF); } }
+        kpi = 7; for (int b = 0; b < out->ntex; b++) { HM(out->tex[b].tsharp[3] >> 28); HM(out->tex[b].is_int); HM(out->tex[b].storage); }
+        kpi = 8;
         /* t142: S_GETPC_B64 puts the shader's own address into the SPIR-V (PC-relative constant tables). Without the
            address in the key, an identical copy of a shader at another address got the first copy's SPIR-V and read
            its tables at the FIRST copy's address - freed and reused memory once that copy was unloaded (the black
@@ -2864,6 +2926,8 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
             for (int i = 0; i < in->native->nshape; i++) { HM(in->native->shape[i].binding); for (int k = 0; k < 8; k++) HM(in->native->shape[i].w[k]); } }
 #undef HM
         out->key = h;
+        for (int q = 0; q < G2S_KP_N; q++) g2s_kp[q] = kp[q];
+        g2s_kp_cnt[0] = (u32)nins; g2s_kp_cnt[1] = (u32)out->ntex; g2s_kp_cnt[2] = nfold_; g2s_kp_key = h; g2s_kp_fresh = 1;
         for (int c = g2s_cache_bypass ? -1 : g2s_cfind(h); c >= 0; c = -1) {
             out->spv = g2s_cache[c].spv; out->n = g2s_cache[c].n; out->cached = 1;
             out->vs_params = g2s_cache[c].vs_params; out->ps_mrt_mask = g2s_cache[c].mrt; out->ps_inputs = g2s_cache[c].inputs; out->uses_lds = g2s_cache[c].lds; out->structured = g2s_cache[c].structured; out->writes_mem = g2s_cache[c].wmem;
@@ -2941,6 +3005,18 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
     /* ---- module header ---- */
     sb_init(s, in->native != 0);
     s->zero_regs = in->zero_regs && !in->native;
+    if (!g2s_movrel_sel) {   /* t156: the registers V_MOVREL* may address, from the lowest base up to the program's VGPR count */
+        int lo = 256, nv = (int)(((in->rsrc1 & 0x3F) + 1) * 4); if (nv > 256) nv = 256;
+        for (int i = 0; i < nins; i++) { const GInst *I = &ins[i]; if (!g2s_starts(I->name, "V_MOVREL")) continue;
+            int rs_ = g2s_streq(I->name, "V_MOVRELS_B32") || g2s_streq(I->name, "V_MOVRELSD_B32"), rd_ = g2s_streq(I->name, "V_MOVRELD_B32") || g2s_streq(I->name, "V_MOVRELSD_B32");
+            VOps o_; em_vops(I, &o_);
+            if (rs_ && o_.src[0] >= 256 && (int)o_.src[0] - 256 < lo) lo = (int)o_.src[0] - 256;
+            if (rd_ && (int)o_.vdst < lo) lo = (int)o_.vdst; }
+        if (lo < nv) {
+            s->vrel_lo1 = lo + 1; s->vrel_n = nv - lo;
+            u32 t_arr = ty(s, 28, 2, (u32[]){s->t_u32, cu(s, (u32)(s->vrel_n + 1))});
+            u32 t_parr = ty_ptr(s, SC_Private, t_arr);
+            s->vrel_arr = s->zero_regs ? gvar_init(s, t_parr, SC_Private, cst(s, 46, t_arr, 0, 0)) : gvar(s, t_parr, SC_Private, 1); } }
     s->no_contract = (in->native && in->nat_no_contract) || in->exact_mad;
     sb_op(&s->caps, 17, 1, (u32[]){1});        /* Shader */
     if (!in->native) {   /* native mode needs neither (plain storage buffers, 32-bit offsets) */
@@ -2962,6 +3038,7 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
     s->stage = in->stage;
     s->nat = in->native;
     s->count_slow = in->mem_slow_count && !in->native;
+    s->helper_fc = !in->native && (in->gs_mode == 1 || in->gs_mode == 2) ? (u32)g2s_gs_fc : 0; s->gs_hl = s->gs_hh = 0; s->gsn_on = 0;   /* t154 experiments; t158 */
     if (s->nat) emit_native_mem_helpers(s); else emit_mem_helpers(s);
 
     /* push constants: user data, VS/CS at offset 0, PS at offset 64 */
@@ -3042,6 +3119,9 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
     u32 fn_main = nid(s);
     sb_op(&s->code, 54, 4, (u32[]){s->t_void, fn_main, 0, s->t_fn_void});
     label(s);
+    if (g2s_gs_hoist && !s->nat && (in->gs_mode == 2 || in->gs_mode == 3)) {   /* t154 experiment: the ring base noted in the header, once (entry block: dominates every use) */
+        u32 hb = cu64(s, in->gs_base + G2S_GS_HDR), o = in->gs_mode == 2 ? 0 : 8;
+        s->gs_hl = ld32(s, add64c(s, hb, cu(s, o))); s->gs_hh = ld32(s, add64c(s, hb, cu(s, o + 4))); }
     if (in->dbg_pc && in->stage == G2S_PS)   /* diagnostic: kept VGPRs, -7777.0 until the instruction runs */
         for (int k = 0; k < 4; k++) { e->dbg_var[k] = gvar(s, s->t_pp_u32, SC_Private, 1); st(s, e->dbg_var[k], cu(s, 0xC5F30800u)); }
     if (in->nan_probe && !s->nat) { s->nan_seen = gvar(s, s->t_pp_u32, SC_Private, 1); st(s, s->nan_seen, cu(s, 0)); nan_rec_make(e); }
@@ -3469,7 +3549,7 @@ done:
    (shader code, descriptor tables, folded constants) gets the previous result without decoding the shader again.
    The first translation records every memory range it read (and every "GPU-written?" answer); later calls only
    re-read those ranges and compare a hash. */
-typedef struct { u64 a; u32 n; u8 ok; u32 tag; u64 h; AExp x; u16 cmask; u8 full; u64 ch; } MRange;   /* tag: read group (0 = code, always compared); h: a code range's hash (code_hash_cached); x / cmask / full / ch: STATUS 78 */
+typedef struct { u64 a; u32 n; u8 ok; u32 tag; u64 h; AExp x; u16 cmask; u8 full; u16 dup1; u64 ch; } MRange;   /* t155: dup1 = 1 + an earlier tagged range of the same entry with the same address expression and size (0: none) */   /* tag: read group (0 = code, always compared); h: a code range's hash (code_hash_cached); x / cmask / full / ch: STATUS 78 */
 typedef struct { u64 a; u32 n; u8 r; AExp x; } MGw;
 typedef struct { u8 slot; u8 cnt; AExp x; } MRd;
 /* STATUS 78: a memo entry can be reused with other user data when the words that differ were only used as bases of
@@ -3488,6 +3568,7 @@ typedef struct MEnt { u64 key; int next, used; G2SIn in; void *outp; u32 outb; M
                       int unused_links;   /* (t107g's prev/prev2: moved to MLink, t107h) */
                       u16 udpass, cmpm; MSrc *src; u16 nsrc; MDc *dc; u16 ndc; MDi *di; u16 ndi;
                       u32 born; } MEnt;   /* born: g2s_memo_flip when recorded (t138 diagnostics) */
+u64 g2s_kp[G2S_KP_N], g2s_kp_key; u32 g2s_kp_cnt[4]; int g2s_kp_fresh;   /* t154: see gcn2spv.h */
 u32 g2s_memo_flip; int g2s_memo_last_kind; u32 g2s_memo_last_born;   /* t138: the renderer's flip count; the last lookup: 0 translated, 1 exact reuse, 2 relocated reuse; its entry's born */
 int g2s_memo_reloc = 1;   /* t107b: on by default (v2: descriptors pass into the result, offset terms; 320,172 reuses of the stranger-scene trace re-translated with no difference); --no-memo-reloc: exact-key reuse only */
 /* STATUS 60: 8192 entries were fewer than the station frame's ~10,300 shader setups; entries were evicted before their
@@ -3691,6 +3772,12 @@ void g2s_spv_flush(int force) {
 }
 void g2s_spv_stats(u64 *released, u64 *released_bytes, u64 *flushes) { *released = g_spv_rel_n; *released_bytes = g_spv_rel_bytes; *flushes = g_spv_flushes; }
 static u64 g_memo_m_new, g_memo_m_gw, g_memo_m_mem, g_memo_evict, g_memo_samekey_repl;
+static u64 g_mpath[8];   /* t155 (diagnostic): 0 exact-input entries found, 1 of them with other memory contents, 2 relocated from such an entry, 3 relocation attempts from other inputs, 4 of them reused */
+void g2s_memo_path_stats(u64 o[8]) { for (int i = 0; i < 8; i++) o[i] = g_mpath[i]; }
+static u64 g_memo_full;   /* t154: translations the memo could not reuse at all (exact or relocated): run in full */
+u64 g2s_memo_full(void) { return g_memo_full; }
+static u64 g_memo_nokeep[6];   /* t154: full translations whose result was not kept (see g2s_translate) */
+void g2s_memo_nokeep(u64 out6[6]) { for (int i = 0; i < 6; i++) out6[i] = g_memo_nokeep[i]; }
 u64 g2s_memo_samekey_repl(void) { return g_memo_samekey_repl; }   /* misses: no entry for these inputs / a "GPU-written?" answer changed / memory changed; entries evicted */
 void g2s_memo_why(u64 *nokey, u64 *gw, u64 *mem, u64 *evict) { *nokey = g_memo_m_new; *gw = g_memo_m_gw; *mem = g_memo_m_mem; *evict = g_memo_evict; }
 /* STATUS 78 counters: relocated reuses; relocation attempts that failed (no candidate / readability / content / GPU-written
@@ -3860,6 +3947,17 @@ static void rec_res_list(const GInst *ins, int nins, const GDesc *descs, const i
         MDi *d = &g_rec->di[g_rec->ndi++]; d->si = g_rec->dsi[I->desc]; d->kind = kind; d->bind = bind;
     }
 }
+static int aexp_same(const AExp *p, const AExp *q) {
+    return p->kind == q->kind && p->himask12 == q->himask12 && p->b == q->b && p->d == q->d && p->dl == q->dl && p->off == q->off && p->abs == q->abs
+        && p->okind == q->okind && p->od == q->od && p->ob == q->ob && p->omul == q->omul;
+}
+/* t155: tagged ranges that repeat an earlier one (half of the reads of a relocated reuse in the stranger scene: the same
+   table entry loaded again) are marked, so a reuse reads each address once (memo_reloc_try, memo_hash) */
+static void memo_mark_dups(MRange *rg, int nrg) {
+    for (int k = 0; k < nrg; k++) { rg[k].dup1 = 0; if (!rg[k].tag) continue;
+        for (int j = k > 128 ? k - 128 : 0; j < k; j++) if (rg[j].tag && !rg[j].dup1 && rg[j].n == rg[k].n && rg[j].ok == rg[k].ok && rg[j].a == rg[k].a && aexp_same(&rg[j].x, &rg[k].x)) { rg[k].dup1 = (u16)(j + 1); break; } }
+}
+int g2s_memo_nodups;   /* t155 test: 1 = every range read (before t155) */
 static int memo_rd(void *ctx, u64 a, u32 *o, u32 n) {
     MRec *R = (MRec *)ctx; int ok = R->orig->read && R->orig->read(R->orig->ctx, a, o, n); u32 tag = g_ss_tag;
     AExp x; if (R->has_cur && tag) { x = R->cur; } else { x.kind = PK_TAINT; x.abs = a; x.off = 0; x.dl = 0; x.b = x.d = 0; x.himask12 = 0; x.okind = 0; x.od = 0; x.ob = 0; x.omul = 0; }
@@ -3955,6 +4053,7 @@ static u64 memo_hash(const G2SIn *in, const MRange *rg, int nrg, u32 rel, int pa
     u64 h = 1469598103934665603ull;
     for (int i = 0; i < nrg; i++) {
         if (part && (part == 1) != (!rg[i].tag && code_in_window(rg[i].a, rg[i].n))) continue;
+        if (rg[i].dup1 && !g2s_memo_nodups && rg[rg[i].dup1 - 1].tag == rg[i].tag) continue;   /* t155: the same memory as an earlier range (read once) */
         if (rg[i].n > cap) { free(buf); cap = rg[i].n + 1024; buf = (u32 *)malloc(4ull * cap); if (!buf) { cap = 0; return ~0ull; } }
         int ok = in->read && in->read(in->ctx, rg[i].a, buf, rg[i].n);
         if (ok != rg[i].ok) return ~0ull;
@@ -3988,16 +4087,36 @@ static u64 memo_key_cfg(const G2SIn *in) {
     return mh_words(h, (const u32a *)((const char *)in + G2SIN_UD_HI), (u32)((sizeof(G2SIn) - G2SIN_UD_HI) / 4));
 }
 static u64 memo_key3(u64 kc, const G2SIn *in, u16 m) {
-    u64 h = kc ^ 0x5BD1E9955BD1E995ull;
-    for (int q = 0; q < 16; q++) if ((m >> q) & 1) { h ^= (u64)in->user_data[q] + ((u64)q << 32); h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+    /* t155: the selected words two at a time (half the multiply chain of one word per step; the mask, mixed in first,
+       says which words they are) */
+    u64 h = (kc ^ 0x5BD1E9955BD1E995ull) + ((u64)m << 40); h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29;
+    u32 w[16]; int n = 0;
+    for (u32 mm = m; mm; mm &= mm - 1) w[n++] = in->user_data[__builtin_ctz(mm)];
+    int q = 0;
+    for (; q + 1 < n; q += 2) { h ^= (u64)w[q] | ((u64)w[q + 1] << 32); h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+    if (q < n) { h ^= (u64)w[q] | (0xA5A5A5A5ull << 32); h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
     return h;
 }
 static int memo_same_cfg(const G2SIn *a, const G2SIn *b) {
     const unsigned char *p = (const unsigned char *)a, *q = (const unsigned char *)b;
-    for (size_t i = 0; i < G2SIN_UD_LO; i++) if (p[i] != q[i]) return 0;
+    { const u32a *x = (const u32a *)p, *y = (const u32a *)q; u32 d = 0; for (size_t i = 0; i < G2SIN_UD_LO / 4; i++) d |= x[i] ^ y[i]; if (d) return 0; }   /* (t155: words, not bytes) */
     const u32a *x = (const u32a *)(p + G2SIN_UD_HI), *y = (const u32a *)(q + G2SIN_UD_HI); u32 d = 0;
     for (size_t i = 0; i < (sizeof(G2SIn) - G2SIN_UD_HI) / 4; i++) d |= x[i] ^ y[i];
     return d == 0;
+}
+/* t155: memo_key_cfg hashes ~390 bytes per lookup; the hash of each recent configuration is kept in a small table
+   (direct-mapped by shader address and stage), and a lookup that finds the same bytes there takes it (a compare is
+   several times cheaper than the hash). The bytes are compared in full, so the result is the same as hashing. */
+typedef struct { u64 kc; G2SIn cfg; int used; } KcEnt;
+enum { KC_N = 1024 };
+static KcEnt *g_kc; int g2s_memo_nokc;   /* g2s_memo_nokc (test): 1 = hashed every time */
+static u64 memo_key_cfg_cached(const G2SIn *in) {
+    if (g2s_memo_nokc) return memo_key_cfg(in);
+    if (!g_kc) { g_kc = (KcEnt *)calloc(KC_N, sizeof(KcEnt)); if (!g_kc) { g2s_memo_nokc = 1; return memo_key_cfg(in); } }
+    KcEnt *c = &g_kc[(u32)((((in->code_addr >> 8) ^ ((u64)in->stage << 40) ^ ((u64)in->gs_mode << 44) ^ ((u64)in->tess_mode << 48)) * 0x9E3779B97F4A7C15ull) >> 54) & (KC_N - 1)];
+    if (c->used && memo_same_cfg(&c->cfg, in)) return c->kc;
+    u64 kc = memo_key_cfg(in); c->cfg = *in; c->kc = kc; c->used = 1;
+    return kc;
 }
 static int memo_same_in(const G2SIn *a, const G2SIn *b) {
     const u64a *p = (const u64a *)a, *q = (const u64a *)b; u64 d = 0;
@@ -4068,9 +4187,15 @@ static int memo_reloc_try(MEnt *E, const G2SIn *in, G2SOut *out) {
             if (!code_ok) { g_memo_rl_code++; return 0; }
             continue;
         }
+        int ok;
+        if (g->dup1 && !g2s_memo_nodups) {   /* t155: the address and size of an earlier range: its values (read moments ago) */
+            int j = g->dup1 - 1; ok = g->ok;   /* (range j was read with this readability, or the reuse has failed already) */
+            typedef struct { u32 w[16]; } V16_; if (ok) *(V16_ *)vals[k] = *(const V16_ *)vals[j];   /* (all 16: one block copy) */
+        } else {
         u64 a; if (!aexp_eval(&g->x, in, E->rg, E->nrg, vals, valok, &a)) { g_memo_rl_eval++; return 0; }
-        int ok = in->read && in->read(in->ctx, a, vals[k], g->n);
+        ok = in->read && in->read(in->ctx, a, vals[k], g->n);
         if ((u8)ok != g->ok) { g_memo_rl_read++; return 0; }
+        }
         if (!ok) continue;
         valok[k] = 1;
         if ((g->full || g->cmask) && range_content_hash(vals[k], g->n, g->cmask, g->full) != g->ch) { g_memo_rl_content++;
@@ -4108,6 +4233,21 @@ void g2s_memo_flush(void) {
     g_memo_clock = 0;
     if (g_cfgm) for (int i = 0; i < CFG_N; i++) g_cfgm[i].kc = 0;
 }
+#ifdef G2S_MEMO_STATS   /* t155 (offline harness): what relocated reuses go through, weighted by use */
+static u32 g_dbg_use[MEMO_N];
+void g2s_memo_dbg_stats(void) {
+    extern int printf(const char *, ...);
+    double w = 0, nrg = 0, tag = 0, dup = 0, gw = 0, dc = 0, fx = 0, rd = 0, src = 0, di = 0, rdw = 0, gwdup = 0;
+    for (int i = 0; i < MEMO_N; i++) { MEnt *E = &g_memo[i]; u32 u = g_dbg_use[i]; if (!u || !E->rg) continue;
+        int nt = 0, nd = 0, ndw = 0, ngd = 0;
+        for (int k = 0; k < E->nrg; k++) { const MRange *a = &E->rg[k]; if (!a->tag) continue; nt++; ndw += a->n;
+            for (int q = 0; q < k; q++) { const MRange *b = &E->rg[q]; if (b->tag && b->n == a->n && b->x.kind == a->x.kind && b->x.b == a->x.b && b->x.d == a->x.d && b->x.dl == a->x.dl && b->x.off == a->x.off && b->x.okind == a->x.okind && b->x.ob == a->x.ob && b->x.od == a->x.od && b->x.omul == a->x.omul && b->x.himask12 == a->x.himask12) { nd++; break; } } }
+        for (int k = 0; k < E->ngw; k++) for (int q = 0; q < k; q++) if (E->gw[q].n == E->gw[k].n && E->gw[q].x.kind == E->gw[k].x.kind && E->gw[q].x.b == E->gw[k].x.b && E->gw[q].x.d == E->gw[k].x.d && E->gw[q].x.off == E->gw[k].x.off && E->gw[q].x.dl == E->gw[k].x.dl) { ngd++; break; }
+        w += u; nrg += (double)u * E->nrg; tag += (double)u * nt; dup += (double)u * nd; rdw += (double)u * ndw; gw += (double)u * E->ngw; gwdup += (double)u * ngd; dc += (double)u * E->ndc; fx += (double)u * E->nfx; rd += (double)u * E->nrd; src += (double)u * E->nsrc * 12; di += (double)u * E->ndi; }
+    if (w) printf("  relocated reuses (t155 stats, per reuse): ranges %.1f (tagged %.1f, %.1f dwords; tagged ranges equal to an earlier one %.1f), GPU-written questions %.1f (equal to an earlier one %.1f), descriptor checks %.1f, fold addresses %.1f, read ranges %.1f, sources %.1f, descriptor rebuilds %.1f\n",
+        nrg / w, tag / w, rdw / w, dup / w, gw / w, gwdup / w, dc / w, fx / w, rd / w, src / w, di / w);
+}
+#endif
 u64 g2s_memo_skip_addr;   /* t141 (diagnostic): the shader at this address is translated without the memo (same key, cached SPIR-V) */
 int g2s_translate(const G2SIn *in0, G2SOut *out) {
     /* t107b: user-data words past n_user are never read by the translation, but callers pass all 16 SPI user-data
@@ -4126,12 +4266,12 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
         if (!g_memo || !g_memo_head || !g_memo_head2 || !g_ml) { free(g_memo); free(g_memo_head); free(g_memo_head2); free(g_ml); g_memo = 0; g_memo_head = 0; g_memo_head2 = 0; g_ml = 0; return g2s_translate_full(in, out); }
         for (int i = 0; i < MEMO_B; i++) { g_memo_head[i] = -1; g_memo_head2[i] = -1; }
     }
-    u64 kc = memo_key_cfg(in), key = memo_key3(kc, in, 0xFFFF); int b = (int)(key & (MEMO_B - 1)); int why = 0;   /* t107b: one hash of the configuration, then the user data mixed in */
+    u64 kc = memo_key_cfg_cached(in), key = memo_key3(kc, in, 0xFFFF); int b = (int)(key & (MEMO_B - 1)); int why = 0;   /* t107b: one hash of the configuration, then the user data mixed in */
     for (int i = g_memo_head[b]; i >= 0; i = g_ml[i].next) {
         if (g_ml[i].key != key) continue;
         MEnt *E = &g_memo[i];
         if (!memo_same_in(&E->in, in)) continue;
-        int same = 1; g_memo_chk++;
+        int same = 1; g_memo_chk++; g_mpath[0]++;
         for (int k = 0; k < E->ngw && same; k++) same = (in->gpu_written ? in->gpu_written(in->ctx, E->gw[k].a, E->gw[k].n) != 0 : 0) == E->gw[k].r;
         if (!same) { why |= 1; continue; }
         u64 ep = g_memo_ep;
@@ -4139,9 +4279,9 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
         if (E->ep != ep) for (int k = 0; k < E->nrg && code_ok; k++) { const MRange *r = &E->rg[k];
             if (!r->tag && code_in_window(r->a, r->n)) code_ok = code_hash_cached(in, r->a, r->n) == r->h; }
         if (!code_ok || memo_hash(in, E->rg, E->nrg, E->rel, 2) != E->vh) {
-            why |= 2;
+            why |= 2; g_mpath[1]++;
             /* STATUS 78: the same inputs, but a table the pre-pass read holds other pointers now: replay with relocation */
-            if (g2s_memo_reloc && !E->noreloc && memo_reloc_try(E, in, out)) { E->used = 1; g_memo_hit++; g2s_memo_last_kind = 2; g2s_memo_last_born = E->born; g_memo_hit_reloc++; g_memo_last_reloc = 1; if (g2s_memo_verify) memo_verify(in, out, E); g_memo_last_reloc = 0; return 1; }
+            if (g2s_memo_reloc && !E->noreloc && memo_reloc_try(E, in, out)) { g_mpath[2]++; E->used = 1; g_memo_hit++; g2s_memo_last_kind = 2; g2s_memo_last_born = E->born; g_memo_hit_reloc++; g_memo_last_reloc = 1; if (g2s_memo_verify) memo_verify(in, out, E); g_memo_last_reloc = 0; return 1; }
         }
         else {
             if (E->ep == ep) g_memo_code_skips++; else E->ep = ep;
@@ -4166,8 +4306,11 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
                 if (!sameud || !memo_same_cfg(&E->in, in)) continue;
                 found = 1;
                 if (++tries > 6) break;   /* t107b: a few candidates (most recently used first) */
-                g_memo_rl_try++;
-                if (memo_reloc_try(E, in, out)) {
+                g_memo_rl_try++; g_mpath[3]++;
+                if (memo_reloc_try(E, in, out)) { g_mpath[4]++;
+#ifdef G2S_MEMO_STATS
+                    g_dbg_use[i]++;
+#endif
                     E->used = 1; g_memo_hit++; g_memo_hit_reloc++; g_memo_last_reloc = 1; g2s_memo_last_kind = 2; g2s_memo_last_born = E->born; if (g2s_memo_verify) memo_verify(in, out, E); g_memo_last_reloc = 0;
                     if (prev >= 0) {   /* to the front of its chain */
                         MLink *L = &g_ml[i];
@@ -4193,13 +4336,24 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
     R.orig = in;
     G2SIn rin = *in; rin.read = memo_rd; rin.gpu_written = in->gpu_written ? memo_gw : 0; rin.ctx = &R;
     u64 ep = g_memo_ep;   /* the epoch the translation read the code in */
-    g_rec = &R;
+    g_rec = &R; g_memo_full++;
     int ok = g2s_translate_full(&rin, out);
     g_rec = 0;
+    /* t154: why a full translation's result is not kept for reuse (0 failed, 1 the translation cache was full, 2 the
+       recorder ran out of memory; 3-5 below) */
+    if (!ok) g_memo_nokeep[0]++; else if (!out->cached) g_memo_nokeep[1]++; else if (R.overflow) g_memo_nokeep[2]++;
     if (ok && out->cached && !R.overflow) {
         u32 rel = g_ss_rel;
+        memo_mark_dups(R.rg, R.nrg);   /* t155 (before the hash: memo_hash reads each address once) */
         u64 vh = memo_hash(in, R.rg, R.nrg, rel, 2), vhc = 0;
-        for (int k = 0; k < R.nrg; k++) if (!R.rg[k].tag && code_in_window(R.rg[k].a, R.rg[k].n)) { R.rg[k].h = code_hash_cached(in, R.rg[k].a, R.rg[k].n); if (R.rg[k].h >= ~0ull - 1) vhc = ~0ull; }
+        for (int k = 0; k < R.nrg; k++) if (!R.rg[k].tag && code_in_window(R.rg[k].a, R.rg[k].n)) { R.rg[k].h = code_hash_cached(in, R.rg[k].a, R.rg[k].n); if (R.rg[k].h >= ~0ull - 1) vhc = ~0ull;
+#ifdef G2S_NOKEEP_DEBUG   /* t154 (offline harness): the range that kept a result from being stored */
+            if (R.rg[k].h >= ~0ull - 1) { extern int printf(const char *, ...); static int nd; if (nd++ < 200) printf("NOKEEP code-hash: stage %d code %llx range %llx +%u dwords ok %u (range %d of %d)\n", in->stage, (unsigned long long)in->code_addr, (unsigned long long)R.rg[k].a, R.rg[k].n, R.rg[k].ok, k, R.nrg); }
+#endif
+        }
+#ifdef G2S_NOKEEP_DEBUG
+        if (vh == ~0ull) { extern int printf(const char *, ...); static int nd2; if (nd2++ < 200) printf("NOKEEP readability: stage %d code %llx\n", in->stage, (unsigned long long)in->code_addr); }
+#endif
         /* STATUS 78: content hashes of the tagged ranges (the masks are final now); a code range outside the window cannot be relocated */
         for (int k = 0; k < R.nrg && !R.noreloc; k++) { MRange *g = &R.rg[k];
             if (!g->tag) { if (!code_in_window(g->a, g->n)) { R.noreloc = 1; R.why = "code outside the window"; } continue; }
@@ -4207,7 +4361,9 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
             if (g->ok && (g->full || g->cmask)) { static u32 cb[16]; if (g->n > 16 || !in->read || !in->read(in->ctx, g->a, cb, g->n)) { R.noreloc = 1; R.why = "range not re-readable"; break; } g->ch = range_content_hash(cb, g->n, g->cmask, g->full); } }
         if (R.nfx != out->nfold) { R.noreloc = 1; R.why = "fold expressions incomplete"; }
         void *ob = 0; u32 obn = 0;
-        if (vh != ~0ull && vhc != ~0ull && (ob = memo_out_pack(out, &obn)) != 0) {   /* (t113: no memory for the packed result: not kept) */
+        if (vh == ~0ull) g_memo_nokeep[3]++; else if (vhc == ~0ull) g_memo_nokeep[4]++;   /* t154: memory not re-readable / code hash failed */
+        if (vh != ~0ull && vhc != ~0ull && (ob = memo_out_pack(out, &obn)) == 0) g_memo_nokeep[5]++;   /* t154: no memory for the packed result */
+        if (vh != ~0ull && vhc != ~0ull && ob != 0) {   /* (t113: no memory for the packed result: not kept) */
             code_mark(R.rg, R.nrg);
             /* pick a slot: t107h: when MEMO_SAMEKEY entries with this exact key exist already (same inputs, other memory
                contents: each one failed for this setup), the oldest of them is replaced - otherwise every lookup of

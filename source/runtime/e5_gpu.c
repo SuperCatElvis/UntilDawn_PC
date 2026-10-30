@@ -37,6 +37,7 @@ static u64 g_op_n[256], g_op_dw[256];
 static u64 g_t0_packets, g_t2_packets, g_bad_streams;
 static u8 g_reg_ctx[0x400], g_reg_sh[0x400], g_reg_cfg[0x1000], g_reg_ucfg[0x4000];
 static u64 g_stall_at; static u32 g_stall_ms;
+static int g_rwd_secs = 120; static volatile u64 g_rwd_prog;   /* t156: replay watchdog (--replay-watchdog S, 0 = off) */
 static u64 g_submits, g_flips, g_dcb_bytes, g_ccb_bytes, g_ib_follow, g_ib_bad;
 static u64 g_draws, g_dispatches, g_label_writes, g_label_skipped, g_eop_irqs, g_dingdongs, g_compute_dw;
 static u64 g_hle_calls[32];
@@ -832,7 +833,7 @@ static SYSV int vo_open(int user, int bus, int index, void *param) {
     TRACE("sceVideoOutOpen", user, bus, index); (void)param;
     say("\n>>> sceVideoOutOpen: display opened (E4's end point)\n");
     g_vo_t0 = plat_ticks();
-    if (g_opt_window) { plat_window_open(); vkr_init(); plat_pad_start(); }   /* controllers: STATUS 49 */
+    if (g_opt_window) { plat_window_open(); vkr_init(); plat_pad_start(); prep_run(); }   /* controllers: STATUS 49; t159: shader preparation, before the game's first screen */
     update_window_text();
     return 1;
 }
@@ -1337,6 +1338,68 @@ static void prof_start(void) {
     { char en[260]; u64 eb = plat_module_of((u64)(void *)prof_start, en, sizeof en);   /* our exe's extent (SizeOfImage) */
       if (eb) { u32 lf = *(const u32 *)(eb + 0x3C); g_prof_exe_lo = eb; g_prof_exe_hi = eb + *(const u32 *)(eb + lf + 0x50); } }
     pt_create(prof_thread, 0, 0x40000); }
+/* t156: replay watchdog. A replay that makes no progress (no capture record read, no pipeline compile finished) for
+   --replay-watchdog seconds (120 by default) reports where the replay thread and every pipeline compiler thread are -
+   the instruction (module+offset; exe+offset is named by UntilDawn.map) and the first return addresses into our exe on
+   its stack - then ends the program with exit code 5, so the benchmark script runs the replay again instead of waiting
+   for someone to close it. A replay has no game threads, so the stall report of play (stall_watch) never runs there. */
+static void *g_rwd_main; static u64 g_rwd_exe_lo, g_rwd_exe_hi;
+static void rwd_where(u64 a) {
+    if (a >= g_rwd_exe_lo && a < g_rwd_exe_hi) { say("exe+"); say_hex(a - g_rwd_exe_lo); return; }
+    char nm[260]; u64 b = plat_module_of(a, nm, sizeof nm);
+    if (!b) { say_hex(a); return; }
+    const char *base = nm; for (const char *q = nm; *q; q++) if (*q == '\\' || *q == '/') base = q + 1;
+    say(base); say("+"); say_hex(a - b);
+}
+static void rwd_one(const char *name, int ix, void *h) {
+    static __attribute__((aligned(16))) u8 ctx[1232]; u64 ret[12]; int nr = 0;
+    say("  ["); say(name); if (ix >= 0) say_dec(ix); say("]");
+    if (!h) { say(" (no handle)\n"); return; }
+    for (u64 z = 0; z < 0x40; z++) ctx[z] = 0;
+    *(u32 *)(ctx + 0x30) = 0x100001;           /* CONTEXT_CONTROL */
+    if (SuspendThread(h) == 0xFFFFFFFFu) { say(" (could not pause it)\n"); return; }
+    int ok = GetThreadContext(h, ctx);
+    u64 rip = *(u64 *)(ctx + 0xF8), rsp = *(u64 *)(ctx + 0x98);
+    if (ok && rsp && !(rsp & 7)) {   /* (read while it is paused: the stack cannot change under us) */
+        struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
+        if (VirtualQuery((const void *)rsp, &mi, sizeof mi) == sizeof mi && mi.state == 0x1000 && !(mi.prot & 0x101)) {
+            u64 end = mi.base + mi.size, nq = end > rsp ? (end - rsp) / 8 : 0; if (nq > 8192) nq = 8192;
+            const u64 *sp = (const u64 *)rsp;
+            for (u64 q = 0; q < nq && nr < 12; q++) { u64 v = sp[q];
+                if (v > g_rwd_exe_lo + 0x1006 && v < g_rwd_exe_hi) { const u8 *c = (const u8 *)v;
+                    if (c[-5] == 0xE8 || (c[-6] == 0xFF && (c[-5] == 0x15 || (c[-5] & 0xF8) == 0x90)) || (c[-2] == 0xFF && (c[-1] & 0xF8) == 0xD0) || (c[-3] == 0xFF && (c[-2] & 0xF8) == 0x50)) ret[nr++] = v; } } } }
+    ResumeThread(h);
+    if (!ok) { say(" (no context)\n"); return; }
+    say(" at "); rwd_where(rip); say("\n    returns into our code:");
+    for (int k = 0; k < nr; k++) { say(" "); rwd_where(ret[k]); }
+    say(nr ? "\n" : " (none found)\n");
+}
+static void rwd_thread(void *arg) {
+    (void)arg; u64 last = ~0ull, since = plat_ticks(), f = plat_ticks_per_sec();
+    for (;;) {
+        plat_sleep_ms(1000);
+        u64 now = plat_ticks(), p = g_rwd_prog + (u64)__atomic_load_n(&g_pj_done, __ATOMIC_ACQUIRE);
+        if (p != last) { last = p; since = now; continue; }
+        if ((now - since) / f < (u64)g_rwd_secs) continue;
+        say("\n>>> replay watchdog (t156): no progress for "); say_dec(g_rwd_secs); say(" s - where the replay is:\n");
+        say("  pipeline jobs queued "); say_dec((i64)g_pj_queued); say(", taken "); say_dec((i64)g_pj_claimed); say(", finished "); say_dec((i64)g_pj_done);
+        say("; capture records read "); say_dec((i64)g_rwd_prog); say("\n");
+        rwd_one("replay thread", -1, g_rwd_main);
+        for (int i = 0; i < g_pj_threads && i < PJOB_THREADS_MAX; i++) rwd_one("pipeline compiler ", i, g_pj_th[i]);
+        say(">>> end of watchdog report: the replay is ended (exit code 5)\n");
+        vl("  replay watchdog (t156): no progress for "); vl_d(g_rwd_secs); vl(" s; the replay was ended (report in the console output)\n");
+        plat_log_flush(0, 5000, 1);
+        TerminateProcess((void *)(intptr_t)-1, 5);
+        return;
+    }
+}
+static void rwd_start(void) {
+    if (g_rwd_secs <= 0 || g_rwd_main) return;
+    { char en[260]; u64 eb = plat_module_of((u64)(void *)rwd_start, en, sizeof en);
+      if (eb) { u32 lf = *(const u32 *)(eb + 0x3C); g_rwd_exe_lo = eb; g_rwd_exe_hi = eb + *(const u32 *)(eb + lf + 0x50); } }
+    g_rwd_main = pt_self_handle();
+    pt_create(rwd_thread, 0, 0x40000);
+}
 /* t115: --profile-replay (called by the replay from its second repeat to the last) */
 static void prof_replay_begin(void) {
     if (g_opt_profile != 3 || g_prof_x) return;

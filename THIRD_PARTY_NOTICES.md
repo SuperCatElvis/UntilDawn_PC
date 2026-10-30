@@ -5,7 +5,7 @@
 ## What the release contains
 
 `UntilDawn.exe` and `compat\ud_compat.exe` are built from this project's own source code ([source/](source/README.md);
-from WIP 0.2.1 on — for earlier releases see [below](#earlier-releases-wip-012--020)).
+from v0.2.1 on — for earlier releases see [below](#earlier-releases-wip-012--020)).
 They link only against libraries that are part of Windows (`kernel32`, `user32`, `gdi32`, `winmm`, `msvcrt`). At run
 time they load, from your own system:
 
@@ -101,7 +101,7 @@ The executables of WIP 0.1.2 to WIP 0.2.0 also contained:
 - three very small GPU programs from the game (228 bytes in total) and 2,565 engine class names (used only by a
   developer diagnostic).
 
-From WIP 0.2.1 these are no longer part of the program (see above). Those releases also contain the Microsoft
+From v0.2.1 these are no longer part of the program (see above). Those releases also contain the Microsoft
 tessellator code and the Khronos headers described above, under the same notices.
 
 The complete source code of WIP 0.1.3, 0.1.4, 0.1.5 and 0.2.0 (the exact code each release was built from, with build

@@ -223,6 +223,21 @@ int g2s_exports(const u32 *code, u32 ndw);   /* export target kinds, for offline
 void g2s_memo_stats(u64 *hit, u64 *miss, u64 *checks);
 void g2s_mem_stats(u64 *memo_used, u64 *memo_bytes, u64 *spv_n, u64 *spv_bytes, u64 *memo_at);   /* t110: translator memory (memory report) */
 void g2s_memo_why(u64 *nokey, u64 *gw, u64 *mem, u64 *evict);   /* why setups were translated in full (counts) */
+/* t154: the last key computed by a translation that was not an exact memo reuse: per group of inputs a hash of its own
+   (0 stage registers, 1 options, 2 tessellation / geometry, 3 per-draw data slots of scalar loads, 4 instruction words,
+   5 texture binding of each instruction, 6 buffer formats, 7 texture kinds, 8 other, 9 pixel-shader input registers,
+   10 compute thread counts) and counts (instructions, textures,
+   scalar loads read from per-draw data); g2s_kp_fresh is set to 1 each time (the caller clears it) */
+enum { G2S_KP_N = 11 };
+extern int g2s_gs_fc, g2s_gs_hoist;   /* t154 experiments (see gcn2spv.c) */
+extern int g2s_gs_notes_all;
+extern int g2s_rd_code;   /* t160: 1 while the translator reads shader code (program, fetch shader) through G2SIn.read */   /* t158: every ES / GS ring store notes its V# (as before t158) */
+extern int g2s_movrel_sel;   /* t156: 1 = V_MOVREL* as select chains over the registers (as before) */
+extern u64 g2s_kp[G2S_KP_N], g2s_kp_key; extern u32 g2s_kp_cnt[4]; extern int g2s_kp_fresh;
+void g2s_memo_path_stats(u64 o[8]);   /* t155: exact-input entries found / with other memory / relocated from them; relocation attempts from other inputs / reused */
+extern int g2s_memo_nodups, g2s_memo_nokc;   /* t155 test: 1 = repeated memo read ranges read again (as before t155) */
+u64 g2s_memo_full(void);   /* t154: setups translated in full (neither an exact nor a relocated reuse) */
+void g2s_memo_nokeep(u64 out6[6]);   /* t154: full translations not kept for reuse: failed, translation cache full, recorder out of memory, memory not re-readable, code hash failed, no memory to pack */
 void g2s_memo_epoch(void);                  /* a new game submit: recorded code ranges are hashed again at their next use */
 void g2s_memo_wrote(u64 lo, u64 hi);        /* our side wrote [lo, hi) of game memory (ends the epoch if it holds recorded code) */
 void g2s_memo_code_stats(u64 *skips, u64 *ep_writes, u64 *ep);

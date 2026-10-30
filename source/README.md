@@ -3,7 +3,7 @@
 This folder holds the complete source of the programs: `UntilDawn.exe` (the Windows runtime, the PS4 compatibility
 layer, the Vulkan renderer and the GCN → SPIR-V shader translator) and `compat\ud_compat.exe` (the hardware
 compatibility tester), with the build scripts, the tests and the tools that generate the tables the build uses. It is
-the source of the releases from WIP 0.2.1 on; for earlier releases see
+the source of the releases from v0.2.1 on; for earlier releases see
 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md#earlier-releases-wip-012--020).
 
 It is licensed like the rest of the repository ([LICENSE](../LICENSE)); third-party notices are in
@@ -28,7 +28,9 @@ log and those tools are not published, but the comments explain the code on thei
 | `runtime/skipprompt_as/` | ActionScript source of the movie Skip prompt (compiled into `udskip_doabc.h`) |
 | `renderer/` | The second, native renderer core (`udr_*.c`; linked in, off by default) and its compute shader |
 | `renderer/tools/` | `udr_shaderscan.c`: extracts the GPU programs from your own game files (for the tests) |
-| `tools/` | Python tools for PS4 ELF files used by the generators (`ps4_inspect.py`, `ps4_xref.py`, `ps4_ehframe.py`, `fself_unpack.py`) and `make_test_corpus.sh` |
+| `tools/` | Python tools for PS4 ELF files used by the generators (`ps4_inspect.py`, `ps4_xref.py`, `ps4_ehframe.py`, `fself_unpack.py`), `make_test_corpus.sh`, `bench_report.py` (benchmark reports from replay results) and `package_release.sh` (the release folder and zip) |
+| `tools/ud_manifest/` | The shader preparation manifest (v0.2.1): `udm_build.c` builds it from the renderer's records and your own game files, `udm_check.c` checks it against them (every program location read back; no shader code in it) |
+| `../data/` | `pipelines.udm`, the shader preparation manifest shipped next to `UntilDawn.exe` (locations in the game's files, translator inputs, pipeline state - no game code) |
 
 ## Building
 
@@ -45,7 +47,17 @@ sh source/runtime/build_compat.sh               # build/ud_compat.exe
 The scripts can be run from any folder. Everything they produce goes to `build/` at the top of the repository (ignored
 by git; set `UD_BUILD_DIR` for another folder), with intermediate files in `build/obj/`. To run a build, copy
 `UntilDawn.exe` (or `e6_loader.exe` for a console with the log) into the folder of an installed release, next to its
-`Game\` and `Config\` folders.
+`Game\` and `Config\` folders. The build also copies `data/pipelines.udm` next to `UntilDawn.exe` (v0.2.1).
+
+**Release package:** `sh source/tools/package_release.sh <version> [build folder] [output folder]` lays out the
+release folder (`UntilDawn.exe`, `pipelines.udm`, `Config\settings.ini` with the program's defaults, `Game\`,
+`compat\`, the text files) and zips it into `dist/`. With `UDM_CHECK_GAME_DIR=<game folder>` it first checks the
+manifest against your game files with `udm_check`.
+
+**Shader preparation manifest:** `cc -O2 -o udm_build source/tools/ud_manifest/udm_build.c`, then
+`udm_build data/pipelines.udm <game folder> <record folder> ...`, where a record folder holds the renderer's
+`prep_pipelines.bin` / `prep_translations.bin` (a `Cache\` folder after play, or a replay's `--cache-dir` with
+`--prep-record`). Check the result with `udm_check data/pipelines.udm <game folder> [source files ...]`.
 
 **Program icon (optional):** the icon is the game's own `sce_sys/icon0.png`, so it is not in the repository. To build
 with it, make it from your own copy first (needs Pillow): `python3 source/runtime/make_icon.py <game folder>

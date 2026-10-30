@@ -86,3 +86,4 @@ FindFirstFileW
 FindNextFileW
 VirtualProtect
 GetThreadTimes
+TerminateProcess

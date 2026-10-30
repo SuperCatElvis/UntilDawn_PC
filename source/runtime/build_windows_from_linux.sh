@@ -29,4 +29,6 @@ ICO=; [ -f untildawn.ico ] && ICO=$(pwd)/untildawn.ico; [ -f $B/untildawn.ico ] 
 if [ -n "$ICO" ]; then sed "s#\"untildawn.ico\"#\"$ICO\"#" untildawn.rc > $O/untildawn.rc; llvm-rc /fo $O/untildawn.res $O/untildawn.rc; RES=$O/untildawn.res
 else RES=; echo "no untildawn.ico (python3 make_icon.py <game folder> $B/untildawn.ico): UntilDawn.exe without icon"; fi
 lld-link $TS /subsystem:windows /entry:entry /nodefaultlib /stack:0x400000 /map:$B/UntilDawn.map $RES $O/e6_loader.obj $O/gcn2spv.obj $UDR_OBJS $LIBS /out:$B/UntilDawn.exe
+# The shader preparation manifest (v0.2.1, data/pipelines.udm): next to UntilDawn.exe, where the program looks for it
+if [ -f ../../data/pipelines.udm ]; then cp ../../data/pipelines.udm "$B/pipelines.udm"; else echo "no data/pipelines.udm: the build has no shader preparation manifest"; fi
 echo "built $B/UntilDawn.exe and $B/e6_loader.exe"

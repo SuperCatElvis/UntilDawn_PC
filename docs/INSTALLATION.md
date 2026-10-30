@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This guide covers WIP 0.2.0 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
+This guide covers v0.2.1 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
 copy of the original PS4 game**. The download does not contain the game.
 
 ---
@@ -23,7 +23,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 
 ## 2. Download and extract the release
 
-1. Download `UntilDawn_0.2.0.zip` from the
+1. Download `UntilDawn_0.2.1.zip` from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder **you can write to**, for example `D:\Games\UntilDawn_WIP`.
    Don't use `C:\Program Files`: the program keeps its settings, logs, shader cache and saves in its own folder.
@@ -31,8 +31,9 @@ The program does not decrypt anything. It needs the game files in their decrypte
 After extracting you have:
 
 ```
-UntilDawn_0.2.0\
+UntilDawn_0.2.1\
   UntilDawn.exe                     the game
+  pipelines.udm                     the shader list prepared on the first start (v0.2.1; keep it here)
   Config\settings.ini               settings (see section 5)
   Game\                             empty: your game files go here
     PUT_YOUR_GAME_FILES_HERE.txt
@@ -41,25 +42,34 @@ UntilDawn_0.2.0\
     ud_compat.exe
     README_COMPAT.txt
   README.txt
+  INSTALLATION.txt                  this guide
   CHANGELOG.txt
   Controls.txt
   KNOWN_ISSUES.txt
   THIRD_PARTY_NOTICES.txt
 ```
 
-### Updating from an earlier WIP release
+### Updating from an earlier release
 
-Copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files into your old folder. **Do not
-overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.2.0 to a
+**From 0.2.0:** copy the new `UntilDawn.exe`, the new `pipelines.udm`, `compat\ud_compat.exe` and the text files
+into your old folder. **Do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves, settings and the
+shader cache (`Cache\`) carry over. v0.2.1 has one new setting, `shader_preparation` (on by default when it is not in
+your file, see section 5). The first start shows a "Preparing shaders" screen while the shaders are compiled; Esc or
+Circle skips it (the rest is then compiled during play, as before).
+
+**From 0.1.5 or earlier:**
+
+Copy the new `UntilDawn.exe`, `pipelines.udm`, `compat\ud_compat.exe` and the text files into your old folder. **Do not
+overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.2.1 to a
 new folder and copy your `settings.ini`, `savedata` and game files over.
 
-- Saves and settings from earlier WIP releases work as they are. WIP 0.2.0 has four new settings (`gpu`,
-  `present_mode`, `heap_slot_mb`, `heap_slot_reuse`, see section 5); an older `settings.ini` doesn't have them and
-  their defaults are used. To see them in the file, delete it (it is recreated with the defaults; set `game_dir`
+- Saves and settings from earlier WIP releases work as they are. WIP 0.2.0 added four settings (`gpu`,
+  `present_mode`, `heap_slot_mb`, `heap_slot_reuse`) and v0.2.1 one more (`shader_preparation`, see section 5); an
+  older `settings.ini` doesn't have them and their defaults are used. To see them in the file, delete it (it is recreated with the defaults; set `game_dir`
   again) or copy the lines from the new release's `Config\settings.ini`.
 - `compat\ud_compat.exe` is new in 0.2.0 (built with 0.2.0's shader translator).
-- 0.2.0 translates every shader anew, so the contents of the shader cache (`Cache\`) from earlier versions no
-  longer match and the first-run shader-compilation pauses return once. You can delete the old `Cache\` folder.
+- Since 0.2.0 every shader is translated anew, so the contents of the shader cache (`Cache\`) from 0.1.5 and
+  earlier no longer match. You can delete the old `Cache\` folder; v0.2.1 prepares the shaders on the first start.
 
 ---
 
@@ -87,7 +97,7 @@ Choose **one** of these three ways:
 Copy the contents of your game folder into the release's `Game` folder, so that this file exists:
 
 ```
-UntilDawn_0.2.0\Game\eboot.bin
+UntilDawn_0.2.1\Game\eboot.bin
 ```
 
 ### Option B — point `settings.ini` at your game
@@ -134,17 +144,20 @@ Double-click **`UntilDawn.exe`**.
   If something is wrong, a message says which file is missing or which version was found, and the game does
   not start.
 - It also checks your CPU and graphics card. If a requirement is missing, a message explains what it is.
-- **The first play-through compiles shaders** for your graphics card the first time new content appears. On the
-  development PC (24 threads), with an empty cache, that meant one pause of about 12 seconds and a few of 3–8
-  seconds in the first minutes; on CPUs with fewer cores pauses of 10–20 seconds or more are possible. This is not a crash. Later runs use the shader cache and are much
-  smoother.
+- **Shader preparation (v0.2.1).** Before the brightness screen, a "Preparing shaders" screen compiles the shaders
+  the game will need: on the first start those listed in `pipelines.udm` (read together with your own game files;
+  about 30–40 seconds on the development PC with 24 threads, longer with fewer cores), later also those earlier
+  sessions needed - under a second when nothing changed, longer after a graphics driver update. Esc or Circle skips
+  it. Scenes that are not in the list yet still compile their shaders the first time they appear (with an empty
+  cache in 0.2.0 that meant pauses of 3–12 seconds on the development PC, 10–20 seconds or more with fewer cores).
+  This is not a crash; they are prepared from the next start on.
 
 The program creates these folders next to `UntilDawn.exe` when it runs:
 
 | Folder | Contents |
 | --- | --- |
 | `savedata\` | Your saves (and locally recorded trophy unlocks). Back this folder up if you care about your progress. |
-| `Cache\` | Compiled shaders for your graphics card. Rebuilt automatically if deleted. |
+| `Cache\` | Compiled shaders for your graphics card; since v0.2.1 also the list of shaders to prepare at the next start. Rebuilt automatically if deleted (from v0.2.1 the first start after that prepares the shaders in `pipelines.udm` again). |
 | `Logs\` | `UntilDawn.log` for the current session, the logs of the last five sessions, and diagnostic files in `Logs\captures\`. |
 | `temp0\` | The game's temporary data. |
 
@@ -167,6 +180,7 @@ The file is created with these defaults if it is missing. Delete it to restore t
 | `present_mode` | `auto` | How frames are shown: `auto`, `fifo` (in step with the display), `mailbox` or `immediate`. `auto` uses `mailbox` and switches to `fifo` by itself if frames take very long to reach the screen (seen on some laptops with two GPUs). New in 0.2.0. |
 | `heap_slot_mb` | `512` | Distance between the game's heap address slots in MB. `512` keeps all of the game's memory where the GPU can read it; `2048` is the game's own layout, under which the GPU loses sight of game data loaded after about 30 minutes. Only for testing. New in 0.2.0. |
 | `heap_slot_reuse` | `1` | `1` = a heap address slot the game has released is reused at once (the memory committed for the heaps stays at the level of the heaps in use); `0` = the game's own order (it grows during long sessions). Only for testing. New in 0.2.0. |
+| `shader_preparation` | `1` | `1` = shaders are compiled before the game starts, behind a progress screen (Esc or Circle skips it): on the first start those listed in `pipelines.udm`, later also those earlier sessions needed. `0` = off (shaders are compiled when they first appear, as in 0.2.0). New in v0.2.1. |
 | `developer` | `0` | `1` turns on developer capture keys that write multi-gigabyte diagnostic files. Leave it at `0` unless asked. |
 
 The game itself renders at 1920×1080, as on the PS4, and is scaled to the window.

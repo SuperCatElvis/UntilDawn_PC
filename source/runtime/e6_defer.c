@@ -77,9 +77,13 @@ typedef struct {
     VkFormat cf[8]; VkPipelineRenderingCreateInfo pri; VkGraphicsPipelineCreateInfo gci;
     volatile VkResult r; volatile int done;
     u64 vs_addr, ps_addr; u32 ncol, topo, ntex; int depth; u64 ticks;
+    u64 vs_key, ps_key;   /* t154: graphics: the stages' translation keys (compute: P->h1) */
     int compute; VkComputePipelineCreateInfo cci; const char *what;   /* t116: a compute pipeline (cci; vs_addr = the CS) */
+    int prep_cls;   /* t161: shader preparation coverage class (prep_note) */
 } PJob;
 enum { PJOB_MAX = 4096, PJOB_THREADS_MAX = 16 };
+static void prep_note(PJob *j);   /* t159: shader preparation records (e6_prep.c) */
+static void prep_cov_done(const PJob *j, u64 ms);   /* t161: coverage (e6_prep.c) */
 static PJob *g_pjob;                     /* PJOB_MAX jobs, used in order and recycled at each drain */
 /* job numbers only grow (slot = number % PJOB_MAX); jobs [g_pj_base, queued) belong to the batch being recorded and the
    drain waits for all of them, so a slot is never reused while a worker could still look at it */
@@ -96,6 +100,7 @@ static int g_opt_sync_compute;   /* t116: --sync-compute: compute pipelines buil
    four (chosen by its shader key, the same ones in every run and mode) is treated as failed to compile - to check that
    failures are handled the same way with parallel and synchronous compiles. */
 static int g_opt_cold_pipes, g_opt_cfail; static u64 g_cfail_n;
+static int g_opt_salt;   /* t159 test: --pipeline-salt N: the --cold-pipelines specialization entry with value N, but the pipeline cache used (a driver that has not seen these pipelines; the same N matches across runs) */
 static u32 g_cold_val; static VkSpecializationMapEntry g_cold_me = {0x7FFF1234u, 0, 4}; static VkSpecializationInfo g_cold_si = {1, &g_cold_me, 4, &g_cold_val};
 static int cfail_pick(const VPipe *P) { return g_opt_cfail && ((P->h1 * 0x9E3779B97F4A7C15ull) >> 62) == 0; }
 static void *g_pj_th[PJOB_THREADS_MAX];   /* the compiler threads (their CPU time at the end) */
@@ -104,7 +109,7 @@ static u64 pj_cpu_ms(void) { u64 t = 0; for (int i = 0; i < PJOB_THREADS_MAX; i+
 static void pj_fix(PJob *j) {            /* the create info points into the job itself */
     j->cbs.pAttachments = j->ba; j->dys.pDynamicStates = j->dyn; j->pri.pColorAttachmentFormats = j->cf;
     j->gci.pNext = &j->pri; j->gci.pStages = j->st; j->gci.pVertexInputState = &j->vi; j->gci.pInputAssemblyState = &j->ia;
-    if (g_opt_cold_pipes) { j->st[0].pSpecializationInfo = &g_cold_si; j->st[1].pSpecializationInfo = &g_cold_si; }   /* t116 */
+    if (g_opt_cold_pipes || g_opt_salt) { j->st[0].pSpecializationInfo = &g_cold_si; j->st[1].pSpecializationInfo = &g_cold_si; }   /* t116; t159 */
     j->gci.pViewportState = &j->vps; j->gci.pRasterizationState = &j->rs; j->gci.pMultisampleState = &j->ms;
     j->gci.pDepthStencilState = &j->dss; j->gci.pColorBlendState = &j->cbs; j->gci.pDynamicState = &j->dys;
 }
@@ -465,7 +470,8 @@ static void pj_finish_log(void) {
         else { V.n_pipes++; vl("  pipeline (parallel): VS "); vl_x(j->vs_addr); vl(" PS "); vl_x(j->ps_addr);
                vl(" targets "); vl_d(j->ncol); vl(j->depth ? " +depth" : ""); vl(" topology "); vl_d(j->topo); vl(" textures "); vl_d(j->ntex); vl("\n"); }
         { u64 ms = j->ticks / (plat_ticks_per_sec() / 1000 ? plat_ticks_per_sec() / 1000 : 1);   /* t107b: the driver's slow compiles (the 13.6 s frame of t107b part A) */
-          if (ms >= 250) slow_pipe_note(j->compute ? "compute (parallel)" : "graphics", j->vs_addr, j->compute ? 0 : j->ps_addr, ms); }
+          if (ms >= 250) slow_pipe_note(j->compute ? "compute (parallel)" : "graphics", j->vs_addr, j->compute ? 0 : j->ps_addr, ms, j->compute ? j->P->h1 : j->vs_key, j->compute ? 0 : j->ps_key);
+          if (!j->r) prep_cov_done(j, ms); }
         j->P->pend = 0;
     }
     g_pj_base = n;
@@ -479,6 +485,7 @@ static PJob *pj_new(void) {   /* a job slot for the batch being recorded, or 0 (
 }
 static void pj_queue(PJob *j) {   /* the job is filled: start recording (if not already) and release it to the workers */
     pj_fix(j);
+    prep_note(j);   /* t159 */
     j->P->pend = 1;
     if (!D.active) { D.active = 1; D.cb = V.cb; D.deferred_batches++; }
     g_pj_total++;

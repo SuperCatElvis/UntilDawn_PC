@@ -58,6 +58,9 @@ if [ -f "${UD_ELF_DIR:-/nonexistent}/eboot.elf" ]; then
 else say "(needs UD_ELF_DIR with your own eboot.elf: skipped)"; fi
 say "== 17. controller input reports (DualShock 4 / DualSense) =="; (gcc -O1 -Wall -I$HERE -o $W/pad_hid_test $HERE/pad_hid_test.c && $W/pad_hid_test) || fail=1
 say "== 18. diagnostic probe stub (red zone, registers) =="; (cc -O1 -I$HERE -o $W/probe_stub_test $HERE/probe_stub_test.c && $W/probe_stub_test) || fail=1
+say "== 19. V_MOVREL* (t156): register array and select chains, run on the CPU (spvi) =="; gcc -O1 -w -I$HERE -o $W/movrel_test $HERE/tests/movrel_test.c $HERE/spvi.c $HERE/gcn2spv.c -lm && $W/movrel_test || fail=1
+say "== 20. fetch shaders made from a description (t161, fetchgen.h) =="; (gcc -O2 -Wall -I$HERE -o $W/fetchgen_test $HERE/tests/fetchgen_test.c && $W/fetchgen_test) || fail=1
+say "== 21. helper-thread part hand-out (t161, par_claim.h): 2,000,000 small jobs =="; (gcc -O2 -Wall -I$HERE -o $W/par_claim_test $HERE/tests/par_claim_test.c -lpthread && $W/par_claim_test) || fail=1
 say "== 9. SPIR-V compressor (t114): every corpus module packed and unpacked, damaged inputs (AddressSanitizer) =="
 gcc -O2 -g -fsanitize=address -fno-omit-frame-pointer -Wall -Wno-unused-function -o $W/spvz_host_test $HERE/tests/spvz_host_test.c && $W/spvz_host_test $W/corp_default/*.spv || fail=1
 say "== capabilities used by the corpus (default mode) =="

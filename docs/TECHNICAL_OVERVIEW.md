@@ -145,7 +145,7 @@ the end of `Logs\UntilDawn.log` ("OS functions with no implementation that the g
 0.2.0 that list holds 36 functions, mostly networking, font, camera, live-streaming or start-up initialisation calls
 the game does not depend on.
 
-From WIP 0.2.1 the program reads the list of imports from the game's executable at start. Each import is identified by a hash of
+From v0.2.1 the program reads the list of imports from the game's executable at start. Each import is identified by a hash of
 its name (NID); it is named after the function this program implements or knows with that NID, otherwise it is shown
 as `nid:<NID>`.
 

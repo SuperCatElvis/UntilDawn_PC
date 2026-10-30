@@ -351,12 +351,14 @@ static u64 g_rc_sum; static const char *g_rc_sum_path; static const char *g_rc_r
 /* --replay-repeat N: after the frame has run once (with its image checks), run its submits N more times and report each
    run's cost - the frame's steady-state cost with shaders, pipelines and textures already made (performance work) */
 static int g_rc_memo_flush;   /* t107: --replay-memo-flush */
+static int g_rc_trc_from, g_rc_trc_to;   /* t154: --g2s-trace-repeats A-B: translation trace (e6_g2strace.c) of replay repeats A..B */
 static int g_rc_repeat, g_rc_vram_at;   /* --replay-vram K: before repeat K, game memory copied to VRAM (vk_mirror_all) */
-typedef struct { u64 t, busy, sub, tr, tex, pipe, wait, draw, draws, bar, batches, bsub, qsub, disp, wbk, mh, mm, mc, w_new, w_gw, w_mem, w_ev, fw, csk, cew, cep, sf; u32 slow[24]; int has_slow; u64 tc[11], tx[4], gws; } RcRep;
+typedef struct { u64 t, busy, sub, tr, tex, pipe, wait, draw, draws, bar, batches, bsub, qsub, disp, wbk, mh, mm, mc, w_new, w_gw, w_mem, w_ev, fw, csk, cew, cep, sf; u32 slow[24]; int has_slow; u64 tc[11], tx[4], gws; u64 nk[6], full, rel; } RcRep;
 static void rc_rep_take(RcRep *r) { r->t = plat_ticks(); r->busy = g_gpu_busy_ns; r->sub = g_t_submit; r->tr = g_t_tr; r->tex = g_t_tex; r->pipe = g_t_pipe;
     r->wait = g_t_wait; r->draw = g_t_draw; r->draws = g_draws; r->bar = g_n_vkbar; r->batches = g_gpu_batches;
     r->bsub = g_t_bsub; r->qsub = g_t_qsub; r->disp = g_t_disp; r->wbk = g_t_wbk; g2s_memo_stats(&r->mh, &r->mm, &r->mc); g2s_memo_why(&r->w_new, &r->w_gw, &r->w_mem, &r->w_ev); r->fw = g_n_full_waits; r->sf = g_n_slot_full; r->has_slow = vk_slow_read(r->slow); g2s_memo_code_stats(&r->csk, &r->cew, &r->cep);
-    for (int k = 0; k < 11; k++) r->tc[k] = g_tc[k]; for (int k = 0; k < 4; k++) r->tx[k] = g_t_tx[k]; r->gws = g_gw_seq; }   /* t107e */
+    for (int k = 0; k < 11; k++) r->tc[k] = g_tc[k]; for (int k = 0; k < 4; k++) r->tx[k] = g_t_tx[k]; r->gws = g_gw_seq; g2s_memo_nokeep(r->nk);
+    r->full = g2s_memo_full(); { u64 x_; g2s_memo_reloc_stats(&r->rel, &x_, &x_, &x_, &x_, &x_, &x_, &x_, &x_); } }   /* t107e; t154: full translations, relocated reuses */
 static void rc_rep_say(int k, const RcRep *a, void *res) {
     RcRep b; rc_rep_take(&b);
     u64 f = plat_ticks_per_sec() / 10000;   /* 0.1 ms */
@@ -369,10 +371,12 @@ static void rc_rep_say(int k, const RcRep *a, void *res) {
     sb_s(&s, ", full GPU waits "); sb_d(&s, (i64)(b.fw - a->fw)); sb_s(&s, ", batches handed over early "); sb_d(&s, (i64)(b.sf - a->sf));
     sb_s(&s, "\n      also in the submit calls: dispatches "); D01((b.disp - a->disp) / f); sb_s(&s, " ms, submit-start memory syncs "); D01((b.bsub - a->bsub) / f);
     sb_s(&s, ", vkQueueSubmit "); D01((b.qsub - a->qsub) / f); sb_s(&s, ", write-backs after batches "); D01((b.wbk - a->wbk) / f);
-    sb_s(&s, "; shader setups reused "); sb_d(&s, (i64)(b.mh - a->mh)); sb_s(&s, ", translated in full "); sb_d(&s, (i64)(b.mm - a->mm));
-    sb_s(&s, " (new inputs "); sb_d(&s, (i64)(b.w_new - a->w_new)); sb_s(&s, ", GPU-write state changed "); sb_d(&s, (i64)(b.w_gw - a->w_gw)); sb_s(&s, ", memory changed "); sb_d(&s, (i64)(b.w_mem - a->w_mem));
+    sb_s(&s, "; shader setups reused "); sb_d(&s, (i64)(b.mh - a->mh)); sb_s(&s, " (relocated "); sb_d(&s, (i64)(b.rel - a->rel)); sb_s(&s, "), translated in full "); sb_d(&s, (i64)(b.full - a->full));
+    sb_s(&s, " (t155; lookups without an exact match "); sb_d(&s, (i64)(b.mm - a->mm)); sb_s(&s, ": new inputs "); sb_d(&s, (i64)(b.w_new - a->w_new)); sb_s(&s, ", GPU-write state changed "); sb_d(&s, (i64)(b.w_gw - a->w_gw)); sb_s(&s, ", memory changed "); sb_d(&s, (i64)(b.w_mem - a->w_mem));
     sb_s(&s, "; memo entries evicted "); sb_d(&s, (i64)(b.w_ev - a->w_ev)); sb_s(&s, "); code checks skipped "); sb_d(&s, (i64)(b.csk - a->csk));
-    sb_s(&s, " (epochs "); sb_d(&s, (i64)(b.cep - a->cep)); sb_s(&s, ", of them ended by writes over code "); sb_d(&s, (i64)(b.cew - a->cew)); sb_s(&s, ")\n");
+    sb_s(&s, " (epochs "); sb_d(&s, (i64)(b.cep - a->cep)); sb_s(&s, ", of them ended by writes over code "); sb_d(&s, (i64)(b.cew - a->cew)); sb_s(&s, ")");
+    sb_s(&s, "; full translations not kept (t154): translation cache full "); sb_d(&s, (i64)(b.nk[1] - a->nk[1])); sb_s(&s, ", memory not re-readable "); sb_d(&s, (i64)(b.nk[3] - a->nk[3]));
+    sb_s(&s, ", code hash failed "); sb_d(&s, (i64)(b.nk[4] - a->nk[4])); sb_s(&s, ", other "); sb_d(&s, (i64)(b.nk[0] - a->nk[0] + b.nk[2] - a->nk[2] + b.nk[5] - a->nk[5])); sb_s(&s, "\n");
     sb_s(&s, "      texture checks (t107e) "); sb_d(&s, (i64)(b.tc[0] - a->tc[0])); sb_s(&s, ": unchanged "); sb_d(&s, (i64)(b.tc[1] - a->tc[1])); sb_s(&s, "; looked at again: first ");
     sb_d(&s, (i64)(b.tc[2] - a->tc[2])); sb_s(&s, ", tracking lost "); sb_d(&s, (i64)(b.tc[3] - a->tc[3])); sb_s(&s, ", size "); sb_d(&s, (i64)(b.tc[4] - a->tc[4])); sb_s(&s, ", VRAM copy "); sb_d(&s, (i64)(b.tc[5] - a->tc[5]));
     sb_s(&s, ", CPU writes "); sb_d(&s, (i64)(b.tc[6] - a->tc[6])); sb_s(&s, ", GPU writes "); sb_d(&s, (i64)(b.tc[7] - a->tc[7])); sb_s(&s, "; same bytes "); sb_d(&s, (i64)(b.tc[8] - a->tc[8]));
@@ -412,6 +416,7 @@ static VImg *rc_find_img(const RcImg *ri) {
 }
 /* exit code: 0 every image identical, 1 differences, 2 capture unusable, 3 replay failed */
 static void prof_replay_begin(void); static void prof_replay_end(void);   /* t115: --profile-replay (e5_gpu.c) */
+static void rwd_start(void);   /* t156: replay watchdog (e5_gpu.c) */
 static int rc_replay(const char *path) {
     void *f = hf_open_rb(path);
     if (!f) { say("replay: cannot open "); say(path); say("\n"); return 2; }
@@ -423,6 +428,7 @@ static int rc_replay(const char *path) {
     i64 rep_pos = -1; int rep_k = 0; RcRep rep0;
     for (;;) {
         i64 hpos = hf_tell(f);
+        g_rwd_prog++;   /* t156: progress for the replay watchdog */
         u64 h[2]; if (!rc_rd(f, h, 16)) break;
         u32 tag = (u32)h[0]; u64 n = h[1];
         if (tag == RC_INFO) { u64 info[4]; if (n != sizeof info || !rc_rd(f, info, n)) return 2; flip_no = info[0]; fmtver = info[3] ? info[3] : 1; continue; }
@@ -441,7 +447,8 @@ static int rc_replay(const char *path) {
             have_regn = 1;
             plat_window_open(); vkr_init();
             if (!g_vk_on) { say("replay: Vulkan renderer did not start\n"); return 3; }
-            vk_up = 1;
+            vk_up = 1; rwd_start();   /* t156 */
+            if (g_prep_replay) { prep_run(); if (g_prep_exit) { vk_save_pcache(); say("replay: --prep-exit: ended after the shader preparation\n"); return 0; } }   /* t159 */
             /* result file: the first free replay_<flip>_run<k>.txt */
             for (run = 1; run < 1000; run++) { Sb s = {rp, 0, sizeof rp}; sb_s(&s, g_cap_dir); sb_s(&s, "/replay_"); sb_d(&s, (i64)flip_no); sb_s(&s, "_run"); sb_d(&s, run); sb_s(&s, ".txt"); if (plat_file_size(rp) < 0) break; }
             res = g_rc_sum_path ? 0 : plat_open_write(rp);   /* bisection children write only the sum */
@@ -601,8 +608,12 @@ static int rc_replay(const char *path) {
                 if (!g_opt_nexp && rep_k == (g_rc_repeat >= 4 ? g_rc_repeat - 2 : g_rc_repeat)) {   /* (--exp: all repeats, one variant each) */   /* the GPU-time-by-shader table: the last repeats only (steady state) */
                     pm_lock(&g_slock); g_nprof = 0; pm_unlock(&g_slock); g_prof_reps = g_rc_repeat - rep_k + 1; }
                 if (rep_k == 3) prof_replay_begin();   /* (repeats 1-2 still create images and warm up) */
+                if (g_rc_trc_from && rep_k == g_rc_trc_from) trc_start();   /* t154: --g2s-trace-repeats A-B (translation trace of repeats A..B) */
+                if (g_rc_trc_from && rep_k == g_rc_trc_to + 1) trc_stop();
+                if (g_trc_f) trc_event('F', (u64)rep_k, 0);   /* (the harness counts frames by these) */
                 hf_seek(f, rep_pos, 0); rc_rep_take(&rep0); continue;
             }
+            if (g_rc_trc_from) trc_stop();   /* t154: (a trace still open at the last repeat) */
             ended = 1; break; }
         say("replay: unknown chunk, skipped\n"); hf_seek(f, (i64)n, 1);
     }

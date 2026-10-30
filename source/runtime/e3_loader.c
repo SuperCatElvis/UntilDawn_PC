@@ -2185,7 +2185,8 @@ static int ud_player_start(int *pargc, char ***pargv) {
     g_win_title = "Until Dawn"; g_dev_mode = g_uds.developer;
     path_join(cap, logs, "captures"); g_cap_dir = cap;
     { static char cdir[1100], cp[1200], ct[1200]; path_join(cdir, base, "Cache"); plat_mkdir(cdir);
-      path_join(cp, cdir, "vulkan_pipelines.bin"); path_join(ct, cdir, "vulkan_pipelines.tmp"); g_pcache_path = cp; g_pcache_tmp = ct; }
+      path_join(cp, cdir, "vulkan_pipelines.bin"); path_join(ct, cdir, "vulkan_pipelines.tmp"); g_pcache_path = cp; g_pcache_tmp = ct;
+      static char mp[1200]; path_join(mp, base, "pipelines.udm"); g_prep_manifest_path = mp; }   /* t160: the shipped pipeline manifest */
     say("settings: frame-rate limit "); if (g_uds.fps_limit) say_dec(g_uds.fps_limit); else say("none");
     say(", display "); say(g_uds.borderless ? "borderless" : "windowed"); say(", developer mode "); say(g_uds.developer ? "on" : "off");
     say(", renderer thread "); say(g_uds.renderer_thread ? "on" : "off (renderer_thread = 0)");
@@ -2198,6 +2199,7 @@ static int ud_player_start(int *pargc, char ***pargv) {
     if (g_uds.gpu[0] && !ud_key_is(g_uds.gpu, "auto")) { av[n++] = "--gpu"; av[n++] = g_uds.gpu; }   /* t121 */
     if (g_uds.present_mode) { av[n++] = "--present-mode"; av[n++] = g_uds.present_mode == 1 ? "fifo" : g_uds.present_mode == 2 ? "mailbox" : "immediate"; }   /* t121 */
     if (!g_uds.heap_slot_reuse) av[n++] = "--heap-slots-roundrobin";   /* t131 */
+    if (!g_uds.shader_prep) av[n++] = "--no-prep";   /* t159 */
     if (g_uds.heap_slot_mb != 512) { static char hs[16]; char *q = hs + sizeof hs - 1; *q = 0; int v = g_uds.heap_slot_mb; do { *--q = (char)('0' + v % 10); v /= 10; } while (v); av[n++] = "--heap-slot-mb"; av[n++] = q; }   /* t130 */
     if (g_uds.developer) {   /* t107: developer mode only - extra options from Config\dev_options.txt (one line, separated by spaces) */
         static char dop[1100], dbuf[2048]; path_join(dop, cfg, "dev_options.txt");
@@ -2288,6 +2290,18 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--ww-probe-verify")) g_opt_ww_probe = 3;   /* t118 test: probe, and the reset scan anyway: count what the probe would have missed */
         else if (str_eq(argv[i], "--ww-probe-ab")) g_opt_ww_probe = 2;   /* t117: the probe at every other submit (to measure both) */
         else if (str_eq(argv[i], "--cold-pipelines")) g_opt_cold_pipes = 1;   /* t116 test: every pipeline compiled (no cache) */
+        else if (str_eq(argv[i], "--no-pipe-dedupe")) g_opt_no_pipe_dedupe = 1;   /* t154: every translation key compiles its own pipeline (as before) */
+        else if (str_eq(argv[i], "--no-key-notes")) g_opt_no_key_notes = 1;   /* t154: no notes of shaders translated under another key */
+        else if (str_eq(argv[i], "--gs-noinline")) g2s_gs_fc = 2;   /* t154 experiment: geometry passes' memory helpers marked DontInline */
+        else if (str_eq(argv[i], "--gs-notes-all")) g2s_gs_notes_all = 1;   /* t158: every geometry ring store notes its V# in the header (as before) */
+        else if (str_eq(argv[i], "--gs-hoist")) g2s_gs_hoist = 1;   /* t154 experiment; the default from t159 */
+        else if (str_eq(argv[i], "--gs-no-hoist")) g2s_gs_hoist = 0;   /* t159: the geometry ring base read at every ring load (as before t159) */
+        else if (str_eq(argv[i], "--no-tex-cache")) g_opt_no_tbcache = 1;   /* t156: every texture binding looked up (as before) */
+        else if (str_eq(argv[i], "--movrel-select")) g2s_movrel_sel = 1;   /* t156: V_MOVREL* as select chains over the registers (the default again from t157) */
+        else if (str_eq(argv[i], "--movrel-array")) g2s_movrel_sel = 0;   /* t157: V_MOVREL* through a register array (t156; changes pictures slightly on NVIDIA) */
+        else if (str_eq(argv[i], "--qpc-timers")) g_opt_qpc_timers = 1;   /* t155: the renderer's time accounting with QueryPerformanceCounter (as before) */
+        else if (str_eq(argv[i], "--memo-reread")) g2s_memo_nodups = 1;   /* t155: a reuse reads repeated memory ranges again (as before t155) */
+        else if (str_eq(argv[i], "--keep-unused-inputs")) g_opt_keep_unused_in = 1;   /* t155: translator inputs a stage never reads are passed as before (own keys) */
         else if (str_eq(argv[i], "--compute-fail-test")) g_opt_cfail = 1;     /* t116 test: some compute pipelines treated as failed */   /* t116: compute pipelines built at the dispatch, one at a time (t115 and before) */
 #endif
         else if (str_eq(argv[i], "--no-stencil")) g_opt_nostencil = 1;
@@ -2337,7 +2351,7 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--acquire-timeout-ms") && i + 1 < argc) g_acq_timeout_ns = str_to_u64(argv[++i]) * 1000000ull;   /* t121 test */
         else if (str_eq(argv[i], "--slow-present-test")) g_opt_slow_present_test = 1;   /* t121 test */
         else if (str_eq(argv[i], "--present-mode") && i + 1 < argc) { const char *m = argv[++i]; g_opt_pm = str_eq(m, "fifo") ? 1 : str_eq(m, "mailbox") ? 2 : str_eq(m, "immediate") ? 3 : 0; }   /* t121 */
-        else if (str_eq(argv[i], "--replay") && i + 1 < argc) g_replay_path = argv[++i];
+        else if (str_eq(argv[i], "--replay") && i + 1 < argc) { g_replay_path = argv[++i]; g_prep_in_replay = 1; }
         else if (str_eq(argv[i], "--replay-trace")) g_rc_trace = 1;
         else if (str_eq(argv[i], "--renderer") && i + 1 < argc) { i++; if (str_eq(argv[i], "native")) { g_rnative = 1; g_win_title = "Until Dawn - native renderer (test build)"; } else if (str_eq(argv[i], "e6")) g_rnative = 0; else say("--renderer: native or e6\n"); }   /* RENDERER_PLAN 12 */
         else if (str_eq(argv[i], "--native-e6-equiv")) g_nv_e6equiv = 1;      /* native renderer: E6's behaviour, for step-by-step comparisons */
@@ -2356,6 +2370,20 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-wait-sync")) g_opt_no_wait_sync = 1;
 #endif
         else if (str_eq(argv[i], "--replay-sum") && i + 1 < argc) g_rc_sum_path = argv[++i];
+        else if (str_eq(argv[i], "--no-prep")) g_prep_on = 0;   /* t159: no shader preparation records and no preparation at start-up */
+        else if (str_eq(argv[i], "--prep")) g_prep_replay = 1;   /* t159 (replays): record, and prepare the recorded pipelines when the replay starts */
+        else if (str_eq(argv[i], "--prep-force")) g_prep_force = 1;
+        else if (str_eq(argv[i], "--prep-shot")) g_prep_shot = 1;
+        else if (str_eq(argv[i], "--prep-cache-check")) g_prep_pcc_req = 1;   /* t159e test; the default again from t160 */
+        else if (str_eq(argv[i], "--no-prep-cache-check")) g_prep_pcc_req = 0;   /* t160: preparation without the cache check (every recorded pipeline made) */
+        else if (str_eq(argv[i], "--manifest") && i + 1 < argc) g_prep_manifest_path = argv[++i];   /* t160: the pipeline manifest (the program folder's pipelines.udm by default) */   /* t159e: the device feature for FAIL_ON_PIPELINE_COMPILE_REQUIRED (test) */   /* t159 test: the preparation screen saved as prep_screen.bmp in the capture folder */   /* t159 test: no cache check, every recorded pipeline made */
+        else if (str_eq(argv[i], "--prep-skip-after") && i + 1 < argc) g_prep_skip_after_ms = (int)str_to_u64(argv[++i]);   /* t159 test: the screen skipped after MS ms */
+        else if (str_eq(argv[i], "--pipeline-salt") && i + 1 < argc) { g_opt_salt = 1; g_cold_val = (u32)str_to_u64(argv[++i]) | 1; }   /* t159 test: pipelines the driver has not seen, with the pipeline cache in use */
+        else if (str_eq(argv[i], "--prep-record")) g_prep_rec_req = 1;   /* t159 (replays): record the pipelines made */
+        else if (str_eq(argv[i], "--prep-exit")) { g_prep_replay = 1; g_prep_exit = 1; }   /* t159 (replays): prepare, then end */
+        else if (str_eq(argv[i], "--cache-dir") && i + 1 < argc) { static char cp_[1200], ct_[1200]; g_prep_dir = argv[++i]; plat_mkdir(g_prep_dir);   /* t159: pipeline cache and preparation records in DIR */
+            Sb a_ = {cp_, 0, sizeof cp_}; sb_s(&a_, g_prep_dir); sb_s(&a_, "\\vulkan_pipelines.bin"); cp_[a_.n] = 0; Sb b_ = {ct_, 0, sizeof ct_}; sb_s(&b_, g_prep_dir); sb_s(&b_, "\\vulkan_pipelines.tmp"); ct_[b_.n] = 0; g_pcache_path = cp_; g_pcache_tmp = ct_; }
+        else if (str_eq(argv[i], "--replay-watchdog") && i + 1 < argc) g_rwd_secs = (int)str_to_u64(argv[++i]);   /* t156: a replay without progress for S seconds is reported and ended (exit 5); 0 = off */
         else if (str_eq(argv[i], "--replay-repeat") && i + 1 < argc) g_rc_repeat = (int)str_to_u64(argv[++i]);   /* performance: run the replayed frame N more times, cost of each */
         else if (str_eq(argv[i], "--mem-report") && i + 1 < argc) { const char *q = argv[++i]; u64 v = 0; if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) { q += 2; for (; *q; q++) v = v * 16 + (u64)(*q >= 'a' ? *q - 'a' + 10 : *q >= 'A' ? *q - 'A' + 10 : *q - '0'); } else v = str_to_u64(q); g_memrep_addr = v; }   /* diagnostic: where the memory of the shader at ADDR lives */
         else if (str_eq(argv[i], "--small-shadow-bytes") && i + 1 < argc) g_small_shadow_min = str_to_u64(argv[++i]);   /* smallest GPU-written buffer copied to VRAM with write-back (default 16384) */
@@ -2471,6 +2499,8 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--nan-hunt")) g_opt_nan_hunt = 1;   /* t135 diagnostic: the scan, then find the draw that makes them and NaN-probe its pixel shader */
         else if (str_eq(argv[i], "--g2s-trace-at") && i + 1 < argc) { g_trc_req = (int)str_to_u64(argv[++i]); if (g_trc_req <= 0) g_trc_req = -1; }   /* t107: translation trace from flip N */
         else if (str_eq(argv[i], "--g2s-trace-flips") && i + 1 < argc) { g_trc_flips = (int)str_to_u64(argv[++i]); if (g_trc_flips < 1) g_trc_flips = 1; }
+        else if (str_eq(argv[i], "--g2s-trace-repeats") && i + 1 < argc) { const char *v = argv[++i]; u32 x = 0, y = 0; while (*v >= '0' && *v <= '9') x = x * 10 + (u32)(*v++ - '0'); if (*v == '-') v++; while (*v >= '0' && *v <= '9') y = y * 10 + (u32)(*v++ - '0');
+            g_rc_trc_from = x ? (int)x : 3; g_rc_trc_to = y >= (u32)g_rc_trc_from ? (int)y : g_rc_trc_from; }   /* t154: translation trace of replay repeats A-B */
         else if (str_eq(argv[i], "--replay-memo-flush")) g_rc_memo_flush = 1;   /* t107: every replay repeat translates every setup again (the cost of moved user data in play) */   /* t105 test keys F6 / F7 / F8 without developer mode */
         else if (str_eq(argv[i], "--no-helpers-auto")) g_opt_helpers_auto = 0;
         else if (str_eq(argv[i], "--no-lazy-memory")) g_opt_lazy_mem = 0;   /* the game's large mappings committed at once (the default again since t112) */

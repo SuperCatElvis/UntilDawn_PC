@@ -1,4 +1,4 @@
-# Known issues — WIP 0.2.0
+# Known issues — v0.2.1
 
 [← Back to README](../README.md)
 
@@ -61,6 +61,29 @@ GPUs, and the flickering menus may remain. Things to try:
 3. `present_mode = fifo` in `Config\settings.ini`.
 
 Please report what happened, with `Logs\UntilDawn.log`.
+
+## New in v0.2.1
+
+v0.2.1 adds **shader preparation** and keeps every fix of 0.2.0 (see the [release notes](releases/v0.2.1.md)). It has
+so far been **tested on the development PC only** (NVIDIA RTX 3090 Ti): with replays of 17 recorded scenes and a fresh
+first start played through brightness, controls, intro and menu. It is untested on AMD and Intel graphics.
+
+- **The first start takes longer:** a "Preparing shaders" screen compiles the shaders in `pipelines.udm` before the
+  brightness screen (about 30–40 seconds on the development PC; longer with fewer CPU cores). Esc or Circle skips it;
+  what is skipped is compiled during play, as before. Later starts take under a second unless the graphics driver
+  changed. `shader_preparation = 0` in `Config\settings.ini` turns it off.
+- **Not every scene is in the list yet.** Scenes nobody has recorded (for example the main-menu background of later
+  chapters) still pause to compile their shaders the first time they appear, and are prepared from the next start
+  on. In replays of scenes left out of the list on purpose, 85–88% of their shaders were ready.
+- **A second form of a few shaders.** Some shaders read data that the graphics card itself writes every frame. Whether
+  that data can be read on the CPU depends on timing, so such a shader can come out in either of two (correct) forms,
+  and the second one is compiled once when it first appears. Not changed in v0.2.1: it would mean changing how every
+  shader is translated.
+- **Fixed in v0.2.1:** a rare hang of the renderer while new textures were converted on its helper threads (one
+  helper could drop a piece of work, and the renderer then waited for it forever). Found in a test replay; the same
+  hang was possible in play.
+- If v0.2.1 crashes, freezes or stutters where 0.2.0 did not, please [report it](../README.md#reporting-bugs) with
+  `Logs\UntilDawn.log`; `shader_preparation = 0` is worth a try to see whether the preparation is involved.
 
 ## New in WIP 0.2.0
 
@@ -181,7 +204,8 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 ## Performance
 
 - **Shader-compilation pauses.** The first time new content appears, the graphics driver compiles the shader combinations it needs. With an empty shader cache (a new install), the development PC (Core i9-12900KF, 24 threads) paused once for about 12 seconds and a few times for 3–8 seconds in the first minutes of the prologue, mostly while large compute shaders were compiled; once the cache holds an area, new content costs up to about 2 seconds (in one measured case, 12 pipelines compiled together took 2 seconds, and a texture upload in the same frame had to wait for them). CPUs with fewer cores pause longer; 10–20 seconds or more have been reported with earlier versions. WIP 0.2.0 does not improve this yet. Each pause happens once: the shader cache (`Cache\`) removes it on later runs. After updating from 0.1.5 the pauses return once, because every shader is translated anew. The game is not frozen permanently; allow time for it.
-- **Initial loading black screens.** When first launching the game, a black screen may appear before the main menu. A similar delay can occur when starting a new story after the opening lodge shots. These are caused by shaders being generated and compiled; loading the same scene again is generally much faster.
+  *New in v0.2.1 (shader preparation):* the shaders in `pipelines.udm` and those of earlier sessions are compiled before the brightness screen (about 30–40 seconds on the development PC on a first start, under a second afterwards). On the development PC the first-start sequence (brightness, controls, intro, menu) then compiled nothing during play, and replays of scenes that were left out of `pipelines.udm` had 85–88% of their shaders ready (about 90% less waiting). Scenes nobody has recorded yet (for example the main-menu background of later chapters) still compile their shaders the first time; they are prepared from the next start on. A few shaders that read data the graphics card writes itself can come out in one of two forms depending on timing, so a second form may still be compiled once during play.
+- **Initial loading black screens.** When first launching the game, a black screen of about a second may appear before the main menu. A similar delay can occur when starting a new story after the opening lodge shots. The logs show this is mostly the game loading the scene and the textures being set up for it (in one measured start: a 1.2-second frame, about 0.3 s of it texture uploads, no shader compilation). In WIP 0.2.0 a first start also compiled the menu's shaders at that point, which made the pause longer; v0.2.1 prepares them before the game starts, so what remains is the loading itself.
 - **Frame-rate drops.** Frame rates still vary with the scene; WIP 0.2.0 is similar to 0.1.5 on the same route. Measured on the development PC (RTX 3090 Ti, Core i9-12900KF): light scenes often reach 60 FPS, busy scenes (2,000–3,000 draws) about 30–45 FPS, and the heaviest scenes measured, the prologue's "stranger" shots, about 22–29 FPS (about 5 FPS with 0.1.3 in the same scene). Slower PCs will see lower numbers. In the heaviest scenes the renderer's own work on the CPU is the limit; spreading that work over several CPU cores is the next planned step.
 - **Memory.** On the development PC the program used at most about 8.8 GB of RAM and committed up to about 18 GB on the prologue route (0.1.5: 8.2 GB and 17 GB), and 9.2 GB / 20 GB in a ten-minute session elsewhere in the game. Much of the committed memory is reserved by the graphics driver and not in RAM, but Windows needs room for it: keep the page file switched on ("System managed"). 16 GB of RAM is recommended.
 - **Higher frame-rate limits.** Frame-rate limits above 60 FPS are available but have not been thoroughly tested across all scenes. The default 60 FPS cap does not guarantee a consistent 60 FPS.
