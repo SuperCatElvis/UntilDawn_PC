@@ -543,7 +543,7 @@ int e3_main(int argc, char **argv) {
 #endif
     }
     g_rep = plat_open_write("ud_compat_report.txt");
-    rp("Until Dawn native port - hardware compatibility test (build " __DATE__ " " __TIME__ ")\n");
+    rp("Until Dawn native port v" UD_VERSION " - hardware compatibility test (build " __DATE__ " " __TIME__ ")\n");
     { u32 maj = 0, mn = 0, bld = 0; if (plat_os_version(&maj, &mn, &bld)) { char b[48]; Sb s = {b, 0, sizeof b}; sb_d(&s, maj); sb_s(&s, "."); sb_d(&s, mn); sb_s(&s, " build "); sb_d(&s, bld); kv("os.windows", b); } }
     cpu_tests();
 #ifdef _WIN32

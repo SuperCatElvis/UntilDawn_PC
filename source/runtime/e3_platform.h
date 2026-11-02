@@ -8,6 +8,7 @@ typedef signed char i8;
 typedef int i32;
 typedef long long i64;
 #define SYSV __attribute__((sysv_abi))
+#define UD_VERSION "0.3.0"   /* the release this program is (log, file properties, compatibility test) */
 
 static u64 g_main_va;
 
@@ -193,9 +194,20 @@ static void *lp_CreateFile(const char *p, u32 acc, u32 share, u32 disp, u32 fl) 
 }
 static void *hf_open_rb(const char *p) { void *h = lp_CreateFile(p, 0x80000000u, 1, 3, 0x80); return h == (void *)-1 ? 0 : h; }
 static void hf_close(void *f) { CloseHandle(f); }
+static void (*g_coh_ensure_fn)(u64 a, u64 n);   /* t165 --gpu-coherence: memory the GPU holds is brought to RAM before a Windows call reads or writes it */
+static volatile u64 g_coh_kernel_refused;   /* t165: Windows calls that failed with ERROR_NOACCESS (998) on game memory */
+/* t165i --coh-test only: ReadFile straight into b (no coherence step), *err = GetLastError() on failure */
+static u64 hf_read_raw(void *f, void *b, u32 n, u32 *err) { u32 got = 0; *err = 0; if (!ReadFile(f, b, n, &got, 0)) { *err = GetLastError(); return 0; } return got; }
 static u64 hf_read(void *f, void *b, u64 n) {
     u64 tot = 0; u32 got;
-    while (tot < n) { u32 c = (u32)(n - tot > 0x40000000 ? 0x40000000 : n - tot); if (!ReadFile(f, (u8 *)b + tot, c, &got, 0) || !got) break; tot += got; }
+    if (g_coh_ensure_fn && n) g_coh_ensure_fn((u64)b, n);
+    for (int again = 0; tot < n; ) { u32 c = (u32)(n - tot > 0x40000000 ? 0x40000000 : n - tot);
+        int rok = ReadFile(f, (u8 *)b + tot, c, &got, 0);
+        if (!rok || !got) {
+            if (!rok && GetLastError() == 998) {   /* (t165w, review 2 N16: only when the read failed - not a stale code at end of file) */ __atomic_add_fetch(&g_coh_kernel_refused, 1, __ATOMIC_RELAXED);   /* t165w: made GPU-held again meanwhile: once more after making it current */
+                if (g_coh_ensure_fn && again++ < 3) { g_coh_ensure_fn((u64)b + tot, n - tot); continue; } }
+            break; }
+        tot += got; }
     return tot;
 }
 static i64 hf_seek(void *f, i64 o, int w) { i64 np = -1; return SetFilePointerEx(f, o, &np, (u32)w) ? np : -1; }
@@ -312,6 +324,22 @@ static void *plat_read_file(const char *p, u64 *size) {
 }
 static void *plat_alloc_rwx(u64 n) { return VirtualAlloc(0, n, 0x3000, 0x40); }
 static void *plat_alloc_rw(u64 n) { return VirtualAlloc(0, n, 0x3000, 0x04); }
+/* t165w: address space only (committed later, a piece at a time - no heap, usable inside an exception handler) */
+static void *plat_reserve_any(u64 n) { return VirtualAlloc(0, n, 0x2000, 0x01); }
+static void plat_release_rw(void *p, u64 n) { (void)n; VirtualFree(p, 0, 0x8000); }   /* t165x: back to the system (reserved with plat_reserve_any) */
+static int plat_commit_rw(void *a, u64 n) { return VirtualAlloc(a, n, 0x1000, 0x04) == a; }
+/* t165w: the protection at a (0: not committed / unknown) and where the same protection ends (*end) */
+static u32 plat_query_span(u64 a, u64 *end) {
+    struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
+    if (VirtualQuery((const void *)a, &mi, sizeof mi) != sizeof mi || mi.state != 0x1000) { *end = a; return 0; }
+    *end = mi.base + mi.size; return mi.prot;
+}
+/* t165w: the page's current protection (0: not committed / unknown) */
+static u32 plat_query_prot(u64 a) {
+    struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
+    if (VirtualQuery((const void *)a, &mi, sizeof mi) != sizeof mi || mi.state != 0x1000) return 0;
+    return mi.prot;
+}
 /* 1 when the page holding a is committed and writable (the lump repair writes only there, STATUS 47) */
 static int plat_writable8(u64 a) {
     struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
@@ -345,23 +373,77 @@ static int plat_readable(u64 a, u64 n) {
    to the address it asked for (t112 D2 hit the same at 0x2c80000000). Before anything else runs, the window is
    reserved in 512 MB blocks (address space only: no RAM, no commit); a block is released just before a mapping
    at a fixed address inside it is made (plat_alloc_at / plat_reserve_at), so only game memory can land there. */
-enum { GUARD_BLOCK = 512u << 20, GUARD_MAX = 512 };
-static u64 g_guard_lo; static volatile u8 g_guard[GUARD_MAX]; static int g_guard_n, g_guard_held, g_guard_busy;
+enum { GUARD_BLOCK = 512u << 20, GUARD_MAX = 512, GUARD_ENT = 16384 };
+/* t163: the guard is a list of reserved ranges. A fixed mapping takes only its own part of a range: the rest is reserved
+   again right after it (before, the whole 512 MB block was freed for the first mapping in it, and Windows could put a
+   thread stack or other host memory into the rest; the game's next fixed mapping in that heap slot then "moved" and the
+   game crashed on the address it asked for: chapter loads, flips 300 / 34760 of the t163 chapter sessions, Lump Loader
+   at 0x1520000000 / 0x1904000000). Guard changes and the mapping between them happen under one lock. */
+typedef struct { u64 lo, hi; } GuardEnt;
+static GuardEnt *g_gr; static int g_ngr, g_guard_held, g_guard_busy, g_guard_n; static u64 g_guard_lo, g_guard_hi, g_guard_rereserved, g_guard_lost;
+static volatile int g_guard_spin; static u64 g_guard_busy_at[4], g_guard_busy_what[4], g_guard_busy_type[4];
+static void guard_lock(void) { while (__atomic_exchange_n(&g_guard_spin, 1, __ATOMIC_ACQUIRE)) { while (__atomic_load_n(&g_guard_spin, __ATOMIC_RELAXED)) __builtin_ia32_pause(); } }
+static void guard_unlock(void) { __atomic_store_n(&g_guard_spin, 0, __ATOMIC_RELEASE); }
 static void plat_guard_init(u64 lo, u64 hi) {
-    g_guard_lo = lo; g_guard_n = (int)((hi - lo) / GUARD_BLOCK); if (g_guard_n > GUARD_MAX) g_guard_n = GUARD_MAX;
-    for (int i = 0; i < g_guard_n; i++) { void *a = (void *)(lo + (u64)i * GUARD_BLOCK);
-        if (VirtualAlloc(a, GUARD_BLOCK, 0x2000, 0x01) == a) { g_guard[i] = 1; g_guard_held++; } else g_guard_busy++; }   /* MEM_RESERVE, PAGE_NOACCESS */
+    g_gr = (GuardEnt *)VirtualAlloc(0, sizeof(GuardEnt) * GUARD_ENT, 0x3000, 0x04); if (!g_gr) return;
+    g_guard_lo = lo; g_guard_hi = hi; g_guard_n = (int)((hi - lo) / GUARD_BLOCK); if (g_guard_n > GUARD_MAX) g_guard_n = GUARD_MAX;
+    for (int i = 0; i < g_guard_n; i++) { u64 a = lo + (u64)i * GUARD_BLOCK;
+        if (VirtualAlloc((void *)a, GUARD_BLOCK, 0x2000, 0x01) == (void *)a) { g_gr[g_ngr].lo = a; g_gr[g_ngr].hi = a + GUARD_BLOCK; g_ngr++; g_guard_held++; }
+        else {   /* t163: something is already there: guard the free parts of the block around it */
+            if (g_guard_busy < 4) g_guard_busy_at[g_guard_busy] = a;
+            g_guard_busy++;
+            for (u64 q = a; q < a + GUARD_BLOCK; ) {
+                struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
+                if (VirtualQuery((const void *)q, &mi, sizeof mi) != sizeof mi || !mi.size) break;
+                u64 e = mi.base + mi.size; if (e > a + GUARD_BLOCK) e = a + GUARD_BLOCK;
+                if (mi.state == 0x10000 && g_ngr < GUARD_ENT) {   /* MEM_FREE */
+                    u64 lo = (q + 0xFFFF) & ~0xFFFFull, hi = e & ~0xFFFFull;
+                    if (hi > lo && VirtualAlloc((void *)lo, hi - lo, 0x2000, 0x01) == (void *)lo) { g_gr[g_ngr].lo = lo; g_gr[g_ngr].hi = hi; g_ngr++; }
+                } else if (g_guard_busy <= 4 && !g_guard_busy_what[g_guard_busy - 1]) { g_guard_busy_what[g_guard_busy - 1] = mi.abase; g_guard_busy_type[g_guard_busy - 1] = mi.type | (u64)mi.state << 32; }
+                if (e <= q) break; q = e;
+            }
+        } }   /* MEM_RESERVE, PAGE_NOACCESS */
 }
-static void plat_guard_release(u64 a, u64 n) {
-    if (!g_guard_n || !n || a + n <= g_guard_lo || a >= g_guard_lo + (u64)g_guard_n * GUARD_BLOCK) return;
-    u64 f = a < g_guard_lo ? 0 : (a - g_guard_lo) / GUARD_BLOCK, l = (a + n - 1 - g_guard_lo) / GUARD_BLOCK;
-    for (u64 i = f; i <= l && i < (u64)g_guard_n; i++) if (__atomic_exchange_n(&g_guard[i], 0, __ATOMIC_ACQ_REL)) VirtualFree((void *)(g_guard_lo + i * GUARD_BLOCK), 0, 0x8000);
+/* frees the guard ranges overlapping [a, a + n); the freed ranges go to took[] (at most tmax; further overlaps are left
+   reserved, and the mapping then fails as it would without the guard) */
+static int guard_take(u64 a, u64 n, GuardEnt *took, int tmax) {
+    int nt = 0; if (!g_ngr || !n || a + n <= g_guard_lo || a >= g_guard_hi) return 0;
+    for (int i = 0; i < g_ngr && nt < tmax; ) {
+        GuardEnt e = g_gr[i];
+        if (e.hi <= a || e.lo >= a + n) { i++; continue; }
+        VirtualFree((void *)e.lo, 0, 0x8000); took[nt++] = e; g_gr[i] = g_gr[--g_ngr];
+    }
+    return nt;
 }
+static void guard_add(u64 lo, u64 hi) {
+    if (hi <= lo) return;
+    if (g_ngr < GUARD_ENT && VirtualAlloc((void *)lo, hi - lo, 0x2000, 0x01) == (void *)lo) { g_gr[g_ngr].lo = lo; g_gr[g_ngr].hi = hi; g_ngr++; g_guard_rereserved++; }
+    else g_guard_lost += hi - lo;
+}
+/* after the mapping: the freed ranges are reserved again - only their parts outside [a, a + n) (64 KB granules) when the
+   mapping was made there, all of them when it failed */
+static void guard_give_back(const GuardEnt *took, int nt, u64 a, u64 n, int mapped) {
+    u64 al = a & ~0xFFFFull, bl = (a + n + 0xFFFF) & ~0xFFFFull;
+    for (int k = 0; k < nt; k++) {
+        if (!mapped) { guard_add(took[k].lo, took[k].hi); continue; }
+        if (took[k].lo < al) guard_add(took[k].lo, al < took[k].hi ? al : took[k].hi);
+        if (bl < took[k].hi) guard_add(bl > took[k].lo ? bl : took[k].lo, took[k].hi);
+    }
+}
+/* (callers that only need the range free) */
+static void plat_guard_release(u64 a, u64 n) { GuardEnt t[64]; guard_lock(); guard_take(a, n, t, 64); guard_unlock(); }
 /* game memory is allocated with MEM_WRITE_WATCH so the GPU layer can find pages the CPU changed */
-static void *plat_alloc_at(void *a, u64 n) { if (a) plat_guard_release((u64)a, n); void *p = VirtualAlloc(a, n, 0x3000 | 0x200000, 0x40); return p ? p : VirtualAlloc(a, n, 0x3000, 0x40); }
+static void *guard_map(void *a, u64 n, u32 type) {
+    GuardEnt took[64]; int nt = 0, g = a && g_gr && (u64)a < g_guard_hi && (u64)a + n > g_guard_lo;
+    if (g) { guard_lock(); nt = guard_take((u64)a, n, took, 64); }
+    void *p = VirtualAlloc(a, n, type | 0x200000, 0x40); if (!p) p = VirtualAlloc(a, n, type, 0x40);
+    if (g) { guard_give_back(took, nt, (u64)a, n, p == a); guard_unlock(); }
+    return p;
+}
+static void *plat_alloc_at(void *a, u64 n) { return guard_map(a, n, 0x3000); }
 /* t109: address space only (MEM_RESERVE, write-watched like plat_alloc_at); pieces of it are committed later with
    plat_commit. Reserved pages cost neither RAM nor commit. */
-static void *plat_reserve_at(void *a, u64 n) { if (a) plat_guard_release((u64)a, n); void *p = VirtualAlloc(a, n, 0x2000 | 0x200000, 0x40); return p ? p : VirtualAlloc(a, n, 0x2000, 0x40); }
+static void *plat_reserve_at(void *a, u64 n) { return guard_map(a, n, 0x2000); }
 static int plat_commit(void *a, u64 n) { return VirtualAlloc(a, n, 0x1000, 0x40) == a; }
 __declspec(dllimport) int WINAPI VirtualProtect(void *, u64, u32, u32 *);
 static int plat_commit_ro(void *a, u64 n) { return VirtualAlloc(a, n, 0x1000, 0x02) == a; }   /* t111: PAGE_READONLY until imported */
@@ -534,7 +616,9 @@ static void crash_dump(const u64 *gregs, u64 rip, u64 fault);
 static void (*g_dr_hook)(u8 *ctx, u64 dr6);   /* hardware watchpoints (plat_dr_arm_all) */
 static volatile u32 g_veh_ignore_tid, g_veh_ignore_tid2;   /* host-only threads (the controller readers, STATUS 49): their exceptions are left to Windows */
 __declspec(dllimport) u32 WINAPI GetCurrentThreadId(void);
-static int (*g_lz_fault_fn)(u64 addr);   /* t111: game memory committed on first use (e3_hle.c lz_fault) */
+static int (*g_lz_fault_fn)(u64 addr, int write);   /* t111: game memory committed on first use (e3_hle.c lz_fault) */
+static int (*g_coh_fault_fn)(u64 addr, int write, u64 rip);   /* t165 --gpu-coherence: CPU access to memory whose current bytes the GPU holds (e6_vk.c) */
+static int plat_protect(void *a, u64 n, u32 prot, u32 *old) { u32 o = 0; int ok = VirtualProtect(a, n, prot, &o) != 0; if (old) *old = o; return ok; }   /* t165 */
 /* t148: --fp-trap: a noisy site that only compares (an AVX compare with a signalling predicate, or a comiss / comisd)
    gets the quiet form of the same comparison - identical results, no exception for NaN inputs - instead of pausing
    its whole thread until the next flip (t147: JobSched threads were paused for most of each frame, so the place that
@@ -560,7 +644,8 @@ static int fp_quiet_patch(u8 *ip) {
 static int (*g_rsq_bp_fn)(u8 *ctx), (*g_rsq_ss_fn)(u8 *ctx);   /* t149 --rsqrt-trap (e5_gpu.c) */
 static WINAPI long plat_veh(ExcPtrs *ep) {
     u32 code = ep->rec->code;
-    if (code == 0xC0000005 && g_lz_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_lz_fault_fn(ep->rec->info[1])) return -1;   /* read / write, not execute */
+    if (code == 0xC0000005 && g_coh_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_coh_fault_fn(ep->rec->info[1], ep->rec->info[0] == 1, *(u64 *)(ep->ctx + CTX_RIP))) return -1;   /* t165 */
+    if (code == 0xC0000005 && g_lz_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_lz_fault_fn(ep->rec->info[1], ep->rec->info[0] == 1)) return -1;   /* read / write, not execute */
     if (code == 0x80000004 && g_dr_hook && (*(u64 *)(ep->ctx + 0x68) & 0xF)) {   /* a hardware write watchpoint (STATUS 69) */
         g_dr_hook(ep->ctx, *(u64 *)(ep->ctx + 0x68)); *(u64 *)(ep->ctx + 0x68) = 0; return -1; }
     if (g_veh_ignore_tid || g_veh_ignore_tid2) { u32 me = GetCurrentThreadId(); if (me == g_veh_ignore_tid || me == g_veh_ignore_tid2) return 0; }
@@ -609,7 +694,7 @@ static WINAPI u32 thread_tramp(void *p) { (void)p; g_body(); return 0; }
 __declspec(dllimport) u32 WINAPI SuspendThread(void *);
 __declspec(dllimport) u32 WINAPI ResumeThread(void *);
 __declspec(dllimport) int WINAPI GetThreadContext(void *, void *);
-static void report_where(u64 rip, u64 rbp, u64 rsp);
+static void report_where(u64 rip, u64 rbp, u64 rsp); static void plat_stop_lock(void); static void plat_stop_unlock(void);
 static int plat_run_thread(thread_body_fn fn, u64 stack, int timeout_s) {
     g_body = fn;
     void *t = CreateThread(0, stack, (void *)thread_tramp, 0, 0 /* commit the whole stack: PS4 code never probes its stack */, 0);
@@ -617,11 +702,13 @@ static int plat_run_thread(thread_body_fn fn, u64 stack, int timeout_s) {
     if (WaitForSingleObject(t, timeout_s <= 0 ? 0xFFFFFFFFu /* INFINITE: the player-facing program */ : (u32)timeout_s * 1000u) == 0) return 0;
     static __attribute__((aligned(16))) u8 ctx[1232];
     for (int k = 0; k < 3; k++) {
+        plat_stop_lock();   /* t165w (review 2, N5) */
         SuspendThread(t);
         for (u64 z = 0; z < sizeof ctx; z++) ctx[z] = 0;
         *(u32 *)(ctx + 0x30) = 0x100003;           /* CONTEXT_CONTROL | CONTEXT_INTEGER */
-        if (GetThreadContext(t, ctx)) report_where(*(u64 *)(ctx + 0xF8), *(u64 *)(ctx + 0xA0), *(u64 *)(ctx + 0x98));
-        ResumeThread(t);
+        int okc = GetThreadContext(t, ctx);
+        ResumeThread(t); plat_stop_unlock();
+        if (okc) report_where(*(u64 *)(ctx + 0xF8), *(u64 *)(ctx + 0xA0), *(u64 *)(ctx + 0x98));   /* (reported with the thread running: the report may need locks) */
         Sleep(300);
     }
     return 1;
@@ -685,15 +772,18 @@ __declspec(dllimport) void *WINAPI OpenThread(u32, int, u32);
 __declspec(dllimport) u32 WINAPI GetCurrentThreadId(void);
 static void *pt_self_handle(void) { return OpenThread(0x001F03FFu, 0, GetCurrentThreadId()); }
 static void plat_suspend_thread(void *h) { SuspendThread(h); }
-/* sample a thread: rip/rbp/rsp */
+static void plat_stop_lock(void); static void plat_stop_unlock(void);
+/* sample a thread: rip/rbp/rsp (t165w: under the thread-stop lock - two suspenders could each stop the other) */
 static int pt_sample(void *h, u64 *rip, u64 *rbp, u64 *rsp) {
     static __attribute__((aligned(16))) u8 ctx[1232];
-    if (SuspendThread(h) == 0xFFFFFFFFu) return 0;
+    plat_stop_lock();
+    if (SuspendThread(h) == 0xFFFFFFFFu) { plat_stop_unlock(); return 0; }
     for (u64 z = 0; z < sizeof ctx; z++) ctx[z] = 0;
     *(u32 *)(ctx + 0x30) = 0x100003;
     int ok = GetThreadContext(h, ctx);
     if (ok) { *rip = *(u64 *)(ctx + 0xF8); *rbp = *(u64 *)(ctx + 0xA0); *rsp = *(u64 *)(ctx + 0x98); }
     ResumeThread(h);
+    plat_stop_unlock();
     return ok;
 }
 
@@ -705,6 +795,63 @@ __declspec(dllimport) void *WINAPI CreateToolhelp32Snapshot(u32, u32);
 __declspec(dllimport) int WINAPI Thread32First(void *, void *);
 __declspec(dllimport) int WINAPI Thread32Next(void *, void *);
 __declspec(dllimport) u32 WINAPI GetCurrentProcessId(void);
+/* t165: every other thread of the process stopped (and known to be stopped: GetThreadContext waits for that) / resumed.
+   Used by the GPU-coherence handler while it rewrites pages no other thread may touch in between. While threads are
+   stopped nothing here may take a lock another thread could hold (the process heap, the log): the threads come from
+   NtGetNextThread (this process only, no allocation; t165j - t165i read the whole system's thread list twice, ~7 ms),
+   and the list is walked again after stopping until it names no thread that started meanwhile. -1: could not be done
+   (nothing stopped). */
+__declspec(dllimport) u32 WINAPI GetThreadId(void *); __declspec(dllimport) int WINAPI GetExitCodeThread(void *, u32 *);
+static PMutex g_stop_m; static volatile int g_stop_m_init;
+static i32 (WINAPI *g_stop_gnt)(void *, void *, u32, u32, u32, void **);
+static int stop_scan(u32 me, u32 *tids, void **hs, int *n, int max) {   /* stops the threads not yet in tids; returns how many were new, -1 on failure */
+    void *h = 0; int added = 0;
+    for (;;) {
+        void *nh = 0;
+        i32 st = g_stop_gnt((void *)-1, h, 0x2 | 0x8 | 0x800 | 0x100000 /* SUSPEND_RESUME, GET_CONTEXT, QUERY_LIMITED_INFORMATION, SYNCHRONIZE */, 0, 0, &nh);
+        int keep_prev = 0;
+        if (h) { for (int k = 0; k < *n; k++) if (hs[k] == h) { keep_prev = 1; break; } if (!keep_prev) CloseHandle(h); }
+        if (st < 0) return st == (i32)0x8000001A /* STATUS_NO_MORE_ENTRIES */ ? added : -1;   /* (t165x, review 5 R5-5: any other error is a failure, not the end of the list - threads after it kept running) */
+        if (!nh) return added;
+        h = nh;
+        u32 tid = GetThreadId(nh);
+        if (tid == me) continue;
+        int k = 0; while (k < *n && tids[k] != tid) k++;
+        if (k < *n) continue;
+        if (*n >= max) { CloseHandle(nh); return -1; }
+        if (SuspendThread(nh) == 0xFFFFFFFFu) {   /* (t165x, R5-5: skipped only when it has really ended; review 6 X2-4: signalled = ended, handle closed on failure) */
+            u32 xc = 259; if (WaitForSingleObject(nh, 0) == 0 || (GetExitCodeThread(nh, &xc) && xc != 259 /* STILL_ACTIVE */)) continue;   /* (review 7 N2: ending - its exit code is set before it is signalled) */
+            CloseHandle(nh); return -1; }
+        static __attribute__((aligned(16))) u8 ctx[1232];
+        for (u64 z = 0; z < 0x34; z++) ctx[z] = 0;
+        *(u32 *)(ctx + 0x30) = 0x100001;   /* CONTEXT_CONTROL: returns once the thread is really stopped */
+        GetThreadContext(nh, ctx);
+        tids[*n] = tid; hs[*n] = nh; (*n)++; added++;
+    }
+}
+static void plat_resume_others(void **hs, int n) { for (int i = 0; i < n; i++) if (hs[i]) { ResumeThread(hs[i]); CloseHandle(hs[i]); } if (n >= 0) pm_unlock(&g_stop_m); }
+static void plat_stop_ready(void) {
+    if (!__atomic_load_n(&g_stop_m_init, __ATOMIC_ACQUIRE)) { static volatile int once; if (!__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL)) {
+            pm_init(&g_stop_m);
+            void *nt = GetModuleHandleA("ntdll.dll"); if (nt) g_stop_gnt = (i32 (WINAPI *)(void *, void *, u32, u32, u32, void **))GetProcAddress(nt, "NtGetNextThread");
+            __atomic_store_n(&g_stop_m_init, 1, __ATOMIC_RELEASE); } else while (!__atomic_load_n(&g_stop_m_init, __ATOMIC_ACQUIRE)) {} }
+}
+/* t165w: every piece of code that suspends threads holds this lock meanwhile (two at once could each suspend the other) */
+static void plat_stop_lock(void) { plat_stop_ready(); pm_lock(&g_stop_m); }
+static void plat_stop_unlock(void) { pm_unlock(&g_stop_m); }
+static int plat_stop_others(void **hs, int max) {
+    plat_stop_ready();
+    if (!g_stop_gnt) return -1;
+    pm_lock(&g_stop_m);
+    static u32 tids[1024]; int n = 0; u32 me = GetCurrentThreadId();
+    if (max > 1024) max = 1024;
+    for (int pass = 0; pass < 16; pass++) {
+        int r = stop_scan(me, tids, hs, &n, max);
+        if (r < 0) { plat_resume_others(hs, n); return -1; }   /* (resumes and unlocks) */
+        if (pass && r == 0) return n;   /* g_stop_m stays held until plat_resume_others */
+    }
+    plat_resume_others(hs, n); return -1;   /* threads kept starting */
+}
 static int plat_dr_arm_all(const u64 *addr, int n) {   /* n <= 4 addresses, 1-byte write watches; returns threads set */
     u64 dr7 = 0;
     for (int i = 0; i < n && i < 4; i++) dr7 |= (1ull << (2 * i)) | (1ull << (16 + 4 * i));   /* Li, R/Wi = 01 (write), LENi = 00 (1 byte) */
@@ -718,6 +865,7 @@ static int plat_dr_arm_all(const u64 *addr, int n) {   /* n <= 4 addresses, 1-by
         if (te.pid != pid || te.tid == me) continue;
         void *h = OpenThread(0x2 | 0x8 | 0x10 /* SUSPEND_RESUME, GET_CONTEXT, SET_CONTEXT */, 0, te.tid);
         if (!h) continue;
+        plat_stop_lock();   /* t165w (review 2, N5) */
         if (SuspendThread(h) != 0xFFFFFFFFu) {
             for (u64 z = 0; z < sizeof ctx; z++) ctx[z] = 0;
             *(u32 *)(ctx + 0x30) = 0x100010;   /* CONTEXT_DEBUG_REGISTERS */
@@ -728,6 +876,7 @@ static int plat_dr_arm_all(const u64 *addr, int n) {   /* n <= 4 addresses, 1-by
             }
             ResumeThread(h);
         }
+        plat_stop_unlock();
         CloseHandle(h);
     }
     CloseHandle(snap);
@@ -886,7 +1035,12 @@ static void *hf_open_rw(const char *p, int create, int trunc) {
     u32 disp = trunc ? (create ? 2 /*CREATE_ALWAYS*/ : 5 /*TRUNCATE_EXISTING*/) : (create ? 4 /*OPEN_ALWAYS*/ : 3 /*OPEN_EXISTING*/);
     void *h = lp_CreateFile(p, 0xC0000000u, 3, disp, 0x80); return h == (void *)-1 ? 0 : h;
 }
-static u64 hf_write(void *f, const void *b, u64 n) { u32 w; u64 t = 0; while (t < n) { u32 c = (u32)(n - t > 0x40000000 ? 0x40000000 : n - t); if (!WriteFile(f, (const u8 *)b + t, c, &w, 0) || !w) break; t += w; } return t; }
+static u64 hf_write(void *f, const void *b, u64 n) {   /* (t165w, review 3 NF10: like hf_read - a page held again between making it current and the call: once more) */
+    u32 w; u64 t = 0; if (g_coh_ensure_fn && n) g_coh_ensure_fn((u64)b, n);
+    for (int again = 0; t < n; ) { u32 c = (u32)(n - t > 0x40000000 ? 0x40000000 : n - t); int ok = WriteFile(f, (const u8 *)b + t, c, &w, 0);
+        if (!ok || !w) { if (!ok && GetLastError() == 998) { __atomic_add_fetch(&g_coh_kernel_refused, 1, __ATOMIC_RELAXED); if (g_coh_ensure_fn && again++ < 3) { g_coh_ensure_fn((u64)b + t, n - t); continue; } } break; }
+        t += w; }
+    return t; }
 __declspec(dllimport) u32 WINAPI GetFileAttributesW(const u16 *);
 static u32 lp_attrs(const char *p) { if (!lp_long(p)) return GetFileAttributesA(p); u16 *w = lp_wide(p); u32 a = w ? GetFileAttributesW(w) : 0xFFFFFFFFu; lp_free(w); return a; }
 static int plat_is_dir(const char *p) { u32 a = lp_attrs(p); return a != 0xFFFFFFFFu && (a & 0x10); }
@@ -1074,7 +1228,9 @@ static u64 plat_module_of(u64 a, char *name, u32 n) { (void)a; (void)n; name[0] 
 #include <asm/prctl.h>
 static void *hf_open_rb(const char *p) { return fopen(p, "rb"); }
 static void hf_close(void *f) { fclose((FILE *)f); }
+static void (*g_coh_ensure_fn)(u64 a, u64 n); static volatile u64 g_coh_kernel_refused;
 static u64 hf_read(void *f, void *b, u64 n) { return fread(b, 1, n, (FILE *)f); }
+static u64 hf_read_raw(void *f, void *b, u32 n, u32 *err) { *err = 0; return fread(b, 1, n, (FILE *)f); }
 static i64 hf_seek(void *f, i64 o, int w) { return fseeko((FILE *)f, o, w) == 0 ? ftello((FILE *)f) : -1; }
 static i64 hf_tell(void *f) { return ftello((FILE *)f); }
 static void plat_write(void *h, const char *s) {
@@ -1112,6 +1268,12 @@ static void *plat_read_file(const char *p, u64 *size) {
     fclose(f);
     return b;
 }
+static void *plat_reserve_any(u64 n) { void *p = mmap(0, n, 0, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0); return p == MAP_FAILED ? 0 : p; }
+static void plat_release_rw(void *p, u64 n) { munmap(p, n); }
+static int plat_commit_rw(void *a, u64 n) { return mprotect(a, n, 3) == 0; }
+static u32 plat_query_prot(u64 a) { (void)a; return 0x04; }
+static u32 plat_query_span(u64 a, u64 *end) { *end = a + 0x10000; return 0x04; }
+static void plat_stop_lock(void) {} static void plat_stop_unlock(void) {}
 static void *plat_alloc_rwx(u64 n) { void *p = mmap(0, n, 7, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0); return p == MAP_FAILED ? 0 : p; }
 static int plat_readable(u64 a, u64 n) { (void)a; (void)n; return 0; }   /* (Linux test builds: diagnostics read GPU-visible memory only) */
 static int plat_readable_span(u64 a, u64 *end) { *end = ~0ull; (void)a; return 1; }
@@ -1120,13 +1282,15 @@ static void *plat_alloc_rw(u64 n) { void *p = mmap(0, n, 3, MAP_PRIVATE | MAP_AN
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 static void plat_guard_init(u64 lo, u64 hi) { (void)lo; (void)hi; }
-static int g_guard_held, g_guard_busy;
+static int g_guard_held, g_guard_busy, g_ngr; static u64 g_guard_rereserved, g_guard_lost;
 static void *plat_alloc_at(void *a, u64 n) { void *p = mmap(a, n, 7, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0); return (p == MAP_FAILED || p != a) ? 0 : p; }
 static void *plat_reserve_at(void *a, u64 n) { void *p = mmap(a, n, 0, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0); return (p == MAP_FAILED || p != a) ? 0 : p; }
 static int plat_commit(void *a, u64 n) { return mprotect(a, n, 7) == 0; }
 static int plat_commit_ro(void *a, u64 n) { return mprotect(a, n, 1) == 0; }
 static int plat_protect_rwx(void *a, u64 n) { return mprotect(a, n, 7) == 0; }
-static int (*g_lz_fault_fn)(u64 addr);   /* (t111: unused on Linux: lazy memory is off there) */
+static int (*g_lz_fault_fn)(u64 addr, int write);   /* (t111: unused on Linux: lazy memory is off there) */
+static int (*g_coh_fault_fn)(u64 addr, int write, u64 rip);   /* (t165: unused on Linux) */
+static int plat_protect(void *a, u64 n, u32 prot, u32 *old) { if (old) *old = 4; return mprotect(a, n, prot == 1 ? 0 : 3) == 0; }
 typedef struct { u64 abase, bytes, res; } PlatTopAlloc;
 typedef struct { u64 priv, priv_game, mapped, image, nreg, other_res, image_res; PlatTopAlloc top[8]; } PlatMemWalk;
 static int plat_mem_walk(PlatMemWalk *o, u64 (*in_game)(u64, u64)) { (void)in_game; for (u32 i = 0; i < sizeof *o; i++) ((u8 *)o)[i] = 0; return 0; }
@@ -1141,6 +1305,8 @@ static i64 plat_dirty_pages(void *base, u64 size, void **out, u64 max) { (void)b
 static i64 plat_any_dirty(void *base, u64 size) { (void)base; (void)size; return -1; }
 static i64 plat_dirty_list(void *base, u64 size, void **out, u64 max) { (void)base; (void)size; (void)out; (void)max; return -1; }
 static int plat_dr_arm_all(const u64 *addr, int n) { (void)addr; (void)n; return -1; }
+static int plat_stop_others(void **hs, int max) { (void)hs; (void)max; return 0; }
+static void plat_resume_others(void **hs, int n) { (void)hs; (void)n; }
 static void (*g_dr_hook)(u8 *ctx, u64 dr6);
 static void plat_exit(int c) { fflush(0); _exit(c); }
 static void plat_sleep_ms(u32 ms) { usleep(ms * 1000); }

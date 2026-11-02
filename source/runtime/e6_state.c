@@ -45,6 +45,7 @@ static u64 g_index_base; static u32 g_index_type, g_index_size, g_num_instances 
 #define CTX_PA_CL_CLIP_CNTL 0x204
 #define CTX_PA_SU_SC_MODE_CNTL 0x205
 #define CTX_PA_CL_VTE_CNTL 0x206
+static int g_opt_halloween;   /* t167: --halloween-hunt / halloween_hunt = 1 (the clock override is in e5_system.c) */
 #define CTX_PA_CL_VS_OUT_CNTL 0x207
 #define CTX_CB_COLOR0_BASE 0x318
 #define SH_PGM_LO_PS 0x008
@@ -62,6 +63,17 @@ static u64 g_index_base; static u32 g_index_type, g_index_size, g_num_instances 
 static void st_set_ctx(u32 r, const u32 *v, u32 n) { for (u32 k = 0; k < n && r + k < 0x400; k++) g_ctx[r + k] = v[k]; }
 static void st_set_sh(u32 r, const u32 *v, u32 n) { for (u32 k = 0; k < n && r + k < 0x400; k++) g_shr[r + k] = v[k]; }
 static void st_set_uc(u32 r, const u32 *v, u32 n) { for (u32 k = 0; k < n && r + k < 0x4000; k++) g_ucfg[r + k] = v[k]; }
+/* t162: the game's sceGnmDrawInitDefaultHardwareState200 (our HLE writes a tagged NOP in its place, e5_gpu.c fn 20).
+   The real one starts with CLEAR_STATE, which puts the context registers back to their defaults. Its effect on the
+   viewport scissors was missing: the game's UI library starts its command buffer with this call and then sets only its
+   viewport (1984x1152 UI layer), so it inherited the 3D pass's viewport scissor (1920x1080, enabled by
+   PA_SC_MODE_CNTL_0) and its letterbox bars ended at x 1888 / y 1048 on screen (replay_83503 steps 1128-1138; the
+   PS4 shows them whole). Only these registers are reset: the scissors to "never set" (bottom-right 0: unlimited here,
+   as the driver's default state is not replayed) and PA_SC_MODE_CNTL_0 to 0. */
+static void st_init_default_hw(void) {
+    for (u32 r = CTX_PA_SC_VPORT_SCISSOR_0_TL; r < CTX_PA_SC_VPORT_SCISSOR_0_TL + 32; r++) g_ctx[r] = 0;   /* PA_SC_VPORT_SCISSOR_0..15 TL / BR */
+    g_ctx[0x292] = 0;   /* PA_SC_MODE_CNTL_0 (VPORT_SCISSOR_ENABLE) */
+}
 
 /* ---- frame report ---- */
 static int g_dump_list[32], g_ndump_list;
@@ -207,7 +219,8 @@ static void dump_texture(const u32 *T) {
 
 /* translate a stage's shader with the live user data and memory; save the SPIR-V next to the frame report */
 static void ov_apply(u64 a, void *dst, u64 n);   /* e6_vk.c: memory writes recorded for the GPU but not yet executed */
-static int g2s_reader(void *ctx, u64 a, u32 *out, u32 n) { (void)ctx; if (!mem_ok(a, 4ull * n)) return 0; mem_copy(out, (const void *)a, 4ull * n); ov_apply(a, out, 4ull * n); return 1; }
+static void coh_own_read(u64 a, void *out, u64 n);   /* e6_vk.c (t165w: a GPU-held page is read without leaving it read-only and stale) */
+static int g2s_reader(void *ctx, u64 a, u32 *out, u32 n) { (void)ctx; if (!mem_ok(a, 4ull * n)) return 0; coh_own_read(a, out, 4ull * n); ov_apply(a, out, 4ull * n); return 1; }
 static int g_spv_ok, g_spv_fail;
 static void fr_translate(const char *tag, int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud) {
     G2SIn in; h_memset(&in, 0, sizeof in);

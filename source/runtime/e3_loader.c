@@ -2094,6 +2094,9 @@ static u64 find_ctors_end(Module *m) {
 static void print_summary(void) {
     hw_summary();
     arena_lock_summary();
+    say("C++ static guards (t166"); say(g_opt_old_guard ? ", --old-cxa-guard: as before" : ""); say("): first-use checks "); say_dec((i64)g_guard_calls); say(", waits for another thread constructing the same static ");
+    say_dec((i64)g_guard_waits); say(g_opt_old_guard ? " (each constructed it a second time, as before t166)" : " (each a possible double construction before t166)"); say(", waits over 2 s "); say_dec((i64)g_guard_late);
+    say(", gave up after 10 s "); say_dec((i64)g_guard_gaveup); say(", same thread again "); say_dec((i64)g_guard_same); say(", aborted "); say_dec((i64)g_guard_aborts); say("\n");
     say("\n=== summary ===\nstage reached: ");
     say(g_stage == 3 ? "finished" : g_stage == 2 ? "inside main" : g_stage == 1 ? "inside static constructors" : "not started");
     say("\nconstructors completed: "); say_dec(g_ctors_done); say(" / "); say_dec(g_n_ctors);
@@ -2138,8 +2141,15 @@ static void stub_stop(int idx, u64 ret, u64 a) {
 static void e3_fatal_summary(void) {
     vkr_on_fatal(); print_summary(); plat_close(g_trace);
     if (g_ud_release) pt_suspend_others();   /* after the report (a suspended thread may hold a lock the report needs) */
-    if (g_ud_release && !g_normal_exit) plat_message_box("Until Dawn - stopped", "Until Dawn stopped because of an internal error in the PC runtime.\n\n"
-                                       "The details were written to Logs\\UntilDawn.log (next to UntilDawn.exe). Please keep that file for the bug report.");
+    /* t165w: not in a frame-limited (unattended) run - the box would keep the process open until someone closes it */
+    if (g_ud_release && !g_normal_exit && !(g_opt_frames > 0 && g_opt_frames < 2000000000)) plat_message_box("Until Dawn - stopped", g_coh_fatal_hit ?
+        "Until Dawn stopped because the GPU coherence step could not complete safely (it was stopped rather than go on with memory that may be wrong).\n\n"
+        "For troubleshooting it can be turned off: in Config\\settings.ini set the line  gpu_coherence = 0  (change the existing line, or add it).\n\n"
+        "The details were written to Logs\\UntilDawn.log (next to UntilDawn.exe). Please keep that file for the bug report." : g_dev_lost_hit ?
+        "Until Dawn stopped because the graphics driver stopped responding (the graphics device was lost or reset).\n\n"
+        "Updating the graphics driver may help. The details were written to Logs\\UntilDawn.log (next to UntilDawn.exe). Please keep that file for the bug report." :
+        "Until Dawn stopped because of an internal error in the PC runtime.\n\n"
+        "The details were written to Logs\\UntilDawn.log (next to UntilDawn.exe). Please keep that file for the bug report.");
 }
 
 #ifndef E3_NO_MAIN
@@ -2167,7 +2177,7 @@ static int ud_player_start(int *pargc, char ***pargv) {
     ud_load_settings(cfg);
     if (g_uds.game_dir[0]) { int n = str_len(g_uds.game_dir); mem_copy(game, g_uds.game_dir, (u64)n + 1); }
     else path_join(game, base, "Game");
-    say("Until Dawn - native PC build, started "); say(__DATE__ " " __TIME__); say("\nprogram folder: "); say(base); say("\ngame folder: "); say(game); say("\n");
+    say("Until Dawn v" UD_VERSION " - native PC build, started "); say(__DATE__ " " __TIME__); say("\nprogram folder: "); say(base); say("\ngame folder: "); say(game); say("\n");
     static char mb[4096]; UdMsg msg = {mb, 0, sizeof mb}; mb[0] = 0;
     u64 t0 = plat_ticks();
     int bad = ud_validate(game, &msg);
@@ -2190,16 +2200,23 @@ static int ud_player_start(int *pargc, char ***pargv) {
     say("settings: frame-rate limit "); if (g_uds.fps_limit) say_dec(g_uds.fps_limit); else say("none");
     say(", display "); say(g_uds.borderless ? "borderless" : "windowed"); say(", developer mode "); say(g_uds.developer ? "on" : "off");
     say(", renderer thread "); say(g_uds.renderer_thread ? "on" : "off (renderer_thread = 0)");
+    say(", gpu coherence "); say(g_uds.gpu_coherence ? "on" : "off (gpu_coherence = 0)"); say(", halloween hunt "); say(g_uds.halloween_hunt ? "on" : "off");
     say(", gpu "); say(g_uds.gpu[0] ? g_uds.gpu : "auto"); say(", present mode "); say(g_uds.present_mode == 1 ? "fifo" : g_uds.present_mode == 2 ? "mailbox" : g_uds.present_mode == 3 ? "immediate" : "auto"); say("\n");
     (void)fpsbuf;
     int n = 0;
     av[n++] = "UntilDawn.exe"; av[n++] = game; av[n++] = "--main"; av[n++] = "--frames"; av[n++] = "2000000000"; av[n++] = "--timeout"; av[n++] = "0";
     av[n++] = "--watch-heap"; av[n++] = "--lump-repair";   /* the two containments every good test run used (STATUS 40, 47); the skin check is on by default (STATUS 68) */
+    if (!g_uds.gpu_coherence) av[n++] = "--no-gpu-coherence";   /* t165x */
+    if (g_uds.halloween_hunt) av[n++] = "--halloween-hunt";   /* t167 */
     if (!g_uds.renderer_thread) av[n++] = "--sync-submit";   /* 0.1.4: renderer_thread = 0 -> the submits run on the game's thread, as in 0.1.3 */
     if (g_uds.gpu[0] && !ud_key_is(g_uds.gpu, "auto")) { av[n++] = "--gpu"; av[n++] = g_uds.gpu; }   /* t121 */
     if (g_uds.present_mode) { av[n++] = "--present-mode"; av[n++] = g_uds.present_mode == 1 ? "fifo" : g_uds.present_mode == 2 ? "mailbox" : "immediate"; }   /* t121 */
     if (!g_uds.heap_slot_reuse) av[n++] = "--heap-slots-roundrobin";   /* t131 */
     if (!g_uds.shader_prep) av[n++] = "--no-prep";   /* t159 */
+<<<<<<< Updated upstream
+=======
+    if (g_uds.shader_prep == 2) av[n++] = "--prep-background";   /* t164 */
+>>>>>>> Stashed changes
     if (g_uds.heap_slot_mb != 512) { static char hs[16]; char *q = hs + sizeof hs - 1; *q = 0; int v = g_uds.heap_slot_mb; do { *--q = (char)('0' + v % 10); v /= 10; } while (v); av[n++] = "--heap-slot-mb"; av[n++] = q; }   /* t130 */
     if (g_uds.developer) {   /* t107: developer mode only - extra options from Config\dev_options.txt (one line, separated by spaces) */
         static char dop[1100], dbuf[2048]; path_join(dop, cfg, "dev_options.txt");
@@ -2252,7 +2269,12 @@ int e3_main(int argc, char **argv) {
         say("options after --player:"); for (int k = 0; k < xa && argc < 63; k++) { argv[argc++] = xv[k]; say(" "); say(xv[k]); } argv[argc] = 0; say("\n");
     }
     say("address guard (t148): "); say_dec(g_guard_held); say(" blocks of 512 MB reserved over the game's fixed-address window 0x1200000000-0x4c80000000");
-    if (g_guard_busy) { say(", "); say_dec(g_guard_busy); say(" already taken by host memory"); } say("\n");
+    if (g_guard_busy) { say(", "); say_dec(g_guard_busy); say(" already taken by host memory");
+#ifdef _WIN32
+        for (int k = 0; k < g_guard_busy && k < 4; k++) { say(k ? "; " : " ("); say_hex(g_guard_busy_at[k]); say(": allocation at "); say_hex(g_guard_busy_what[k]); say(" type/state "); say_hex(g_guard_busy_type[k]); }
+        say("; the free parts of those blocks are guarded)");
+#endif
+    } say("\n");
     for (int i = 1; i < argc; i++) {
         if (str_eq(argv[i], "--main")) g_run_main = 1;
         else if (str_eq(argv[i], "--timeout") && i + 1 < argc) timeout = (int)str_to_u64(argv[++i]);
@@ -2307,6 +2329,17 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-stencil")) g_opt_nostencil = 1;
         else if (str_eq(argv[i], "--cpu-writedata")) g_opt_cpu_writedata = 1;
         else if (str_eq(argv[i], "--no-writeback")) g_opt_nowb = 1;
+        else if (str_eq(argv[i], "--gpu-writes-to-ram")) g_opt_shwb_new = 1;
+        else if (str_eq(argv[i], "--coh-test")) g_opt_coh_test = 1;   /* t165: replays: the coherence cases after the frame */
+        else if (str_eq(argv[i], "--coh-test-only") && i + 1 < argc) { g_opt_coh_test = 1; g_ct_only = (int)str_to_u64(argv[++i]); }   /* t165w: one of the review-finding tests 14-21 alone */
+        else if (str_eq(argv[i], "--coh-init-delay") && i + 1 < argc) g_ct_init_delay = (u32)str_to_u64(argv[++i]);   /* t165w test: widens the coherence startup window (ms) */
+        else if (str_eq(argv[i], "--tex-stale-check")) g_opt_tex_stale_chk = 1;   /* t165k: replays: textures in GPU-written VRAM copies, RAM vs VRAM bytes (diagnostic) */
+        else if (str_eq(argv[i], "--gpu-coherence")) g_coh_mode = 2;          /* t165: CPU access to GPU-written VRAM copies copies those pages back (t165x: the default) */
+        else if (str_eq(argv[i], "--halloween-hunt")) g_opt_halloween = 1;   /* t167 (experimental): the game's Halloween 2015 event - only its own date checks see 31 Oct 2015 */
+        else if (str_eq(argv[i], "--old-cxa-guard")) g_opt_old_guard = 1;   /* t166 A/B: C++ static guards as before (no waiting: two threads can both construct a static) */
+        else if (str_eq(argv[i], "--coh-init-fail")) g_ct_init_fail = 1;   /* t165x5 test: coherence set-up fails (the message, the game goes on without it) */
+        else if (str_eq(argv[i], "--no-gpu-coherence")) g_coh_mode = 0;       /* t165x: off (troubleshooting; as before t165x) */
+        else if (str_eq(argv[i], "--gpu-coherence-probe")) g_coh_mode = 1;    /* t165: the same accesses found and logged only */   /* t165 (experimental): one-off GPU writes in VRAM copies go back to RAM */
         else if (str_eq(argv[i], "--depth-sync")) g_opt_depthsync = 1;
         else if (str_eq(argv[i], "--no-defer-gpu-uploads")) g_opt_defer_fill = 0;   /* t107f: textures still being written by the GPU: wait for all GPU work (before t107f) */
         else if (str_eq(argv[i], "--sync-submit")) g_opt_aq = 0;   /* t107g: the game's submit call translates and records the submit itself (before t107g) */
@@ -2370,6 +2403,13 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-wait-sync")) g_opt_no_wait_sync = 1;
 #endif
         else if (str_eq(argv[i], "--replay-sum") && i + 1 < argc) g_rc_sum_path = argv[++i];
+<<<<<<< Updated upstream
+=======
+        else if (str_eq(argv[i], "--replay-skip") && i + 1 < argc && g_nrskip < 16) { const char *x = argv[++i]; u64 a = 0, b = 0; while (*x >= '0' && *x <= '9') a = a * 10 + (u64)(*x++ - '0'); if (*x == '-') { x++; while (*x >= '0' && *x <= '9') b = b * 10 + (u64)(*x++ - '0'); } else b = a; g_rskip[g_nrskip][0] = a; g_rskip[g_nrskip][1] = b; g_nrskip++; }   /* t164f diagnostic */
+        else if (str_eq(argv[i], "--full-hash-max") && i + 1 < argc) g_opt_full_hash_max = str_to_u64(argv[++i]);   /* t164 */
+        else if (str_eq(argv[i], "--prep-background")) g_prep_bg_mode = 1;   /* t164: at most --prep-fg-seconds (20) before the game, the rest during play */
+        else if (str_eq(argv[i], "--prep-fg-seconds") && i + 1 < argc) g_prep_fg_ms = (int)str_to_u64(argv[++i]) * 1000;   /* t164 */
+>>>>>>> Stashed changes
         else if (str_eq(argv[i], "--no-prep")) g_prep_on = 0;   /* t159: no shader preparation records and no preparation at start-up */
         else if (str_eq(argv[i], "--prep")) g_prep_replay = 1;   /* t159 (replays): record, and prepare the recorded pipelines when the replay starts */
         else if (str_eq(argv[i], "--prep-force")) g_prep_force = 1;
@@ -2426,6 +2466,12 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--shots") && i + 1 < argc) {
             const char *q = argv[++i];
             while (*q && g_nshot_more < 64) { g_shot_more[g_nshot_more++] = str_to_u64(q); while (*q && *q != ',') q++; if (*q) q++; } }
+        else if (str_eq(argv[i], "--press-until-recap") && i + 1 < argc) {   /* t165w: START:EVERY:BUTTON:LAST */
+            const char *q = argv[++i]; u64 v[2] = {0, 0}; for (int k = 0; k < 2; k++) { while (*q >= '0' && *q <= '9') v[k] = v[k] * 10 + (u64)(*q++ - '0'); if (*q == ':') q++; }
+            char bn[16]; int nb = 0; while (*q && *q != ':' && nb < 15) bn[nb++] = *q++; bn[nb] = 0; if (*q == ':') q++;
+            u64 last = 0; while (*q >= '0' && *q <= '9') last = last * 10 + (u64)(*q++ - '0');
+            u32 bt = str_eq(bn, "x") ? PAD_CROSS : str_eq(bn, "o") ? PAD_CIRCLE : str_eq(bn, "options") ? PAD_OPTIONS : 0;
+            if (bt && v[1] >= 16) { g_prr_start = v[0]; g_prr_every = v[1]; g_prr_btn = bt; g_prr_last = last ? last : v[0] + 20000; g_prr_state = 1; } }
         else if (str_eq(argv[i], "--press") && i + 1 < argc && g_npress < 64) {   /* FLIP:BUTTON */
             const char *q = argv[++i]; u64 f = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0');
             if (*q == ':') q++;
@@ -2486,6 +2532,10 @@ int e3_main(int argc, char **argv) {
                 for (; *x && *x != ':'; x++) { int d = *x >= '0' && *x <= '9' ? *x - '0' : hex && *x >= 'a' && *x <= 'f' ? *x - 'a' + 10 : hex && *x >= 'A' && *x <= 'F' ? *x - 'A' + 10 : -1; if (d < 0) break; v[k] = v[k] * (hex ? 16 : 10) + (u64)d; }
                 if (*x == ':') x++; }
             g_rc_zero[g_rc_nzero][0] = v[0]; g_rc_zero[g_rc_nzero][1] = v[1]; g_rc_zero[g_rc_nzero][2] = v[2] & 0xFF; g_rc_nzero++; }
+        else if (str_eq(argv[i], "--replay-patch") && i + 1 < argc && g_rc_npatch < 8) {   /* t165: ADDR:FILE (hex address; the file's bytes are written there before the frame runs) */
+            const char *x = argv[++i]; u64 v = 0; if (x[0] == '0' && (x[1] == 'x' || x[1] == 'X')) x += 2;
+            for (; *x && *x != ':'; x++) { int d = *x >= '0' && *x <= '9' ? *x - '0' : *x >= 'a' && *x <= 'f' ? *x - 'a' + 10 : *x >= 'A' && *x <= 'F' ? *x - 'A' + 10 : -1; if (d < 0) break; v = v * 16 + (u64)d; }
+            if (*x == ':') { g_rc_patch_a[g_rc_npatch] = v; g_rc_patch_f[g_rc_npatch] = x + 1; g_rc_npatch++; } }
         else if (str_eq(argv[i], "--replay-dump-captured") && i + 1 < argc && g_rc_ndcap < 8) { const char *v = argv[++i]; u64 a = 0; if (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) v += 2;
             for (; *v; v++) { u32 c = (u32)*v; u32 d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 99; if (d > 15) break; a = a * 16 + d; }
             g_rc_dcap[g_rc_ndcap++] = a; }   /* t135 */
@@ -2510,6 +2560,9 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--lazy-ro-import")) g_opt_lazy_ro = 1;   /* t111 experiment: lazily committed granules imported while read-only */
         else if (str_eq(argv[i], "--late-import")) g_opt_late_import = 1;   /* t107: import new game memory on the render thread at its next submit (before t107) */
         else if (str_eq(argv[i], "--direct-reads")) g_opt_direct_reads = 1;   /* t107: file reads straight into game memory (before t107) */   /* t106: back to the t52-t105 helper handling in every pixel shader */
+        else if (str_eq(argv[i], "--csck-cs") && i + 1 < argc && g_ncsck_cs < 4) { const char *x = argv[++i]; u64 v = 0; if (x[0] == '0' && (x[1] == 'x' || x[1] == 'X')) x += 2;
+            for (; *x; x++) { int d = *x >= '0' && *x <= '9' ? *x - '0' : *x >= 'a' && *x <= 'f' ? *x - 'a' + 10 : *x >= 'A' && *x <= 'F' ? *x - 'A' + 10 : -1; if (d < 0) break; v = v * 16 + (u64)d; }
+            g_csck_cs[g_ncsck_cs++] = v; }   /* t164: the compute check (F8 / --compute-check) saves these programs' dispatches */
         else if (str_eq(argv[i], "--compute-check")) { g_csck_from = 0; g_csck_frame = 0xFFFFFFFFu; g_csck_n = 0; }   /* t105: as F8, from the first frame (replays) */
         else if (str_eq(argv[i], "--diag-mode") && i + 1 < argc) { i++; g_diag_mode = (int)str_to_u64(argv[i]); if (g_diag_mode < 0 || g_diag_mode >= DIAG_N) g_diag_mode = 0; }   /* t105: start in a diagnostic mode (F7 changes it) */
         else if (str_eq(argv[i], "--vote-borrow-all")) g_opt_force_borrow = 1;      /* t104 test: wave votes in the last LDS dword everywhere */
@@ -2542,7 +2595,7 @@ int e3_main(int argc, char **argv) {
     if (g_replay_path) {   /* replay a capture: no game code runs (e6_capture.c) */
         pm_init(&g_log_lock);
         g_trace = plat_open_write("replay_trace.txt");
-        say("Until Dawn PC runtime - replay of a captured frame (build " __DATE__ " " __TIME__ "): "); say(g_replay_path); say("\n");
+        say("Until Dawn PC runtime v" UD_VERSION " - replay of a captured frame (build " __DATE__ " " __TIME__ "): "); say(g_replay_path); say("\n");
         plat_install_handlers();
         g_stage_big_req = 1;   /* t111: replays copy whole images through the staging buffer */
         e5_init();
@@ -2556,12 +2609,15 @@ int e3_main(int argc, char **argv) {
     if (!g_game_dir) { plat_write(0, "usage: e5_loader <game_dir containing eboot.bin> [--main] [--timeout seconds] [--frames N] [--dump N] [--dump-frames a,b,c] [--no-window] [--shot N] [--no-cull]\n"); return 2; }
     pm_init(&g_log_lock);
     g_trace = plat_open_write(g_ud_release ? "Logs/os_calls.txt" : "e3_trace.txt");
-    say("Until Dawn PC runtime (build " __DATE__ " " __TIME__ "): the game's own x86-64 code runs directly on this CPU; "
+    say("Until Dawn PC runtime v" UD_VERSION " (build " __DATE__ " " __TIME__ "): the game's own x86-64 code runs directly on this CPU; "
         "the PS4 system libraries and the GPU are provided by this program's compatibility layer (Windows + Vulkan)\n");
     say("game dir: "); say(g_game_dir); say("\n");
     plat_install_handlers();
     g_lz_fault_fn = lz_fault;   /* t111 */
     say(g_opt_lazy_mem ? "  game memory: large mappings committed on first use (--lazy-memory, experiment)\n" : "  game memory: large mappings committed at once\n");
+    say(g_coh_mode == 2 ? "  GPU coherence: on (the default; to turn it off for troubleshooting: gpu_coherence = 0 in Config\\settings.ini, or --no-gpu-coherence)\n"
+        : g_coh_mode == 1 ? "  GPU coherence: probe (logs only, --gpu-coherence-probe)\n" : "  GPU coherence: off (gpu_coherence = 0 or --no-gpu-coherence)\n");
+    if (g_opt_halloween) say("  Halloween Hunt 2015: on (halloween_hunt = 1 or --halloween-hunt) - the game's own event, its date checks see 31 October 2015\n");   /* v0.2.2: the state in effect */
     if (sys_check(g_ud_release)) return 3;   /* STATUS 88: CPU features the game's code needs, memory, Windows version */
     char path[1024];
     path_join(path, g_game_dir, "eboot.bin");

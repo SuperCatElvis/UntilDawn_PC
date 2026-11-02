@@ -49,10 +49,12 @@ static const char *const g_diag_name[DIAG_N] = {"normal", "registers start at 0"
     "every shader translated afresh (new key, otherwise the same; t137)"};
 static int g_diag_cycle;   /* t135 --diag-teeth: F7 cycles normal -> 8 -> 6 -> 4 -> 7 -> normal (the black-mouth candidates); 2 = "auto": every 10 s */
 static u32 g_csck_from = 0xFFFFFFFFu, g_csck_frame = 0xFFFFFFFFu; static int g_csck_n, g_csck_on, g_csck_cur;   /* t105 compute check (F8), below */
+static u64 g_csck_cs[4]; static int g_ncsck_cs;   /* t164 --csck-cs ADDR: the compute check saves these programs' dispatches (any kind) */
 static int g_diag_keys;   /* t105 test keys F6 / F7 / F8 outside developer mode (--diag-keys) */
 static int g_rw_kind;   /* t105b replay watch: the last step was a dispatch (1) or a draw (0) */
 static u64 g_rc_dcap[8]; static int g_rc_ndcap;   /* t135: --replay-dump-captured ADDR */
-static u64 g_rc_zero[8][3]; static int g_rc_nzero; static int g_rc_scan_start;   /* t135: --replay-fill ADDR:BYTES:VALUE (experiment) */
+static u64 g_rc_zero[8][3]; static int g_rc_nzero; static u64 g_rc_patch_a[8]; static const char *g_rc_patch_f[8]; static int g_rc_npatch;   /* t165: --replay-patch ADDR:FILE (experiment) */
+static int g_rc_scan_start;   /* t135: --replay-fill ADDR:BYTES:VALUE (experiment) */
 static int g_rc_fresh_wseq; static u64 g_rc_wseq_top;   /* t135: --replay-fresh-wseq (restored images numbered in table order, as before) */
 static int g_nrw; static u32 g_rw_w, g_rw_h;   /* replay watch: addresses given; t107b: --replay-watch-size WxH watches every image of that size */
 static u64 g_rw_tex[G2S_MAX_TEX]; static u32 g_rw_texf[G2S_MAX_TEX]; static int g_rw_ntex;   /* t107b: the pixel shader's textures of the draw just made (pixel history) */
@@ -90,6 +92,7 @@ static u32 g_snap_n[16]; static u64 g_snap_a[16]; static int g_nsnap;   /* --sna
    step STEP (the numbering of --replay-trace and udcap_steps.py). File: replay_snap<STEP>_<addr>_<w>x<h>_f<vkformat>.bin,
    depth as copied by Vulkan (D16: 2 bytes per texel, D32: 4). */
 static u32 g_rsnap_n[32]; static u64 g_rsnap_a[32]; static int g_nrsnap; static int g_rp_running; static u64 g_rp_step;
+static u64 g_rskip[16][2]; static int g_nrskip;   /* t164f --replay-skip A-B: replay steps not drawn / dispatched (diagnostic; counted with --replay-snap) */
 /* t107b: --replay-dumptex STEP: the textures the draw / dispatch at that replay step samples, saved as the GPU has them */
 static u32 g_rdt_n[8]; static int g_nrdt; typedef struct { void *m; u32 lb; u32 T[12]; int storage; } RdtEnt; static RdtEnt g_rdt[48]; static int g_nrdte;
 static u64 g_rtl_lo, g_rtl_hi;   /* --replay-texlog A-B: log how each texture of these replay steps is resolved to an image */
@@ -270,6 +273,10 @@ static u64 g_t_submit, g_t_pace, g_n_vkbar;   /* CPU ticks in the game's submit 
 typedef struct { u64 addr, val; u32 n; int irq; } VDefW;
 static void gpu_defw_apply1(u64 addr, u64 val, u32 n, int irq);   /* e5_gpu.c */
 typedef struct { VkCommandBuffer cb; VkFence fence; VkSemaphore acq, done; int pending; u64 seq, gw; u32 qn; VDefW *w; int nw, cap; } VSlot;
+static void coh_device_lost(const char *where); static void rm_unwatch_runs(const u64 *lo, const u64 *hi, u32 n);
+static void coh_rearm(u64 done); static void coh_at_submit(void); static void coh_post_submit(void); static void coh_fatal(const char *why); static int coh_stale4k(u64 a); static int coh_nosync4k(u64 a); static u16 *coh_on(void); enum { COH_CS = 256u << 20, COH_CS_REC = 8192 };
+static VkBuffer g_cs_buf; static VkDeviceMemory g_cs_mem; static u8 *g_cs_map; static u64 g_cs_head, g_cs_tail, g_cs_bytes, g_cs_full;
+static PMutex g_coh_m; static u64 g_sh_rs[4096]; static u32 g_sh_nrs;   /* (t165w: the merge in vk_shadow) */ static int g_coh_mask_any(void); static void qm_lock(void); static void qm_unlock(void); static PMutex g_qm; static int g_qm_init;   /* t165: the queue (submits, presents, idle waits; the coherence read-backs come from other threads) */
 static VSlot g_slot[NSLOT]; static int g_slot_cur; static u32 g_chunk_n; static u64 g_sub_seq, g_done_seq;
 static PMutex g_slock; static PCond g_scond;
 static u64 g_gw_seq, g_gw_done;   /* GPU-write log (see gw_note): next position; position up to which the GPU has finished */
@@ -294,7 +301,7 @@ static void slot_complete(VSlot *S) {
             for (u32 i = 0; i + 1 < S->qn; i += 2) prof_add(V.qkey_a[(base + i) / 2], V.qkey_b[(base + i) / 2], (double)(res[i + 1] - res[i]) * V.ts_period / 1e6, g_qverts[(base + i) / 2]);
     }
     S->qn = 0;
-    g_gw_done = S->gw;
+    g_gw_done = S->gw;   /* (t165w: coh_rearm for this batch ran in vk_done_thread before g_slock was taken - review 1) */
     for (int i = 0; i < S->nw; i++) gpu_defw_apply1(S->w[i].addr, S->w[i].val, S->w[i].n, S->w[i].irq);
     S->nw = 0; S->pending = 0; g_done_seq = S->seq;
 }
@@ -311,6 +318,7 @@ static void vk_done_thread(void *arg) {
         VkResult r = vkWaitForFences(V.dev, 1, &f, 1, 1000000000ull);
         if (r == VK_TIMEOUT) continue;
         if (r == VK_ERROR_DEVICE_LOST) vk_fail("vkWaitForFences", r);
+        coh_rearm(sq);   /* t165 coherence: pages copied back during this batch held again - before its label writes, and (t165w) without g_slock held */
         pm_lock(&g_slock);
         if (S->pending && S->seq == sq) slot_complete(S);
         pc_broadcast(&g_scond);
@@ -366,6 +374,7 @@ static void slow_pipe_note(const char *kind, u64 a, u64 b, u64 ms, u64 ka, u64 k
     sb_s(&t, "    slow pipeline compile: "); sb_d(&t, (i64)ms); sb_s(&t, " ms, "); sb_s(&t, kind); sb_s(&t, b ? " VS " : " CS "); sb_x(&t, a);
     if (b) { sb_s(&t, " PS "); sb_x(&t, b); } sb_s(&t, " (flip "); sb_d(&t, (i64)g_flips); sb_s(&t, ", keys "); sb_x(&t, ka); if (b) { sb_s(&t, " / "); sb_x(&t, kb); } sb_s(&t, ")\n"); say(l);
 }
+static void prep_mark(void);   /* t163 (e6_prep.c) */
 #include "e6_defer.c"    /* parallel pipeline compilation (records the batch while its pipelines compile) */
 static void prep_init(void); static void prep_run(void); static void prep_save(void); static u64 g_prep_new_bytes; static int prep_pcc, g_prep_pcc_req = 1;   /* t159 (e6_prep.c) */
 static void prep_tnote(const G2SIn *in, const G2SOut *out);   /* t160 (e6_prep.c) */
@@ -374,7 +383,7 @@ static void prep_tnote(const G2SIn *in, const G2SOut *out);   /* t160 (e6_prep.c
    not finished are printed with their shaders. */
 typedef struct { u64 a, b; u32 frame, draw, kind, n; } CkRec;   /* kind: 1 draw, 2 dispatch, 3 tessellation LS dispatch */
 enum { CK_RING = 1 << 16 };
-static CkRec g_ck[CK_RING]; static u64 g_ck_seq; static int g_ck_on, g_fault_on, g_lost_reported;
+static CkRec g_ck[CK_RING]; static u64 g_ck_seq; static int g_ck_on, g_fault_on; static volatile int g_lost_reported, g_lost_done, g_dev_lost_hit;
 static PFN_vkGetQueueCheckpointDataNV p_vkGetQueueCheckpointDataNV;
 static PFN_vkGetDeviceFaultInfoEXT p_vkGetDeviceFaultInfoEXT;
 static void ck_mark(u32 kind, u64 a, u64 b, u32 n) {
@@ -395,7 +404,7 @@ static void ck_say(u64 id) {
     else { say(" draw VS "); ck_say_shader(c->a); say(" PS "); ck_say_shader(c->b); say(" vertices "); say_dec(c->n); }
 }
 static void vk_lost_report(void) {
-    if (g_lost_reported++) return;
+    if (__atomic_exchange_n(&g_lost_reported, 1, __ATOMIC_ACQ_REL)) return;   /* (review 7 N3: once, atomically; g_lost_done when written) */
     say("\n*** GPU device lost - diagnostics\n");
     mem_report("at the device loss");
     if (p_vkGetQueueCheckpointDataNV) {
@@ -433,6 +442,7 @@ static void vk_lost_report(void) {
         }
     } else say("    (no device-fault report in this driver)\n");
     say("*** end of GPU diagnostics\n");
+    __atomic_store_n(&g_lost_done, 1, __ATOMIC_RELEASE);
 }
 static void vk_fail(const char *what, VkResult r) {
     vl("VK ERROR: "); vl(what); vl(" -> "); vl_d(r); vl("\n");
@@ -864,7 +874,7 @@ static void vkr_init(void) {
     vkCreateCommandPool(V.dev, &cpi, 0, &V.pool);
     VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, V.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     vkAllocateCommandBuffers(V.dev, &cbai, &V.cb);
-    pm_init(&g_slock); pc_init(&g_scond);
+    pm_init(&g_slock); pc_init(&g_scond); pm_init(&g_qm); g_qm_init = 1;
     for (int i = 0; i < NSLOT; i++) {
         vkAllocateCommandBuffers(V.dev, &cbai, &g_slot[i].cb);
         vkCreateFence(V.dev, &fci, 0, &g_slot[i].fence);
@@ -1252,11 +1262,14 @@ static void pf_fill_slot(int slot) {
     g_npf[slot] = 0;
 }
 static int g_opt_host_barrier;
+static int g_coh_post_open;
 static int vk_submit_async(VkSemaphore wait_sem, VkSemaphore signal_sem) {
     if (!V.recording) return 0;
+    g_coh_post_open = 0;
     if (g_npf[g_slot_cur]) pf_fill_slot(g_slot_cur);   /* t107f: before the batch reaches the GPU */
     { T0(); wb_flush(); sh_writeback(); TADD(g_t_wbk); }
     vk_end_rendering();
+    coh_at_submit();   /* t165w (review 2, N6): pages left read-only after a copy-back during this batch, held again now */
     if (g_gq_active >= 0) { gq_end_active(0); g_n_gq_split++; }   /* a query cannot continue into the next command buffer */
     if (g_opt_host_barrier) {   /* t107k (0.1.4 review): makes what the batch wrote visible to the CPU, which reads it after the fence;
            by the Vulkan memory model the fence alone does not. Off by default (t107l): with ~75 batches per frame it cost
@@ -1273,14 +1286,17 @@ static int vk_submit_async(VkSemaphore wait_sem, VkSemaphore signal_sem) {
     pm_lock(&g_slock);
     S->qn = V.qn; V.qn = 0; S->gw = g_gw_seq;
     const char *st0_ = g_rstep; g_rstep = "vkQueueSubmit"; CRUMB(109, S->fence, 3);
-    VkResult r = vkQueueSubmit(V.q, 1, &si, S->fence);
+    qm_lock(); VkResult r = vkQueueSubmit(V.q, 1, &si, S->fence); qm_unlock();
     g_rstep = st0_;
-    if (r) { vk_fail("vkQueueSubmit", r); S->pending = 0; slot_complete(S); }
+    if (r) { vk_fail("vkQueueSubmit", r); S->pending = 0;
+        if (coh_on()) { pm_unlock(&g_slock); if (r == VK_ERROR_DEVICE_LOST) coh_device_lost("vkQueueSubmit"); coh_fatal("a GPU submit failed (CPU bytes recorded into it would be lost)"); }
+        { u64 keep = g_done_seq; slot_complete(S); g_done_seq = keep; } }   /* (t165w, review 2 N13: its labels applied, but the completed count not set back to this slot's old number) */
     else { S->pending = 1; S->seq = ++g_sub_seq; pc_broadcast(&g_scond); }
     pm_unlock(&g_slock);
     g_t_qsub += plat_ticks() - tq0_;
     V.recording = 0; g_chunk_n = 0;
     g_slot_cur = (g_slot_cur + 1) % NSLOT;
+    coh_post_submit();   /* t165w (review 2, N6) */
     return 1;
 }
 /* everything recorded so far has finished on the GPU (readbacks, page-table changes, ...) */
@@ -1289,6 +1305,10 @@ static void vk_submit_wait_at(int line) {
     T0();
     vk_submit_async(0, 0);
     vk_wait_all();
+<<<<<<< Updated upstream
+=======
+    for (int k = 0; k < 3 && g_coh_post_open; k++) { vk_submit_async(0, 0); vk_wait_all(); }   /* t165w (review 3, NF8): a batch coh_post_submit opened (CPU bytes) - submitted and finished too */
+>>>>>>> Stashed changes
     TADD1(g_t_wait);
     g_n_full_waits++; if (line > 0 && line < 16384) { g_wait_line[line]++; g_wait_ticks_line[line] += t1_ - t0_; }
 }
@@ -1365,6 +1385,7 @@ static void stage_dev(void) {
    shaders write (per-pixel lists, light lists, scratch) are moved to VRAM the first time a shader writes them: their
    current contents are copied once and the page table points at the VRAM copy, so all later GPU access stays on the card. */
 typedef struct { u64 lo, hi, dev; VkBuffer buf; VkDeviceMemory mem; int live, watch; VkBuffer hbuf; u64 hoff; int ro, wb; u32 nwr; u64 wr[8][2]; int rs_all; } VShadow;
+static void coh_sync_copy(VShadow *S, const VkBufferCopy *c, u32 n);   /* t165w: staging ring */
 /* ro: read-only mirror (--replay-vram experiment); wb: the ranges wr[0..nwr) the GPU wrote in the batch are copied back to
    RAM at its end (STATUS 56). They are kept as separate ranges (STATUS 66): one envelope from the lowest to the highest
    written byte also copied the bytes between them back, over whatever the CPU had written there meanwhile.
@@ -1448,6 +1469,54 @@ static void vk_shadow(u64 lo, u64 hi) {
     vk_begin_cb();
     VkBufferCopy bc = {lo - R->lo, 0, size};
     vkCmdCopyBuffer(V.cb, R->buf, N.buf, 1, &bc);
+    if (coh_on()) {
+        /* t165w --gpu-coherence (review 2): the old copies stay in use until the merged one holds everything; it is
+           published under the coherence lock (a fault never sees the copies half-swapped); the copies are ordered
+           (RAM, then the old VRAM copies, then CPU writes made since the last submit to the old copies' pages - those
+           bytes are in RAM only, and the write tracking is read here) */
+        vk_barrier();
+        for (int i = 0; i < g_nsh; i++) if (g_sh[i].live && g_sh[i].lo >= lo && g_sh[i].hi <= hi) {
+            VkBufferCopy oc = {0, g_sh[i].lo - lo, g_sh[i].hi - g_sh[i].lo}; vkCmdCopyBuffer(V.cb, g_sh[i].buf, N.buf, 1, &oc); }
+        vk_barrier();
+        static VkBufferCopy dc[4096]; u32 nd = 0; i64 got;
+        N.watch = 1;
+        for (int pass = 0; pass < 64; pass++) {
+            got = plat_dirty_pages((void *)lo, size, (void **)g_sh_pages, 65536);
+            if (got < 0) { N.watch = 0; break; }
+            for (i64 k = 0; k < got; k++) { u64 a = (u64)g_sh_pages[k] & ~0xFFFull; int inold = 0;
+                for (int i = 0; i < g_nsh; i++) if (g_sh[i].live && a >= g_sh[i].lo && a < g_sh[i].hi) { inold = 1; break; }
+                if (!inold || coh_nosync4k(a)) continue;   /* (outside the old copies: in the RAM copy above; GPU-held: the VRAM bytes win) */
+                if (nd && dc[nd - 1].dstOffset + dc[nd - 1].size == a - lo) { dc[nd - 1].size += 4096; continue; }
+                if (nd == 4096) { vkCmdCopyBuffer(V.cb, R->buf, N.buf, nd, dc); nd = 0; }
+                dc[nd].srcOffset = (lo - R->lo) + (a - lo); dc[nd].dstOffset = a - lo; dc[nd].size = 4096; nd++; }
+            if (got < 65536) break;
+        }
+        for (u32 k = 0; k < g_sh_nrs; k++) { u64 a = g_sh_rs[k]; int inold = 0;   /* (pages the texture checks took from the write tracking) */
+            if (a < lo || a >= hi) continue;
+            for (int i = 0; i < g_nsh; i++) if (g_sh[i].live && a >= g_sh[i].lo && a < g_sh[i].hi) { inold = 1; break; }
+            if (!inold || coh_nosync4k(a)) continue;
+            if (nd == 4096) { vkCmdCopyBuffer(V.cb, R->buf, N.buf, nd, dc); nd = 0; }
+            dc[nd].srcOffset = (lo - R->lo) + (a - lo); dc[nd].dstOffset = a - lo; dc[nd].size = 4096; nd++; }
+        for (int i = 0; i < g_nsh; i++) if (g_sh[i].live && g_sh[i].lo >= lo && g_sh[i].hi <= hi && g_sh[i].rs_all)   /* (that list overflowed for an old copy: all its pages) */
+            for (u64 a = g_sh[i].lo; a < g_sh[i].hi; a += 4096) { if (coh_nosync4k(a)) continue;
+                if (nd == 4096) { vkCmdCopyBuffer(V.cb, R->buf, N.buf, nd, dc); nd = 0; }
+                dc[nd].srcOffset = (lo - R->lo) + (a - lo); dc[nd].dstOffset = a - lo; dc[nd].size = 4096; nd++; }
+        if (nd) vkCmdCopyBuffer(V.cb, R->buf, N.buf, nd, dc);
+        vk_barrier();
+        vk_submit_wait();   /* the merged copy is complete before anything can read it back */
+        vk_begin_cb();
+        pm_lock(&g_coh_m);
+        for (int i = 0; i < g_nsh; i++) if (g_sh[i].live && g_sh[i].lo >= lo && g_sh[i].hi <= hi) g_sh[i].live = 0;
+        N.hbuf = R->buf; N.hoff = lo - R->lo; N.wb = wb; if (wb) g_n_sh_small++;
+        for (u64 a = lo; a < hi; a += 0x10000) V.pt_map[(a - G2S_PT_BASE) >> 16] = N.dev + (a - lo);
+        sh_pg_set(lo, hi, (u16)(g_nsh + 1));
+        g_sh[g_nsh] = N; __atomic_store_n(&g_nsh, g_nsh + 1, __ATOMIC_RELEASE); g_sh_bytes += size;
+        pm_unlock(&g_coh_m);
+        rm_unwatch_images(lo, hi);
+        vl("  moved GPU-written buffer to VRAM: "); vl_x(lo); vl(" - "); vl_x(hi);
+        vl(" (t165: flip "); vl_d((i64)g_flips); vl(", written "); vl_x(orig); vl(" bytes; VS "); vl_x((u64)g_shr[SH_PGM_LO_VS] << 8); vl(" PS "); vl_x((u64)g_shr[SH_PGM_LO_PS] << 8); vl(" CS "); vl_x((u64)g_shr[0x20C] << 8); vl("; merged with the coherence lock, t165w)\n");
+        return;
+    }
     for (int i = 0; i < g_nsh; i++) if (g_sh[i].live && g_sh[i].lo >= lo && g_sh[i].hi <= hi) {   /* older VRAM copies win over RAM */
         VkBufferCopy oc = {0, g_sh[i].lo - lo, g_sh[i].hi - g_sh[i].lo};
         vkCmdCopyBuffer(V.cb, g_sh[i].buf, N.buf, 1, &oc);
@@ -1461,7 +1530,8 @@ static void vk_shadow(u64 lo, u64 hi) {
     for (u64 a = lo; a < hi; a += 0x10000) V.pt_map[(a - G2S_PT_BASE) >> 16] = N.dev + (a - lo);
     sh_pg_set(lo, hi, (u16)(g_nsh + 1));   /* t107e (the copies merged into this one lie inside [lo, hi): their pages now name it) */
     g_sh[g_nsh++] = N; g_sh_bytes += size;
-    vl("  moved GPU-written buffer to VRAM: "); vl_x(lo); vl(" - "); vl_x(hi); vl("\n");
+    vl("  moved GPU-written buffer to VRAM: "); vl_x(lo); vl(" - "); vl_x(hi);
+    vl(" (t165: flip "); vl_d((i64)g_flips); vl(", written "); vl_x(orig); vl(" bytes; VS "); vl_x((u64)g_shr[SH_PGM_LO_VS] << 8); vl(" PS "); vl_x((u64)g_shr[SH_PGM_LO_PS] << 8); vl(" CS "); vl_x((u64)g_shr[0x20C] << 8); vl(")\n");
 }
 /* --replay-vram K (performance experiment, replays only): before repeat K, every imported game region is copied to VRAM
    and the page table points there, so no shader reads game memory across PCIe any more. Not safe for play: GPU writes into
@@ -1486,7 +1556,8 @@ static void sh_note_cpu_write(u64 a) {
     a &= ~0xFFFull;
     VShadow *S = shadow_of(a, 1);
     if (!S || !S->watch) return;
-    if (g_sh_nrs < 4096) g_sh_rs[g_sh_nrs++] = a; else S->rs_all = 1;
+    { u32 k = g_sh_nrs;   /* t165w (review 2 N15, review 3 NF9): the completion thread reads these (coh_cpu_dirty) - entry first, count released after */
+      if (k && g_sh_rs[k - 1] == a) {} else if (k < 4096) { g_sh_rs[k] = a; __atomic_store_n(&g_sh_nrs, k + 1, __ATOMIC_RELEASE); } else S->rs_all = 1; }
     g_n_sh_rs++;
 }
 /* at the start of each submit: pages of moved buffers that the CPU wrote since the last submit are copied to VRAM.
@@ -1513,35 +1584,70 @@ static i64 ww_scan_reset(u64 lo, u64 n, void **out, u64 max, int pass) {
     g_t_wwm[g_ww_mode == 3 ? 1 : g_ww_mode] += plat_ticks() - t;
     return r;
 }
+static u64 g_coh_unw[1024]; static u32 g_coh_nunw; static int g_coh_unw_all; static u64 g_coh_unw_ovf;   /* (t165x, R5-2: pages to un-watch, filled under g_coh_m) */
+static void coh_apply_patches(void); static u32 g_coh_npatch, g_coh_nsnap; static void coh_log_copies(VShadow *S, const VkBufferCopy *c, u32 n);
 static void vk_shadow_sync(void) {
     static VkBufferCopy rc[4096];
-    /* pages the texture path consumed (or whole copies, when that list overflowed) */
-    for (u32 k = 0; k < g_sh_nrs; k++) {
+    if (g_coh_npatch || g_coh_nsnap) coh_apply_patches();   /* t165i: CPU bytes written into pages copied back while their GPU write was recorded (t165w: and the tracked pages' bytes since - review 2, N1) */
+    if (g_coh_nunw || g_coh_unw_all) {   /* t165x (R5-2): pages the CPU wrote after a copy-back - their textures check their bytes again */
+        static u64 un[1024]; u32 nu = 0; int all = 0;
+        pm_lock(&g_coh_m); nu = g_coh_nunw; for (u32 k = 0; k < nu; k++) un[k] = g_coh_unw[k]; all = g_coh_unw_all; g_coh_nunw = 0; g_coh_unw_all = 0; pm_unlock(&g_coh_m);
+        if (all) { for (int i = 0; i < g_nsh; i++) if (g_sh[i].live) rm_unwatch_images(g_sh[i].lo, g_sh[i].hi); }
+        else { static u64 uh2[1024];   /* (sorted, repeats dropped: one pass over the images) */
+            for (u32 k = 1; k < nu; k++) { u64 v = un[k]; u32 j = k; while (j && un[j - 1] > v) { un[j] = un[j - 1]; j--; } un[j] = v; }
+            u32 m = 0; for (u32 k = 0; k < nu; k++) if (!m || un[k] != un[m - 1]) un[m++] = un[k];
+            for (u32 k = 0; k < m; k++) uh2[k] = un[k] + 4096; rm_unwatch_runs(un, uh2, m); }
+        g_n_sh_unwatch += nu; }
+    /* pages the texture path consumed (or whole copies, when that list overflowed) - t165x (review 5 R5-7): runs of one
+       VRAM copy in one copy call (each call is a barrier and the coherence lock) */
+    { VShadow *PS = 0; u32 nr = 0; static u64 hk[8192]; static u64 hg[8192], hgen0; u64 hgen = ++hgen0 << 24;   /* (review 7 N1: 64-bit generations - a u32 one wrapped every 2^19 calls and an old slot could drop a page) */
+      for (u32 k = 0; k < g_sh_nrs; k++) {
         u64 a = g_sh_rs[k]; VShadow *S = shadow_of(a, 1);
-        if (!S || S->rs_all) continue;
+        if (!S || S->rs_all || coh_nosync4k(a)) continue;   /* (t165: a GPU-held page: its RAM is the stale one) */
         u64 n = S->hi - a < 4096 ? S->hi - a : 4096;
-        VkBufferCopy c = {S->hoff + (a - S->lo), a - S->lo, n};
-        vk_begin_cb(); vk_end_rendering(); vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, 1, &c); V.n_sh_sync_pages++;
-    }
-    g_sh_nrs = 0;
+        if (nr && (S != PS || nr == 4096)) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(PS, rc, nr); nr = 0; hgen++; }
+        int dup = 0;   /* (one copy per page: no overlap inside one copy call; review 6 X2-6: a small hash, not a search) */
+        { u64 key = a - S->lo; u32 hsl = (u32)((key >> 12) * 2654435761u) & 8191;
+          while (hg[hsl] == hgen) { if (hk[hsl] == key) { dup = 1; break; } hsl = (hsl + 1) & 8191; }
+          if (!dup) { hg[hsl] = hgen; hk[hsl] = key; } }
+        if (!dup) { rc[nr].srcOffset = S->hoff + (a - S->lo); rc[nr].dstOffset = a - S->lo; rc[nr].size = n; nr++; }
+        PS = S; V.n_sh_sync_pages++;
+      }
+      if (nr) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(PS, rc, nr); } }
+    __atomic_store_n(&g_sh_nrs, 0, __ATOMIC_RELEASE);
     for (int i = 0; i < g_nsh; i++) {
         VShadow *S = &g_sh[i];
         if (!S->live || !S->watch) continue;
-        if (S->rs_all) { VkBufferCopy c = {S->hoff, 0, S->hi - S->lo}; vk_begin_cb(); vk_end_rendering(); vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, 1, &c); S->rs_all = 0; }
+        if (S->rs_all) {
+            if (!g_coh_mask_any()) { VkBufferCopy c = {S->hoff, 0, S->hi - S->lo}; vk_begin_cb(); vk_end_rendering(); vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, 1, &c); }
+            else {   /* t165 --gpu-coherence: not over GPU-held pages (RAM is the stale copy there) */
+                u32 nr = 0;
+                for (u64 a = S->lo; a < S->hi; a += 4096) {
+                    if (coh_nosync4k(a)) continue;
+                    if (nr && rc[nr - 1].srcOffset + rc[nr - 1].size == S->hoff + (a - S->lo)) { rc[nr - 1].size += 4096; continue; }
+                    if (nr == 4096) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(S, rc, nr); nr = 0; }
+                    rc[nr].srcOffset = S->hoff + (a - S->lo); rc[nr].dstOffset = a - S->lo; rc[nr].size = 4096; nr++;
+                }
+                if (nr) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(S, rc, nr); }
+            }
+            S->rs_all = 0; }
         for (int pass = 0; pass < 64; pass++) {
             i64 n = ww_scan_reset(S->lo, S->hi - S->lo, (void **)g_sh_pages, 65536, pass);
             if (n <= 0) break;
             u32 nr = 0;
             for (i64 k = 0; k < n; k++) {
                 u64 a = (u64)g_sh_pages[k] & ~0xFFFull;
+                if (coh_nosync4k(a)) continue;   /* t165: written before the GPU write that made it GPU-held (rare); the GPU's bytes win */
                 if (nr && rc[nr - 1].srcOffset + rc[nr - 1].size == S->hoff + (a - S->lo)) { rc[nr - 1].size += 4096; continue; }
-                if (nr == 4096) { vk_begin_cb(); vk_end_rendering(); vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, nr, rc); nr = 0; }
+                if (nr == 4096) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(S, rc, nr); nr = 0; }
                 rc[nr].srcOffset = S->hoff + (a - S->lo); rc[nr].dstOffset = a - S->lo; rc[nr].size = 4096; nr++;
             }
             for (u32 k = 0; k < nr; k++) { if (rc[k].dstOffset + rc[k].size > S->hi - S->lo) rc[k].size = S->hi - S->lo - rc[k].dstOffset; }
             /* textures there check their bytes again (only copies counting as RAM for them: in the others they always do) */
-            if (S->wb || S->ro) for (u32 k = 0; k < nr; k++) { rm_unwatch_images(S->lo + rc[k].dstOffset, S->lo + rc[k].dstOffset + rc[k].size); g_n_sh_unwatch++; }
-            if (nr) { vk_begin_cb(); vk_end_rendering(); vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, nr, rc); V.n_sh_sync_pages += (u64)n; }
+            if (S->wb || S->ro || coh_on()) {   /* (t165x, review 5 R5-2: with coherence, textures in GPU-written copies check their bytes again after CPU writes too; review 6 X2-6: one pass) */
+                static u64 ul[4096], uh[4096]; for (u32 k = 0; k < nr; k++) { ul[k] = S->lo + rc[k].dstOffset; uh[k] = ul[k] + rc[k].size; }
+                rm_unwatch_runs(ul, uh, nr); g_n_sh_unwatch += nr; }
+            if (nr) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(S, rc, nr); V.n_sh_sync_pages += (u64)n; }
             if (n < 65536) break;
         }
     }
@@ -1655,6 +1761,14 @@ static u32 rm_alloc_slot(void) {
 /* images whose bytes overlap [lo, hi) lose their "unchanged since the last check" state (CPU writes found here) */
 static void rm_unwatch_images(u64 lo, u64 hi) {
     for (int i = 0; i < V.nimg; i++) { VImg *o = &V.img[i]; if (o->img && o->watched && o->addr < hi && lo < o->addr + o->wlen) o->watched = 0; }
+}
+/* t165x (review 6, X2-6): the same for n runs sorted by address (not overlapping) - one pass over the images */
+static void rm_unwatch_runs(const u64 *lo, const u64 *hi, u32 n) {
+    if (!n) return;
+    for (int i = 0; i < V.nimg; i++) { VImg *o = &V.img[i]; if (!o->img || !o->watched) continue;
+        u64 a = o->addr, e = o->addr + o->wlen; u32 l = 0, h = n;   /* first run whose end is past the image's start */
+        while (l < h) { u32 m = (l + h) / 2; if (hi[m] <= a) l = m + 1; else h = m; }
+        if (l < n && lo[l] < e) o->watched = 0; }
 }
 /* copy n bytes at RAM address a into the mirror slot of its page (offset within the page kept) */
 static VkBufferCopy g_rm_bc[RM_MAXBLK][256]; static u32 g_rm_nbc[RM_MAXBLK]; static VkBuffer g_rm_bcsrc[RM_MAXBLK];
@@ -1850,7 +1964,7 @@ static int rm_locate(u64 a, u64 n, VkBuffer *buf, u64 *off) {
 static void sh_writeback(void) {
     int any = 0;
     for (int i = 0; i < g_nsh; i++) { VShadow *S = &g_sh[i];
-        if (!S->live || !S->wb || !S->nwr) continue;
+        if (!S->live || !S->nwr) continue;   /* (t165: other copies have ranges only from shwb_one_off) */
         if (!any) { vk_end_rendering();
             VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
             vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0); any = 1; }
@@ -1871,7 +1985,11 @@ static void rm_cp_written(u64 lo, u64 hi); static void rm_cp_update(u64 a, const
 /* a write by the command processor / copy engine (WRITE_DATA, DMA, query results, write-backs) into RAM: mirrored pages get it too */
 static void gw_note(u64 lo, u64 hi) { rm_cp_written(lo, hi); gw_log(lo, hi); }
 /* a shader's store into RAM: its pages are not mirrored any more (the store goes wherever the page table points) */
-static void gw_note_shader(u64 lo, u64 hi) { rm_never(lo, hi); gw_log(lo, hi); }
+static void gw_log_as(u64 lo, u64 hi, const char *who, int ctx);
+/* t165w (review 2, N4): a shader store's range is an upper bound and its command is not recorded yet - for the
+   coherence code a write before its command (ctx 1: the CPU's bytes in the range go to VRAM first), not an exact write
+   already recorded (ctx 2 left the CPU's bytes the shader never stores out of VRAM, and a copy-back then lost them) */
+static void gw_note_shader(u64 lo, u64 hi) { rm_never(lo, hi); gw_log_as(lo, hi, "shader store", 1); }
 /* add [a, b) to the ranges written back at the end of the batch; the list stays disjoint (merged when ranges overlap or
    touch; when all 8 are used, the new range joins the one it extends least) */
 static void sh_wr_add(VShadow *S, u64 a, u64 b) {
@@ -1889,6 +2007,926 @@ static void sh_wr_add(VShadow *S, u64 a, u64 b) {
                 S->wr[j][0] = S->wr[S->nwr - 1][0]; S->wr[j][1] = S->wr[S->nwr - 1][1]; S->nwr--; again = 1; break; }
     }
 }
+/* t165 (--gpu-writes-to-ram, experimental). GPU writes into the large VRAM copies stay on the card and RAM keeps the old
+   bytes (STATUS 57: those copies were meant for scratch buffers the CPU never reads). The game also moves resources with
+   the GPU (its compute copy kernels) into memory that is, or then becomes, part of such a copy, and reads them on the
+   CPU afterwards. Capture 33896 (Chapter 10, Josh's section): about 92 MB of model data had been copied by the GPU into
+   0x102e4b0000-0x1034160000; the VRAM copy held it, RAM still held the bytes of 200 s earlier. The game copies each hair
+   piece's index buffer from there into a per-instance block every frame (CPU), so it copied old bytes: the hair drew
+   with garbage indices (the stretched triangles across the screen). On the PS4 the CPU sees what the GPU wrote.
+   With this option a write into a VRAM copy whose 64 KB pages the GPU did not write in the 8 frames before this one (a
+   one-off write: a copy, an upload) is copied back to RAM at the end of its batch, as the small copies are (STATUS 56).
+   Buffers rewritten every frame (per-pixel lists, the ocean simulation) are copied back at most once; single ranges
+   over 64 MB never (counted). Per page: (frame << 1) | one-off, so later writes in the same frame keep the decision. */
+static int g_coh_mode; static int g_opt_shwb_new; static u32 *g_shw_pg; static u64 g_n_shwb_new, g_shwb_new_bytes, g_n_shwb_big, g_n_shwb_recent;
+static void shwb_one_off(u64 lo, u64 hi, const char *who) {
+    if (g_opt_shwb_new && g_coh_mode) {   /* t165w (review 4, F1): --gpu-coherence replaces it - its write-backs change the RAM of
+                                             GPU-held pages behind the coherence bookkeeping (and the own-read cache) */
+        g_opt_shwb_new = 0; say("  --gpu-writes-to-ram ignored: --gpu-coherence (or its probe) is on and does that job\n"); }
+    if (!g_opt_shwb_new || hi <= lo || lo < G2S_PT_BASE || hi > G2S_PT_BASE + G2S_PT_SIZE) return;
+    if (!g_shw_pg) { g_shw_pg = (u32 *)calloc(G2S_PT_SIZE >> 16, 4); if (!g_shw_pg) { g_opt_shwb_new = 0; return; } }
+    for (int i = 0; i < g_nsh; i++) { VShadow *S = &g_sh[i];
+        if (!S->live || S->wb || S->ro || lo >= S->hi || hi <= S->lo) continue;
+        u64 a = lo > S->lo ? lo : S->lo, b = hi < S->hi ? hi : S->hi;
+        u32 now = V.frame + 1; int oneoff = 0;
+        for (u64 p = (a - G2S_PT_BASE) >> 16, e = (b - 1 - G2S_PT_BASE) >> 16; p <= e; p++) {
+            u32 st = g_shw_pg[p], f = st >> 1, o;
+            if (f == (now & 0x7FFFFFFFu)) o = st & 1;                 /* written earlier in this frame: same decision */
+            else o = !st || (u32)((now & 0x7FFFFFFFu) - f) > 8;      /* never, or not in the last 8 frames */
+            g_shw_pg[p] = ((now & 0x7FFFFFFFu) << 1) | (u32)o;
+            oneoff |= o;
+        }
+        if (!oneoff) { g_n_shwb_recent++; continue; }
+        if (b - a > (64ull << 20)) { g_n_shwb_big++; continue; }
+        sh_wr_add(S, a, b); g_n_shwb_new++; g_shwb_new_bytes += b - a;
+        { static int nlog; if (nlog++ < 60) { vl("  one-off GPU write in a VRAM copy, copied back to RAM (t165): "); vl_x(a); vl(" - "); vl_x(b); vl(" ("); vl(who);
+            vl("; flip "); vl_d((i64)g_flips); vl("; VS "); vl_x((u64)g_shr[SH_PGM_LO_VS] << 8); vl(" PS "); vl_x((u64)g_shr[SH_PGM_LO_PS] << 8); vl(" CS "); vl_x((u64)g_shr[0x20C] << 8); vl(")\n"); } }
+    }
+}
+/* ---------------------------------------------------------------- t165: CPU access to GPU-written VRAM copies
+   (--gpu-coherence, experimental; --gpu-coherence-probe: find and log only)
+   The large VRAM copies (STATUS 57) keep what the GPU writes on the card; RAM keeps older bytes. On the PS4 the CPU
+   reads one memory and sees what the GPU wrote. Capture 33896: the game moved model data with GPU copies into such a
+   copy and later copied hair index buffers out of it on the CPU - from the stale RAM (STATUS 192).
+   Here the RAM pages (4 KB) the GPU writes inside a VRAM copy are made inaccessible to the CPU when the write is
+   recorded. Whatever touches one later - a game thread, our own layer, a Windows file call through lz_ensure - is
+   stopped by the page fault; the handler copies the page's current bytes from the VRAM copy (the 64 KB around it, and
+   the stale pages next to it up to 1 MB, in one copy on the queue: after every batch submitted so far), makes the pages
+   accessible again and lets the access run. Only memory the CPU actually touches crosses back; buffers only the GPU uses
+   (per-pixel lists, the ocean simulation, light lists) stay where they are and cost one protection change.
+   - A page the CPU wrote since its last copy-in to VRAM (write tracking, before it was protected): t165i sends it to VRAM
+     when the GPU takes it, before the GPU's write (shader stores) or around the written range (copies, fills).
+   - A write still being recorded (the current batch) is not in VRAM yet: the page is protected again when that batch
+     completes, before its label writes (the game waits on those), so a read after the wait faults again and gets it.
+   - Probe mode makes the page accessible without copying (today's behaviour) and only records who touched what. */
+static int coh_fault(u64 a, int write, u64 rip); static void coh_ensure(u64 a, u64 n);
+static int g_coh_mode = 2;   /* 0 off (--no-gpu-coherence, gpu_coherence = 0), 1 probe (--gpu-coherence-probe), 2 on - t165x: the default */
+/* g_coh_mask is published last by coh_init (release store; readers load it with acquire): every other table and the
+   lock exist before any thread can see it (t165w: review 5 - the completion thread could lock an uninitialised lock) */
+static u16 *g_coh_mask; static u32 *g_coh_seq; static u8 *g_coh_prot; static u32 *g_coh_fr; static u8 *g_coh_run; static u64 g_coh_nown, g_coh_nown_kept; static PMutex g_coh_m;
+static int g_coh_ok; static VkCommandPool g_coh_pool; static VkCommandBuffer g_coh_cb; static VkFence g_coh_fence; static VkBuffer g_coh_stage; static VkDeviceMemory g_coh_smem; static u8 *g_coh_smap;
+static int g_coh_cb_busy;   /* t165w: the read-back command buffer / fence may still be in use (a wait that never finished): never reused */
+enum { COH_STAGE = 1u << 20, COH_WR = 4096 };
+typedef struct { u64 lo, hi, vs, ps, cs; u32 flip; const char *who; } CohWr;
+static CohWr g_coh_wr[COH_WR]; static u64 g_coh_nwr;
+static u16 *coh_on(void) { return __atomic_load_n(&g_coh_mask, __ATOMIC_ACQUIRE); }
+/* ---- t165w: growable tables (review 3: fixed tables dropped entries when full). Address space is reserved once and
+   committed as they grow - no heap, so they can grow inside the fault handler; a commit that fails is an error that is
+   logged and counted (never a silent drop). */
+typedef struct { u8 *p; u64 esz, cap, com, res; } CohArr;
+static int coh_arr_init(CohArr *A, u64 esz, u64 res) { A->esz = esz; A->cap = 0; A->com = 0; A->res = res; A->p = (u8 *)plat_reserve_any(res); return A->p != 0; }
+static int coh_arr_ensure(CohArr *A, u64 n) {   /* room for n entries */
+    if (n <= A->cap) return 1;
+    u64 need = (n * A->esz + (1ull << 20) - 1) & ~((1ull << 20) - 1);
+    if (need > A->res || !plat_commit_rw(A->p + A->com, need - A->com)) return 0;
+    A->com = need; A->cap = need / A->esz; return 1;
+}
+static u64 g_coh_err; static const char *g_coh_err_first;
+static void coh_err(const char *what) {   /* (g_coh_m held; may be called with other threads running) */
+    g_coh_err++; if (!g_coh_err_first) g_coh_err_first = what;
+    static int n; if (n++ < 20) { vl("  GPU coherence ERROR (t165w): "); vl(what); vl(" - the data of the pages concerned may be stale\n"); }
+}
+/* pages released while their GPU write was still being recorded: protected again when that batch completes */
+typedef struct { u32 pg; u16 mask; u32 seq; } CohRa;
+static CohArr g_ra_arr; static CohRa *g_coh_ra; static u32 g_coh_nra;
+static volatile u64 g_coh_gen, g_coh_epoch;   /* gen: page releases; epoch: anything that changes what a repeated GPU write must do (t165w, review 7) */
+static u64 g_coh_nprot_pages, g_coh_nfault_r, g_coh_nfault_w, g_coh_nsync, g_coh_sync_bytes, g_coh_nconflict, g_coh_nrearm, g_coh_nensure, g_coh_badprot, g_coh_fail, g_coh_t_sync;
+typedef struct { u64 rip; u64 n, nw; const char *tn; const char *who; u64 a, f0, fw, aw; char lv0[24], lvw[24]; } CohRip;   /* (t165w: flips and levels of the first access / first write) */
+static CohRip g_coh_rips[64]; static int g_coh_nrips;
+/* per 64 KB page, one bit per 4 KB:
+   g_coh_mask - GPU-held: inaccessible, RAM stale, VRAM current.
+   g_coh_ro   - read by our own layer while the GPU rewrites it every frame: read-only, RAM stale (t165i). A CPU write
+                faults and copies first. t165w: only the 4 KB read, and our own code reads through coh_own_read.
+   g_coh_rr   - copied back while its GPU write was still being recorded: read-only, RAM current up to that batch; a CPU
+                write faults and takes a snapshot first (t165w: snapshots only for pages the CPU then writes - review 3).
+   g_coh_pend - written by the CPU after such a copy-back, with a snapshot of the bytes copied in: the CPU-changed bytes
+                reach VRAM after the GPU's write (diff), not the whole page. */
+static u16 *g_coh_ro, *g_coh_pend, *g_coh_rr;
+/* t165w --coh-test hooks (tests only; all zero otherwise): failure injection, the retry-loop trap, the startup window */
+static u64 g_ct_trap_pg; static volatile u64 g_ct_trap_hits, g_coh_retry_ret; static u32 g_ct_init_delay; static int g_ct_init_fail;   /* (t165x5 test: --coh-init-fail) */
+enum { CT_INJ_READBACK = 1, CT_INJ_STOP = 2, CT_INJ_FENCE = 4 };
+static volatile u32 g_ct_inj_rb, g_ct_inj_stop, g_ct_inj_fence;   /* (t165w tests: how many times in a row each fails) */
+static int ct_inj_take(volatile u32 *c) { u32 v = __atomic_load_n(c, __ATOMIC_ACQUIRE); while (v) { if (__atomic_compare_exchange_n(c, &v, v - 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 1; } return 0; }
+/* t165w (review 2, N3): a failure that would leave memory wrong - stop the game, logged, rather than go on with it.
+   Called with no thread stopped (g_coh_m may be held: it is recursive). */
+static volatile int g_coh_fatal_hit; static volatile u32 g_coh_fatal_tid; static volatile int g_coh_fatal_once;
+/* one report only (review 5 R5-10, review 6 X2-7): a second caller waits for the exit; the same thread again (a fault in the
+   report) exits at once */
+static void coh_fatal_once(void) {
+    u32 me = GetCurrentThreadId();
+    if (__atomic_exchange_n(&g_coh_fatal_once, 1, __ATOMIC_ACQ_REL)) { if (g_coh_fatal_tid == me) plat_exit(22); for (;;) plat_sleep_ms(1000); }
+    g_coh_fatal_tid = me;
+}
+/* the graphics device stopped working (review 5 R5-3, review 6 X2-1): not called a coherence failure */
+static void coh_device_lost(const char *where) {
+    coh_fatal_once(); g_dev_lost_hit = 1;
+    for (int w = 0; w < 1000 && __atomic_load_n(&g_lost_reported, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_lost_done, __ATOMIC_ACQUIRE); w++) plat_sleep_ms(10);   /* (review 7 N3: the device-loss diagnostics another thread is writing finish first, up to 10 s) */
+    say("\n*** The graphics device stopped working (driver reset or device lost: "); say(where); say(") - the game stops\n");
+    if (g_on_fatal) g_on_fatal();
+    plat_exit(23);
+}
+static void coh_fatal(const char *why) {
+    if (g_lost_reported) coh_device_lost(why);   /* (the device was lost earlier: that is the cause) */
+    coh_fatal_once(); g_coh_fatal_hit = 1;
+    say("\n*** GPU coherence: "); say(why);
+    say(" - the game is stopped here rather than going on with memory that may be wrong. (For troubleshooting it can be turned"
+        " off: gpu_coherence = 0 in Config\\settings.ini, or --no-gpu-coherence.)\n");
+    vl("*** GPU coherence: "); vl(why); vl(" - stopped\n");
+    if (g_on_fatal) g_on_fatal();
+    plat_exit(22);
+}
+/* (tests: threads standing in for game threads - replays have no game threads, and an unregistered thread counts as
+   our own layer in coh_fault; t165w: the stress test's threads had been taken for the renderer) */
+static volatile u32 g_ct_game_tid[64]; static volatile u32 g_ct_ngame;
+static void ct_as_game(void) { u32 i = __atomic_fetch_add(&g_ct_ngame, 1, __ATOMIC_ACQ_REL); if (i < 64) __atomic_store_n(&g_ct_game_tid[i], GetCurrentThreadId(), __ATOMIC_RELEASE); }
+static int ct_is_game(void) { u32 n = __atomic_load_n(&g_ct_ngame, __ATOMIC_ACQUIRE); if (!n) return 0; u32 me = GetCurrentThreadId(); for (u32 i = 0; i < n && i < 64; i++) if (g_ct_game_tid[i] == me) return 1; return 0; }
+/* (tests: per-page event history, printed when a lost write is found) */
+typedef struct { u64 t, a; u32 kind, x, y, seq; } CtEv;
+static CtEv g_ct_ev[65536]; static volatile u64 g_ct_nev; static int g_ct_trace;
+#define CT_EV(kind_, a_, x_, y_) do { if (g_ct_trace) { u64 i_ = __atomic_fetch_add(&g_ct_nev, 1, __ATOMIC_RELAXED) & 65535; CtEv *e_ = &g_ct_ev[i_]; e_->t = plat_ticks(); e_->a = (u64)(a_) & ~0xFFFull; e_->kind = (kind_); e_->x = (u32)(x_); e_->y = (u32)(y_); e_->seq = (u32)g_sub_seq; } } while (0)
+enum { COH_NOCOPY = 0, COH_COPY = 1, COH_RO = 2 };
+static CohArr g_snapa_arr, g_snapd_arr; static u64 *g_coh_snap_a; static u8 *g_coh_snap; static u32 g_coh_snap_hw; static u64 g_coh_npend_sync;   /* snapshot slots: address (0 free), 4 KB data */
+typedef struct { u64 a; u64 bits[64]; } CohPatch;   /* t165s: per 4 KB page, one bit per byte the CPU changed */
+static CohArr g_patch_arr; static CohPatch *g_coh_patch;
+/* t165j: CPU bytes sent to VRAM in a batch not yet submitted (pushes, the submit's CPU-write copies): a copy-back
+   leaves them as they are in RAM */
+typedef struct { u64 a; u32 n, seq; } CohPush;
+static CohArr g_pl_arr, g_kl_arr; static CohPush *g_coh_pl, *g_coh_kl; static u32 g_coh_npl;
+/* t165v: measuring our own per-frame page handling */
+typedef struct { u64 rip, n, a, cs, ps; const char *tn, *who; } CohOwn;
+static CohOwn g_coh_own[32]; static int g_coh_nownr; static u8 *g_coh_ownf;
+static u64 g_coh_t_own, g_coh_t_wrote, g_coh_t_hold_ro, g_coh_nhold_ro, g_coh_game_on_own, g_coh_game_on_own_pg[16]; static int g_coh_ngoo; static u64 g_coh_pl_full, g_coh_nkept_push;
+static u64 g_coh_npush, g_coh_push_bytes, g_coh_npatch_made, g_coh_patch_bytes, g_coh_patch_full, g_coh_snap_full, g_coh_rearm_dirty, g_coh_nro, g_coh_nstop, g_coh_nostop, g_coh_t_stop, g_coh_max_stop, g_coh_ndirty_copy;
+static u64 g_hp_n, g_hp_pend, g_hp_prot, g_hp_dirty, g_hp_nprot, g_hp_ndirty, g_hp_npush;   /* (t165w15: coh_hold profile, TSC cycles) */
+static struct { u64 tot, pg, prot, dirty; u16 add, done, cur; int ctx; u32 nprot, npush, mixed, flip; } g_hp_slow[8];
+static u64 g_cp_all, g_cp_hold, g_cp_fp, g_cp_pf, g_cp_nsh, g_cp_nhold, g_cp_nheld, g_cp_dedupe;   /* (t165w15: GPU-write bookkeeping profile, TSC cycles) */
+static struct { u64 lo, hi, n, cyc, pages; const char *who; int ctx; } g_cp_top[12];
+static u8 *g_coh_mixed, *g_coh_seenprot; static u16 *g_coh_seen; static u32 *g_coh_hgen; static u64 g_coh_nwrote_calls, g_coh_nwrote_pages, g_coh_t_wrote_wait, g_coh_nmixed, g_coh_post_full, g_coh_ra_done;
+static volatile u64 g_ct_rehold_pg; static volatile u32 g_ct_rehold_n;   /* (--coh-test 29) */
+static u64 g_ct_err_expected;   /* (--coh-test 28: errors it caused on purpose, reported apart) */
+static u64 g_coh_nrr, g_coh_nrr_w, g_coh_nownread, g_coh_rb_retry, g_coh_stop_retry, g_coh_rearm_late, g_coh_norec, g_coh_fence_late;
+static void qm_lock(void) { if (g_qm_init) pm_lock(&g_qm); }
+static void qm_unlock(void) { if (g_qm_init) pm_unlock(&g_qm); }
+static volatile u64 g_ct_iprobe_calls; static volatile int g_ct_iprobe_done, g_ct_iprobe_started;
+static void coh_rearm(u64 done);
+static void ct_iprobe_fn(void *arg) {   /* (test 18: a batch completing while the coherence tables are being set up) */
+    u64 ms = (u64)(uintptr_t)arg, t0 = plat_ticks(), f = plat_ticks_per_sec() / 1000; if (!f) f = 1;
+    while ((plat_ticks() - t0) / f < ms * 8 / 10) { coh_rearm(1); __atomic_add_fetch(&g_ct_iprobe_calls, 1, __ATOMIC_RELAXED); plat_sleep_ms(2); }
+    __atomic_store_n(&g_ct_iprobe_done, 1, __ATOMIC_RELEASE);
+}
+/* t165x (review 5, R5-8): setup failed part way - everything it took is given back, coherence stays off (the game runs as
+   with --no-gpu-coherence) */
+static void coh_arr_free(CohArr *A) { if (A->p) plat_release_rw(A->p, A->res); A->p = 0; A->cap = A->com = A->res = 0; }
+static void coh_init_undo(u16 *mask) {
+    free(mask); free(g_coh_seq); free(g_coh_prot); free(g_coh_mixed); free(g_coh_fr); free(g_coh_run); free(g_coh_ownf); free(g_coh_ro); free(g_coh_pend); free(g_coh_rr);
+    free(g_coh_hgen); free(g_coh_seen); free(g_coh_seenprot);
+    g_coh_seq = 0; g_coh_prot = 0; g_coh_mixed = 0; g_coh_fr = 0; g_coh_run = 0; g_coh_ownf = 0; g_coh_ro = 0; g_coh_pend = 0; g_coh_rr = 0; g_coh_hgen = 0; g_coh_seen = 0; g_coh_seenprot = 0;
+    coh_arr_free(&g_ra_arr); coh_arr_free(&g_snapa_arr); coh_arr_free(&g_snapd_arr); coh_arr_free(&g_patch_arr); coh_arr_free(&g_pl_arr); coh_arr_free(&g_kl_arr);
+    if (g_coh_smap) { vkUnmapMemory(V.dev, g_coh_smem); g_coh_smap = 0; }
+    if (g_coh_stage) { vkDestroyBuffer(V.dev, g_coh_stage, 0); g_coh_stage = 0; } if (g_coh_smem) { vkFreeMemory(V.dev, g_coh_smem, 0); g_coh_smem = 0; }
+    if (g_coh_fence) { vkDestroyFence(V.dev, g_coh_fence, 0); g_coh_fence = 0; } if (g_coh_pool) { vkDestroyCommandPool(V.dev, g_coh_pool, 0); g_coh_pool = 0; g_coh_cb = 0; }
+    g_coh_ok = 0; g_coh_mode = 0;
+}
+/* t165x5 (v0.2.2): coherence could not be turned on - said in UntilDawn.log too (the game goes on without it) */
+static void coh_init_failed(const char *why) {
+    vl("  GPU coherence: "); vl(why); vl(" - not enabled\n");
+    say("\n*** GPU coherence could not be turned on ("); say(why); say("). The game goes on without it: in some scenes the"
+        " lake water may be missing and character models stretched (the problems it fixes). Please keep Logs\\UntilDawn.log"
+        " for a bug report.\n");
+}
+static int coh_init(void) {   /* renderer thread, once the device exists */
+    if (coh_on()) return 1;
+    if (!g_coh_mode || !V.dev) return 0;
+    static int pm_done; if (!pm_done) { pm_init(&g_coh_m); pm_done = 1; }   /* the lock first */
+    u64 np = G2S_PT_SIZE >> 16;
+    u16 *mask = (u16 *)calloc(np, 2); g_coh_seq = (u32 *)calloc(np, 4); g_coh_prot = (u8 *)calloc(np, 1); g_coh_mixed = (u8 *)calloc(np, 1); g_coh_fr = (u32 *)calloc(np, 4); g_coh_run = (u8 *)calloc(np, 1);
+    g_coh_ownf = (u8 *)calloc(np, 1); g_coh_ro = (u16 *)calloc(np, 2); g_coh_pend = (u16 *)calloc(np, 2); g_coh_rr = (u16 *)calloc(np, 2);
+    g_coh_hgen = (u32 *)calloc(np, 4); g_coh_seen = (u16 *)calloc(np, 2); g_coh_seenprot = (u8 *)calloc(np, 1);
+    int ok = mask && g_coh_seq && g_coh_prot && g_coh_mixed && g_coh_hgen && g_coh_seen && g_coh_seenprot && g_coh_fr && g_coh_run && g_coh_ownf && g_coh_ro && g_coh_pend && g_coh_rr
+        && coh_arr_init(&g_ra_arr, sizeof(CohRa), 64ull << 20) && coh_arr_init(&g_snapa_arr, 8, 8ull << 20) && coh_arr_init(&g_snapd_arr, 4096, 4ull << 30)
+        && coh_arr_init(&g_patch_arr, sizeof(CohPatch), 256ull << 20) && coh_arr_init(&g_pl_arr, sizeof(CohPush), 64ull << 20) && coh_arr_init(&g_kl_arr, sizeof(CohPush), 64ull << 20);
+    if (ok) { g_coh_ra = (CohRa *)g_ra_arr.p; g_coh_snap_a = (u64 *)g_snapa_arr.p; g_coh_snap = g_snapd_arr.p; g_coh_patch = (CohPatch *)g_patch_arr.p; g_coh_pl = (CohPush *)g_pl_arr.p; g_coh_kl = (CohPush *)g_kl_arr.p; }
+    if (ok && g_coh_mode == 2) {   /* the copy-back needs every other thread stopped for a moment: check that works here */
+        static void *hs[4096]; int ns = plat_stop_others(hs, 4096);
+        if (ns < 0) { ok = -1; coh_init_failed("the other threads cannot be stopped on this system"); } else plat_resume_others(hs, ns);
+    }
+    if (ok > 0 && g_ct_init_fail) { ok = -1; coh_init_failed("a simulated set-up failure (--coh-init-fail, test)"); }
+    if (ok <= 0) { coh_init_undo(mask); if (!ok) coh_init_failed("its tables could not be set up (out of memory)"); return 0; }
+    if (g_coh_mode == 2) {
+        VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, 0, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, V.qfi};
+        VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, 0, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, COH_STAGE, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
+        if (!vkCreateCommandPool(V.dev, &cpi, 0, &g_coh_pool) && (cbai.commandPool = g_coh_pool, !vkAllocateCommandBuffers(V.dev, &cbai, &g_coh_cb)) && !vkCreateFence(V.dev, &fci, 0, &g_coh_fence)
+            && !vkCreateBuffer(V.dev, &bci, 0, &g_coh_stage)) {
+            VkMemoryRequirements mr; vkGetBufferMemoryRequirements(V.dev, g_coh_stage, &mr);
+            u32 mt = vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            if (mt == 0xFFFFFFFFu) mt = vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, mt};
+            if (mt != 0xFFFFFFFFu && !vkAllocateMemory(V.dev, &mai, 0, &g_coh_smem) && !vkBindBufferMemory(V.dev, g_coh_stage, g_coh_smem, 0)
+                && !vkMapMemory(V.dev, g_coh_smem, 0, COH_STAGE, 0, (void **)&g_coh_smap)) { g_coh_ok = 1; mem_name(g_coh_smap, "renderer: GPU coherence read-back (t165)"); }
+        }
+        if (!g_coh_ok) { coh_init_failed("its GPU read-back objects could not be created"); coh_init_undo(mask); return 0; }   /* (t165x, R5-8: was probe mode) */
+        else {   /* t165w: the staging ring */
+            VkBufferCreateInfo cbi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, COH_CS, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
+            if (!vkCreateBuffer(V.dev, &cbi, 0, &g_cs_buf)) {
+                VkMemoryRequirements mr; vkGetBufferMemoryRequirements(V.dev, g_cs_buf, &mr);
+                u32 mt = vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, mt};
+                if (mt == 0xFFFFFFFFu || vkAllocateMemory(V.dev, &mai, 0, &g_cs_mem) || vkBindBufferMemory(V.dev, g_cs_buf, g_cs_mem, 0) || vkMapMemory(V.dev, g_cs_mem, 0, COH_CS, 0, (void **)&g_cs_map)) { vkDestroyBuffer(V.dev, g_cs_buf, 0); if (g_cs_mem) vkFreeMemory(V.dev, g_cs_mem, 0); g_cs_mem = 0; g_cs_buf = 0; g_cs_map = 0; }
+                else mem_name(g_cs_map, "renderer: GPU coherence staging ring (t165w)"); }
+            if (!g_cs_buf) { coh_init_failed("its staging buffer could not be created"); coh_init_undo(mask); return 0; }
+        }
+    }
+    vl("  GPU coherence (t165): "); vl(g_coh_mode == 2 ? "on (CPU access to GPU-written VRAM copies copies the pages back)\n" : "probe (CPU access to GPU-written VRAM copies is logged, not copied)\n");
+    if (g_ct_init_delay) { g_ct_iprobe_started = 1; pt_create(ct_iprobe_fn, (void *)(uintptr_t)g_ct_init_delay, 1u << 20); plat_sleep_ms(g_ct_init_delay); }   /* (t165w test 18: widens the startup window; a completion arrives in it) */
+    g_coh_ensure_fn = coh_ensure; __atomic_store_n(&g_coh_fault_fn, coh_fault, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_coh_mask, mask, __ATOMIC_RELEASE);   /* published last */
+    return 1;
+}
+static int g_coh_mask_any(void) { return coh_on() != 0; }
+/* is the 4 KB page at a GPU-held (inaccessible)? (the heap watch skips such pages) */
+static int coh_stale4k(u64 a) {
+    u16 *M = coh_on(); if (!M || a < G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE) return 0;
+    return (__atomic_load_n(&M[(a - G2S_PT_BASE) >> 16], __ATOMIC_ACQUIRE) >> ((a >> 12) & 15)) & 1;
+}
+/* is RAM at the 4 KB page a not the copy to send to VRAM? (held, read-only stale, read-only waiting for its batch, or
+   CPU writes tracked by snapshot) - the submit's CPU-write copies leave it out */
+static int coh_nosync4k(u64 a) {
+    u16 *M = coh_on(); if (!M || a < G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE) return 0;
+    u64 pg = (a - G2S_PT_BASE) >> 16;
+    return ((__atomic_load_n(&M[pg], __ATOMIC_ACQUIRE) | __atomic_load_n(&g_coh_ro[pg], __ATOMIC_ACQUIRE) | __atomic_load_n(&g_coh_pend[pg], __ATOMIC_ACQUIRE)
+             | __atomic_load_n(&g_coh_rr[pg], __ATOMIC_ACQUIRE)) >> ((a >> 12) & 15)) & 1;
+}
+/* ---- snapshots (g_coh_m held) */
+static int coh_snap_find(u64 a) { for (u32 i = 0; i < g_coh_snap_hw; i++) if (g_coh_snap_a[i] == a) return (int)i; return -1; }
+static u8 *coh_snap_at(int i) { return g_coh_snap + ((u64)i << 12); }
+static int coh_snap_new(u64 a) {
+    int i = coh_snap_find(a); if (i >= 0) return i;
+    for (u32 k = 0; k < g_coh_snap_hw; k++) if (!g_coh_snap_a[k]) { g_coh_snap_a[k] = a; g_coh_nsnap++; return (int)k; }
+    if (!coh_arr_ensure(&g_snapa_arr, g_coh_snap_hw + 1) || !coh_arr_ensure(&g_snapd_arr, g_coh_snap_hw + 1)) { g_coh_snap_full++; coh_err("no memory for a snapshot"); return -1; }
+    g_coh_snap_a[g_coh_snap_hw] = a; g_coh_nsnap++; return (int)g_coh_snap_hw++;
+}
+static void coh_snap_free(int i, u64 p, u32 s) { CT_EV(10, G2S_PT_BASE + (p << 16) + ((u64)s << 12), i, 0); if (i >= 0) { g_coh_snap_a[i] = 0; g_coh_nsnap--; } __atomic_store_n(&g_coh_pend[p], (u16)(g_coh_pend[p] & ~(1u << s)), __ATOMIC_RELEASE); }
+static int coh_ra_pending(u64 p, u32 s) { for (u32 q = 0; q < g_coh_nra; q++) if (g_coh_ra[q].pg == (u32)p && (g_coh_ra[q].mask >> s & 1)) return 1; return 0; }
+static int coh_ra_add(u64 p, u16 m, u32 seq) {
+    if (!coh_arr_ensure(&g_ra_arr, g_coh_nra + 1)) { coh_err("no memory for a re-protection entry"); return 0; }
+    CohRa *R = &g_coh_ra[g_coh_nra++]; R->pg = (u32)p; R->mask = m; R->seq = seq; return 1;
+}
+/* ---- t165w: the staging ring. Every RAM -> VRAM copy the coherence code records (pushes, patches) and, with
+   --gpu-coherence, the submit's CPU-write copies take their bytes when they are recorded, not when the GPU runs them: a
+   page copied back meanwhile may be written again by the CPU before that batch runs, and a copy reading RAM then gave VRAM
+   bytes the snapshot of that page never saw (a CPU write lost later - the --coh-test 21 traces). g_coh_m held. */
+typedef struct { u64 end; u32 seq; } CsRec;
+static CsRec g_cs_rec[COH_CS_REC]; static u32 g_cs_rh, g_cs_rt;
+static u64 g_ct_cs_cap, g_cs_nwrap;   /* (--coh-test 28: a smaller ring, changed only while it is empty) */
+static i64 coh_cs_alloc(u64 n) {
+    const u64 cap = g_ct_cs_cap ? g_ct_cs_cap : COH_CS;
+    n = (n + 15) & ~15ull;
+    if (!g_cs_buf || n > cap / 4) return -1;
+    u32 dn = (u32)__atomic_load_n(&g_done_seq, __ATOMIC_ACQUIRE);
+    while (g_cs_rt != g_cs_rh && g_cs_rec[g_cs_rt % COH_CS_REC].seq <= dn) { g_cs_tail = g_cs_rec[g_cs_rt % COH_CS_REC].end; g_cs_rt++; }
+    if (g_cs_rt == g_cs_rh) g_cs_tail = g_cs_head;
+    u64 pos = g_cs_head % cap, skip = pos + n > cap ? cap - pos : 0;
+    if (g_cs_head + skip + n - g_cs_tail > cap) return -1;
+    u32 seq = (u32)(__atomic_load_n(&g_sub_seq, __ATOMIC_ACQUIRE) + 1);
+    if (g_cs_rh != g_cs_rt && g_cs_rec[(g_cs_rh - 1) % COH_CS_REC].seq == seq) {}
+    else { if (g_cs_rh - g_cs_rt >= COH_CS_REC) return -1; g_cs_rec[g_cs_rh % COH_CS_REC].seq = seq; g_cs_rh++; }
+    if (skip || (pos + n == cap)) g_cs_nwrap++;
+    g_cs_head += skip; u64 off = g_cs_head % cap; g_cs_head += n;
+    g_cs_rec[(g_cs_rh - 1) % COH_CS_REC].end = g_cs_head; g_cs_bytes += n;
+    return (i64)off;
+}
+static u64 g_cs_nheld, g_cs_nstop, g_cs_protfail;
+static int coh_held4k(u64 p) { return p >= G2S_PT_BASE && p < G2S_PT_BASE + G2S_PT_SIZE && (g_coh_mask[(p - G2S_PT_BASE) >> 16] >> ((p >> 12) & 15) & 1); }
+/* RAM [a, a+n) -> dst, also from GPU-held pages (made readable only for the copy - the caller has stopped the other
+   threads, so none of them can read the page's stale bytes in that window without a fault) */
+static void coh_page_read(u64 a, u8 *dst, u64 n) {
+    for (u64 p = a & ~0xFFFull; p < a + n; p += 4096) {
+        u64 lo = p > a ? p : a, hi = p + 4096 < a + n ? p + 4096 : a + n; u32 old;
+        int held = coh_held4k(p);
+        if (held) { g_cs_nheld++; if (plat_protect((void *)p, 4096, 0x02, &old)) { mem_copy(dst + (lo - a), (const void *)lo, hi - lo); if (!plat_protect((void *)p, 4096, 0x01, &old)) g_cs_protfail++; } else { g_cs_protfail++; h_memset(dst + (lo - a), 0, hi - lo); } }   /* (reported after the threads resume) */
+        else mem_copy(dst + (lo - a), (const void *)lo, hi - lo);
+    }
+}
+/* record RAM -> VRAM copies (S's layout) through the ring; what does not fit goes from RAM directly (an error, logged) */
+static void coh_cs_stop(void **hs, int *nst) {
+    for (u64 t0 = plat_ticks(); *nst < 0 && plat_ticks() - t0 < plat_ticks_per_sec() * 2; ) { *nst = ct_inj_take(&g_ct_inj_stop) ? -1 : plat_stop_others(hs, 4096); if (*nst < 0) { g_coh_stop_retry++; plat_sleep_ms(1); } }   /* (2 s) */
+    if (*nst < 0) coh_fatal("the other threads could not be stopped to read a GPU-held page"); g_cs_nstop++;   /* (t165w, N3) */
+}
+/* record RAM -> VRAM copies (S's layout) through the ring; what does not fit goes from RAM directly (an error, logged).
+   While the other threads are stopped (held pages) nothing here logs or calls Vulkan: a stopped thread may hold a lock. */
+static void coh_cs_record(VShadow *S, const VkBufferCopy *c, u32 n) {
+    static VkBufferCopy st[1024], lv[1024]; static void *hs[4096]; u32 ns = 0, nl = 0; int nst = -1;
+    u64 full0 = g_cs_full, pf0 = g_cs_protfail;
+    int anyheld = 0;   /* bytes on a GPU-held page (a patch, a kept push): read them with the other threads stopped */
+    for (u32 i = 0; i < n && !anyheld; i++)
+        for (u64 p = (S->lo + c[i].dstOffset) & ~0xFFFull; p < S->lo + c[i].dstOffset + c[i].size; p += 4096) if (coh_held4k(p)) { anyheld = 1; break; }
+    if (anyheld) coh_cs_stop(hs, &nst);
+    for (u32 i = 0; i < n; i++)
+        for (u64 o = 0; o < c[i].size; ) {
+            u64 piece = g_ct_cs_cap ? g_ct_cs_cap / 4 : (1u << 20);
+            u64 m = c[i].size - o > piece ? piece : c[i].size - o;
+            i64 off = coh_cs_alloc(m);
+            if (off >= 0) { coh_page_read(S->lo + c[i].dstOffset + o, g_cs_map + off, m); st[ns].srcOffset = (u64)off; st[ns].dstOffset = c[i].dstOffset + o; st[ns].size = m; ns++; }
+            else { if (g_cs_buf) g_cs_full++;
+                lv[nl].srcOffset = S->hoff + c[i].dstOffset + o; lv[nl].dstOffset = c[i].dstOffset + o; lv[nl].size = m; nl++; }
+            o += m;
+            if (ns == 1024 || nl == 1024) {   /* emit (threads running), then stop them again for the rest */
+                if (nst >= 0) { plat_resume_others(hs, nst); nst = -1; }
+                if (ns) vkCmdCopyBuffer(V.cb, g_cs_buf, S->buf, ns, st);
+                if (nl) vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, nl, lv);
+                ns = nl = 0;
+                if (anyheld && (i + 1 < n || o < c[i].size)) coh_cs_stop(hs, &nst);
+            }
+        }
+    if (nst >= 0) plat_resume_others(hs, nst);
+    if (ns) vkCmdCopyBuffer(V.cb, g_cs_buf, S->buf, ns, st);
+    if (nl) vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, nl, lv);
+    if (g_cs_full != full0) coh_err("the staging ring was full (a copy read RAM when the GPU ran it)");
+    if (g_cs_protfail != pf0) coh_fatal("a page protection change failed while reading a GPU-held page");
+}
+/* ---- pushes: RAM -> VRAM in the batch being recorded (renderer thread, a batch is being recorded - the callers make
+   sure of that before they take g_coh_m: t165w, review 1 - starting one may wait for a batch slot) */
+static VShadow *g_cpq_S; static VkBufferCopy g_cpq[512]; static u32 g_ncpq;
+static void coh_log_add(VShadow *S, const VkBufferCopy *c, u32 n) {   /* g_coh_m held */
+    u32 sub = (u32)__atomic_load_n(&g_sub_seq, __ATOMIC_ACQUIRE), j = 0;
+    for (u32 i = 0; i < g_coh_npl; i++) if (g_coh_pl[i].seq > sub) g_coh_pl[j++] = g_coh_pl[i];   /* (submitted ones: a read-back sees them) */
+    g_coh_npl = j;
+    if (!coh_arr_ensure(&g_pl_arr, (u64)g_coh_npl + n) || !coh_arr_ensure(&g_kl_arr, (u64)g_coh_npl + n)) { g_coh_pl_full++; coh_err("no memory for the push log"); return; }
+    for (u32 i = 0; i < n; i++) { CohPush *P = &g_coh_pl[g_coh_npl++]; P->a = S->lo + c[i].dstOffset; P->n = (u32)c[i].size; P->seq = sub + 1; CT_EV(8, P->a, P->n, sub + 1); }
+}
+static void coh_push_flush(void) {
+    if (!g_ncpq) return;
+    if (!V.recording) { g_coh_norec++; coh_err("a push without a batch being recorded (internal)"); }
+    VShadow *S = g_cpq_S; u32 k = g_ncpq; g_ncpq = 0;
+    vk_begin_cb(); vk_end_rendering(); vk_barrier(); coh_cs_record(S, g_cpq, k); vk_barrier();
+    coh_log_add(S, g_cpq, k);
+    g_coh_npush++; for (u32 i = 0; i < k; i++) g_coh_push_bytes += g_cpq[i].size;
+}
+/* the submit's CPU-write copies (vk_shadow_sync) read RAM when the batch runs: logged like pushes */
+static void coh_log_copies(VShadow *S, const VkBufferCopy *c, u32 n) {
+    if (!coh_on() || !n) return;
+    pm_lock(&g_coh_m); coh_log_add(S, c, n); pm_unlock(&g_coh_m);
+}
+/* t165w: the submit's CPU-write copies (vk_shadow_sync; a batch is being recorded): with --gpu-coherence through the
+   staging ring and logged, otherwise from RAM as before */
+static void coh_sync_copy(VShadow *S, const VkBufferCopy *c, u32 n) {
+    if (!n) return;
+    if (!coh_on() || !g_cs_buf) { vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, n, c); coh_log_copies(S, c, n); return; }
+    vk_barrier();   /* t165w (review 3, NF3): the same page can be copied twice in one submit (the texture path's list and the
+                       write tracking): staged at different times, the later copy must land last */
+    pm_lock(&g_coh_m); coh_cs_record(S, c, n); coh_log_add(S, c, n); pm_unlock(&g_coh_m);
+}
+static void coh_push1(VShadow *S, u64 a, u64 n) {
+    if (g_ncpq && (g_cpq_S != S || g_ncpq == 512)) coh_push_flush();
+    if (g_ncpq && g_cpq[g_ncpq - 1].dstOffset + g_cpq[g_ncpq - 1].size == a - S->lo) { g_cpq[g_ncpq - 1].size += n; return; }
+    g_cpq_S = S; g_cpq[g_ncpq].srcOffset = S->hoff + (a - S->lo); g_cpq[g_ncpq].dstOffset = a - S->lo; g_cpq[g_ncpq].size = n; g_ncpq++;
+}
+static void coh_push(VShadow *S, u64 a, u64 n, u64 xl, u64 xh) {   /* [a, a+n) minus [xl, xh) */
+    if (!S || !n) return;
+    if (a < S->lo) { if (a + n <= S->lo) return; n -= S->lo - a; a = S->lo; }
+    if (a + n > S->hi) { if (a >= S->hi) return; n = S->hi - a; }
+    u64 e = a + n;
+    if (xl < xh && xl < e && xh > a) { if (xl > a) coh_push1(S, a, xl - a); if (xh < e) coh_push1(S, xh, e - xh); }
+    else coh_push1(S, a, n);
+}
+/* ---- patches: CPU-changed bytes waiting for the next submit (g_coh_m held) */
+static void coh_patch_add(u64 a, u64 n) {
+    u64 pa = a & ~0xFFFull; u32 i = 0;
+    while (i < g_coh_npatch && g_coh_patch[i].a != pa) i++;
+    if (i == g_coh_npatch) {
+        if (!coh_arr_ensure(&g_patch_arr, (u64)g_coh_npatch + 1)) { g_coh_patch_full++; coh_err("no memory for a patch"); return; }
+        g_coh_patch[i].a = pa; for (int k = 0; k < 64; k++) g_coh_patch[i].bits[k] = 0; g_coh_npatch++; }
+    for (u64 o = a - pa, e = o + n; o < e && o < 4096; o++) g_coh_patch[i].bits[o >> 6] |= 1ull << (o & 63);
+    g_coh_npatch_made++; g_coh_patch_bytes += n; __atomic_add_fetch(&g_coh_epoch, 1, __ATOMIC_RELEASE);
+}
+/* bytes of the 4 KB page a that differ from its snapshot (exact byte runs) -> VRAM now around [xl, xh) (S given) or as
+   patches; the snapshot then equals RAM. The page takes no CPU write meanwhile (read-only or held). */
+static int coh_diff(u64 a, int si, VShadow *S, u64 xl, u64 xh) {   /* returns 1 if the CPU changed bytes (review 7 N6) */
+    u8 *sn = coh_snap_at(si); const volatile u8 *r = (const volatile u8 *)a; int ch = 0;
+    for (u32 i = 0; i < 4096; ) {
+        if (!(i & 7) && i + 8 <= 4096 && *(const volatile u64 *)(a + i) == *(const u64 *)(sn + i)) { i += 8; continue; }
+        if (r[i] == sn[i]) { i++; continue; }
+        u32 j = i + 1; while (j < 4096 && r[j] != sn[j]) j++;
+        if (S) coh_push(S, a + i, j - i, xl, xh); else coh_patch_add(a + i, j - i);
+        i = j; ch = 1;
+    }
+    mem_copy(sn, (const void *)a, 4096);
+    return ch;
+}
+static int coh_cpu_dirty(VShadow *S, u64 a) {
+    void *dl[1];
+    if (plat_dirty_list((void *)a, 4096, dl, 1) > 0) return 1;
+    if (S && S->rs_all) return 1;
+    for (u32 k = 0, nk = __atomic_load_n(&g_sh_nrs, __ATOMIC_ACQUIRE); k < nk; k++) if (g_sh_rs[k] == a) return 1;
+    return 0;
+}
+/* subpages add of 64 KB page pg become GPU-held; g_coh_m held. ctx 0: their batch completed (completion thread);
+   1: a GPU write recorded before its command; 2: recorded after its command, which wrote [xl, xh). CPU bytes VRAM does
+   not have yet go there first (before / around the GPU's write, or as patches). */
+static void coh_hold(u64 pg, u16 add, int ctx, u64 xl, u64 xh) {
+    u64 base = G2S_PT_BASE + (pg << 16); u16 cur = g_coh_mask[pg]; add &= (u16)~cur;
+    if (!add) return;
+    u64 hc0 = __builtin_ia32_rdtsc(), hc1, hc2, hc3; u32 nprot = 0, ndirty = 0, npush = 0;   /* (t165w15 profile) */
+    VShadow *S = ctx ? shadow_of(base, 0x10000) : 0;
+    u16 ro0 = (u16)(g_coh_ro[pg] | g_coh_rr[pg]), pend = (u16)(g_coh_pend[pg] & add & ~ro0);
+    for (u32 s = 0; s < 16; s++) if (pend >> s & 1) {   /* snapshot pages: read-only first, then compared */
+        u64 a = base + ((u64)s << 12); u32 old = 0; int si = coh_snap_find(a);
+        if (!plat_protect((void *)a, 4096, g_coh_prot[pg] == 0x40 ? 0x20 : 0x02, &old)) { g_coh_fail++; coh_fatal("a page protection change failed (a tracked page before its comparison)"); }   /* (t165w, review 2 N11: was counted only, and its CPU writes could be lost) */
+        if (old != 0x04 && old != 0x40) { plat_protect((void *)a, 4096, old, &old); g_coh_badprot++; coh_err("a tracked page had a protection not set here (not held)"); add &= (u16)~(1u << s); continue; }
+        g_coh_prot[pg] = (u8)old;
+        CT_EV(3, a, ctx, si);
+        if (si >= 0) coh_diff(a, si, ctx ? S : 0, ctx == 2 ? xl : 0, ctx == 2 ? xh : 0);
+    }
+    u16 done = 0; hc1 = __builtin_ia32_rdtsc();
+    /* t165w (review 2, N9): VirtualProtect reports the first page's old protection only - so until a 64 KB page is known
+       to have one protection throughout (g_coh_mixed 1), it is protected 4 KB at a time and each page's own old
+       protection decides; once all 16 have been seen with the same one, whole runs. (w16: VirtualQuery was used for this
+       first; it walks the page tables of the whole multi-GB region to size its answer - ~11 ms a call, ~45 s at a level
+       load in the Chapter 10 run) */
+    for (u32 s = 0; s < 16; ) {
+        if (!(add >> s & 1)) { s++; continue; }
+        u32 e = s; if (g_coh_mixed[pg] == 1) while (e < 16 && (add >> e & 1)) e++; else e = s + 1;
+        u32 old = 0; u16 run = (u16)(((1u << (e - s)) - 1) << s);
+        nprot++;
+        if (!plat_protect((void *)(base + ((u64)s << 12)), (u64)(e - s) << 12, 0x01, &old)) { g_coh_fail++; coh_fatal("a page protection change failed (holding a GPU-written page)"); }   /* (t165w, N11) */
+        int okp = old == 0x04 || old == 0x40 || ((run & (ro0 | pend)) && (old == 0x02 || old == 0x20));   /* (read-only: ours) */
+        if (g_coh_mixed[pg] == 0 && !(run & (ro0 | pend))) {   /* (review 4, F4: learnt across calls - a page held in pieces gets there too) */
+            if (!g_coh_seen[pg]) g_coh_seenprot[pg] = (u8)old;
+            if ((u8)old != g_coh_seenprot[pg] || old > 0xFF) { g_coh_mixed[pg] = 2; g_coh_nmixed++; }
+            else g_coh_seen[pg] |= run; }
+        if (!okp) { plat_protect((void *)(base + ((u64)s << 12)), (u64)(e - s) << 12, old, &old); g_coh_badprot++; s = e; continue; }   /* (a protection not set here, e.g. memory mapped read-only: not held - as without coherence) */
+        if (old == 0x04 || old == 0x40) g_coh_prot[pg] = (u8)old;
+        done |= run; g_coh_nprot_pages += e - s; s = e;
+    }
+    if (g_coh_mixed[pg] == 0 && g_coh_seen[pg] == 0xFFFF) g_coh_mixed[pg] = 1;   /* (all 16 seen alike: whole runs from now on) */
+    /* t165w: held from here - the pushes below may flush, and staging reads a page by its held bit (read with the
+       other threads stopped); a no-access page not yet marked held was read directly and faulted (--coh-test 17) */
+    __atomic_store_n(&g_coh_ro[pg], (u16)(g_coh_ro[pg] & ~done), __ATOMIC_RELEASE);
+    __atomic_store_n(&g_coh_rr[pg], (u16)(g_coh_rr[pg] & ~done), __ATOMIC_RELEASE);
+    __atomic_store_n(&g_coh_mask[pg], (u16)(cur | done), __ATOMIC_RELEASE);
+    if (done) __atomic_add_fetch(&g_coh_hgen[pg], 1, __ATOMIC_RELEASE);   /* (t165w: own-read cache) */
+    hc2 = __builtin_ia32_rdtsc();
+    for (u32 s = 0; s < 16; s++) if ((done & ~ro0 & ~pend) >> s & 1) {   /* pages that took CPU writes until now */
+        u64 a = base + ((u64)s << 12); ndirty++;
+        if (!coh_cpu_dirty(S ? S : shadow_of(a, 4096), a)) { CT_EV(4, a, ctx, 0); continue; }
+        CT_EV(5, a, ctx, 1); npush++;
+        if (ctx) coh_push(S, a, 4096, ctx == 2 ? xl : 0, ctx == 2 ? xh : 0);
+        else { g_coh_rearm_dirty++; coh_err("a page written by the CPU outside the tracked states was protected again after its batch"); }
+    }
+    hc3 = __builtin_ia32_rdtsc();
+    g_hp_n++; g_hp_pend += hc1 - hc0; g_hp_prot += hc2 - hc1; g_hp_dirty += hc3 - hc2; g_hp_nprot += nprot; g_hp_ndirty += ndirty; g_hp_npush += npush;
+    { u64 tot = hc3 - hc0; int k = 0; for (int q = 1; q < 8; q++) if (g_hp_slow[q].tot < g_hp_slow[k].tot) k = q;
+      if (tot > g_hp_slow[k].tot) { g_hp_slow[k].tot = tot; g_hp_slow[k].pg = pg; g_hp_slow[k].add = add; g_hp_slow[k].done = done; g_hp_slow[k].cur = cur; g_hp_slow[k].ctx = ctx;
+          g_hp_slow[k].prot = hc2 - hc1; g_hp_slow[k].dirty = hc3 - hc2; g_hp_slow[k].nprot = nprot; g_hp_slow[k].npush = npush; g_hp_slow[k].mixed = g_coh_mixed[pg]; g_hp_slow[k].flip = (u32)g_flips; } }
+}
+static void coh_patch_push(VShadow *S, const CohPatch *P, u64 xl, u64 xh) {
+    for (u32 o = 0; o < 4096; ) {
+        if (!P->bits[o >> 6]) { o = (o | 63) + 1; continue; }
+        if (!(P->bits[o >> 6] >> (o & 63) & 1)) { o++; continue; }
+        u32 e = o + 1; while (e < 4096 && (P->bits[e >> 6] >> (e & 63) & 1)) e++;
+        coh_push(S, P->a + o, e - o, xl, xh); o = e;
+    }
+}
+static void coh_flush_patches(u64 pg, u16 m, int ctx, u64 xl, u64 xh) {   /* patches in subpages m go before / around a GPU write being recorded */
+    u64 base = G2S_PT_BASE + (pg << 16); VShadow *S = shadow_of(base, 0x10000); u32 k = 0;
+    for (u32 i = 0; i < g_coh_npatch; i++) { CohPatch *P = &g_coh_patch[i];
+        if (P->a >= base && P->a < base + 0x10000 && (m >> ((P->a >> 12) & 15) & 1)) { CT_EV(6, P->a, ctx, 0); coh_patch_push(S, P, ctx == 2 ? xl : 0, ctx == 2 ? xh : 0); }
+        else { if (k != i) g_coh_patch[k] = *P; k++; } }
+    g_coh_npatch = k;
+}
+static void coh_apply_patches(void) {   /* renderer thread, at the start of a submit */
+    if (!coh_on()) return;
+    vk_begin_cb();   /* t165w: before the lock (starting a batch may wait for a slot - review 1) */
+    pm_lock(&g_coh_m);
+    for (u32 i = 0; i < g_coh_npatch; i++) { CT_EV(7, g_coh_patch[i].a, 0, 0); coh_patch_push(shadow_of(g_coh_patch[i].a & ~0xFFFFull, 0x10000), &g_coh_patch[i], 0, 0); }
+    g_coh_npatch = 0; coh_push_flush();   /* (its own copy command: the bytes below may overlap these) */
+    /* t165w (review 2, N1): snapshot-tracked pages (copied back while a GPU write to them was pending, then written by
+       the CPU) - the CPU's bytes go into this submit now, not only as patches once that batch completes: the submit-start
+       copies skip these pages (a whole-page copy would undo the pending GPU write), so a GPU read in this submit missed
+       them. Read-only while compared (a CPU write meanwhile waits for g_coh_m, then repeats); the snapshot is updated, so
+       later comparisons find only newer bytes. The earlier batch runs first: its GPU bytes stay (--coh-test 24). */
+    if (g_coh_nsnap) for (u32 i = 0; i < g_coh_snap_hw; i++) {
+        u64 a = g_coh_snap_a[i]; if (!a || a < G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE) continue;
+        u64 pg = (a - G2S_PT_BASE) >> 16; u32 sb = (u32)((a >> 12) & 15);
+        if (!(g_coh_pend[pg] >> sb & 1) || ((g_coh_mask[pg] | g_coh_ro[pg] | g_coh_rr[pg]) >> sb & 1)) continue;   /* (held / read-only: nothing new from the CPU) */
+        VShadow *S = shadow_of(a, 4096); if (!S) continue;
+        u32 old = 0, rop = g_coh_prot[pg] == 0x40 ? 0x20 : 0x02;
+        if (!plat_protect((void *)a, 4096, rop, &old)) { coh_err("a page protection change failed (CPU bytes of a tracked page at a submit)"); continue; }
+        if (old != 0x04 && old != 0x40) { u32 o2; plat_protect((void *)a, 4096, old, &o2); continue; }   /* (not writable now: nothing to send) */
+        CT_EV(12, a, i, 0);
+        int chg = coh_diff(a, (int)i, S, 0, 0); g_coh_npend_sync++;
+        if (chg) { if (g_coh_nunw < 1024) g_coh_unw[g_coh_nunw++] = a; else { g_coh_unw_all = 1; g_coh_unw_ovf++; } }   /* (t165x, review 6 X2-5: its textures check their bytes again; review 7 N6: only when the CPU changed it) */
+        if (!plat_protect((void *)a, 4096, old, &old)) coh_err("a page protection change failed (CPU bytes of a tracked page at a submit, restoring)");
+    }
+    coh_push_flush();
+    pm_unlock(&g_coh_m);
+}
+/* t165w (review 2, N6): at the end of recording a batch (before it reaches the GPU) - pages copied back while this batch's
+   GPU write was being recorded were left read-only with their bytes from before it (right until the GPU runs it); held
+   again now, their CPU bytes since sent in this batch first (after its GPU write: as patches would be). Read-only until the
+   batch completed, a game thread could read them stale after a GPU-written label (WRITE_DATA) said the batch had run.
+   Now such a read faults and is copied back after the batch. Renderer thread; g_coh_m before g_slock (review 1). */
+static u64 g_coh_n_subhold, g_coh_n_posthold; static u32 g_coh_closed; static struct { u32 pg; u16 m; } g_coh_post[256]; static u32 g_coh_npost;
+static void coh_at_submit(void) {
+    if (!coh_on() || !V.recording) return;
+    pm_lock(&g_coh_m);
+    u32 batch = (u32)(__atomic_load_n(&g_sub_seq, __ATOMIC_ACQUIRE) + 1);
+    for (u32 q = 0; q < g_coh_nra; q++) { const CohRa *R = &g_coh_ra[q]; if (R->seq != batch) continue;
+        u64 pg = R->pg; u16 m = (u16)(R->mask & (g_coh_rr[pg] | g_coh_pend[pg]) & ~g_coh_mask[pg]);
+        if (!m) continue;
+        CT_EV(13, G2S_PT_BASE + (pg << 16), m, 0);
+        coh_hold(pg, m, 1, 0, 0); g_coh_n_subhold += (u64)__builtin_popcount(m); }
+    coh_push_flush();
+    g_coh_closed = batch;   /* (a copy-back from here until the submit itself: coh_release lists the page for coh_post_submit) */
+    pm_unlock(&g_coh_m);
+}
+/* right after the submit: pages copied back between coh_at_submit and the submit, held again (their CPU bytes since go
+   into the next batch - after this one on the queue) */
+static void coh_post_submit(void) {
+    if (!__atomic_load_n(&g_coh_npost, __ATOMIC_ACQUIRE) || !coh_on()) return;
+    vk_begin_cb();   /* (before the lock - review 1) */
+    pm_lock(&g_coh_m);
+    for (u32 i = 0; i < g_coh_npost; i++) { u64 pg = g_coh_post[i].pg; u16 m = (u16)(g_coh_post[i].m & (g_coh_rr[pg] | g_coh_pend[pg]) & ~g_coh_mask[pg]);
+        if (m) { coh_hold(pg, m, 1, 0, 0); g_coh_n_posthold += (u64)__builtin_popcount(m); } }
+    g_coh_npost = 0; coh_push_flush(); g_coh_post_open = 1;
+    pm_unlock(&g_coh_m);
+}
+/* the GPU writes [lo, hi) in the batch being recorded */
+static void coh_gpu_wrote(u64 lo, u64 hi, const char *who, int ctx) {
+    if (!g_coh_mode || hi <= lo || lo < G2S_PT_BASE || hi > G2S_PT_BASE + G2S_PT_SIZE || !shadow_overlaps(lo, hi - lo)) return;
+    if (g_rc_active && !g_rp_running) return;   /* a replay capture is being taken */
+    if (!coh_on() && !coh_init()) return;
+    vk_begin_cb();   /* t165w: a batch is being recorded before the lock is taken (review 1) */
+    u32 batch = (u32)(g_sub_seq + 1); u64 ep = __atomic_load_n(&g_coh_epoch, __ATOMIC_ACQUIRE);
+    { static struct { u64 lo, hi, ep; u32 b; } rc[16]; static u32 nrc;   /* the same range again in this batch with nothing changed since (t165w: epoch - review 7) */
+      for (u32 i = 0; i < 16; i++) if (rc[i].lo == lo && rc[i].hi == hi && rc[i].b == batch && rc[i].ep == ep) { g_cp_dedupe++; return; }
+      rc[nrc & 15].lo = lo; rc[nrc & 15].hi = hi; rc[nrc & 15].b = batch; rc[nrc & 15].ep = ep; nrc++; }
+    u64 tw0 = plat_ticks();
+    pm_lock(&g_coh_m);
+    g_coh_t_wrote_wait += plat_ticks() - tw0;   /* (t165w: the part spent waiting for g_coh_m - a copy-back or own read holding it) */
+    g_coh_nwrote_calls++;
+    u64 cp0 = __builtin_ia32_rdtsc(), cp_hold = 0, cp_fp = 0, cp_pf = 0, np0 = g_coh_nwrote_pages, nsh0 = 0;   /* (t165w15 profile, cycles) */
+    for (int i = 0; i < g_nsh; i++) { VShadow *S = &g_sh[i];
+        if (!S->live || S->wb || S->ro || lo >= S->hi || hi <= S->lo) continue;
+        nsh0++;
+        u64 a = (lo > S->lo ? lo : S->lo) & ~0xFFFull, b = ((hi < S->hi ? hi : S->hi) + 0xFFF) & ~0xFFFull;
+        for (u64 pg = (a - G2S_PT_BASE) >> 16, pe = (b - 1 - G2S_PT_BASE) >> 16; pg <= pe; pg++) {
+            u64 pb = G2S_PT_BASE + (pg << 16), s0 = a > pb ? (a - pb) >> 12 : 0, s1 = b < pb + 0x10000 ? (b - pb + 0xFFF) >> 12 : 16;
+            u16 m = (u16)(((1u << (s1 - s0)) - 1) << s0);
+            g_coh_seq[pg] = batch; CT_EV(11, pb, m, ctx); g_coh_nwrote_pages++;
+            { u32 fn = V.frame + 1, fo = g_coh_fr[pg];
+              if (fo != fn) { g_coh_run[pg] = fo + 1 == fn ? (u8)(g_coh_run[pg] < 255 ? g_coh_run[pg] + 1 : 255) : 1; g_coh_fr[pg] = fn; } }
+            if (g_coh_npatch) { u64 c0 = __builtin_ia32_rdtsc(); coh_flush_patches(pg, m, ctx, lo, hi); cp_fp += __builtin_ia32_rdtsc() - c0; }
+            if ((g_coh_mask[pg] & m) != m) { u64 c0 = __builtin_ia32_rdtsc(); u64 th0 = plat_ticks(); int wasro = (g_coh_ro[pg] & m) != 0; coh_hold(pg, m, ctx, lo, hi); if (wasro) { g_coh_t_hold_ro += plat_ticks() - th0; g_coh_nhold_ro++; } cp_hold += __builtin_ia32_rdtsc() - c0; g_cp_nhold++; }
+            else g_cp_nheld++;
+            if (g_ncpq) { u64 c0 = __builtin_ia32_rdtsc(); coh_push_flush(); cp_pf += __builtin_ia32_rdtsc() - c0; }
+        }
+        CohWr *W = &g_coh_wr[g_coh_nwr++ % COH_WR]; W->lo = a; W->hi = b; W->flip = (u32)g_flips; W->who = who;
+        W->vs = (u64)g_shr[SH_PGM_LO_VS] << 8; W->ps = (u64)g_shr[SH_PGM_LO_PS] << 8; W->cs = (u64)g_shr[0x20C] << 8;
+    }
+    g_coh_t_wrote += plat_ticks() - tw0;
+    { u64 cyc = __builtin_ia32_rdtsc() - cp0, np = g_coh_nwrote_pages - np0;   /* (t165w15 profile) */
+      g_cp_all += cyc; g_cp_hold += cp_hold; g_cp_fp += cp_fp; g_cp_pf += cp_pf; g_cp_nsh += nsh0;
+      int k = 0; while (k < 12 && g_cp_top[k].n && !(g_cp_top[k].lo == lo && g_cp_top[k].hi == hi)) k++;
+      if (k == 12) { k = 0; for (int q = 1; q < 12; q++) if (g_cp_top[q].cyc < g_cp_top[k].cyc) k = q; if (g_cp_top[k].cyc > cyc) k = -1; else { g_cp_top[k].lo = lo; g_cp_top[k].hi = hi; g_cp_top[k].n = 0; g_cp_top[k].cyc = 0; g_cp_top[k].pages = 0; } }
+      if (k >= 0) { g_cp_top[k].lo = lo; g_cp_top[k].hi = hi; g_cp_top[k].who = who; g_cp_top[k].ctx = ctx; g_cp_top[k].n++; g_cp_top[k].cyc += cyc; g_cp_top[k].pages += np; } }
+    pm_unlock(&g_coh_m);
+}
+/* batch done: pages copied back while it was being recorded are held again. t165w: called by the completion thread
+   after the fence and before it takes the slot lock (review 1: it used to wait for g_coh_m holding g_slock), and before
+   the batch's label writes. */
+static void coh_rearm(u64 done) {
+    if (!coh_on()) return;
+    pm_lock(&g_coh_m);
+    if (!g_coh_nra) { pm_unlock(&g_coh_m); return; }
+    u32 k = 0;
+    for (u32 i = 0; i < g_coh_nra; i++) { CohRa *R = &g_coh_ra[i];
+        if (R->seq <= done) { CT_EV(9, G2S_PT_BASE + ((u64)R->pg << 16), R->mask, R->seq); coh_hold(R->pg, R->mask, 0, 0, 0); g_coh_nrearm++; }
+        else g_coh_ra[k++] = *R; }
+    g_coh_nra = k;
+    if (g_coh_nsnap) for (u32 i = 0; i < g_coh_snap_hw; i++) { u64 a = g_coh_snap_a[i]; if (!a) continue;   /* snapshots no waiting batch needs */
+        u64 p = (a - G2S_PT_BASE) >> 16; u32 s = (u32)((a >> 12) & 15);
+        if (!coh_ra_pending(p, s)) coh_snap_free((int)i, p, s); }
+    pm_unlock(&g_coh_m);
+}
+static const CohWr *coh_writer(u64 a) {
+    for (u64 k = g_coh_nwr, n = 0; k > 0 && n < COH_WR; k--, n++) { const CohWr *W = &g_coh_wr[(k - 1) % COH_WR]; if (a >= W->lo && a < W->hi) return W; }
+    return 0;
+}
+/* copy the 64 KB pages [pg, pg + n) of VRAM copy S to the staging buffer (after everything submitted so far).
+   t165w (review 4): the fence is waited for until it signals (30 s at most); the command buffer and fence are never
+   reset or reused while they may still be pending - after a wait that never finished the copy-back is turned off. */
+static int coh_readback(VShadow *S, u64 pg, u32 n) {
+    if (ct_inj_take(&g_ct_inj_rb)) return 0;   /* (test) */
+    if (!g_coh_ok) return 0;
+    if (g_coh_cb_busy) {   /* (an earlier read-back still running: wait for it, then go on) */
+        VkResult w = vkWaitForFences(V.dev, 1, &g_coh_fence, 1, 1000000000ull); if (w != VK_SUCCESS) return 0;
+        vkResetFences(V.dev, 1, &g_coh_fence); g_coh_cb_busy = 0; }
+    u64 off = G2S_PT_BASE + (pg << 16) - S->lo;
+    vkResetCommandBuffer(g_coh_cb, 0);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, 0, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, 0};
+    if (vkBeginCommandBuffer(g_coh_cb, &bi)) return 0;
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    real_vkCmdPipelineBarrier(g_coh_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+    VkBufferCopy bc = {off, 0, (u64)n << 16}; real_vkCmdCopyBuffer(g_coh_cb, S->buf, g_coh_stage, 1, &bc);
+    VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    real_vkCmdPipelineBarrier(g_coh_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, 0, 0, 0);
+    if (real_vkEndCommandBuffer(g_coh_cb)) return 0;
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &g_coh_cb, 0, 0};
+    qm_lock(); VkResult r = vkQueueSubmit(V.q, 1, &si, g_coh_fence); qm_unlock();
+    if (r == VK_ERROR_DEVICE_LOST) { vk_fail("vkQueueSubmit (copy-back read)", r); coh_device_lost("submitting a copy-back's GPU read"); }   /* (review 6 X2-1) */
+    if (r) return 0;
+    g_coh_cb_busy = 1;
+    u64 first = 5000000000ull;
+    int injf = ct_inj_take(&g_ct_inj_fence); if (injf) first = 1000;   /* (test: as if the first wait timed out) */
+    r = vkWaitForFences(V.dev, 1, &g_coh_fence, 1, first);
+    /* t165x (review 5, R5-1): no time limit - a GPU that is really hung is reported by Windows as device lost; a long
+       wait means the queue waits for something else (a locked session, a sleeping display, VRAM paging): wait, as the
+       game would without coherence. Device lost or another error: the game stops, and it is not called a coherence fault */
+    for (int k = 0; r == VK_TIMEOUT; k++) { if (injf) g_coh_fence_late++; if (k == 30) vl("  GPU coherence: a copy-back's GPU read has waited 30 s - still waiting\n"); r = vkWaitForFences(V.dev, 1, &g_coh_fence, 1, 1000000000ull); }
+    if (r != VK_SUCCESS) { vk_fail("vkWaitForFences (copy-back read)", r); coh_device_lost("waiting for a copy-back's GPU read"); }
+    vkResetFences(V.dev, 1, &g_coh_fence); g_coh_cb_busy = 0;
+    return 1;
+}
+/* make the GPU-held pages of 64 KB page pg (and stale neighbours, up to 1 MB) accessible; g_coh_m held. how:
+   COH_COPY - current (copied from VRAM), COH_NOCOPY - as they are (probe mode; or after failures, logged), COH_RO -
+   read-only as they are (our own reads of per-frame GPU buffers).
+   No other thread runs between making a page accessible and the end of the copy into it (all stopped); bytes the CPU
+   wrote that VRAM does not have yet stay as they are. A page whose GPU write is still being recorded (or that a waiting
+   batch will protect again) is left read-only after the copy (g_coh_rr): a CPU write to it takes a snapshot first. */
+static void coh_release(u64 pg, int how) {
+    u32 n = 1;
+    VShadow *S = how == COH_COPY ? shadow_of(G2S_PT_BASE + (pg << 16), 0x10000) : 0;
+    if (how == COH_COPY && !S) coh_fatal("a GPU-held page outside every VRAM copy");   /* (t165w, N3: was: released stale) */
+    if (S) while (n < COH_STAGE >> 16 && G2S_PT_BASE + ((pg + n) << 16) < S->hi && (__atomic_load_n(&g_coh_mask[pg + n], __ATOMIC_ACQUIRE) | g_coh_ro[pg + n])) n++;
+    u32 pending = (u32)__atomic_load_n(&g_sub_seq, __ATOMIC_ACQUIRE);   /* (before the read-back - a batch submitted after this may be missing from it) */
+    int got = 0;
+    if (S) { u64 t0 = plat_ticks();
+        for (int k = 0, ms = 1; k < 12 && !got; k++) { got = coh_readback(S, pg, n); if (!got) { g_coh_rb_retry++; plat_sleep_ms(ms); if (ms < 512) ms *= 2; } }   /* (about 2 s in all) */
+        g_coh_t_sync += plat_ticks() - t0;
+        if (!got) coh_fatal("a copy-back's GPU read failed again and again");   /* (t165w, N3: was: pages released stale) */
+        g_coh_nsync++; }
+    /* everything the window needs, prepared before the other threads stop: room for the re-protection entries, the
+       logged pushes over these pages, which pages a waiting batch will protect again */
+    /* t165w (review 3, NF2): a re-protection entry of a batch that was on the queue before this read-back is done with
+       for the pages copied now - the copy has that batch's bytes. Left in place, the page went read-only again and the
+       completion held it once more (a second copy-back for the next read) */
+    if (how == COH_COPY) { u32 k = 0;
+        for (u32 q = 0; q < g_coh_nra; q++) { CohRa R = g_coh_ra[q];
+            if (R.seq <= pending && R.pg >= (u32)pg && R.pg < (u32)(pg + n)) { u16 m = (u16)(g_coh_mask[R.pg] | g_coh_ro[R.pg]); if (R.mask & m) g_coh_ra_done++; R.mask = (u16)(R.mask & ~m); if (!R.mask) continue; }
+            g_coh_ra[k++] = R; }
+        g_coh_nra = k; }
+    u16 pe[16]; for (u32 j = 0; j < n; j++) { pe[j] = 0; for (u32 q = 0; q < g_coh_nra; q++) if (g_coh_ra[q].pg == (u32)(pg + j)) pe[j] |= g_coh_ra[q].mask; }
+    int ra_ok = coh_arr_ensure(&g_ra_arr, (u64)g_coh_nra + n);
+    if (!ra_ok) coh_err("no memory for re-protection entries");
+    u32 nkl = 0;
+    if (how == COH_COPY) { u64 lo = G2S_PT_BASE + (pg << 16), hi = lo + ((u64)n << 16);
+        for (u32 i = 0; i < g_coh_npl; i++) { const CohPush *P = &g_coh_pl[i]; if (P->seq > pending && P->a < hi && P->a + P->n > lo) g_coh_kl[nkl++] = *P; } }
+    static void *hs[4096]; int ns = -1; u64 ts = 0;
+    if (how == COH_COPY) { ts = plat_ticks();
+        for (u64 t0 = plat_ticks(); plat_ticks() - t0 < plat_ticks_per_sec() * 2; ) {   /* (2 s) */
+            if (ct_inj_take(&g_ct_inj_stop)) ns = -1;   /* (test: as if it failed) */
+            else ns = plat_stop_others(hs, 4096);
+            if (ns >= 0) break;
+            g_coh_stop_retry++; plat_sleep_ms(1);
+        }
+        if (ns < 0) { g_coh_nostop++; coh_fatal("the other threads could not be stopped for a copy-back"); }   /* (t165w, N3: was: copied with them running) */
+        g_coh_nstop++; }
+    u16 failed[16]; u32 nfail = 0;
+    for (u32 j = 0; j < n; j++) __atomic_add_fetch(&g_coh_hgen[pg + j], 1, __ATOMIC_RELEASE);   /* (own-read cache: RAM changes now) */
+    /* ---- other threads stopped: no locks, no log, no allocation until they run again ---- */
+    for (u32 j = 0; j < n; j++) {
+        u64 p = pg + j, base = G2S_PT_BASE + (p << 16); u16 m = how == COH_RO ? g_coh_mask[p] : (u16)(g_coh_mask[p] | g_coh_ro[p]);
+        int rearm = g_coh_seq[p] > pending && ra_ok;   /* written by the batch still being recorded */
+        u16 keep_ro = how == COH_COPY ? (u16)((rearm ? m : 0) | (pe[j] & m)) : 0;   /* copied, but a batch will still write it: read-only (g_coh_rr) */
+        u32 orig = g_coh_prot[p] ? g_coh_prot[p] : 0x40, rop = orig == 0x40 ? 0x20 : 0x02;
+        failed[j] = 0;
+        for (u32 s0 = 0; s0 < 16; ) {
+            if (!(m >> s0 & 1)) { s0++; continue; }
+            u32 s1 = s0; while (s1 < 16 && (m >> s1 & 1)) s1++;
+            u64 ra = base + ((u64)s0 << 12), rn = (u64)(s1 - s0) << 12; u32 old; u16 run = (u16)(((1u << (s1 - s0)) - 1) << s0);
+            if (!plat_protect((void *)ra, rn, how == COH_RO ? rop : orig, &old)) { failed[j] |= run; nfail++; s0 = s1; continue; }
+            if (how == COH_RO) g_coh_nro += s1 - s0;
+            for (u32 s = s0; s < s1; s++) {
+                u64 a = base + ((u64)s << 12);
+                if (how == COH_COPY) {
+                    static u8 km[4096]; int np = 0;
+                    for (u32 i = 0; i < g_coh_npatch; i++) if (g_coh_patch[i].a == a) { const CohPatch *P = &g_coh_patch[i]; np++; for (u32 o = 0; o < 4096; o++) km[o] = (u8)(P->bits[o >> 6] >> (o & 63) & 1); break; }
+                    for (u32 i = 0; i < nkl; i++) { const CohPush *P = &g_coh_kl[i]; if (P->a >= a + 4096 || P->a + P->n <= a) continue;
+                        u64 lo = P->a > a ? P->a : a, hi = P->a + P->n < a + 4096 ? P->a + P->n : a + 4096; if (!np++) mem_fill(km, 0, 4096); mem_fill(km + (lo - a), 1, hi - lo); g_coh_nkept_push++; }
+                    const u8 *src = g_coh_smap + ((u64)j << 16) + ((u64)s << 12);
+                    CT_EV(1, a, np, (keep_ro >> s) & 1);
+                    if (!np) mem_copy((void *)a, src, 4096);
+                    else for (u32 i = 0; i < 4096; ) { if (km[i]) { i++; continue; } u32 e = i + 1; while (e < 4096 && !km[e]) e++; mem_copy((void *)(a + i), src + i, e - i); i = e; }
+                    g_coh_sync_bytes += 4096;
+                }
+            }
+            if (how == COH_COPY) {
+                void *dl[16]; if (plat_dirty_pages((void *)ra, rn, dl, 16) > 0) g_coh_ndirty_copy++;   /* (reset: our copy is not a CPU write for the VRAM copy) */
+                u16 kr = keep_ro & run;   /* read-only for the pages a batch will still write */
+                for (u32 s = s0; s < s1; ) { if (!(kr >> s & 1)) { s++; continue; } u32 e = s; while (e < s1 && (kr >> e & 1)) e++;
+                    if (!plat_protect((void *)(base + ((u64)s << 12)), (u64)(e - s) << 12, rop, &old)) { keep_ro &= (u16)~(((1u << (e - s)) - 1) << s); nfail++; }
+                    s = e; }
+            }
+            s0 = s1;
+        }
+        u16 rel = (u16)(m & ~failed[j]);
+        if (how == COH_RO) __atomic_store_n(&g_coh_ro[p], (u16)(g_coh_ro[p] | rel), __ATOMIC_RELEASE); else __atomic_store_n(&g_coh_ro[p], (u16)(g_coh_ro[p] & ~rel), __ATOMIC_RELEASE);
+        if (how == COH_COPY) __atomic_store_n(&g_coh_rr[p], (u16)(g_coh_rr[p] | (keep_ro & rel)), __ATOMIC_RELEASE);
+        __atomic_store_n(&g_coh_mask[p], (u16)(g_coh_mask[p] & ~rel), __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_coh_gen, 1, __ATOMIC_RELEASE);
+        if (rearm && rel) { CohRa *R = &g_coh_ra[g_coh_nra++]; R->pg = (u32)p; R->mask = rel; R->seq = g_coh_seq[p];   /* (room made before the window) */
+            if (R->seq == g_coh_closed && g_coh_npost < 256) { g_coh_post[g_coh_npost].pg = (u32)p; g_coh_post[g_coh_npost].m = rel; g_coh_npost++; } else if (R->seq == g_coh_closed) g_coh_post_full++; }   /* (t165w, N6: its batch closed, not yet submitted) */
+    }
+    if (ns >= 0) { plat_resume_others(hs, ns); u64 d = plat_ticks() - ts; g_coh_t_stop += d; if (d > g_coh_max_stop) g_coh_max_stop = d; }
+    /* after the window: snapshots of copied pages are stale now (a CPU write to a read-only page takes a new one) */
+    if (how == COH_COPY) for (u32 j = 0; j < n; j++) for (u32 s = 0; s < 16; s++) if (g_coh_pend[pg + j] >> s & 1) {
+        u64 a = G2S_PT_BASE + ((pg + j) << 16) + ((u64)s << 12);
+        if ((g_coh_rr[pg + j] >> s & 1) || !coh_ra_pending(pg + j, s)) coh_snap_free(coh_snap_find(a), pg + j, s); }
+    if (g_coh_post_full) { g_coh_post_full = 0; coh_err("too many pages copied back between a batch's end and its submit (left read-only until it completes)"); }
+    if (nfail) coh_fatal("a page protection change failed during a copy-back");   /* (t165w, N3 / N7: was: logged, and the page faulted again and again) */
+    if (how == COH_COPY) g_coh_nrr += 0;
+    __atomic_add_fetch(&g_coh_epoch, 1, __ATOMIC_RELEASE);
+}
+/* a CPU write to a page copied back while its GPU write was being recorded (read-only, g_coh_rr): snapshot, then
+   writable - its CPU-changed bytes are found by comparing when the batch completes (t165w). g_coh_m held. */
+static void coh_rr_write(u64 pg, u32 s) {
+    u64 a = G2S_PT_BASE + (pg << 16) + ((u64)s << 12); u32 old;
+    u32 orig = g_coh_prot[pg] ? g_coh_prot[pg] : 0x40;
+    int si = coh_snap_new(a);
+    CT_EV(2, a, si, 0);
+    if (si >= 0) {
+        mem_copy(coh_snap_at(si), (const void *)a, 4096);
+        __atomic_store_n(&g_coh_pend[pg], (u16)(g_coh_pend[pg] | (1u << s)), __ATOMIC_RELEASE); }
+    else coh_err("a CPU write during a GPU write's batch could not be tracked (no snapshot memory)");
+    if (!plat_protect((void *)a, 4096, orig, &old)) coh_fatal("a page protection change failed (a write after a copy-back)");
+    if (g_coh_nunw < 1024) g_coh_unw[g_coh_nunw++] = a; else { g_coh_unw_all = 1; g_coh_unw_ovf++; }   /* (t165x, R5-2: its textures check their bytes again - by the renderer, at its next submit) */   /* (t165w, N7: was: logged, and the write faulted again and again) */
+    __atomic_store_n(&g_coh_rr[pg], (u16)(g_coh_rr[pg] & ~(1u << s)), __ATOMIC_RELEASE);
+    g_coh_nrr_w++; __atomic_add_fetch(&g_coh_epoch, 1, __ATOMIC_RELEASE);
+}
+/* our own layer reading one 4 KB page the GPU rewrites every frame: read-only (stale), only that page (t165w) */
+static void coh_own_ro(u64 pg, u32 s) {
+    u64 a = G2S_PT_BASE + (pg << 16) + ((u64)s << 12); u32 old;
+    u32 orig = g_coh_prot[pg] ? g_coh_prot[pg] : 0x40;
+    if (!plat_protect((void *)a, 4096, orig == 0x40 ? 0x20 : 0x02, &old)) { coh_err("a page protection change failed (own read)"); return; }
+    u32 pending = (u32)__atomic_load_n(&g_sub_seq, __ATOMIC_ACQUIRE);
+    if (g_coh_seq[pg] > pending) coh_ra_add(pg, (u16)(1u << s), g_coh_seq[pg]);
+    __atomic_store_n(&g_coh_ro[pg], (u16)(g_coh_ro[pg] | (1u << s)), __ATOMIC_RELEASE);
+    __atomic_store_n(&g_coh_mask[pg], (u16)(g_coh_mask[pg] & ~(1u << s)), __ATOMIC_RELEASE);
+    g_coh_nro++; __atomic_add_fetch(&g_coh_gen, 1, __ATOMIC_RELEASE); __atomic_add_fetch(&g_coh_epoch, 1, __ATOMIC_RELEASE);
+}
+static int coh_fault(u64 a, int write, u64 rip) {
+    u16 *M = coh_on(); if (!M || a < G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE) return 0;
+    u64 pg = (a - G2S_PT_BASE) >> 16; u32 sub = (u32)((a >> 12) & 15); u16 bit = (u16)(1u << sub);
+    u64 tf0 = plat_ticks();
+    pm_lock(&g_coh_m);
+    if (g_coh_rr[pg] & bit) {   /* read-only after a copy-back during its batch */
+        if (write) coh_rr_write(pg, sub);
+        pm_unlock(&g_coh_m); return 1; }
+    int held = (M[pg] & bit) != 0, rob = (g_coh_ro[pg] & bit) != 0;
+    if (!held && !rob) {   /* not ours (any more): t165w (review 6) - repeat only if the page now allows this access */
+        /* (w17: once without asking Windows - the usual case is a page another thread released meanwhile; VirtualQuery
+           sizes its answer by walking the whole region's page tables, ~11 ms here. The same thread faulting at the same
+           address again goes to the check, so a real access violation still reaches the crash path on its second fault) */
+        { static struct { u32 tid; u64 a; } nr[64]; u32 me = GetCurrentThreadId(), k = (me >> 2) % 64;   /* (review 4, F2: thread ids are multiples of 4) */
+          if (!(nr[k].tid == me && nr[k].a == a)) { nr[k].tid = me; nr[k].a = a; g_coh_retry_ret++; pm_unlock(&g_coh_m); return 1; }
+          nr[k].tid = 0; }
+        u32 pr = plat_query_prot(a & ~0xFFFull);
+        int ok = !(pr & 0x101) && (write ? (pr & 0xCC) != 0 : (pr & 0xEE) != 0);
+        if (ok) { g_coh_retry_ret++; pm_unlock(&g_coh_m); return 1; }
+        if (g_ct_trap_pg && (a & ~0xFFFull) == g_ct_trap_pg) { g_ct_trap_hits++; u32 o; plat_protect((void *)g_ct_trap_pg, 4096, 0x04, &o); pm_unlock(&g_coh_m); return 1; }   /* (test: reached the crash path) */
+        pm_unlock(&g_coh_m); return 0; }
+    if (rob && !held && !write) { pm_unlock(&g_coh_m); return 1; }   /* (read-only: readable - made so meanwhile) */
+    { const char *tn = cur_thread_name(); int own = (!tn || tn[0] == '(' || (tn[0] == 'E' && tn[1] == '6' && tn[2] == ' ')) && !ct_is_game();
+      if (own && !write && held && g_coh_run[pg] >= 2) {
+          g_coh_nown++; g_coh_ownf[pg] |= 1;
+          { int k = 0; while (k < g_coh_nownr && g_coh_own[k].rip != rip) k++;
+            if (k == g_coh_nownr && k < 32) { const CohWr *W0 = coh_writer(a); CohOwn *O = &g_coh_own[k]; O->rip = rip; O->n = 0; O->a = a; O->tn = tn; O->who = W0 ? W0->who : "?"; O->cs = W0 ? W0->cs : 0; O->ps = W0 ? W0->ps : 0; g_coh_nownr++; }
+            if (k < g_coh_nownr) g_coh_own[k].n++; }
+          /* t165w (review 8): copied back like any other access - read-only here left the page readable with stale
+             bytes until the GPU's next write, and a game thread reading it then got them without a fault (--coh-test 23) */
+          coh_release(pg, g_coh_mode == 2 && g_coh_ok ? COH_COPY : COH_NOCOPY);
+          g_coh_t_own += plat_ticks() - tf0; pm_unlock(&g_coh_m); return 1; }
+      if (own) g_coh_nown_kept++;
+      else if (g_coh_ownf[pg] & 1) { g_coh_game_on_own++; if (g_coh_ngoo < 16) g_coh_game_on_own_pg[g_coh_ngoo++] = a; } }
+    if (write) g_coh_nfault_w++; else g_coh_nfault_r++;
+    const CohWr *W = coh_writer(a);
+    { int k = 0; while (k < g_coh_nrips && g_coh_rips[k].rip != rip) k++;
+      if (k == g_coh_nrips && k < 64) { g_coh_rips[k].rip = rip; g_coh_rips[k].n = 0; g_coh_rips[k].nw = 0; g_coh_rips[k].tn = cur_thread_name(); g_coh_rips[k].who = W ? W->who : "?"; g_coh_rips[k].a = a; g_coh_rips[k].f0 = g_plat_frame; g_coh_rips[k].fw = ~0ull; g_coh_rips[k].aw = 0;
+          for (int i = 0; i < 23; i++) g_coh_rips[k].lv0[i] = g_level_now[i]; g_coh_rips[k].lv0[23] = 0; g_coh_nrips++; }
+      if (k < g_coh_nrips) { CohRip *R = &g_coh_rips[k]; R->n++;
+          if (write) { if (!R->nw++) { R->fw = g_plat_frame; R->aw = a; for (int i = 0; i < 23; i++) R->lvw[i] = g_level_now[i]; R->lvw[23] = 0; } } } }
+    { static int nlog; if (nlog++ < 200) { vl("  GPU coherence (t165): "); vl(write ? "write" : "read"); vl(" of "); vl_x(a); vl(" by "); vl(cur_thread_name()); vl(" at ");
+        if (rip >= (u64)g_eboot.base && rip < (u64)g_eboot.base + g_eboot.size) { vl("eboot+"); vl_x(rip - (u64)g_eboot.base); } else vl_x(rip);
+        vl(" (flip "); vl_d((i64)g_flips); vl(", level "); vl(g_level_now[0] ? g_level_now : "-"); vl("); GPU write "); if (W) { vl_x(W->lo); vl("-"); vl_x(W->hi); vl(" "); vl(W->who); vl(" flip "); vl_d(W->flip); vl(" VS "); vl_x(W->vs); vl(" PS "); vl_x(W->ps); vl(" CS "); vl_x(W->cs); } else vl("(older than the log)");
+        vl(g_coh_mode == 2 ? "\n" : " - probe: not copied\n"); } }
+    coh_release(pg, g_coh_mode == 2 && g_coh_ok ? COH_COPY : COH_NOCOPY);
+    pm_unlock(&g_coh_m);
+    return 1;
+}
+/* t165w: our own code reading game memory that may be GPU-held (the shader translator's reads): a held 4 KB page is
+   made readable only for the copy and held again at once, under the lock - no page is left read-only and stale
+   behind it (review 8: the stale-read gap). RAM is read as it is (as before: no copy-back for our own reads). */
+/* t165w (review 3, NF1): RAM of a GPU-held page does not change while it is held (no CPU write gets through, the GPU
+   writes VRAM) - the bytes our own reads get are kept per 4 KB page and hold generation, so only the first read of a
+   page in each hold period stops the other threads */
+enum { COH_ORC = 64 };
+static struct { u64 a; u32 gen; u8 d[4096]; } g_coh_orc[COH_ORC]; static u32 g_coh_orc_next; static u64 g_coh_orc_hit, g_coh_orc_miss;
+static void coh_own_read(u64 a, void *out, u64 n) {
+    u16 *M = coh_on();
+    if (!M || a + n <= G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE || !n) { mem_copy(out, (const void *)a, n); return; }
+    int any = 0; for (u64 p = a & ~0xFFFull; p < a + n; p += 4096) if (coh_stale4k(p)) { any = 1; break; }
+    if (!any) { mem_copy(out, (const void *)a, n); return; }
+    pm_lock(&g_coh_m);
+    static void *hs[4096]; int nst = -1; u64 pf0 = g_cs_protfail;
+    for (u64 p = a & ~0xFFFull; p < a + n; p += 4096) {
+        u64 lo = p > a ? p : a, hi = p + 4096 < a + n ? p + 4096 : a + n;
+        if (!coh_held4k(p)) { mem_copy((u8 *)out + (lo - a), (const void *)lo, hi - lo); continue; }
+        u32 gen = __atomic_load_n(&g_coh_hgen[(p - G2S_PT_BASE) >> 16], __ATOMIC_ACQUIRE); int k = -1;
+        for (int c = 0; c < COH_ORC; c++) if (g_coh_orc[c].a == p && g_coh_orc[c].gen == gen) { k = c; break; }
+        if (k < 0) {   /* the page's bytes, read with the other threads stopped (review 8: no stale read by a game thread meanwhile) */
+            k = (int)(g_coh_orc_next++ % COH_ORC);
+            if (nst < 0) coh_cs_stop(hs, &nst);
+            coh_page_read(p, g_coh_orc[k].d, 4096); g_coh_orc[k].a = p; g_coh_orc[k].gen = gen; g_coh_orc_miss++; g_coh_nownread++;
+        } else g_coh_orc_hit++;
+        mem_copy((u8 *)out + (lo - a), g_coh_orc[k].d + (lo - p), hi - lo);
+    }
+    if (nst >= 0) plat_resume_others(hs, nst);
+    if (g_cs_protfail != pf0) coh_fatal("a page protection change failed while reading a GPU-held page");
+    pm_unlock(&g_coh_m);
+}
+/* a Windows call will use [a, a+n) (file reads / writes): its pages current and writable first */
+static void coh_ensure(u64 a, u64 n) {
+    u16 *M = coh_on(); if (!M || !n || a + n <= G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE) return;
+    if (g_coh_nsnap) { pm_lock(&g_coh_m); pm_unlock(&g_coh_m); }   /* t165w (review 3, NF5): a tracked page made read-only for its comparison (under g_coh_m) is writable again */
+    u64 lo = a < G2S_PT_BASE ? G2S_PT_BASE : a, hi = a + n > G2S_PT_BASE + G2S_PT_SIZE ? G2S_PT_BASE + G2S_PT_SIZE : a + n;
+    for (u64 pg = (lo - G2S_PT_BASE) >> 16, pe = (hi - 1 - G2S_PT_BASE) >> 16; pg <= pe; pg++) {
+        if (!(__atomic_load_n(&M[pg], __ATOMIC_ACQUIRE) | __atomic_load_n(&g_coh_ro[pg], __ATOMIC_ACQUIRE) | __atomic_load_n(&g_coh_rr[pg], __ATOMIC_ACQUIRE))) continue;
+        pm_lock(&g_coh_m);
+        if (M[pg] | g_coh_ro[pg]) { coh_release(pg, g_coh_mode == 2 && g_coh_ok ? COH_COPY : COH_NOCOPY); g_coh_nensure++; }
+        for (u32 s = 0; s < 16; s++) if (g_coh_rr[pg] >> s & 1) { u64 p = G2S_PT_BASE + (pg << 16) + ((u64)s << 12); if (p + 4096 > lo && p < hi) coh_rr_write(pg, s); }   /* (the kernel cannot write a read-only page) */
+        pm_unlock(&g_coh_m);
+    }
+    if (g_ct_rehold_n && g_ct_rehold_pg < hi && g_ct_rehold_pg + 4096 > lo) {   /* (the 4 KB page at g_ct_rehold_pg overlaps the range) */   /* (--coh-test 29: as if a completion held the page again right now) */
+        g_ct_rehold_n--; u64 q = (g_ct_rehold_pg - G2S_PT_BASE) >> 16;
+        pm_lock(&g_coh_m); coh_hold(q, (u16)(1u << ((g_ct_rehold_pg >> 12) & 15)), 0, 0, 0); pm_unlock(&g_coh_m); }
+}
+/* everything GPU-held back to RAM (replay capture snapshots read all memory) */
+static void coh_release_all(void) {
+    u16 *M = coh_on(); if (!M) return;
+    pm_lock(&g_coh_m);
+    for (u64 pg = 0; pg < (G2S_PT_SIZE >> 16); pg++) if (M[pg] | g_coh_ro[pg]) coh_release(pg, g_coh_mode == 2 && g_coh_ok ? COH_COPY : COH_NOCOPY);
+    pm_unlock(&g_coh_m);
+}
+static void coh_report(void) {
+    if (!g_coh_mode) return;
+    u64 f = plat_ticks_per_sec() / 1000; if (!f) f = 1;
+    say("    GPU coherence (t165, "); say(g_coh_mode == 2 ? "on" : "probe"); say("): pages made GPU-held "); say_dec((i64)g_coh_nprot_pages); say(", CPU accesses to them: reads "); say_dec((i64)g_coh_nfault_r);
+    say(", writes "); say_dec((i64)g_coh_nfault_w); say(", Windows calls "); say_dec((i64)g_coh_nensure); say("; copied back "); say_dec((i64)g_coh_nsync); say(" times, "); say_dec((i64)(g_coh_sync_bytes >> 10));
+    say(" KB, "); say_dec((i64)(g_coh_t_sync / f)); say(" ms; protected again after their batch "); say_dec((i64)g_coh_nrearm);
+    say(", not protectable "); say_dec((i64)g_coh_badprot); say(", failures "); say_dec((i64)g_coh_fail); say("\n");
+    { u64 us = plat_ticks_per_sec() / 1000000; if (!us) us = 1;
+      say("      t165i: copies with every other thread stopped "); say_dec((i64)g_coh_nstop); say(" ("); say_dec((i64)(g_coh_t_stop / us)); say(" us in all, longest "); say_dec((i64)(g_coh_max_stop / us));
+      say(" us), without (could not stop them) "); say_dec((i64)g_coh_nostop); say("; CPU-written pages sent to VRAM when the GPU took them "); say_dec((i64)g_coh_npush); say(" ("); say_dec((i64)(g_coh_push_bytes >> 10)); say(" KB)\n");
+      say("      t165i: CPU bytes written after a copy-back during their batch: patches "); say_dec((i64)g_coh_npatch_made); say(" ("); say_dec((i64)g_coh_patch_bytes); say(" bytes), patch list full "); say_dec((i64)g_coh_patch_full);
+      say(", snapshot pool full "); say_dec((i64)g_coh_snap_full); say(", kept unsubmitted CPU bytes "); say_dec((i64)g_coh_nkept_push); say(" (log full "); say_dec((i64)g_coh_pl_full); say(")"); say(", re-protected while CPU-written without a snapshot "); say_dec((i64)g_coh_rearm_dirty); say("; pages made read-only for our own reads "); say_dec((i64)g_coh_nro);
+      say("; Windows file calls refused on game memory (ERROR_NOACCESS) "); say_dec((i64)__atomic_load_n(&g_coh_kernel_refused, __ATOMIC_RELAXED)); say("\n"); }
+    say("      t165w: ERRORS "); say_dec((i64)g_coh_err); if (g_ct_err_expected) { say(" (+"); say_dec((i64)g_ct_err_expected); say(" caused on purpose by --coh-test 28)"); } if (g_coh_err_first) { say(" (first: "); say(g_coh_err_first); say(")"); }
+    say("; pages left read-only after a copy-back during their batch, then written by the CPU "); say_dec((i64)g_coh_nrr_w); say("; read-back retries "); say_dec((i64)g_coh_rb_retry);
+    say(", thread-stop retries "); say_dec((i64)g_coh_stop_retry); say("; our own reads of held pages (translator) "); say_dec((i64)g_coh_nownread); say("; pushes without a batch (must be 0) "); say_dec((i64)g_coh_norec);
+    say("; own-read cache hits "); say_dec((i64)g_coh_orc_hit); say(" / reads "); say_dec((i64)g_coh_orc_miss); say("; tracked pages' CPU bytes sent at a submit "); say_dec((i64)g_coh_npend_sync); say("; held again when their batch went to the GPU "); say_dec((i64)g_coh_n_subhold); say(" (+"); say_dec((i64)g_coh_n_posthold); say(" right after)"); say("; 64 KB pages of mixed protection "); say_dec((i64)g_coh_nmixed); say("; staging ring "); say_dec((i64)(g_cs_bytes >> 20)); say(" MB in all, full "); say_dec((i64)g_cs_full); say(", held pages staged "); say_dec((i64)g_cs_nheld); say(" (stops "); say_dec((i64)g_cs_nstop); say(")");
+    say("; tables: re-protection entries "); say_dec((i64)g_coh_nra); say(" waiting, snapshots "); say_dec((i64)g_coh_nsnap); say(" (high-water "); say_dec((i64)g_coh_snap_hw); say("), patch pages "); say_dec((i64)g_coh_npatch); say(", push log "); say_dec((i64)g_coh_npl); say("\n");
+    { u64 us = plat_ticks_per_sec() / 1000000; if (!us) us = 1; u64 fr = g_flips ? g_flips : 1;
+      say("      t165v per-frame handling ("); say_dec((i64)fr); say(" flips): our own read faults "); say_dec((i64)(g_coh_nown / fr)); say("."); say_dec((i64)(g_coh_nown * 10 / fr % 10)); say(" per flip, handler ");
+      say_dec((i64)(g_coh_t_own / us / fr)); say(" us per flip; pages protected again after them "); say_dec((i64)(g_coh_nhold_ro / fr)); say(" per flip, "); say_dec((i64)(g_coh_t_hold_ro / us / fr));
+      say(" us per flip; all GPU-write bookkeeping "); say_dec((i64)(g_coh_t_wrote / us / fr)); say(" us per flip (of it waiting for the coherence lock "); say_dec((i64)(g_coh_t_wrote_wait / us / fr)); say(" us; GPU writes handled "); say_dec((i64)(g_coh_nwrote_calls / fr)); say(" per flip over "); say_dec((i64)(g_coh_nwrote_pages / fr)); say(" 64 KB pages) (Windows' fault dispatch not included: see --coh-test 13)\n");
+      say("      t165v game threads touching a page our own layer reads every frame (caught while held): "); say_dec((i64)g_coh_game_on_own);
+      for (int i = 0; i < g_coh_ngoo; i++) { say(i ? ", " : " - "); say_hex(g_coh_game_on_own_pg[i]); } say("\n");
+      for (int k = 0; k < g_coh_nownr; k++) { const CohOwn *O = &g_coh_own[k]; say("        own read at "); say_hex(O->rip); say(": "); say_dec((i64)O->n); say(" times, thread "); say(O->tn ? O->tn : "(unnamed)");
+          say(", first at "); say_hex(O->a); say(", GPU writer "); say(O->who); say(" PS "); say_hex(O->ps); say(" CS "); say_hex(O->cs); say("\n"); } }
+    { u64 fr = g_flips ? g_flips : 1, t0c = __builtin_ia32_rdtsc(), q0 = plat_ticks(); plat_sleep_ms(50); u64 cps = (__builtin_ia32_rdtsc() - t0c) * plat_ticks_per_sec() / ((plat_ticks() - q0) ? (plat_ticks() - q0) : 1); u64 cpu = cps / 1000000; if (!cpu) cpu = 1;
+      say("      t165w15 profile (TSC "); say_dec((i64)(cps / 1000000)); say(" MHz): GPU-write bookkeeping "); say_dec((i64)(g_cp_all / cpu / fr)); say(" us per flip under the lock - holding pages "); say_dec((i64)(g_cp_hold / cpu / fr));
+      say(" us ("); say_dec((i64)(g_cp_nhold / fr)); say(" pages per flip), patches "); say_dec((i64)(g_cp_fp / cpu / fr)); say(" us, pushes "); say_dec((i64)(g_cp_pf / cpu / fr)); say(" us, the rest (walking "); say_dec((i64)(g_cp_nheld / fr));
+      say(" held pages per flip) "); say_dec((i64)((g_cp_all - g_cp_hold - g_cp_fp - g_cp_pf) / cpu / fr)); say(" us; calls skipped as repeats "); say_dec((i64)(g_cp_dedupe / fr)); say(" per flip; VRAM copies per call "); say_dec((i64)(g_cp_nsh * 10 / (g_coh_nwrote_calls ? g_coh_nwrote_calls : 1)));
+      say(" /10\n");
+      say("      coh_hold: "); say_dec((i64)g_hp_n); say(" calls - before protecting "); say_dec((i64)(g_hp_pend / cpu)); say(" us, protecting "); say_dec((i64)(g_hp_prot / cpu)); say(" us ("); say_dec((i64)g_hp_nprot);
+      say(" VirtualProtect runs), CPU-write checks "); say_dec((i64)(g_hp_dirty / cpu)); say(" us ("); say_dec((i64)g_hp_ndirty); say(" pages, "); say_dec((i64)g_hp_npush); say(" pushed) - in all, whole run\n");
+      for (int k = 0; k < 8; k++) if (g_hp_slow[k].tot) { say("        slow coh_hold: "); say_dec((i64)(g_hp_slow[k].tot / cpu)); say(" us at "); say_hex(G2S_PT_BASE + (g_hp_slow[k].pg << 16)); say(" flip "); say_dec(g_hp_slow[k].flip); say(" ctx "); say_dec(g_hp_slow[k].ctx);
+          say(" add "); say_hex(g_hp_slow[k].add); say(" cur "); say_hex(g_hp_slow[k].cur); say(" done "); say_hex(g_hp_slow[k].done); say(" mixed "); say_dec(g_hp_slow[k].mixed); say(": protecting "); say_dec((i64)(g_hp_slow[k].prot / cpu)); say(" us ("); say_dec(g_hp_slow[k].nprot);
+          say(" runs), CPU-write checks "); say_dec((i64)(g_hp_slow[k].dirty / cpu)); say(" us ("); say_dec(g_hp_slow[k].npush); say(" pushed)\n"); }
+      for (int k = 0; k < 12; k++) if (g_cp_top[k].n) { say("        range "); say_hex(g_cp_top[k].lo); say("-"); say_hex(g_cp_top[k].hi); say(" ("); say_dec((i64)((g_cp_top[k].hi - g_cp_top[k].lo) >> 10)); say(" KB) "); say(g_cp_top[k].who ? g_cp_top[k].who : "?");
+          say(" ctx "); say_dec(g_cp_top[k].ctx); say(": "); say_dec((i64)(g_cp_top[k].n / fr)); say("."); say_dec((i64)(g_cp_top[k].n * 10 / fr % 10)); say(" calls per flip, "); say_dec((i64)(g_cp_top[k].cyc / cpu / fr)); say(" us per flip, pages per call ");
+          say_dec((i64)(g_cp_top[k].pages / g_cp_top[k].n)); say("\n"); } }
+    say("      our own reads of per-frame GPU buffers (released without a copy, as before; t165i: read-only): "); say_dec((i64)g_coh_nown); say("; our own reads of one-off GPU writes (copied): "); say_dec((i64)g_coh_nown_kept); say("\n");
+    for (int k = 0; k < g_coh_nrips; k++) { const CohRip *R = &g_coh_rips[k];
+        say("      "); if (R->rip >= (u64)g_eboot.base && R->rip < (u64)g_eboot.base + g_eboot.size) { say("eboot+"); say_hex(R->rip - (u64)g_eboot.base); } else say_hex(R->rip);
+        say(": "); say_dec((i64)R->n); say(" accesses ("); say_dec((i64)R->nw); say(" writes), thread "); say(R->tn); say(", first at "); say_hex(R->a); say(", GPU writer: "); say(R->who);
+        say(", first flip "); say_dec((i64)R->f0); say(" (level "); say(R->lv0[0] ? R->lv0 : "-"); say(")");
+        if (R->nw) { say(", first write flip "); say_dec((i64)R->fw); say(" at "); say_hex(R->aw); say(" (level "); say(R->lvw[0] ? R->lvw : "-"); say(")"); }
+        say("\n"); }
+}
 /* t107e: per 64 KB page of the page-table range, the last log position (+1) that wrote it, and per 4 MB the largest of
    those: gw_since without scanning the log. The scan went over up to 4096 entries for every texture check, and once more
    than 4096 writes had been logged since a texture was last checked it answered "written" whatever the address: the
@@ -1903,9 +2941,12 @@ static void gwp_mark(u64 lo, u64 hi, u64 seq1) {
     for (u64 c = (lo - G2S_PT_BASE) >> 22, e = (hi - 1 - G2S_PT_BASE) >> 22; c <= e; c++) g_gwp_ch[c] = seq1;
 }
 static void lw_own(u64 a, u64 n);
-static void gw_log(u64 lo, u64 hi) {
+static void gw_log(u64 lo, u64 hi) { gw_log_as(lo, hi, "copy / fill / CP write", 2); }
+static void gw_log_as(u64 lo, u64 hi, const char *who, int ctx) {
     g2s_memo_wrote(lo, hi);   /* (a write over recorded shader code: the translation memo checks the code again) */
     if (hi > lo) lw_own(lo, hi - lo);   /* t107g: ours (the late-write check does not count it as the game's) */
+    shwb_one_off(lo, hi, who);   /* t165 (experimental, off by default) */
+    coh_gpu_wrote(lo, hi, who, ctx);   /* t165 --gpu-coherence (experimental, off by default) */
     for (int i = 0; i < g_nsh; i++) { VShadow *S = &g_sh[i];   /* written-back VRAM copies: this range goes back to RAM at the end of the batch */
         if (!S->live || !S->wb || lo >= S->hi || hi <= S->lo) continue;
         u64 a = lo > S->lo ? lo : S->lo, b = hi < S->hi ? hi : S->hi;
@@ -2015,6 +3056,7 @@ static void vk_shadow_for(const G2SOut *o) {
         vk_shadow(o->wr_lo[i], o->wr_hi[i]);
         VShadow *S_ = shadow_of(o->wr_lo[i], o->wr_hi[i] - o->wr_lo[i]);
         if (!S_ || S_->wb) gw_note_shader(o->wr_lo[i], o->wr_hi[i]);   /* (written-back copies: RAM is updated at the end of the batch) */
+        else { shwb_one_off(o->wr_lo[i], o->wr_hi[i], "shader store"); coh_gpu_wrote(o->wr_lo[i], o->wr_hi[i], "shader store", 1); }   /* t165 (experimental, off by default) */
         if (S_ && g_rc_trace) rc_trace_shadow_write(o->wr_lo[i], o->wr_hi[i]);
     }
     if (o->wr_unknown) g_rm_wr_unknown++;   /* stores through descriptors not known when translating (reported) */
@@ -2377,7 +3419,9 @@ static u64 mem_sig(u64 a, u64 len) {
     if (len < 64 || !mem_ok(a, len)) return 0;
     u64 step = (len / 64) & ~7ull; if (step < 8) step = 8;
     u64 h = 1469598103934665603ull;
-    for (u64 o = 0, n = 0; o + 8 <= len && n < 64; o += step, n++) { u64 v = *(const volatile u64 *)(a + o); h = (h ^ v) * 1099511628211ull; h ^= h >> 29; }
+    for (u64 o = 0, n = 0; o + 8 <= len && n < 64; o += step, n++) {
+        u64 v = coh_stale4k(a + o) ? 0x5EEDull : *(const volatile u64 *)(a + o);   /* t165w: a GPU-held page is not read (its RAM is stale; reading it made it read-only every frame) - a CPU write there releases it and changes the sample */
+        h = (h ^ v) * 1099511628211ull; h ^= h >> 29; }
     return h | 1;
 }
 static void rt_mark(VImg *m) {
@@ -2586,6 +3630,28 @@ static u64 g_n_depth_copies; static int g_opt_depth_whole;   /* --depth-whole: s
 /* t107e: texture change checks (memory textures, once per frame each): 0 checks, 1 unchanged, then the first reason for
    looking at the bytes again: 2 first time, 3 write tracking lost, 4 other size, 5 in a GPU-written VRAM copy, 6 CPU
    writes, 7 GPU writes logged; 8 hashed again but the same, 9 uploaded; 10 waited for GPU work writing it */
+static void csck_read(u64 a, u64 n, u8 *dst);
+/* t165k --tex-stale-check (replays only, diagnostic): a texture whose memory lies in a GPU-written VRAM copy is read
+   from RAM by the texture path (its RAM bytes are stale there). Compares those RAM bytes with the VRAM copy's (what the
+   GPU wrote) and logs how much differs - whether the stale read can show on screen. Once per texture. */
+static int g_opt_tex_stale_chk; static u64 g_tsc_seen[64]; static int g_tsc_n;
+static void tex_stale_check(u64 lo, u64 len, u32 w, u32 h, u32 dfmt, u32 tm) {
+    static u32 g_tsc_cnt[64], g_tsc_logged[64]; int ti = 0;
+    while (ti < g_tsc_n && g_tsc_seen[ti] != lo) ti++;
+    if (ti == g_tsc_n) { if (g_tsc_n == 64) return; g_tsc_seen[g_tsc_n++] = lo; }
+    if (g_tsc_cnt[ti]++ >= 400) return;   /* (t165t: every use is compared - repeated replays carry GPU results across frames) */
+    static u8 *vb; static u64 vbn;
+    if (vbn < len) { vb = (u8 *)plat_alloc_rw(len); vbn = vb ? len : 0; if (!vb) return; }
+    vk_submit_wait(); csck_read(lo, len, vb); vk_begin_cb();
+    const u8 *r = (const u8 *)lo; u64 nd = 0, first = ~0ull, nz_ram = 0, nz_vram = 0;
+    for (u64 k = 0; k < len; k++) { if (r[k] != vb[k]) { nd++; if (first == ~0ull) first = k; } if (r[k]) nz_ram++; if (vb[k]) nz_vram++; }
+    if (!(g_tsc_cnt[ti] == 1 || (nd && g_tsc_logged[ti] < 8))) return;
+    g_tsc_logged[ti]++;
+    vl("  stale texture check (t165k): use "); vl_d(g_tsc_cnt[ti]); vl(", step "); vl_d((i64)g_rp_step); vl(": "); vl_x(lo); vl(" + "); vl_x(len); vl(" "); vl_d(w); vl("x"); vl_d(h); vl(" dfmt "); vl_d(dfmt); vl(" tiling "); vl_d(tm);
+    vl(" sampled by PS "); vl_x((u64)g_shr[SH_PGM_LO_PS] << 8); vl(": bytes differing RAM vs VRAM "); vl_d((i64)nd); vl(" ("); vl_d((i64)(len ? nd * 1000 / len : 0)); vl(" per mille)");
+    if (nd) { vl(", first at +"); vl_x(first); }
+    vl("; non-zero bytes RAM "); vl_d((i64)nz_ram); vl(", VRAM "); vl_d((i64)nz_vram); vl("\n");
+}
 static u64 g_tc[11], g_t_tx[7];   /* t129: [4] full hash, [5] de-tiling, [6] the rest of the upload (staging, barriers, the copy command) */   /* g_t_tx: ticks in the checks (with waits for GPU writers), re-starting the write tracking, hashing, uploading */
 /* images other than m whose bytes overlap [a, b) lose their "clean" state (their write tracking was used up there) */
 static void img_unwatch_others(const VImg *m, u64 a, u64 b) {
@@ -2699,6 +3765,7 @@ static u64 g_chix_dead, g_chix_rebuilds;   /* deletions since the last rebuild *
    keeps a stale copy (e.g. a streamed texture whose later bytes were missed): logged; with "fix" it is uploaded again.
    Diagnostic for the black mouths (replays, which upload every texture fresh, show the teeth; the live game did not). */
 static int g_opt_tex_audit; static u64 g_n_audit, g_n_audit_stale, g_t_audit;
+static u64 g_opt_full_hash_max = 1u << 20, g_n_fullchk, g_n_fullchk_stale;   /* t164: textures up to 1 MB checked in full when the sparse hash says unchanged (--full-hash-max BYTES, 0 = off) */
 static int g_hunt_audit_now, g_tex_audit_res = -1;   /* t135 NaN hunt: every texture of the watched frame compared (not repaired); the last result */
 static int tex_audit_stale(VImg *m, u64 lo, u64 len, u64 lay, int path, u32 w, u32 h, u32 dfmt, u32 tm) {
     int every = g_diag_mode == 7, look = every || g_hunt_audit_now;   /* t135 diagnostic mode 7: every frame, and repaired */
@@ -2943,6 +4010,8 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
       g_tc[why]++;
       if (why == 5) { static int n5; if (n5++ < 12) { vl("  texture in a GPU-written VRAM copy (its RAM bytes are stale; t107f log): "); vl_x(lo); vl(" + "); vl_x(len); vl(" "); vl_d(w); vl("x"); vl_d(h);
           vl(" dfmt "); vl_d(dfmt); vl(" tiling "); vl_d(tm); vl(" frame "); vl_d((i64)V.frame); vl("; PS "); vl_x((u64)g_shr[SH_PGM_LO_PS] << 8); vl(" CS "); vl_x((u64)g_shr[0x20C] << 8); vl("\n"); } }
+      if (g_opt_tex_stale_chk && g_rp_running && len <= (64ull << 20) && shadow_overlaps_rw(lo, len)) tex_stale_check(lo, len, w, h, dfmt, tm);   /* t165k diagnostic (first uploads too) */
+      if (why == 5 && coh_on() && m->hash) { V.n_tex_clean++; m->n_clean++; g_t_tx[0] += plat_ticks() - tx0; return m; }   /* t165: as before (its RAM bytes are not looked at), without pulling them back from VRAM every frame */
       u64 tx1 = plat_ticks(); g_t_tx[0] += tx1 - tx0; tx0 = tx1;
       if (why == 1 && !tex_audit_stale(m, lo, len, TEXLAY(tm, pitch, pow2pad, first, nlev, is3d ? d : layers, is3d, arrayed), 1, w, h, dfmt, tm)) { V.n_tex_clean++; m->n_clean++; return m; } }
     u64 hsh = mem_hash((const u8 *)lo, len) ^ ((u64)first << 56) ^ ((u64)nlev << 60);
@@ -2950,7 +4019,16 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
     /* restart tracking for this range (t107f: tex_track_restart) */
     tex_track_restart(m, lo, len);
     { u64 tx1 = plat_ticks(); g_t_tx[1] += tx1 - tx0; tx0 = tx1; }
-    if (hsh == m->hash && m->hash && !tex_audit_stale(m, lo, len, TEXLAY(tm, pitch, pow2pad, first, nlev, is3d ? d : layers, is3d, arrayed), 2, w, h, dfmt, tm)) { m->n_same++; g_tc[8]++; return m; }
+    if (hsh == m->hash && m->hash && !tex_audit_stale(m, lo, len, TEXLAY(tm, pitch, pow2pad, first, nlev, is3d ? d : layers, is3d, arrayed), 2, w, h, dfmt, tm)) {
+        /* t164: the sparse hash reads every 56th byte; a small texture the game rewrites (a ring buffer of float data,
+           e.g. the 192x64 RGBA32F query tables of Chapter 10) can change only between the samples. Small textures are
+           compared in full with the bytes last uploaded (fhash) before they are kept. */
+        int keep = 1;
+        if (len <= g_opt_full_hash_max && m->fhash && !m->gpu_written && !m->is_copy) {
+            u64 f2 = mem_hash_full((const u8 *)lo, len) ^ TEXLAY(tm, pitch, pow2pad, first, nlev, is3d ? d : layers, is3d, arrayed);
+            g_n_fullchk++; if (f2 != m->fhash) { keep = 0; g_n_fullchk_stale++; }
+        }
+        if (keep) { m->n_same++; g_tc[8]++; return m; } }
     g_tc[9]++;
     u64 fh; if (g_fhl_frame == V.frame && g_fhl_lo == lo && g_fhl_len == len && g_fhl_first == first) { fh = g_fhl_val; g_fhl_frame = 0; g_n_fh_reused++; }   /* t129: hashed by the lookup just above */
     else fh = mem_hash_full_par((const u8 *)lo, len) ^ TEXLAY(tm, pitch, pow2pad, first, nlev, is3d ? d : layers, is3d, arrayed);   /* (the bytes being uploaded now) */
@@ -3228,6 +4306,31 @@ static u64 hmix(u64 h, u64 v) { h ^= v; h *= 1099511628211ull; return h; }
 
 /* ---------------------------------------------------------------- skip bookkeeping */
 static struct { const char *why; u64 n; } g_skips[48]; static int g_nskips;
+/* t167c (Halloween Hunt only): the Halloween screen's interface draws a 1-pixel yellow outline of its whole stage (an
+   anti-aliased frame whose top and left edges lie between pixel 0 and pixel 1). Our rasterizer gives the first column
+   and row of the screen to its solid inner strip; on the PS4 the line does not show (the user's PS4 screenshot). The
+   draw is recognised by its content - no textures, 4-256 vertices, every vertex colour yellow (R = G >= 0x7f, B = 0),
+   every vertex outside +-30000 stage units in both x and y (the stage's corners) - and left out. Only with the Halloween
+   Hunt on; the rest of the screen and every other screen are drawn as before. */
+static u64 g_hh_outline_skips;
+static int hh_stage_outline(int ntex) {
+    if (ntex) return 0;
+    const u32 *ud = &g_shr[SH_USER_DATA_VS];
+    u64 tab = (u64)ud[2] | ((u64)(ud[3] & 0xFFFF) << 32);
+    if (!tab || !mem_ok(tab, 48)) return 0;
+    const u32 *c = (const u32 *)(uintptr_t)tab, *p = c + 8;   /* the fetch shader's V#s: 0 colour, 2 position */
+    u64 cb = c[0] | ((u64)(c[1] & 0xFFF) << 32), pb = p[0] | ((u64)(p[1] & 0xFFF) << 32);
+    u32 cs = (c[1] >> 16) & 0x3FFF, ps_ = (p[1] >> 16) & 0x3FFF, n = p[2];
+    if (((p[3] >> 15) & 0xF) != 11 || ((p[3] >> 12) & 7) != 7 || ((c[3] >> 15) & 0xF) != 10 || n < 4 || n > 256 || c[2] != n || cs < 4 || ps_ < 8) return 0;
+    if (!mem_ok(cb, (u64)cs * n) || !mem_ok(pb, (u64)ps_ * n)) return 0;
+    for (u32 i = 0; i < n; i++) {
+        const u8 *col = (const u8 *)(uintptr_t)(cb + (u64)i * cs); const float *xy = (const float *)(uintptr_t)(pb + (u64)i * ps_);
+        if (col[0] != col[1] || col[2] != 0 || col[0] < 0x7f) return 0;
+        float x = xy[0] < 0 ? -xy[0] : xy[0], y = xy[1] < 0 ? -xy[1] : xy[1];
+        if (!(x >= 30000.0f && y >= 30000.0f)) return 0;
+    }
+    return 1;
+}
 static void vk_skip(const char *why) {
     V.n_skipped++;
     for (int i = 0; i < g_nskips; i++) if (str_eq(g_skips[i].why, why)) { g_skips[i].n++; return; }
@@ -3424,12 +4527,17 @@ static int vkr_write_data(u64 a, const u32 *src, u32 n) {
     ov_retire();
     if (g_nov >= OV_N || n > OV_BYTES / 4) { g_n_wd_cpu++; return 0; }
     vk_begin_cb(); vk_barrier();
+    /* t165k: the driver copies src in user mode - not a fault inside the driver (it may hold its own locks). t165w
+       (review 2, N12): made current after vk_begin_cb (which may wait for a batch whose completion holds pages again),
+       and g_coh_m kept until src has been read, so no completion can hold its pages again in between */
+    int cl = 0; if (g_coh_mask && coh_on()) { pm_lock(&g_coh_m); cl = 1; coh_ensure((u64)(uintptr_t)src, n); }
     vkCmdUpdateBuffer(V.cb, buf, off, n, src);
     rm_cp_update(a, src, n);   /* the same bytes into mirrored pages (STATUS 57) */
-    vk_barrier();
-    gw_log(a, a + n);
     if (g_ovpos + n > OV_BYTES) g_ovpos = 0;   /* ring: entries this old have long retired (a frame writes a few KB) */
     mem_copy(g_ovbuf + g_ovpos, src, n);
+    if (cl) pm_unlock(&g_coh_m);
+    vk_barrier();
+    gw_log(a, a + n);
     g_ov[g_nov].a = a; g_ov[g_nov].n = n; g_ov[g_nov].off = g_ovpos; g_ov[g_nov].seq = g_sub_seq + 1;   /* the batch being recorded */
     if (a < g_ov_lo) g_ov_lo = a; if (a + n > g_ov_hi) g_ov_hi = a + n;
     g_nov++; g_ovpos += (n + 15) & ~15u;
@@ -4007,8 +5115,10 @@ static int ix_assemble(u64 a, u64 len, u64 qoff) {
     vk_barrier(); g_n_ix_assembled++; g_n_ix_pieces += (u64)n;
     return 1;
 }
+static int rp_skipped(void) { if (!g_rp_running || !g_nrskip) return 0; u64 k = g_rp_step + 1; for (int i = 0; i < g_nrskip; i++) if (k >= g_rskip[i][0] && k <= g_rskip[i][1]) return 1; return 0; }
 static void vkr_draw(const char *kind, u32 count, int indexed, u32 first_index) {
     if (!g_vk_on) return;
+    if (rp_skipped()) return;   /* t164f */
     vk_chunk();
     RSTEP("draw", (u64)g_shr[SH_PGM_LO_VS] << 8, (u64)g_shr[SH_PGM_LO_PS] << 8);
     T0(); vkr_draw_body(kind, count, indexed, first_index); TADD(g_t_draw);
@@ -4177,6 +5287,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     g_tess.mode = 0; g_gs.mode = 0;
     if (!vok) return;
     if (!vk_tr(G2S_PS, g_shr[SH_PGM_LO_PS], g_shr[SH_RSRC1_PS], g_shr[SH_RSRC1_PS + 1], &g_shr[SH_USER_DATA_PS], 33, 0, &ps)) return;
+    if (g_opt_halloween && hh_stage_outline(ps.ntex)) { if (!g_hh_outline_skips++) vl("  Halloween screen (t167c): its stage outline left out (the yellow edge line; not shown on the PS4)\n"); return; }
     if (g_rw_w || g_nrw) { g_rw_ntex = ps.ntex < G2S_MAX_TEX ? ps.ntex : G2S_MAX_TEX;   /* t107b: for the replay's pixel history */
         for (int k = 0; k < g_rw_ntex; k++) { g_rw_tex[k] = (((u64)ps.tex[k].tsharp[0]) | ((u64)(ps.tex[k].tsharp[1] & 0xFF) << 32)) << 8; g_rw_texf[k] = (ps.tex[k].tsharp[1] >> 20) & 0x3F; } }
     if (noatt && !(vs.writes_mem || ps.writes_mem)) { vk_skip("no render target, no depth and no memory writes"); return; }
@@ -4667,9 +5778,13 @@ static int csck_merge(u64 *lo, u64 *hi, int n) {   /* sort and merge touching ra
 /* is this dispatch one to save? (the frame after F8; LDS programs with known stores; at most 8) */
 static int csck_want(const G2SOut *cs) {
     if (g_csck_from == 0xFFFFFFFFu || g_csck_n >= 8 || g_gs.mode || g_tess.mode) return 0;
-    if (g_csck_frame == 0xFFFFFFFFu) { if (V.frame < g_csck_from) return 0; if (V.frame > g_csck_from + 600) { g_csck_from = 0xFFFFFFFFu; say("    compute check: no LDS compute pass within 600 frames\n"); return 0; } }
+    if (g_csck_frame == 0xFFFFFFFFu) { if (V.frame < g_csck_from) return 0; if (V.frame > g_csck_from + 600) { g_csck_from = 0xFFFFFFFFu; say(g_ncsck_cs ? "    compute check: the chosen programs did not run within 600 frames\n" : "    compute check: no LDS compute pass within 600 frames\n"); return 0; } }
     else if (V.frame != g_csck_frame) { g_csck_from = 0xFFFFFFFFu; say("    compute check: done, "); say_dec(g_csck_n); say(" dispatches saved to the captures folder (csck_*)\n"); return 0; }
-    if (!cs->uses_lds || cs->wr_unknown || !cs->nwr) return 0;
+    if (g_ncsck_cs) {   /* t164: only the chosen programs, whatever they use (image-store passes too) */
+        u64 a = (u64)g_shr[SH_COMPUTE_PGM_LO] << 8; int hit = 0; for (int i = 0; i < g_ncsck_cs; i++) hit |= g_csck_cs[i] == a;
+        if (!hit) return 0;
+        if (cs->wr_unknown) return 0;
+    } else if (!cs->uses_lds || cs->wr_unknown || !cs->nwr) return 0;
     u64 tot = 0; for (u32 i = 0; i < cs->nrd; i++) tot += cs->rd_hi[i] - cs->rd_lo[i]; for (u32 i = 0; i < cs->nwr; i++) tot += 2 * (cs->wr_hi[i] - cs->wr_lo[i]);
     if (tot > (96ull << 20)) return 0;
     return 1;
@@ -4747,7 +5862,7 @@ static void csck_post(const G2SOut *cs) {
     vk_begin_cb();
 }
 static void vkr_dispatch_body(u32 x, u32 y, u32 z);
-static void vkr_dispatch(u32 x, u32 y, u32 z) { RSTEP("dispatch", (u64)g_shr[SH_COMPUTE_PGM_LO] << 8, 0); T0(); vkr_dispatch_body(x, y, z); TADD(g_t_disp); g_rstep = "between draws"; }
+static void vkr_dispatch(u32 x, u32 y, u32 z) { if (rp_skipped()) return; RSTEP("dispatch", (u64)g_shr[SH_COMPUTE_PGM_LO] << 8, 0); T0(); vkr_dispatch_body(x, y, z); TADD(g_t_disp); g_rstep = "between draws"; }
 static void vkr_dispatch_body(u32 x, u32 y, u32 z) {
     g_natt = 0; g_csck_on = 0; g_rw_kind = 1;
     if (g_vk_on) vk_chunk();
@@ -5494,7 +6609,7 @@ static void hunt_step(void) {
 static void vkr_snap(u32 n) {
     if (g_vk_on && g_hunt_state == 1) hunt_step();   /* t135 */
     if (g_vk_on && (g_nrw || g_rw_w)) rwatch_step();
-    if (g_vk_on && g_rp_running && (g_nrsnap || g_nrsm || g_nrdt)) { ++g_rp_step; if (g_nrsnap) vk_replay_snap(g_rp_step); if (g_nrsm) vk_replay_snapmem(g_rp_step); if (g_nrdte) vk_replay_dumptex(g_rp_step); }
+    if (g_vk_on && g_rp_running && (g_nrsnap || g_nrsm || g_nrdt || g_nrskip)) { ++g_rp_step; if (g_nrsnap) vk_replay_snap(g_rp_step); if (g_nrsm) vk_replay_snapmem(g_rp_step); if (g_nrdte) vk_replay_dumptex(g_rp_step); }
     if (g_vk_on && g_rc_trace) rc_trace_step();
     else if (g_vk_on && g_rc_nsync) { u64 k = ++g_rcs_step; for (int i = 0; i < g_rc_nsync; i++) if (k >= g_rc_sync[i][0] && k <= g_rc_sync[i][1]) { vk_submit_wait(); break; } }
     if (g_vk_on && n && g_ntrace) vk_trace_after(n);
@@ -5630,6 +6745,7 @@ static void vkr_perf_window(u64 flips, u64 window_ticks, u64 draws_total) {
               { static u64 lmv, ldp, lru;
                 say("\n    new textures with another image's bytes (t118c): moved "); say_dec((i64)(g_n_tmove_seen - lmv)); say(", copies in use "); say_dec((i64)(g_n_tmove_dup - ldp));
                 say(", reused "); say_dec((i64)(g_n_tmove_reused - lru)); lmv = g_n_tmove_seen; ldp = g_n_tmove_dup; lru = g_n_tmove_reused; }
+              { say("\n    small textures checked in full (t164): "); say_dec((i64)g_n_fullchk); say(", changed between the sparse samples (uploaded again) "); say_dec((i64)g_n_fullchk_stale); }
               if (g_opt_tex_audit) { say("\n    texture audit (t135): compared in full "); say_dec((i64)g_n_audit); say(", STALE "); say_dec((i64)g_n_audit_stale); say(" ("); say_dec((i64)(g_t_audit * 1000 / plat_ticks_per_sec())); say(" ms in all)"); }
               say("\n    texture cache (t118): images "); say_dec(nl); say(" of 4096 ("); say_dec((i64)(mb >> 20)); say(" MB of "); say_dec((i64)(V.img_budget >> 20));
               say(" MB budget; memory textures "); say_dec(ntex); say(", render targets "); say_dec(nrt); say(", copies "); say_dec(ncp);
@@ -5749,7 +6865,7 @@ static void vk_present_slow(int timed_out) {
         g_pm_fallback = 1; g_pm_fallback_flip = V.frame;
         say("    present: frames are taking very long to reach the display (3 times within 600 flips) - switching to FIFO (t121)\n");
         vl("flip "); vl_d(V.frame); vl(": slow presents - swapchain recreated with FIFO\n");
-        vkDeviceWaitIdle(V.dev); if (!vk_make_swapchain()) vl("  (swapchain not recreated now: the window has no size; FIFO is used when it is)\n");
+        { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } if (!vk_make_swapchain()) vl("  (swapchain not recreated now: the window has no size; FIFO is used when it is)\n");
     }
 }
 
@@ -5796,7 +6912,7 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
           if (g_nshot_more < 64) g_shot_more[g_nshot_more++] = g_flips + 300; }   /* a screenshot of the mode once its shaders are built (Logs\captures\e6_shot_<flip>.bmp) */
       if (shown != g_diag_mode) { shown = g_diag_mode;
           char t[200]; Sb sb = {t, 0, sizeof t}; sb_s(&sb, "Until Dawn  [developer keys - mode "); sb_d(&sb, g_diag_mode); sb_s(&sb, ": "); sb_s(&sb, g_diag_name[g_diag_mode]);
-          sb_s(&sb, g_dev_mode ? "  |  F6 capture, F7 mode, F8 compute check, F10 translation trace, F11 flashback]" : "  |  F6 capture, F7 next mode, F8 compute check, F10 translation trace]"); plat_set_title(t);
+          sb_s(&sb, g_dev_mode ? "  |  F5 mark, F6 capture, F7 mode, F8 compute check, F10 translation trace, F11 flashback]" : "  |  F5 mark, F6 capture, F7 next mode, F8 compute check, F10 translation trace]"); plat_set_title(t);
           say("    diagnostic mode "); say_dec(g_diag_mode); say(": "); say(g_diag_name[g_diag_mode]); say(" (from flip "); say_dec((i64)g_flips); say(")\n");
           vl("  diagnostic mode "); vl_d(g_diag_mode); vl(": "); vl(g_diag_name[g_diag_mode]); vl(" (from flip "); vl_d((i64)g_flips); vl(")\n"); }
       if (k8 && !f8was) {
@@ -5811,6 +6927,10 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
       static int f10was; int k10 = foc && plat_key(0x79);   /* t107: F10 = translation trace of the next 60 flips (e6_g2strace.c) */
       if (k10 && !f10was && !g_trc_f && !g_trc_req) { g_trc_req = -1; say("    translation trace key (F10) pressed\n"); }
       f10was = k10;
+      /* t163: F5 = a numbered mark in the log with the shader counts so far (chapter-by-chapter recording sessions) */
+      static int f5was; int k5 = foc && plat_key(0x74);
+      if (k5 && !f5was) prep_mark();
+      f5was = k5;
       static int f6was; int k6 = foc && plat_key(0x75);
       if (k6 && !f6was && !g_rc_active) { g_rc_req = 1; stage_dev(); if (g_nshot_more < 64) g_shot_more[g_nshot_more++] = g_flips + 1;
           say("    frame capture key (F6) pressed: capturing the next frame (the game pauses for a few seconds, then writes several GB in the background)\n"); }
@@ -5884,7 +7004,7 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
     u64 t_acq0 = plat_ticks();
     VkResult r = vkAcquireNextImageKHR(V.dev, V.sw, g_acq_timeout_ns, PS->acq, 0, &idx);
     u64 t_acq = plat_ticks() - t_acq0;
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { vkDeviceWaitIdle(V.dev); vk_make_swapchain(); V.frame++; pm_unlock(&g_gpu_lock); return; }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); V.frame++; pm_unlock(&g_gpu_lock); return; }
     if (r < 0) { vk_fail("vkAcquireNextImageKHR", r); V.frame++; pm_unlock(&g_gpu_lock); return; }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {   /* t121: no image was acquired (and its semaphore will not be signalled): skip this frame's present */
         g_n_acq_timeout++;
@@ -5921,9 +7041,9 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
     vk_submit_async(PS->acq, img_done[idx]);
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, 0, 1, &img_done[idx], 1, &V.sw, &idx, 0};
     u64 t_pr0 = plat_ticks();
-    r = vkQueuePresentKHR(V.q, &pi);
+    qm_lock(); r = vkQueuePresentKHR(V.q, &pi); qm_unlock();
     u64 t_pr = plat_ticks() - t_pr0;
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(V.dev); vk_make_swapchain(); }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); }
     else if (t_acq + t_pr > plat_ticks_per_sec() / 10 || (g_opt_slow_present_test && V.frame > 300 && V.frame % 200 == 0)) vk_present_slow(0);   /* t121: getting an image and presenting it took over 100 ms */
     V.n_presents++; V.gds_reset = 1;
     if (V.frame < 5 || V.frame % 300 == 0) { vl("flip "); vl_d(V.frame); vl(src ? ": presented " : ": nothing rendered at "); vl_x(addr);
@@ -5949,7 +7069,9 @@ static void vk_save_pcache_bg(void) {
     g_pcs_frame0 = V.frame;
     if (!CreateThread(0, 1u << 20, (void *)pc_saver, 0, 0, 0)) __atomic_store_n(&g_pc_busy, 0, __ATOMIC_RELEASE);
 }
+static void prep_bg_stop(void);
 static void vk_save_pcache(void) {   /* at exit: wait for a background save, then save once more */
+    prep_bg_stop();   /* t164: a background shader preparation stops first */
     while (__atomic_load_n(&g_pc_busy, __ATOMIC_ACQUIRE)) plat_sleep_ms(10);
     vk_save_pcache_now();
 }
@@ -6097,6 +7219,9 @@ static void vkr_report(void) {
         for (int k = 0; k < 10; k++) { int best = -1; for (int l = 1; l < 16384; l++) { int dup = 0; for (int j = 0; j < ns; j++) if ((int)shown[j] == l) dup = 1; if (!dup && g_wait_line[l] && (best < 0 || g_wait_line[l] > g_wait_line[best])) best = l; }
             if (best < 0) break; shown[ns++] = (u32)best; say(" "); say_dec(best); say(": "); say_dec(g_wait_line[best]); say(" ("); say_dec((i64)(g_wait_ticks_line[best] / f)); say(" ms)"); }
         say("\n"); }
+    coh_report();
+    if (g_opt_shwb_new) { say("    one-off GPU writes in VRAM copies copied back to RAM (t165, --gpu-writes-to-ram): "); say_dec((i64)g_n_shwb_new); say(" ("); say_dec((i64)(g_shwb_new_bytes >> 20));
+        say(" MB); not copied: rewritten within 8 frames "); say_dec((i64)g_n_shwb_recent); say(", over 64 MB "); say_dec((i64)g_n_shwb_big); say("\n"); }
     if (g_n_sh_small) { say("    GPU-written buffers under 1 MB in VRAM with write-back to RAM: "); say_dec((i64)g_n_sh_small); say(", write-backs "); say_dec((i64)g_n_sh_wb); say(" ("); say_dec((i64)(g_sh_wb_bytes >> 20)); say(" MB)\n"); }
     say("    textures resolved to a GPU-written image of another kind (STATUS 71): "); say_dec((i64)g_n_tex_odd); say("\n");
     say("    textures read as another kind of number than the image holds (STATUS 74): "); say_dec((i64)g_n_kind_odd); say("\n");
@@ -6113,7 +7238,7 @@ static void vkr_report(void) {
     say("; t111: textures over two game mappings "); say_dec((i64)g_n_tex_span); say("\n");
     say("    file reads into game memory reported to the textures / mirror (STATUS 80): "); say_dec((i64)g_n_cw_ranges); say(" ranges, "); say_dec((i64)g_n_cw_pages); say(" pages; dropped "); say_dec((i64)g_cw_dropped); say("\n");
     if (g_opt_catch_flash) { say("    flash catcher: "); say_dec((i64)g_flash_checked); say(" frames checked, "); say_dec((i64)g_n_flash); say(" with saturated blue\n"); }
-    if (g_nsh) { say("    VRAM copies: CPU-written ranges whose textures were told to check again "); say_dec((i64)g_n_sh_unwatch); say(", pages passed on by the texture path "); say_dec((i64)g_n_sh_rs); say("\n"); }
+    if (g_nsh) { say("    VRAM copies: CPU-written ranges whose textures were told to check again "); say_dec((i64)g_n_sh_unwatch); say(", pages passed on by the texture path "); say_dec((i64)g_n_sh_rs); if (g_coh_unw_ovf) { say(", un-watch list overflows (all textures) "); say_dec((i64)g_coh_unw_ovf); } say("\n"); }
     if (g_nsh) { say("    GPU-written buffers moved to VRAM: "); say_dec(g_nsh); say(" ("); say_dec((i64)(g_sh_bytes >> 20)); say(" MB), CPU-written pages copied in: "); say_dec((i64)V.n_sh_sync_pages); say("\n"); }
     if (g_n_gs_draws || g_n_gs_fail) { say("    geometry-shader draws: "); say_dec((i64)g_n_gs_draws); say(" ("); say_dec((i64)g_n_gs_prims); say(" primitives, "); say_dec((i64)g_n_gs_verts); say(" output vertices); not run "); say_dec((i64)g_n_gs_fail); say(g_opt_no_gs ? " (--no-gs)\n" : "\n"); }
     if (V.n_tess_draws) { say("    tessellated draws: "); say_dec((i64)V.n_tess_draws); say(" ("); say_dec((i64)V.n_tess_patches); say(" patches, drawn at tess factor 1); hull-shader passes run "); say_dec((i64)g_n_hs_pass); say(", not run "); say_dec((i64)g_n_hs_fail); say("\n"); }
@@ -6226,6 +7351,635 @@ static void vkr_report(void) {
     }
     if (g_vklog) plat_close(g_vklog);
     g_vklog = 0;
+}
+/* ---------------------------------------------------------------- t165: --coh-test (replays only): the coherence cases
+   recreated on one of the replayed frame's own VRAM copies, after the frame. Each case is a GPU write (fill / copy, as the
+   game's copy kernels and CP DMA do: through gw_note), then what the CPU does with those bytes. Run without
+   --gpu-coherence it shows today's behaviour (the stale reads are the bug); with it, every case must pass.
+     1 GPU moves data (fill A, copy A -> B), then the CPU reads B                      (the hair index copy, STATUS 192)
+     2 eight threads read B at once, unaligned, across pages
+     3 a 4 KB page shared by GPU data (its first 256 bytes) and CPU data (the rest): the CPU writes its part, the next
+       submit copies CPU-written pages to VRAM - the GPU's bytes must survive        (the lake's ocean state, STATUS 194)
+     4 a GPU write still being recorded when the CPU reads: old bytes now, the new ones after the batch completes
+     5 overlapping GPU writes in two batches, then a CPU read
+     6 a Windows file read into GPU-written memory (through lz_ensure, as the file calls do)
+     7 CPU write, then a GPU write to the other half of the page, then a CPU read of both halves
+   t165i:
+     8 a CPU writer and two readers on one page while the GPU rewrites the page's other half 400 times: no CPU write may
+       be lost while a page is made accessible and filled from VRAM
+     9 Windows file reads into GPU-held memory: through hf_read (no lz_ensure first), and a bare ReadFile (the kernel
+       refuses the inaccessible page - ERROR_NOACCESS - rather than writing it; nothing is silently lost)
+    10 CPU write, then a GPU write to the other half in the same submit (no copy to VRAM in between)
+    11 our own layer reads a page the GPU rewrites every frame, then the CPU writes part of it
+    12 a GPU write still being recorded, the CPU writes the other half meanwhile, then the batch completes */
+static int g_opt_coh_test;
+typedef struct { u64 a, n; u32 want; volatile u64 bad, done; } CohTT;
+static void coh_tt_fn(void *arg) {
+    CohTT *T = (CohTT *)arg; ct_as_game();   /* (stands in for a game thread) */
+    static volatile u32 seedc; u64 x = (u64)(__atomic_add_fetch(&seedc, 1, __ATOMIC_RELAXED)) * 0x9E3779B97F4A7C15ull + 12345, bad = 0;
+    for (int it = 0; it < 4000; it++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        u64 off = (x % (T->n - 64)) & ~3ull; u8 buf[64]; mem_copy(buf, (const void *)(T->a + off), 64);
+        for (int k = 0; k < 64; k += 4) if (*(u32 *)(buf + k) != T->want) bad++;
+    }
+    __atomic_add_fetch(&T->bad, bad, __ATOMIC_RELAXED); __atomic_add_fetch(&T->done, 1, __ATOMIC_RELEASE);
+}
+typedef struct { u64 a; volatile int stop; volatile u64 done, lost, rounds, sink; volatile u32 k; } CohWT;
+static void coh_wt_writer(void *arg) {   /* writes the round number into the page's second half, checks the last round is still there */
+    CohWT *T = (CohWT *)arg; u32 k = 0x50000000u; u64 lost = 0, rounds = 0; ct_as_game();
+    while (!__atomic_load_n(&T->stop, __ATOMIC_ACQUIRE)) {
+        if (rounds) for (u64 o = 0x800; o < 0x1000; o += 4) if (*(volatile u32 *)(T->a + o) != k) lost++;
+        k++; for (u64 o = 0x800; o < 0x1000; o += 4) *(volatile u32 *)(T->a + o) = k;
+        rounds++; __atomic_store_n(&T->k, k, __ATOMIC_RELEASE);
+    }
+    T->lost = lost; T->rounds = rounds; __atomic_add_fetch(&T->done, 1, __ATOMIC_RELEASE);
+}
+static void coh_wt_reader(void *arg) {
+    CohWT *T = (CohWT *)arg; u64 x = 0; ct_as_game();
+    while (!__atomic_load_n(&T->stop, __ATOMIC_ACQUIRE)) { x += *(volatile u32 *)(T->a + 0x100); x += *(volatile u32 *)(T->a + 0x7FC); }
+    T->sink += x; __atomic_add_fetch(&T->done, 1, __ATOMIC_RELEASE);
+}
+static u64 g_cb_t_hold, g_cb_t_fault;
+static void coh_bench_fn(void *arg) {   /* (unregistered thread: counts as our own layer) */
+    CohWT *T = (CohWT *)arg; u64 pg = (T->a - G2S_PT_BASE) >> 16, x = 0;
+    for (int i = 0; i < 2000; i++) {
+        u64 t0 = plat_ticks(); pm_lock(&g_coh_m); coh_hold(pg, 0xFFFF, 0, 0, 0); pm_unlock(&g_coh_m); u64 t1 = plat_ticks();
+        x += *(volatile u32 *)(T->a + 0x10); u64 t2 = plat_ticks();
+        g_cb_t_hold += t1 - t0; g_cb_t_fault += t2 - t1; T->rounds++;
+    }
+    T->sink = x; __atomic_add_fetch(&T->done, 1, __ATOMIC_RELEASE);
+}
+static void coh_wt_once(void *arg) { CohWT *T = (CohWT *)arg; T->sink = *(volatile u32 *)(T->a + 0x10); __atomic_add_fetch(&T->done, 1, __ATOMIC_RELEASE); }
+static void ct_wait_done(CohWT *T, u64 n) { u64 t0 = plat_ticks(); while (__atomic_load_n(&T->done, __ATOMIC_ACQUIRE) < n && plat_ticks() - t0 < plat_ticks_per_sec() * 60) plat_sleep_ms(2); }
+static void ct_fill(u64 a, u64 n, u32 v) {   /* a GPU fill into game memory, logged as the game's GPU writes are */
+    VkBuffer b; u64 o; if (!vk_locate(a, n, &b, &o)) { say("    coh test: not locatable\n"); return; }
+    vk_begin_cb(); vk_end_rendering(); vk_barrier(); vkCmdFillBuffer(V.cb, b, o, n, v); vk_barrier(); gw_note(a, a + n);
+}
+static void ct_copy(u64 d, u64 s, u64 n) {
+    VkBuffer bs, bd; u64 os_, od; if (!vk_locate(s, n, &bs, &os_) || !vk_locate(d, n, &bd, &od)) { say("    coh test: not locatable\n"); return; }
+    vk_begin_cb(); vk_end_rendering(); vk_barrier(); VkBufferCopy bc = {os_, od, n}; vkCmdCopyBuffer(V.cb, bs, bd, 1, &bc); vk_barrier(); gw_note(d, d + n);
+}
+static u64 ct_count(u64 a, u64 n, u32 want) { u64 bad = 0; for (u64 k = 0; k < n; k += 4) if (*(volatile u32 *)(a + k) != want) bad++; return bad; }
+static u64 ct_count_gpu(u64 a, u64 n, u32 want) { static u8 buf[1 << 16]; if (n > sizeof buf) n = sizeof buf; vk_submit_wait(); csck_read(a, n, buf); u64 bad = 0; for (u64 k = 0; k < n; k += 4) if (*(u32 *)(buf + k) != want) bad++; return bad; }
+static int g_ct_pass, g_ct_fail;
+static void ct_result(int k, const char *what, u64 bad, u64 of) {
+    char t[300]; Sb s = {t, 0, sizeof t};
+    sb_s(&s, "    coh test "); sb_d(&s, k); sb_s(&s, bad ? ": FAIL - " : ": pass - "); sb_s(&s, what); sb_s(&s, " ("); sb_d(&s, (i64)bad); sb_s(&s, " of "); sb_d(&s, (i64)of); sb_s(&s, " words wrong)\n");
+    say(t); if (bad) g_ct_fail++; else g_ct_pass++;
+}
+/* ---- t165w: review-finding tests (--coh-test; --coh-test-only N runs one of 14-21 alone). Each one reproduces a failure
+   the independent review found (STATUS 196) and checks the correction. A watchdog ends a test that stops making progress
+   (a deadlock or an endless fault loop) with a FAIL line instead of hanging the run. */
+static int g_ct_only;
+static volatile int g_ct_wd_test; static volatile u64 g_ct_wd_kick; static volatile u32 g_ct_wd_secs;
+static void ct_wd_fn(void *arg) {
+    (void)arg; u64 f = plat_ticks_per_sec(), last = 0, since = plat_ticks();
+    for (;;) {
+        plat_sleep_ms(500);
+        int t = __atomic_load_n(&g_ct_wd_test, __ATOMIC_ACQUIRE); u64 k = __atomic_load_n(&g_ct_wd_kick, __ATOMIC_ACQUIRE);
+        if (!t || k != last) { last = k; since = plat_ticks(); continue; }
+        if ((plat_ticks() - since) / f >= g_ct_wd_secs) {
+            say("    coh test "); say_dec(t); say(": FAIL - no progress for "); say_dec(g_ct_wd_secs); say(" s (deadlock or endless fault loop); the run is ended here\n");
+            say("    coh test summary: "); say_dec(g_ct_pass); say(" passed, "); say_dec(g_ct_fail + 1); say(" failed (ended by the watchdog)\n");
+            plat_log_flush(0, 3000, 1);
+            TerminateProcess((void *)(intptr_t)-1, 9);
+        }
+    }
+}
+static void ct_wd(int test, u32 secs) { g_ct_wd_secs = secs; __atomic_add_fetch(&g_ct_wd_kick, 1, __ATOMIC_RELEASE); __atomic_store_n(&g_ct_wd_test, test, __ATOMIC_RELEASE); }
+static void ct_kick(void) { __atomic_add_fetch(&g_ct_wd_kick, 1, __ATOMIC_RELEASE); }
+static int ct_sel(int k) { return !g_ct_only || g_ct_only == k; }
+/* GPU backlog: n batches of heavy work (repeated 256 MB fills of a scratch buffer), submitted without waiting */
+static VkBuffer g_ct_scr; static VkDeviceMemory g_ct_scr_mem;
+static void ct_backlog(int n, int reps) {
+    if (!g_ct_scr) {
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, 256ull << 20, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
+        if (vkCreateBuffer(V.dev, &bci, 0, &g_ct_scr)) { g_ct_scr = 0; return; }
+        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(V.dev, g_ct_scr, &mr);
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        if (vkAllocateMemory(V.dev, &mai, 0, &g_ct_scr_mem)) { vkDestroyBuffer(V.dev, g_ct_scr, 0); g_ct_scr = 0; return; }
+        vkBindBufferMemory(V.dev, g_ct_scr, g_ct_scr_mem, 0);
+    }
+    for (int b = 0; b < n; b++) {
+        vk_begin_cb(); vk_end_rendering();
+        for (int r = 0; r < reps; r++) { vkCmdFillBuffer(V.cb, g_ct_scr, 0, 256ull << 20, (u32)(r * 7 + b)); vk_barrier(); }
+        vk_submit_async(0, 0); ct_kick();
+    }
+}
+static u64 ct_gpu_word_bad(u64 a, u64 n, u32 want) { u64 bad = 0; for (u64 o = 0; o < n; o += 0x10000) { u64 c = n - o > 0x10000 ? 0x10000 : n - o; bad += ct_count_gpu(a + o, c, want); ct_kick(); } return bad; }
+typedef struct { u64 a, n; u32 val; volatile u64 done, bad; int stride_pages; } CohPW;
+static void ct_pagewriter(void *arg) {   /* writes val into the second half of each 4 KB page of [a, a+n) */
+    CohPW *W = (CohPW *)arg; ct_as_game();
+    for (u64 p = W->a; p < W->a + W->n; p += 4096) { for (u64 o = 0x800; o < 0x1000; o += 4) *(volatile u32 *)(p + o) = W->val; ct_kick(); }
+    __atomic_store_n(&W->done, 1, __ATOMIC_RELEASE);
+}
+static void ct_reader1(void *arg) { CohWT *T = (CohWT *)arg; ct_as_game(); T->sink = *(volatile u32 *)(T->a); __atomic_add_fetch(&T->done, 1, __ATOMIC_RELEASE); }
+static void ct_trapreader(void *arg) { CohWT *T = (CohWT *)arg; ct_as_game(); T->sink = *(volatile u32 *)(T->a); __atomic_add_fetch(&T->done, 1, __ATOMIC_RELEASE); }
+static void ct_wait_done_s(CohWT *T, u64 n, u32 secs) { u64 t0 = plat_ticks(); while (__atomic_load_n(&T->done, __ATOMIC_ACQUIRE) < n && plat_ticks() - t0 < plat_ticks_per_sec() * secs) plat_sleep_ms(2); }
+/* free RAM (no VRAM copy) of n bytes inside one imported region, 64 KB aligned */
+static u64 ct_free_ram(u64 n) {
+    for (int i = 0; i < V.nreg; i++) { VReg *R = &V.reg[i];
+        if (!R->ok || R->lo < G2S_PT_BASE || R->lo >= G2S_TESS_BASE || R->hi - R->lo < n + (4u << 20)) continue;
+        for (u64 x = (R->lo + 0x10000 + 0xFFFF) & ~0xFFFFull; x + n + 0x10000 <= R->hi; x += 1u << 20)
+            if (!shadow_overlaps(x - 0x10000, n + 0x20000)) return x; }
+    return 0;
+}
+/* stress state */
+typedef struct { u64 a; int np; volatile int stop; volatile u64 lost, rounds, done; u32 k; int id; } CohSW;
+static struct { u64 a, t; u32 want, got; } g_ct_loss[8]; static volatile u32 g_ct_nloss;
+static void ct_stress_writer(void *arg) {   /* owns the second halves of np pages; checks its last round survived */
+    CohSW *W = (CohSW *)arg; u32 k = 0x70000000u + ((u32)W->id << 24); u64 lost = 0, rounds = 0; ct_as_game();
+    while (!__atomic_load_n(&W->stop, __ATOMIC_ACQUIRE)) {
+        for (int p = 0; p < W->np; p++) for (u64 o = 0x800; o < 0x1000; o += 64) { u64 a = W->a + (u64)p * 4096 + o; u32 v; if (rounds && (v = *(volatile u32 *)a) != k) { lost++;
+            u32 i = __atomic_fetch_add(&g_ct_nloss, 1, __ATOMIC_RELAXED); if (i < 8) { g_ct_loss[i].a = a; g_ct_loss[i].t = plat_ticks(); g_ct_loss[i].want = k; g_ct_loss[i].got = v; } } }
+        k++; for (int p = 0; p < W->np; p++) for (u64 o = 0x800; o < 0x1000; o += 64) *(volatile u32 *)(W->a + (u64)p * 4096 + o) = k;
+        rounds++; W->k = k;
+    }
+    W->lost = lost; W->rounds = rounds; __atomic_store_n(&W->done, 1, __ATOMIC_RELEASE);
+}
+static void ct_stress_reader(void *arg) { CohSW *W = (CohSW *)arg; u64 x = 0, r = 0; if (W->id >= 0) ct_as_game(); while (!__atomic_load_n(&W->stop, __ATOMIC_ACQUIRE)) { r = r * 6364136223846793005ull + 1442695040888963407ull; x += *(volatile u32 *)(W->a + ((r >> 33) % ((u64)W->np * 4096) & ~3ull)); } W->rounds = x; __atomic_store_n(&W->done, 1, __ATOMIC_RELEASE); }
+
+static void coh_selftest2(VShadow *S) {
+    static int wd_started; if (!wd_started) { wd_started = 1; pt_create(ct_wd_fn, 0, 1u << 20); }
+    u64 us = plat_ticks_per_sec() / 1000000; if (!us) us = 1;
+    say("    --- review-finding tests (t165w) ---\n");
+    if (g_coh_mode != 2) { say("    (tests 14-21 need --gpu-coherence)\n"); return; }
+    u64 big = S->hi - S->lo >= (10u << 20) ? (S->hi - (9u << 20)) & ~0xFFFFull : 0;   /* 8 MB below the 512 KB area of tests 1-13 */
+    /* 14: lock order - a CPU-write patch sent at the start of a submit while every batch slot is busy and the
+       completion thread wants the coherence lock (review 1: the renderer waited for a slot holding the coherence lock,
+       the completion thread held the slot lock waiting for the coherence lock) */
+    if (ct_sel(14)) {
+        u64 P = big ? big : S->lo; ct_wd(14, 30);
+        ct_fill(P, 0x1000, 0x14141414u); vk_submit_wait();
+        ct_backlog(NSLOT, 120);   /* every slot busy for a while */
+        pm_lock(&g_coh_m); coh_patch_add(P + 0x800, 64); pm_unlock(&g_coh_m);
+        u64 t0 = plat_ticks();
+        coh_apply_patches();   /* (what vk_shadow_sync does first at a submit, with no batch being recorded) */
+        vk_submit_wait();
+        ct_wd(0, 30);
+        char t[160]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 14: patch sent with every slot busy: done in "); sb_d(&q, (i64)((plat_ticks() - t0) / us / 1000)); sb_s(&q, " ms\n"); say(t);
+        ct_result(14, "a CPU-write patch at a submit start with a full GPU backlog (no deadlock)", 0, 1);
+    }
+    /* 15: VRAM copies merged while a page is GPU-held (review 2: the merge's copies were not yet run when the new copy
+       was published - a read-back got its uninitialised bytes; CPU writes since the last submit were lost) */
+    if (ct_sel(15)) {
+        u64 X = ct_free_ram(4u << 20); ct_wd(15, 60);
+        if (!X) say("    coh test 15: no free RAM region found (skipped)\n");
+        else {
+            vk_shadow(X, X + (1u << 20)); vk_submit_wait();
+            VShadow *A = shadow_of(X, 0x10000);
+            if (!A) say("    coh test 15: could not create the first VRAM copy (skipped)\n");
+            else {
+                u64 P = X + 0x10000, Q = X + 0x20000;
+                ct_fill(P, 0x1000, 0x15151515u); vk_submit_wait();          /* P: GPU-held, VRAM has 0x15.. */
+                for (u64 o = 0; o < 0x1000; o += 4) *(volatile u32 *)(Q + o) = 0x16161616u;   /* Q: written by the CPU since the last submit */
+                vk_shadow(X + (1u << 20) - 0x10000, X + (2u << 20));       /* merges A into a new copy (recorded, not yet submitted in t165v) */
+                static CohWT T; T.a = P; T.done = 0; T.sink = 0;
+                pt_create(ct_reader1, &T, 1u << 20); ct_wait_done_s(&T, 1, 20);   /* a game-like thread reads P right away */
+                u64 b1 = (T.done == 1 && (u32)T.sink == 0x15151515u) ? 0 : 1;
+                vk_submit_wait();
+                u64 b2 = ct_count(P, 0x1000, 0x15151515u), b3 = ct_gpu_word_bad(Q, 0x1000, 0x16161616u), b4 = ct_gpu_word_bad(P, 0x1000, 0x15151515u);
+                ct_result(15, "merge while a page is GPU-held: a read right after the merge gets the GPU's bytes", b1 + b2, 1 + 0x400);
+                ct_result(15, "merge: CPU writes made since the last submit reach the merged VRAM copy", b3, 0x400);
+                ct_result(15, "merge: the GPU's bytes are in the merged VRAM copy", b4, 0x400);
+            }
+        }
+        ct_wd(0, 30);
+    }
+    /* 16: bookkeeping beyond the old fixed tables (review 3): 1024 pages copied back during a recorded GPU write
+       (snapshots: 512 before), CPU-written afterwards (patch pages: 256 before) */
+    if (ct_sel(16)) {
+        if (!big) say("    coh test 16: needs a VRAM copy of 10 MB or more (skipped)\n");
+        else {
+            u64 R0 = big, N = 4u << 20; ct_wd(16, 120);
+            ct_fill(R0, N, 0x16000001u); vk_submit_wait();                /* all GPU-held */
+            for (u64 p = R0; p < R0 + N; p += 4096) ct_fill(p, 0x800, 0x16000002u);   /* recorded, not submitted: first halves */
+            static CohPW W; W.a = R0; W.n = N; W.val = 0x16000003u; W.done = 0;
+            pt_create(ct_pagewriter, &W, 1u << 20);                         /* second halves, while the fills are recorded */
+            { u64 t0 = plat_ticks(); while (!__atomic_load_n(&W.done, __ATOMIC_ACQUIRE) && plat_ticks() - t0 < plat_ticks_per_sec() * 60) plat_sleep_ms(2); }
+            vk_submit_wait(); vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+            u64 bad = 0;
+            for (u64 p = R0; p < R0 + N; p += 4096) { bad += ct_count(p, 0x800, 0x16000002u) + ct_count(p + 0x800, 0x800, 0x16000003u); }
+            u64 gbad = 0; { static u8 b[0x10000]; for (u64 o = 0; o < N; o += 0x10000) { vk_submit_wait(); csck_read(R0 + o, 0x10000, b); ct_kick();
+                for (u64 k = 0; k < 0x10000; k += 4) gbad += *(u32 *)(b + k) != ((k & 0xFFF) < 0x800 ? 0x16000002u : 0x16000003u); } }
+            ct_result(16, "1024 pages: CPU reads both halves after the batch (RAM)", bad, N / 4);
+            ct_result(16, "1024 pages: VRAM has the GPU's and the CPU's halves", gbad, N / 4);
+        }
+        ct_wd(0, 30);
+    }
+    /* 17: failure paths (review 4): a failed read-back, a failed thread stop, a timed-out fence */
+    if (ct_sel(17)) {   /* t165w (review 2): failures in a row, each recovered from by retrying - the old version's
+                           single injection was used up by the first attempt, so the failure path itself never ran */
+        u64 P = (big ? big + (5u << 20) : S->lo + 0x40000); ct_wd(17, 120);
+        static CohWT T;
+        ct_fill(P, 0x1000, 0x17171717u); vk_submit_wait();
+        u64 r0 = g_coh_rb_retry; __atomic_store_n(&g_ct_inj_rb, 6, __ATOMIC_RELEASE);
+        T.a = P; T.done = 0; pt_create(ct_reader1, &T, 1u << 20); ct_wait_done_s(&T, 1, 30);
+        ct_result(17, "GPU read-back failing 6 times in a row: retried, the reader gets the GPU's bytes", (T.done == 1 && (u32)T.sink == 0x17171717u && g_coh_rb_retry - r0 >= 6) ? 0 : 1, 1);
+        ct_fill(P + 0x1000, 0x1000, 0x17171718u); vk_submit_wait(); ct_backlog(NSLOT, 120);
+        u64 f0 = g_coh_fence_late; __atomic_store_n(&g_ct_inj_fence, 1, __ATOMIC_RELEASE);
+        T.a = P + 0x1000; T.done = 0; pt_create(ct_reader1, &T, 1u << 20); ct_wait_done_s(&T, 1, 60);
+        vk_submit_wait();
+        ct_result(17, "read-back fence wait timing out first: waited on, the reader gets the GPU's bytes", (T.done == 1 && (u32)T.sink == 0x17171718u && g_coh_fence_late > f0) ? 0 : 1, 1);
+        { static CohWT T8; T8.a = P + 0x2000; T8.stop = 0; T8.done = 0; T8.lost = 0; T8.rounds = 0; T8.k = 0;
+          ct_fill(P + 0x2000, 0x1000, 0x17000000u); vk_submit_wait();
+          u64 s0 = g_coh_stop_retry;
+          pt_create(coh_wt_writer, &T8, 1u << 20); pt_create(coh_wt_reader, &T8, 1u << 20); pt_create(coh_wt_reader, &T8, 1u << 20);
+          for (int i = 0; i < 100; i++) { __atomic_store_n(&g_ct_inj_stop, 8, __ATOMIC_RELEASE); ct_fill(P + 0x2000, 0x800, 0x17000001u + (u32)i); vk_submit_wait(); plat_sleep_ms(1); ct_kick(); }
+          __atomic_store_n(&T8.stop, 1, __ATOMIC_RELEASE); ct_wait_done(&T8, 3);
+          char t[160]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 17: thread-stop failures retried: "); sb_d(&q, (i64)(g_coh_stop_retry - s0)); sb_s(&q, "\n"); say(t);
+          ct_result(17, "stopping the threads failing 8 times in a row at each copy-back: retried, no CPU write lost", T8.lost + (T8.done == 3 ? 0 : 1) + (g_coh_stop_retry - s0 >= 8 ? 0 : 1), T8.rounds * 512); }
+        __atomic_store_n(&g_ct_inj_rb, 0, __ATOMIC_RELEASE); __atomic_store_n(&g_ct_inj_stop, 0, __ATOMIC_RELEASE); __atomic_store_n(&g_ct_inj_fence, 0, __ATOMIC_RELEASE);
+        ct_wd(0, 30);
+    }
+    /* 27: review 2, N6 - a page copied back while its GPU write was being recorded, read by a game thread after that batch
+       ran on the GPU but before its completion was processed (the completion thread held off: g_coh_m kept here) - as after
+       a GPU-written label said the batch had run. It must get the batch's bytes */
+    if (ct_sel(27)) {
+        u64 P = (big ? big + (5u << 20) + 0x80000 : S->lo + 0xA0000); ct_wd(27, 60);
+        for (int round = 0; round < 2; round++) {
+            u32 v0 = 0x27000000u + (u32)round, v1 = 0x27110000u + (u32)round;
+            ct_fill(P, 0x1000, v0); vk_submit_wait();
+            static CohWT R; R.a = P + 0x20; R.done = 0; pt_create(ct_reader1, &R, 1u << 20); ct_wait_done_s(&R, 1, 20);   /* current, writable */
+            ct_fill(P, 0x1000, v1);                                                         /* B: the GPU write (recorded) */
+            R.a = P + 0x40; R.done = 0; pt_create(ct_reader1, &R, 1u << 20); ct_wait_done_s(&R, 1, 20);   /* a game read during B: copied back */
+            pm_lock(&g_coh_m);                                                              /* B's completion waits here */
+            int bs = g_slot_cur; vk_submit_async(0, 0);
+            { u64 t0 = plat_ticks(); while (vkWaitForFences(V.dev, 1, &g_slot[bs].fence, 1, 0) != VK_SUCCESS && plat_ticks() - t0 < plat_ticks_per_sec() * 10) plat_sleep_ms(1); }   /* B has run on the GPU */
+            static CohWT G; G.a = P + 0x80; G.done = 0; G.sink = 0; pt_create(ct_reader1, &G, 1u << 20);
+            plat_sleep_ms(300);
+            int early = (int)__atomic_load_n(&G.done, __ATOMIC_ACQUIRE); u32 ev = (u32)G.sink;
+            pm_unlock(&g_coh_m);
+            ct_wait_done_s(&G, 1, 20); vk_submit_wait();
+            char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 27: round "); sb_d(&q, round); sb_s(&q, early ? ": the read went through before the completion was processed, value " : ": the read waited for the coherence code (page held), value "); sb_x(&q, early ? ev : (u32)G.sink); sb_s(&q, "\n"); say(t);
+            ct_result(27, round ? "... again" : "read after the batch ran, before its completion was processed: the batch's bytes", (G.done == 1 && (u32)G.sink == v1) ? 0 : 1, 1);
+        }
+        ct_wd(0, 30);
+    }
+    /* 28: the staging ring - wrapping many times (a 64 KB ring), and full (an 8 KB ring: the copy goes from RAM, an error
+       logged, and the data still right with no CPU writes in flight) */
+    if (ct_sel(28) && big) {
+        u64 Z = big + (6u << 20) + 0x200000; ct_wd(28, 90); enum { NP = 12 };
+        vk_submit_wait(); u64 w0 = g_cs_nwrap, e0 = g_coh_err, f0 = g_cs_full;
+        g_ct_cs_cap = 64u << 10;
+        static CohPW W; u64 bad = 0;
+        for (int round = 0; round < 60; round++) {   /* 4 different pages a round (16 KB staged), 3 rounds in flight, then all 12 checked */
+            W.a = Z + (u64)(round % 3) * 4 * 4096; W.n = 4 * 4096; W.val = 0x28000000u + (u32)round; W.done = 0; pt_create(ct_pagewriter, &W, 1u << 20);
+            { u64 t0 = plat_ticks(); while (!__atomic_load_n(&W.done, __ATOMIC_ACQUIRE) && plat_ticks() - t0 < plat_ticks_per_sec() * 20) plat_sleep_ms(1); }
+            vk_begin_cb(); vk_shadow_sync(); vk_submit_async(0, 0);                       /* the submit's CPU-write copies: staged */
+            if (round % 3 == 2) { vk_submit_wait();
+                for (int i = 0; i < NP; i++) bad += ct_count_gpu(Z + (u64)i * 4096 + 0x800, 0x800, 0x28000000u + (u32)(round - 2 + i / 4)); }
+        }
+        u64 wraps = g_cs_nwrap - w0, full1 = g_cs_full - f0;
+        ct_result(28, "staging ring wrapping with batches in flight (64 KB ring, 60 rounds): every page's bytes right after every group", bad + (wraps ? 0 : 1) + (full1 ? 1 : 0), (u64)NP * 512 * 20 + 2);
+        g_ct_cs_cap = 8u << 10; u64 f2 = g_cs_full, e2 = g_coh_err;
+        W.a = Z; W.n = (u64)NP * 4096; W.val = 0x28FF0000u; W.done = 0; pt_create(ct_pagewriter, &W, 1u << 20);
+        { u64 t0 = plat_ticks(); while (!__atomic_load_n(&W.done, __ATOMIC_ACQUIRE) && plat_ticks() - t0 < plat_ticks_per_sec() * 20) plat_sleep_ms(1); }
+        vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+        u64 bad2 = 0; for (int i = 0; i < NP; i++) bad2 += ct_count_gpu(Z + (u64)i * 4096 + 0x800, 0x800, 0x28FF0000u);
+        g_ct_cs_cap = 0;
+        u64 exp = g_coh_err - e2;
+        char t[220]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 28: wraps "); sb_d(&q, (i64)wraps); sb_s(&q, ", full while wrapping "); sb_d(&q, (i64)full1); sb_s(&q, ", full in the 8 KB part "); sb_d(&q, (i64)(g_cs_full - f2));
+        sb_s(&q, ", errors logged there "); sb_d(&q, (i64)exp); sb_s(&q, " (expected; kept out of the run's error count)\n"); say(t);
+        ct_result(28, "staging ring full (8 KB): copied from RAM, the error logged, VRAM right", bad2 + (g_cs_full > f2 ? 0 : 1) + (exp ? 0 : 1), (u64)NP * 512 + 2);
+        g_coh_err = e0 + (e2 - e0); g_ct_err_expected += exp; if (g_coh_err == e0 && exp) g_coh_err_first = 0;
+        ct_wd(0, 30);
+    }
+    /* 29: a Windows file read into a page held again between making it current and the read (review 2: the hf_read retry
+       on ERROR_NOACCESS was never run): the read is repeated after making it current again; the GPU's half kept */
+    if (ct_sel(29)) {
+        u64 P = (big ? big + (5u << 20) + 0x90000 : S->lo + 0xB0000); ct_wd(29, 60);
+        static u8 fb[0x800]; for (int i = 0; i < 0x800; i++) fb[i] = (u8)(0x29 + i * 7);
+        const char *fn = "coh_test29.bin"; void *wf = hf_open_rw(fn, 1, 1); u64 wr = wf ? hf_write(wf, fb, sizeof fb) : 0; if (wf) hf_close(wf);
+        ct_fill(P, 0x1000, 0x29292929u); vk_submit_wait();
+        g_ct_rehold_pg = P; g_ct_rehold_n = 1; u64 k0 = g_coh_kernel_refused;
+        void *rf = hf_open_rb(fn); u64 got = rf ? hf_read(rf, (void *)(P + 0x800), 0x800) : 0; if (rf) hf_close(rf);
+        g_ct_rehold_pg = 0; plat_unlink(fn);
+        u64 bad = 0; { static CohWT G; for (u32 o = 0; o < 0x800; o += 0x100) { G.a = P + 0x800 + o; G.done = 0; pt_create(ct_reader1, &G, 1u << 20); ct_wait_done_s(&G, 1, 20); if ((u32)G.sink != *(u32 *)(fb + o)) bad++; } }
+        u64 gb = ct_count(P, 0x800, 0x29292929u);
+        char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 29: file written "); sb_d(&q, (i64)wr); sb_s(&q, ", read "); sb_d(&q, (i64)got); sb_s(&q, ", refused by Windows first "); sb_d(&q, (i64)(g_coh_kernel_refused - k0)); sb_s(&q, "\n"); say(t);
+        ct_result(29, "file read into a page held again just before it: retried, the file's bytes in RAM", bad + (got == 0x800 ? 0 : 1) + (g_coh_kernel_refused > k0 ? 0 : 1), 8 + 2);
+        ct_result(29, "... and the GPU's half of the page kept", gb, 0x200);
+        vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+        ct_result(29, "... and both in VRAM", ct_count_gpu(P, 0x800, 0x29292929u) + (ct_count_gpu(P + 0x800, 4, *(u32 *)fb)), 0x201);
+        ct_wd(0, 30);
+    }
+    /* 26: review 2, N4 - a shader store whose declared range (an upper bound) is wider than what it writes, logged the way
+       stores outside a single VRAM copy are (gw_note_shader): the CPU's bytes in the range it does not write must stay */
+    if (ct_sel(26)) {
+        u64 P = (big ? big + (5u << 20) + 0x70000 : S->lo + 0x90000); ct_wd(26, 30);
+        ct_fill(P, 0x1000, 0x26000000u); vk_submit_wait();
+        static CohWT R; R.a = P; R.done = 0; pt_create(ct_reader1, &R, 1u << 20); ct_wait_done_s(&R, 1, 20);   /* copied back: RAM current, page writable */
+        static CohPW W; W.a = P; W.n = 0x1000; W.val = 0x26CCCCCCu; W.done = 0; pt_create(ct_pagewriter, &W, 1u << 20);   /* a game write: the second half */
+        { u64 t0 = plat_ticks(); while (!__atomic_load_n(&W.done, __ATOMIC_ACQUIRE) && plat_ticks() - t0 < plat_ticks_per_sec() * 20) plat_sleep_ms(1); }
+        gw_note_shader(P, P + 0x1000);                              /* the store's declared range: the whole page */
+        { VkBuffer b; u64 o; if (vk_locate(P, 0x800, &b, &o)) { vk_begin_cb(); vk_end_rendering(); vk_barrier(); vkCmdFillBuffer(V.cb, b, o, 0x800, 0x26111111u); vk_barrier(); } }   /* what it stores: the first half */
+        vk_submit_wait();
+        static CohWT G; G.a = P + 0x900; G.done = 0; pt_create(ct_reader1, &G, 1u << 20); ct_wait_done_s(&G, 1, 20);
+        ct_result(26, "shader store with a wider declared range: the CPU's bytes it does not store survive (CPU view)", (G.done == 1 && (u32)G.sink == 0x26CCCCCCu) ? 0 : 1, 1);
+        ct_result(26, "... and in VRAM, with the shader's half", ct_count_gpu(P, 0x800, 0x26111111u) + ct_count_gpu(P + 0x800, 0x800, 0x26CCCCCCu), 0x400);
+        ct_wd(0, 30);
+    }
+    /* 25: a failure that does not go away (the threads can never be stopped): the game must stop, logged (exit code 22),
+       not go on with a copy made while other threads run. Ends the process - run on its own (--coh-test-only 25) */
+    if (ct_sel(25) && g_ct_only != 25) say("    coh test 25: not run here - it ends the process (run on its own: --coh-test-only 25; expected exit code 22)\n");
+    else if (ct_sel(25)) {
+        u64 P = (big ? big + (5u << 20) + 0x3000 : S->lo + 0x43000);
+        ct_fill(P, 0x1000, 0x25252525u); vk_submit_wait();
+        say("    coh test 25: thread stopping made to fail every time; a game read of a GPU-held page follows - expected: the stop below, exit code 22\n");
+        __atomic_store_n(&g_ct_inj_stop, 0xFFFFFFFFu, __ATOMIC_RELEASE);
+        static CohWT T; T.a = P; T.done = 0; pt_create(ct_reader1, &T, 1u << 20); ct_wait_done_s(&T, 1, 120);
+        ct_result(25, "permanent failure: the game stopped instead of going on", 1, 1);   /* (reached only if the read went through or nothing happened in 120 s) */
+    }
+    /* 18: startup race (review 5) - run as its own replay with --coh-init-delay 400 (see run_t165w_review.bat); here
+       only reported: a completion before the tables were ready must have been skipped, not blocked */
+    if (ct_sel(18) && !g_ct_init_delay) say("    coh test 18: not run here - it needs --coh-init-delay MS (run on its own: --coh-test-only 18 --coh-init-delay 400)\n");
+    else if (ct_sel(18)) {
+        char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 18: startup window "); sb_d(&q, g_ct_init_delay); sb_s(&q, " ms; completions during it: "); sb_d(&q, (i64)g_ct_iprobe_calls); sb_s(&q, g_ct_iprobe_done ? ", all returned\n" : ", one is STILL WAITING\n"); say(t);
+        ct_result(18, "a batch completing while the coherence tables are set up does not wait forever", (g_ct_iprobe_started && g_ct_iprobe_done) ? 0 : 1, 1); }
+    /* 19: a real access violation on a page the coherence code released moments before (review 6: endless retry) */
+    if (ct_sel(19)) {
+        u64 P = (big ? big + (5u << 20) + 0x8000 : S->lo + 0x48000); ct_wd(19, 30);
+        ct_fill(P, 0x1000, 0x19191919u); vk_submit_wait(); u64 x = ct_count(P, 0x1000, 0x19191919u); (void)x;   /* released (copied) */
+        u32 o; plat_protect((void *)P, 4096, 0x01, &o);   /* something else makes it inaccessible: a real fault now */
+        g_ct_trap_pg = P; g_ct_trap_hits = 0; u64 r0 = g_coh_retry_ret;
+        static CohWT T; T.a = P; T.done = 0; pt_create(ct_trapreader, &T, 1u << 20);
+        ct_wait_done_s(&T, 1, 10);
+        u64 loops = g_coh_retry_ret - r0;
+        char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 19: retried as 'released meanwhile' "); sb_d(&q, (i64)loops); sb_s(&q, " times, reached the crash path "); sb_d(&q, (i64)g_ct_trap_hits); sb_s(&q, " times\n"); say(t);
+        ct_result(19, "a real access violation on a just-released page reaches the crash path (no endless retry)", (T.done == 1 && g_ct_trap_hits == 1) ? 0 : 1, 1);
+        g_ct_trap_pg = 0; plat_protect((void *)P, 4096, 0x40, &o);
+        ct_wd(0, 30);
+    }
+    /* 20: the same GPU range twice in one batch, with a CPU write in between (review 7) */
+    if (ct_sel(20)) {
+        u64 P = (big ? big + (5u << 20) + 0x10000 : S->lo + 0x50000); ct_wd(20, 30);
+        ct_fill(P, 0x1000, 0x20202020u); vk_submit_wait();
+        ct_fill(P, 0x1000, 0x20202021u);                                   /* batch X, recorded */
+        for (u64 o = 0x800; o < 0x1000; o += 4) *(volatile u32 *)(P + o) = 0x20202022u;   /* CPU write meanwhile (copy-back during X) */
+        ct_fill(P, 0x1000, 0x20202023u);                                   /* the same range again in X: comes after the CPU write */
+        vk_submit_wait(); vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+        ct_result(20, "same GPU range twice in a batch around a CPU write: the later GPU write wins (CPU view)", ct_count(P, 0x1000, 0x20202023u), 0x400);
+        ct_result(20, "... and in VRAM", ct_gpu_word_bad(P, 0x1000, 0x20202023u), 0x400);
+        ct_wd(0, 30);
+    }
+    /* 22: a copy-back taken on a thread with a small stack (review 11: the handler, the read-back and the thread stop
+       run on the faulting thread's own stack). The game's threads get the stack size the game asks for (1 MB when it
+       does not say); 64 KB and 32 KB here */
+    if (ct_sel(22)) {
+        u64 P = (big ? big + (5u << 20) + 0x20000 : S->lo + 0x60000); ct_wd(22, 30);
+        ct_fill(P, 0x1000, 0x22222223u); vk_submit_wait();
+        static CohWT T; T.a = P; T.done = 0; T.sink = 0; pt_create(ct_reader1, &T, 64u << 10); ct_wait_done_s(&T, 1, 20);
+        ct_result(22, "copy-back on a thread with a 64 KB stack", (T.done == 1 && (u32)T.sink == 0x22222223u) ? 0 : 1, 1);
+        ct_fill(P + 0x1000, 0x1000, 0x22222224u); vk_submit_wait();
+        T.a = P + 0x1000; T.done = 0; T.sink = 0; pt_create(ct_reader1, &T, 32u << 10); ct_wait_done_s(&T, 1, 20);
+        ct_result(22, "copy-back on a thread with a 32 KB stack", (T.done == 1 && (u32)T.sink == 0x22222224u) ? 0 : 1, 1);
+        ct_wd(0, 30);
+    }
+    /* 23: the stale-read gap (review 8) - our own layer reads a page the GPU rewrites every frame, then a game thread
+       reads the same page: it must get the GPU's bytes, not the stale RAM our own read left readable */
+    if (ct_sel(23)) {
+        u64 P = (big ? big + (5u << 20) + 0x40000 : S->lo + 0x70000), pgp = (P - G2S_PT_BASE) >> 16; ct_wd(23, 30);
+        for (int round = 0; round < 2; round++) {
+            u32 v = 0x23230000u + (u32)round, old = 0x23000000u + (u32)round;
+            for (u64 o = 0; o < 0x1000; o += 4) *(volatile u32 *)(P + o) = old;   /* RAM before the GPU write */
+            vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+            ct_fill(P, 0x1000, v); vk_submit_wait();
+            if (g_coh_run) g_coh_run[pgp] = 5;   /* (as if the GPU had rewritten it every frame) */
+            static CohWT O, G; O.a = P; O.done = 0; O.sink = 0; pt_create(coh_wt_once, &O, 1u << 20); ct_wait_done_s(&O, 1, 20);   /* our own layer reads it */
+            G.a = P + 0x10; G.done = 0; G.sink = 0; pt_create(ct_reader1, &G, 1u << 20); ct_wait_done_s(&G, 1, 20);              /* then a game thread */
+            if (g_coh_run) g_coh_run[pgp] = 0;
+            ct_result(23, round ? "... again on the same page" : "our own read of a per-frame GPU page, then a game thread reads it: the GPU's bytes",
+                      (G.done == 1 && (u32)G.sink == v) ? 0 : 1, 1);
+        }
+        ct_wd(0, 30);
+    }
+    /* 24: review 2, N1 - a page copied back while a GPU write to it is being recorded (batch B), then written by the CPU
+       (snapshot-tracked): a later game submit in the same batch (C: its submit-start sync, then a GPU read of the page)
+       must see the CPU's bytes on top of B's - the submit-start copies skip tracked pages (a whole-page copy would undo
+       B's write), so before the fix they reached VRAM only once B had completed */
+    if (ct_sel(24)) {
+        u64 P = (big ? big + (5u << 20) + 0x50000 : S->lo + 0x80000), Q = P + 0x10000; ct_wd(24, 60);
+        for (int round = 0; round < 3; round++) {
+            u32 v0 = 0x24000000u + (u32)round, v1 = 0x24110000u + (u32)round, c1 = 0x24CC0000u + (u32)round;
+            ct_fill(P, 0x1000, v0); ct_fill(Q, 0x1000, 0x24EEEEEEu); vk_submit_wait();
+            ct_fill(P, 0x800, v1);                                  /* B: the GPU writes the first half (recorded) */
+            static CohWT R; R.a = P + 0x10; R.done = 0; pt_create(ct_reader1, &R, 1u << 20); ct_wait_done_s(&R, 1, 20);   /* a game read: copied back */
+            static CohPW W; W.a = P; W.n = 0x1000; W.val = c1; W.done = 0; pt_create(ct_pagewriter, &W, 1u << 20);   /* a game write: the second half */
+            { u64 t0 = plat_ticks(); while (!__atomic_load_n(&W.done, __ATOMIC_ACQUIRE) && plat_ticks() - t0 < plat_ticks_per_sec() * 20) plat_sleep_ms(1); }
+            u64 pgp = (P - G2S_PT_BASE) >> 16; u32 sp = (u32)((P >> 12) & 15);
+            int tracked = (g_coh_pend[pgp] >> sp & 1) && !(g_coh_mask[pgp] >> sp & 1);
+            u64 ps0 = g_coh_npend_sync;
+            vk_shadow_sync();                                       /* C (same batch): what a game submit does first */
+            ct_copy(Q, P, 0x1000);                                  /* C reads the page on the GPU */
+            u64 sent = g_coh_npend_sync - ps0;
+            vk_submit_wait();
+            u64 bad = ct_count_gpu(Q, 0x800, v1) + ct_count_gpu(Q + 0x800, 0x800, c1);
+            char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 24: round "); sb_d(&q, round); sb_s(&q, tracked ? ": the page was snapshot-tracked at C's start" : ": the page was NOT snapshot-tracked at C's start (case not reached)");
+            sb_s(&q, ", tracked pages sent at C's start "); sb_d(&q, (i64)sent); sb_s(&q, "\n"); say(t);
+            ct_result(24, round == 0 ? "CPU write to a tracked page, read by the GPU later in the same batch (C): C sees it on top of B's half" : "... again",
+                      bad + (tracked ? 0 : 1), 0x400 + 1);
+            u64 cr = 0; { static CohWT G; G.a = P + 0x900; G.done = 0; pt_create(ct_reader1, &G, 1u << 20); ct_wait_done_s(&G, 1, 20); cr = (u32)G.sink != c1; }
+            ct_result(24, "... and the CPU still reads its own half afterwards", cr, 1);
+        }
+        ct_wd(0, 30);
+    }
+    /* 21: combined stress - GPU backlog, 4 CPU writers + 2 readers, overlapping and repeated GPU ranges, submit-start
+       syncs, for 400 rounds; then every page's halves checked in RAM and VRAM */
+    if (ct_sel(21)) {
+        if (!big) say("    coh test 21: needs a VRAM copy of 10 MB or more (skipped)\n");
+        else {
+            u64 Z = big + (6u << 20); enum { NW = 4, PPW = 8 }; ct_wd(21, 60);
+            static CohSW W[NW], RD[3]; static u32 gval[NW * PPW];
+            ct_fill(Z, (u64)NW * PPW * 4096, 0x21000000u); vk_submit_wait();
+            for (int i = 0; i < NW * PPW; i++) gval[i] = 0x21000000u;
+            for (int w = 0; w < NW; w++) { W[w].a = Z + (u64)w * PPW * 4096; W[w].np = PPW; W[w].stop = 0; W[w].done = 0; W[w].lost = 0; W[w].id = w; pt_create(ct_stress_writer, &W[w], 1u << 20); }
+            for (int r = 0; r < 3; r++) { RD[r].a = Z; RD[r].np = NW * PPW; RD[r].stop = 0; RD[r].done = 0; RD[r].id = r < 2 ? 0 : -1; pt_create(ct_stress_reader, &RD[r], 1u << 20); }   /* (2 game readers, 1 like our renderer) */
+            for (int i = 0; i < NW * PPW; i += 3) { u64 q = (Z + (u64)i * 4096 - G2S_PT_BASE) >> 16; if (g_coh_run && g_coh_run[q] < 2) g_coh_run[q] = 2; }   /* (some pages count as rewritten every frame: our reads of them take the read-only path) */
+            u64 rnd = 0x2121; g_ct_trace = 1; g_ct_nloss = 0;
+            for (int it = 0; it < 400; it++) {
+                rnd = rnd * 6364136223846793005ull + 1442695040888963407ull;
+                int pg = (int)((rnd >> 33) % (NW * PPW)); u32 v = 0x21000001u + (u32)it;
+                u64 a = Z + (u64)pg * 4096;
+                switch ((rnd >> 20) & 3) {
+                case 0: ct_fill(a, 0x800, v); gval[pg] = v; break;                                 /* one first half */
+                case 1: ct_fill(a, 0x800, v); ct_fill(a, 0x800, v + 0x100000u); gval[pg] = v + 0x100000u; break;   /* the same range twice */
+                case 2: ct_fill(a + 0x400, 0x400, v); ct_fill(a, 0x400, v); gval[pg] = v; break;   /* overlapping pieces of it */
+                default: if (it % 5 == 0) ct_backlog(2, 20); break;                                /* more GPU backlog */
+                }
+                if (it % 7 == 0) vk_submit_async(0, 0);
+                if (it % 11 == 0) { vk_begin_cb(); vk_shadow_sync(); }                             /* what a game submit does first */
+                if (it % 50 == 49) vk_submit_wait();
+                ct_kick();
+            }
+            for (int w = 0; w < NW; w++) __atomic_store_n(&W[w].stop, 1, __ATOMIC_RELEASE);
+            for (int r = 0; r < 3; r++) __atomic_store_n(&RD[r].stop, 1, __ATOMIC_RELEASE);
+            { u64 t0 = plat_ticks(); for (;;) { int d = 0; for (int w = 0; w < NW; w++) d += (int)W[w].done; for (int r = 0; r < 3; r++) d += (int)RD[r].done; if (d == NW + 3 || plat_ticks() - t0 > plat_ticks_per_sec() * 30) break; plat_sleep_ms(5); ct_kick(); } }
+            vk_submit_wait(); vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+            u64 lost = 0, rounds = 0, ram = 0, gpu = 0;
+            for (int w = 0; w < NW; w++) { lost += W[w].lost; rounds += W[w].rounds; }
+            for (int i = 0; i < NW * PPW; i++) {
+                u64 a = Z + (u64)i * 4096; u32 cv = W[i / PPW].k;
+                ram += ct_count(a, 0x800, gval[i]);
+                for (u64 o = 0x800; o < 0x1000; o += 64) ram += *(volatile u32 *)(a + o) != cv;
+                gpu += ct_count_gpu(a, 0x800, gval[i]);
+                { static u8 b[0x800]; csck_read(a + 0x800, 0x800, b); for (u64 o = 0; o < 0x800; o += 64) gpu += *(u32 *)(b + o) != cv; }
+                ct_kick();
+            }
+            g_ct_trace = 0;
+            for (u32 L = 0; L < g_ct_nloss && L < 3; L++) {   /* the page's history before the loss */
+                u64 pa = g_ct_loss[L].a & ~0xFFFull; u64 f = plat_ticks_per_sec() / 1000000; if (!f) f = 1;
+                say("    coh test 21: LOST write at "); say_hex(g_ct_loss[L].a); say(" wanted "); say_hex(g_ct_loss[L].want); say(" found "); say_hex(g_ct_loss[L].got); say("; page history (newest last, us before the loss):\n");
+                u64 nev = g_ct_nev, from = nev > 65536 ? nev - 65536 : 0; int shown = 0;
+                static u64 idx[64]; int ni = 0;
+                for (u64 e = nev; e > from && ni < 40; e--) { const CtEv *E = &g_ct_ev[(e - 1) & 65535];
+                    if ((E->a == pa || (E->kind == 11 && pa >= E->a && pa < E->a + 0x10000) || (E->kind == 9 && pa >= E->a && pa < E->a + 0x10000)) && E->t <= g_ct_loss[L].t + f * 2000) idx[ni++] = e - 1; }
+                for (int q2 = ni - 1; q2 >= 0; q2--) { const CtEv *E = &g_ct_ev[idx[q2] & 65535];
+                    static const char *nm[] = {"?", "copy-back (kept-bytes, read-only after)", "write to read-only: snapshot", "hold pend-diff (ctx, snap)", "hold, not dirty (ctx)", "hold, dirty push (ctx)", "patch flushed (ctx)", "patch applied", "push/sync logged (bytes, seq)", "re-protect entry (mask, seq)", "snapshot freed (slot)", "GPU write (mask, ctx)", "tracked page's CPU bytes sent at a submit (slot)", "held again when its batch went to the GPU (mask)"};
+                    char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "      "); sb_d(&q, (i64)((g_ct_loss[L].t - E->t) / f)); sb_s(&q, " us before: "); sb_s(&q, E->kind < 14 ? nm[E->kind] : "?"); sb_s(&q, " "); sb_x(&q, E->x); sb_s(&q, " "); sb_x(&q, E->y); sb_s(&q, " submitted "); sb_d(&q, E->seq); sb_s(&q, "\n"); say(t); shown++; }
+                if (!shown) say("      (no events)\n");
+            }
+            char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 21: writer rounds "); sb_d(&q, (i64)rounds); sb_s(&q, ", copy-backs so far "); sb_d(&q, (i64)g_coh_nsync); sb_s(&q, "\n"); say(t);
+            ct_result(21, "stress: no CPU write lost under GPU backlog and overlapping GPU writes", lost, rounds * PPW * 32);
+            ct_result(21, "stress: every page's GPU and CPU halves correct afterwards (RAM)", ram, NW * PPW * (512 + 32));
+            ct_result(21, "stress: ... and in VRAM", gpu, NW * PPW * (512 + 32));
+        }
+        ct_wd(0, 30);
+    }
+}
+static void coh_selftest(void) {
+    vk_submit_wait();
+    VShadow *S = 0; for (int i = 0; i < g_nsh; i++) { VShadow *T = &g_sh[i]; if (T->live && !T->wb && !T->ro && T->hi - T->lo >= (1u << 20) && (!S || T->hi - T->lo > S->hi - S->lo)) S = T; }
+    say("\n=== GPU coherence test (t165, --coh-test): "); say(g_coh_mode == 2 ? "with --gpu-coherence" : g_coh_mode == 1 ? "probe mode (no copies)" : "without the coherence change (today's behaviour)"); say(" ===\n");
+    if (!S) { say("    coh test: no VRAM copy of 1 MB or more in this replay\n"); return; }
+    u64 base = (S->hi - (512u << 10)) & ~0xFFFFull, A = base, B = base + (128u << 10), C = base + (320u << 10), D = base + (384u << 10), E = base + (400u << 10), F = base + (416u << 10), G = base + (448u << 10);
+    say("    VRAM copy used: "); say_hex(S->lo); say(" - "); say_hex(S->hi); say(", test area "); say_hex(base); say(" + 512 KB\n");
+    if (g_ct_only >= 14) { coh_selftest2(S); say("    coh test summary: "); say_dec(g_ct_pass); say(" passed, "); say_dec(g_ct_fail); say(" failed\n"); coh_report(); return; }
+    /* 1 */
+    ct_fill(A, 64u << 10, 0x11111111u); vk_submit_wait(); ct_copy(B, A, 64u << 10); vk_submit_wait();
+    ct_result(1, "GPU moves 64 KB, the CPU reads the destination", ct_count(B, 64u << 10, 0x11111111u), (64u << 10) / 4);
+    /* 2 */
+    ct_fill(B, 128u << 10, 0x22222222u); vk_submit_wait();
+    { static CohTT T; T.a = B; T.n = 128u << 10; T.want = 0x22222222u; T.bad = 0; T.done = 0;
+      for (int k = 0; k < 8; k++) pt_create(coh_tt_fn, &T, 1u << 20);
+      u64 t0 = plat_ticks(); while (__atomic_load_n(&T.done, __ATOMIC_ACQUIRE) < 8 && plat_ticks() - t0 < plat_ticks_per_sec() * 60) plat_sleep_ms(5);
+      ct_result(2, T.done == 8 ? "eight threads read 128 KB of GPU-written memory at once" : "eight threads read at once - DID NOT FINISH IN 60 s", T.bad + (T.done == 8 ? 0 : 1), 8ull * 4000 * 16); }
+    /* 3: GPU data in the first 256 bytes of page C (and the page before), CPU data after it */
+    ct_fill(C - 0x1000, 0x1100, 0x33333333u); vk_submit_wait();
+    for (u64 k = 0x100; k < 0x1000; k += 4) *(volatile u32 *)(C + k) = 0x44444444u;   /* the CPU fills its part (an index buffer upload, say) */
+    vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();   /* what the next game submit does first */
+    { u64 b1 = ct_count_gpu(C, 0x100, 0x33333333u), b2 = ct_count_gpu(C + 0x100, 0xF00, 0x44444444u), b3 = ct_count_gpu(C - 0x1000, 0x1000, 0x33333333u);
+      ct_result(3, "shared page: the GPU's bytes in VRAM after the CPU wrote the rest of the page", b1 + b3, (0x100 + 0x1000) / 4);
+      ct_result(3, "shared page: the CPU's bytes reached VRAM", b2, 0xF00 / 4); }
+    /* 4 */
+    ct_fill(D, 0x1000, 0x55555555u); vk_submit_wait();
+    ct_fill(D, 0x1000, 0x66666666u);   /* recorded, not submitted */
+    { u64 b1 = ct_count(D, 0x1000, 0x55555555u); vk_submit_wait(); u64 b2 = ct_count(D, 0x1000, 0x66666666u);
+      ct_result(4, "write still being recorded: the CPU reads the bytes from before it", b1, 0x400);
+      ct_result(4, "after that batch completed: the CPU reads the new bytes", b2, 0x400); }
+    /* 5 */
+    ct_fill(E, 0x4000, 0x01010101u); vk_submit_wait(); ct_fill(E + 0x1800, 0x1000, 0x02020202u); vk_submit_wait();
+    ct_result(5, "two overlapping GPU writes, then a CPU read", ct_count(E, 0x1800, 0x01010101u) + ct_count(E + 0x1800, 0x1000, 0x02020202u) + ct_count(E + 0x2800, 0x1800, 0x01010101u), 0x1000);
+    /* 6 */
+    { ct_fill(F, 0x2000, 0x07070707u); vk_submit_wait();
+      char p[1200]; Sb q = {p, 0, sizeof p}; sb_s(&q, g_cap_dir); sb_s(&q, "/coh_test.bin"); void *h = hf_open_rw(p, 1, 1); static u8 src[0x2000]; for (int i = 0; i < 0x2000; i++) src[i] = 0x77;
+      u64 got = 0; if (h) { hf_write(h, src, 0x2000); hf_close(h); h = hf_open_rb(p); }
+      if (h) { lz_ensure(F, 0x2000); got = hf_read(h, (void *)F, 0x2000); hf_close(h); plat_unlink(p); }
+      ct_result(6, "Windows file read into GPU-written memory", (got == 0x2000 ? 0 : 1) + ct_count(F, 0x2000, 0x77777777u), 0x800); }
+    /* 7 */
+    { for (u64 k = 0; k < 0x800; k += 4) *(volatile u32 *)(G + k) = 0x0A0A0A0Au;
+      vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+      ct_fill(G + 0x800, 0x800, 0x0B0B0B0Bu); vk_submit_wait();
+      ct_result(7, "CPU writes half a page, the GPU the other half, the CPU reads both", ct_count(G, 0x800, 0x0A0A0A0Au) + ct_count(G + 0x800, 0x800, 0x0B0B0B0Bu), 0x400); }
+    /* 8 */
+    { u64 H = base + 0x10000; static CohWT T; T.a = H; T.stop = 0; T.done = 0; T.lost = 0; T.rounds = 0; T.k = 0;
+      ct_fill(H, 0x1000, 0x80808080u); vk_submit_wait();
+      pt_create(coh_wt_writer, &T, 1u << 20); pt_create(coh_wt_reader, &T, 1u << 20); pt_create(coh_wt_reader, &T, 1u << 20);
+      u32 v = 0;
+      for (int i = 0; i < 400; i++) { v = 0x81000000u + (u32)i; ct_fill(H, 0x800, v); vk_submit_wait(); plat_sleep_ms(1); }
+      __atomic_store_n(&T.stop, 1, __ATOMIC_RELEASE); ct_wait_done(&T, 3);
+      u32 k = __atomic_load_n(&T.k, __ATOMIC_ACQUIRE);
+      { char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 8: writer rounds "); sb_d(&q, (i64)T.rounds); sb_s(&q, ", threads finished "); sb_d(&q, (i64)T.done); sb_s(&q, " of 3\n"); say(t); }
+      ct_result(8, "concurrent CPU writer while the page is copied back: its writes all survive", T.lost + (T.done == 3 ? 0 : 1), T.rounds * 512);
+      u64 c1 = ct_count(H, 0x800, v), c2 = ct_count(H + 0x800, 0x800, k);
+      if (g_coh_mask) { u64 pg8 = (H - G2S_PT_BASE) >> 16; u32 s8 = (u32)((H >> 12) & 15); void *dl[1]; char t[300]; Sb q = {t, 0, sizeof t};
+        int np = 0; for (u32 i = 0; i < g_coh_npatch; i++) if (g_coh_patch[i].a == H) for (int k = 0; k < 64; k++) np += __builtin_popcountll(g_coh_patch[i].bits[k]);
+        int nl = 0; for (u32 i = 0; i < g_coh_npl; i++) if (g_coh_pl[i].a < H + 4096 && g_coh_pl[i].a + g_coh_pl[i].n > H) nl++;
+        VShadow *S8 = shadow_of(H, 4096);
+        sb_s(&q, "    coh test 8 state before the final sync: held "); sb_d(&q, g_coh_mask[pg8] >> s8 & 1); sb_s(&q, ", read-only "); sb_d(&q, g_coh_ro[pg8] >> s8 & 1); sb_s(&q, ", snapshot-tracked "); sb_d(&q, g_coh_pend[pg8] >> s8 & 1);
+        sb_s(&q, " (snapshot "); sb_d(&q, coh_snap_find(H) >= 0); sb_s(&q, "), patches "); sb_d(&q, np); sb_s(&q, ", logged pushes "); sb_d(&q, nl); sb_s(&q, ", waiting re-protections "); sb_d(&q, (i64)g_coh_nra);
+        sb_s(&q, ", write-tracked dirty "); sb_d(&q, (i64)plat_dirty_list((void *)H, 4096, dl, 1)); sb_s(&q, ", in the submit's list "); { int inr = 0; for (u32 i = 0; i < g_sh_nrs; i++) if (g_sh_rs[i] == H) inr = 1; sb_d(&q, inr); }
+        sb_s(&q, ", rs_all "); sb_d(&q, S8 ? S8->rs_all : -1); sb_s(&q, ", watch "); sb_d(&q, S8 ? S8->watch : -1); sb_s(&q, "\n"); say(t); }
+      vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+      u64 g1 = ct_count_gpu(H, 0x800, v), g2 = ct_count_gpu(H + 0x800, 0x800, k);
+      ct_result(8, "after it: the CPU reads the GPU's half and its own", c1 + c2, 0x400);
+      ct_result(8, "after it: VRAM has the GPU's half", g1, 0x200);
+      ct_result(8, "after it: VRAM has the CPU's half", g2, 0x200);
+      if (g2) { static u8 b8[0x800]; csck_read(H + 0x800, 0x800, b8); char t[200]; Sb q = {t, 0, sizeof t}; sb_s(&q, "    coh test 8: VRAM CPU half first word "); sb_x(&q, *(u32 *)b8); sb_s(&q, " last "); sb_x(&q, *(u32 *)(b8 + 0x7FC)); sb_s(&q, ", wanted "); sb_x(&q, k); sb_s(&q, "\n"); say(t); } }
+    /* 9 */
+    { u64 F2 = base + 0x18000;
+      char p[1200]; Sb q = {p, 0, sizeof p}; sb_s(&q, g_cap_dir); sb_s(&q, "/coh_test9.bin"); void *h = hf_open_rw(p, 1, 1); static u8 src[0x2000]; for (int i = 0; i < 0x2000; i++) src[i] = 0x99;
+      if (h) { hf_write(h, src, 0x2000); hf_close(h); }
+      ct_fill(F2, 0x2000, 0x09090909u); vk_submit_wait();
+      u64 got = 0; h = hf_open_rb(p); if (h) { got = hf_read(h, (void *)F2, 0x2000); hf_close(h); }
+      ct_result(9, "Windows file read into GPU-written memory through hf_read (no lz_ensure)", (got == 0x2000 ? 0 : 1) + ct_count(F2, 0x2000, 0x99999999u), 0x800);
+      ct_fill(F2, 0x2000, 0x0A0A0A0Au); vk_submit_wait();
+      u32 err = 0; got = 0; h = hf_open_rb(p); if (h) { got = hf_read_raw(h, (void *)F2, 0x2000, &err); hf_close(h); }
+      u64 bad;
+      if (got == 0x2000) bad = ct_count(F2, 0x2000, 0x99999999u);                 /* written (memory not held): the file's bytes */
+      else bad = (err == 998 ? 0 : 1) + ct_count(F2, 0x2000, 0x0A0A0A0Au);         /* refused: memory keeps the GPU's bytes */
+      { char t[200]; Sb r = {t, 0, sizeof t}; sb_s(&r, "    coh test 9: bare ReadFile into the GPU-held page: "); if (got == 0x2000) sb_s(&r, "read 8192 bytes"); else { sb_s(&r, "refused, error "); sb_d(&r, (i64)err); } sb_s(&r, "\n"); say(t); }
+      ct_result(9, "bare ReadFile: either the file's bytes or refused with the GPU's bytes intact (no silent loss)", bad, 0x800);
+      plat_unlink(p); }
+    /* 10 */
+    { u64 I = base + 0x20000;
+      ct_fill(I, 0x1000, 0x10101010u); vk_submit_wait();
+      u64 c0 = ct_count(I, 0x1000, 0x10101010u);
+      for (u64 k = 0x800; k < 0x1000; k += 4) *(volatile u32 *)(I + k) = 0x12121212u;
+      ct_fill(I, 0x800, 0x13131313u); vk_submit_wait();
+      u64 g = ct_count_gpu(I, 0x800, 0x13131313u) + ct_count_gpu(I + 0x800, 0x800, 0x12121212u);
+      u64 c = ct_count(I, 0x800, 0x13131313u) + ct_count(I + 0x800, 0x800, 0x12121212u);
+      ct_result(10, "CPU writes half, GPU the other half in the same submit: VRAM has both", g, 0x400);
+      ct_result(10, "... and the CPU reads both", c0 + c, 0x800); }
+    /* 11 */
+    { u64 K = base + 0x30000; u64 pgk = (K - G2S_PT_BASE) >> 16; static CohWT T; T.a = K; T.done = 0;
+      ct_fill(K, 0x1000, 0x20202020u); vk_submit_wait();
+      if (g_coh_run) g_coh_run[pgk] = 5;   /* (as if the GPU had rewritten it every frame) */
+      pt_create(coh_wt_once, &T, 1u << 20); ct_wait_done(&T, 1);
+      for (u64 k = 0x800; k < 0x1000; k += 4) *(volatile u32 *)(K + k) = 0x21212121u;
+      vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+      u64 g = ct_count_gpu(K, 0x800, 0x20202020u) + ct_count_gpu(K + 0x800, 0x800, 0x21212121u);
+      u64 c = ct_count(K, 0x800, 0x20202020u) + ct_count(K + 0x800, 0x800, 0x21212121u);
+      if (g_coh_run) g_coh_run[pgk] = 0;
+      ct_result(11, "our own read of a per-frame GPU page, then a CPU write: VRAM keeps the GPU's half", g, 0x400);
+      ct_result(11, "... and the CPU reads the GPU's half and its own", c, 0x400); }
+    /* 12 */
+    { u64 L = base + 0x8000;
+      ct_fill(L, 0x1000, 0x30303030u); vk_submit_wait();
+      ct_fill(L, 0x800, 0x31313131u);   /* recorded, not submitted */
+      for (u64 k = 0x800; k < 0x1000; k += 4) *(volatile u32 *)(L + k) = 0x32323232u;
+      vk_submit_wait();
+      u64 c = ct_count(L, 0x800, 0x31313131u) + ct_count(L + 0x800, 0x800, 0x32323232u);
+      vk_begin_cb(); vk_shadow_sync(); vk_submit_wait();
+      u64 g = ct_count_gpu(L, 0x800, 0x31313131u) + ct_count_gpu(L + 0x800, 0x800, 0x32323232u);
+      ct_result(12, "CPU writes half a page while the GPU's write to the other half is recorded: the CPU reads both", c, 0x400);
+      ct_result(12, "... and VRAM has both", g, 0x400); }
+    /* 13 (t165v): cost of our own per-frame page handling, seen from the reading thread - protect again (as a GPU write
+       does), then one read from an unregistered thread (our own layer): Windows' fault dispatch + handler + read-only */
+    if (g_coh_mask && g_coh_run) {
+        u64 K = base + 0x40000, pgk = (K - G2S_PT_BASE) >> 16; static CohWT T; T.a = K; T.done = 0;
+        ct_fill(K, 0x10000, 0x40404040u); vk_submit_wait(); g_coh_run[pgk] = 5;
+        T.stop = 0; T.lost = 0; T.rounds = 0; T.sink = 0;
+        pt_create(coh_bench_fn, &T, 1u << 20); ct_wait_done(&T, 1);
+        g_coh_run[pgk] = 0;
+        u64 us = plat_ticks_per_sec() / 1000000; if (!us) us = 1;
+        char t[300]; Sb q = {t, 0, sizeof t};
+        sb_s(&q, "    coh test 13: own-read cycle (64 KB page: protect again + fault + read-only), "); sb_d(&q, (i64)T.rounds); sb_s(&q, " cycles: protect "); sb_d(&q, (i64)(g_cb_t_hold / us * 1000 / (T.rounds ? T.rounds : 1)));
+        sb_s(&q, " ns, fault to read done "); sb_d(&q, (i64)(g_cb_t_fault / us * 1000 / (T.rounds ? T.rounds : 1))); sb_s(&q, " ns per cycle\n"); say(t);
+    }
+    coh_selftest2(S);
+    say("    coh test summary: "); say_dec(g_ct_pass); say(" passed, "); say_dec(g_ct_fail); say(" failed\n");
+    coh_report();
 }
 #include "e6_capture.c"   /* replay captures (RENDERER_PLAN stage 1) */
 #endif

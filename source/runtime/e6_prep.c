@@ -58,6 +58,17 @@ enum { PCOV_NONE, PCOV_PREPARED, PCOV_KNOWN, PCOV_NEW, PCOV_AGAIN, PCOV_N };   /
 static u64 g_pcov_n[PCOV_N], g_pcov_ms[PCOV_N], g_pcov_slow[PCOV_N], g_pcov_mf, g_pcov_mf_ms; static int g_pcov_logged;
 static u64 g_pcov_start_total, g_pcov_start_ok, g_pcov_start_failed, g_pcov_start_left, g_pcov_start_ms, g_pcov_mf_total, g_pcov_mf_records;
 
+<<<<<<< Updated upstream
+=======
+/* t164 background preparation (--prep-background, shader_preparation = 2): the screen is shown for at most
+   g_prep_fg_ms (or until Esc / Circle); what is left is then prepared during play on fewer worker threads at the lowest
+   priority. Pipelines the game needs before the background reaches them are compiled by the renderer as before (the
+   background then finds them in the pipeline cache). While it runs, the records are not saved (their file is open for
+   reading); the exit waits for the workers (each finishes the pipeline it is making). */
+static int g_prep_bg_mode, g_prep_fg_ms = 20000;
+static volatile long g_prep_bg_running, g_prep_bg_n, g_prep_bg_fin; static void *g_prep_th[16]; static u64 g_prep_bg_t0;
+static void prep_bg_finish(void);
+>>>>>>> Stashed changes
 static u32 prep_rd16(const u8 *p) { return (u32)p[0] | (u32)p[1] << 8; }
 static u32 prep_rd32(const u8 *p) { return prep_rd16(p) | prep_rd16(p + 2) << 16; }
 #define PREP_NST(r) ((r)->kind == 1 ? 2u : 1u)   /* stages: graphics VS + PS, compute CS */
@@ -319,6 +330,10 @@ static void prep_tsave(void) {   /* (from prep_save) */
 /* write what is new (with the pipeline cache saves: background thread, and at exit) */
 static void prep_save(void) {
     if (!g_prep_rec_on) return;
+<<<<<<< Updated upstream
+=======
+    if (__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE)) return;   /* t164: the background preparation reads the module file (saved once it ends) */
+>>>>>>> Stashed changes
     prep_tsave();   /* t160 */
     pm_lock(&g_prep_m);
     int nn = g_prep_nnew; PrepNewMod *nm = 0;
@@ -634,7 +649,11 @@ static int prep_present(u32 done, u32 total, u32 compiled, u32 cached, u64 elaps
     vk_begin_cb();
     VSlot *PS = &g_slot[g_slot_cur]; u32 idx = 0;
     VkResult r = vkAcquireNextImageKHR(V.dev, V.sw, 200000000ull, PS->acq, 0, &idx);
+<<<<<<< Updated upstream
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_submit_async(0, 0); vk_wait_all(); vkDeviceWaitIdle(V.dev); vk_make_swapchain(); pm_unlock(&g_gpu_lock); return 0; } }
+=======
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_submit_async(0, 0); vk_wait_all(); { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); pm_unlock(&g_gpu_lock); return 0; } }
+>>>>>>> Stashed changes
     if (r < 0 || r == VK_TIMEOUT || r == VK_NOT_READY) { vk_submit_async(0, 0); vk_wait_all(); pm_unlock(&g_gpu_lock); return 0; }
     VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, 0, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_prep_img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
@@ -652,9 +671,15 @@ static int prep_present(u32 done, u32 total, u32 compiled, u32 cached, u64 elaps
     if (!g_prep_done_sem[idx & 7]) { VkSemaphoreCreateInfo semi = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; vkCreateSemaphore(V.dev, &semi, 0, &g_prep_done_sem[idx & 7]); }
     vk_submit_async(PS->acq, g_prep_done_sem[idx & 7]);
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, 0, 1, &g_prep_done_sem[idx & 7], 1, &V.sw, &idx, 0};
+<<<<<<< Updated upstream
     r = vkQueuePresentKHR(V.q, &pi);
     vk_wait_all();   /* (the canvas buffer is written again for the next frame) */
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(V.dev); vk_make_swapchain(); }
+=======
+    qm_lock(); r = vkQueuePresentKHR(V.q, &pi); qm_unlock();
+    vk_wait_all();   /* (the canvas buffer is written again for the next frame) */
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); }
+>>>>>>> Stashed changes
     pm_unlock(&g_gpu_lock);
     return 1;
 }
@@ -673,7 +698,12 @@ static void prep_save_bmp(void) {   /* the canvas as last drawn (test: --prep-sh
     plat_close(f);
 }
 /* ---------------- preparing ---------------- */
+<<<<<<< Updated upstream
 typedef struct { int rec; VkPipelineLayout pl; } PrepJob;
+=======
+typedef struct { int rec; VkPipelineLayout pl; int mi[2]; } PrepJob;   /* (t164: module indices found before the workers start) */
+
+>>>>>>> Stashed changes
 static PrepJob *g_pj_list; static int g_pj_n;
 static volatile long g_prep_next, g_prep_done, g_prep_compiled, g_prep_cached, g_prep_failed, g_prep_stop, g_prep_workers_left;
 static VkShaderModule *g_prep_vmod; static volatile long *g_prep_vmod_st;   /* per module: 0 not made, 1 being made, 2 made, 3 failed */
@@ -701,16 +731,28 @@ static VkShaderModule prep_module(int mi, void *fh, u8 **zb, size_t *zcap, u32 *
     return m;
 }
 static u32 WINAPI prep_worker(void *arg) {
+<<<<<<< Updated upstream
     (void)arg;
+=======
+    long me = (long)(intptr_t)arg;
+>>>>>>> Stashed changes
     void *fh = hf_open_rb(g_prep_spath);
     u8 *zb = 0, *work = 0; u32 *wb = 0; size_t zcap = 0, wcap = 0, workcap = 0;
     for (;;) {
         if (__atomic_load_n(&g_prep_stop, __ATOMIC_ACQUIRE)) break;
+<<<<<<< Updated upstream
+=======
+        if (__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE) && me >= __atomic_load_n(&g_prep_bg_n, __ATOMIC_ACQUIRE)) break;   /* t164: fewer threads in the background */
+>>>>>>> Stashed changes
         long i = __atomic_fetch_add(&g_prep_next, 1, __ATOMIC_ACQ_REL);
         if (i >= g_pj_n) break;
         const PrepRec *R = &g_prep_rec[g_pj_list[i].rec];
         VkShaderModule m[2] = {0, 0}; int ok = fh != 0;
+<<<<<<< Updated upstream
         for (u32 s = 0; s < PREP_NST(R) && ok; s++) { int mi = prep_find_mod(R->mw[s][0], R->mw[s][1]); m[s] = mi >= 0 ? prep_module(mi, fh, &zb, &zcap, &wb, &wcap, &work, &workcap) : 0; if (!m[s]) ok = 0; }
+=======
+        for (u32 s = 0; s < PREP_NST(R) && ok; s++) { int mi = g_pj_list[i].mi[s]; m[s] = mi >= 0 ? prep_module(mi, fh, &zb, &zcap, &wb, &wcap, &work, &workcap) : 0; if (!m[s]) ok = 0; }
+>>>>>>> Stashed changes
         if (!ok) { g_prep_st[g_pj_list[i].rec] = 2; __atomic_add_fetch(&g_prep_failed, 1, __ATOMIC_ACQ_REL); __atomic_add_fetch(&g_prep_done, 1, __ATOMIC_ACQ_REL); continue; }
         PJob j; h_memset(&j, 0, sizeof j);   /* the create info as the renderer builds it (e6_vk.c), from the record */
         VkPipeline p = 0; VkResult r;
@@ -746,7 +788,11 @@ static u32 WINAPI prep_worker(void *arg) {
         __atomic_add_fetch(&g_prep_done, 1, __ATOMIC_ACQ_REL);
     }
     free(zb); free(wb); free(work); if (fh) hf_close(fh);
+<<<<<<< Updated upstream
     __atomic_sub_fetch(&g_prep_workers_left, 1, __ATOMIC_ACQ_REL);
+=======
+    if (__atomic_sub_fetch(&g_prep_workers_left, 1, __ATOMIC_ACQ_REL) == 0 && __atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE)) prep_bg_finish();   /* t164: the last background worker */
+>>>>>>> Stashed changes
     return 0;
 }
 /* ---------------- t161: coverage - which pipelines the game created were prepared at the start ----------------
@@ -762,13 +808,35 @@ static void prep_cov_done(const PJob *j, u64 ms) {
         vl("  pipeline not prepared at the start (t161; recorded for the next start): "); vl(j->compute ? "CS " : "VS "); vl_x(j->vs_addr);
         if (!j->compute) { vl(" PS "); vl_x(j->ps_addr); } vl(", "); vl_d((i64)ms); vl(" ms, flip "); vl_d((i64)g_flips); vl("\n"); }
 }
+<<<<<<< Updated upstream
+=======
+/* t163: the F5 mark (and the 60-flip line): pipelines made this session so far - prepared at the start, new (first seen,
+   recorded for the next start) - so a session that visits several places can be split by the marks */
+static u64 g_prep_marks;
+static void prep_counts(Sb *t) {
+    u64 made = 0; for (int c = 1; c < PCOV_N; c++) made += g_pcov_n[c];
+    sb_s(t, "pipelines made "); sb_d(t, (i64)made); sb_s(t, ", prepared at the start "); sb_d(t, (i64)g_pcov_n[PCOV_PREPARED]);
+    sb_s(t, ", new "); sb_d(t, (i64)(g_pcov_n[PCOV_NEW] + g_pcov_n[PCOV_AGAIN])); sb_s(t, " ("); sb_d(t, (i64)(g_pcov_ms[PCOV_NEW] + g_pcov_ms[PCOV_AGAIN])); sb_s(t, " ms)");
+    sb_s(t, ", records "); sb_d(t, (i64)g_prep_nrec);
+}
+static void prep_mark(void) {
+    char l[400]; Sb t = {l, 0, sizeof l};
+    sb_s(&t, "    MARK "); sb_d(&t, (i64)++g_prep_marks); sb_s(&t, " (F5) at flip "); sb_d(&t, (i64)g_flips); sb_s(&t, ": "); prep_counts(&t); sb_s(&t, "\n");
+    say(l);   /* (UntilDawn.log only: the Vulkan log belongs to the renderer's thread) */
+}
+>>>>>>> Stashed changes
 static void prep_report(void) {
     if (!g_prep_rec_on) return;
     u64 made = 0, made_ms = 0; for (int c = 1; c < PCOV_N; c++) { made += g_pcov_n[c]; made_ms += g_pcov_ms[c]; }
     char l[900]; Sb t = {l, 0, sizeof l};
     sb_s(&t, "    shader preparation coverage (t161): ");
     if (g_pcov_mf_total) { sb_s(&t, "manifest "); sb_d(&t, (i64)g_pcov_mf_total); sb_s(&t, " pipelines ("); sb_d(&t, (i64)g_pcov_mf_records); sb_s(&t, " among the records here); "); }
+<<<<<<< Updated upstream
     if (g_pcov_start_total) { sb_s(&t, "at the start "); sb_d(&t, (i64)g_pcov_start_total); sb_s(&t, " recorded pipelines: "); sb_d(&t, (i64)g_pcov_start_ok); sb_s(&t, " prepared, ");
+=======
+    if (__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE)) { sb_s(&t, "background preparation (t164) still running: "); sb_d(&t, (i64)__atomic_load_n(&g_prep_done, __ATOMIC_ACQUIRE)); sb_s(&t, " of "); sb_d(&t, (i64)g_pj_n); sb_s(&t, " done; "); }
+    else if (g_pcov_start_total) { sb_s(&t, "at the start "); sb_d(&t, (i64)g_pcov_start_total); sb_s(&t, " recorded pipelines: "); sb_d(&t, (i64)g_pcov_start_ok); sb_s(&t, " prepared, ");
+>>>>>>> Stashed changes
         sb_d(&t, (i64)g_pcov_start_failed); sb_s(&t, " failed, "); sb_d(&t, (i64)g_pcov_start_left); sb_s(&t, " left by a skip ("); sb_d(&t, (i64)g_pcov_start_ms); sb_s(&t, " ms); "); }
     else sb_s(&t, "no preparation at this start; ");
     sb_s(&t, "this session made "); sb_d(&t, (i64)made); sb_s(&t, " pipelines ("); sb_d(&t, (i64)made_ms); sb_s(&t, " ms of driver time): "); sb_d(&t, (i64)g_pcov_n[PCOV_PREPARED]); sb_s(&t, " prepared at the start (");
@@ -971,7 +1039,13 @@ static void prep_run(void) {
             for (u32 s = 0; s < PREP_NST(R); s++) if (prep_find_mod(R->mw[s][0], R->mw[s][1]) < 0) ok = 0;
             if (!ok) continue;
             VLayout *L = vk_layout(R->sig); if (!L) continue;
+<<<<<<< Updated upstream
             g_pj_list[g_pj_n].rec = i; g_pj_list[g_pj_n].pl = L->pl; g_pj_n++;
+=======
+            g_pj_list[g_pj_n].rec = i; g_pj_list[g_pj_n].pl = L->pl;
+            for (u32 s = 0; s < 2; s++) g_pj_list[g_pj_n].mi[s] = s < PREP_NST(R) ? prep_find_mod(R->mw[s][0], R->mw[s][1]) : -1;
+            g_pj_n++;
+>>>>>>> Stashed changes
         }
     pm_unlock(&g_prep_m);
     if (!g_pj_n) { free(g_pj_list); free(g_prep_vmod); free((void *)g_prep_vmod_st); g_pj_list = 0; g_prep_vmod = 0; g_prep_vmod_st = 0;
@@ -980,19 +1054,45 @@ static void prep_run(void) {
     g_prep_next = g_prep_done = g_prep_compiled = g_prep_cached = g_prep_failed = g_prep_stop = 0;
     int nt = plat_ncpu() - 1; if (nt < 2) nt = 2; if (nt > 16) nt = 16;
     g_prep_workers_left = nt;
+<<<<<<< Updated upstream
     for (int i = 0; i < nt; i++) if (!CreateThread(0, 1u << 20, (void *)prep_worker, 0, 0, 0)) __atomic_sub_fetch(&g_prep_workers_left, 1, __ATOMIC_ACQ_REL);
+=======
+    for (int i = 0; i < nt; i++) { g_prep_th[i] = CreateThread(0, 1u << 20, (void *)prep_worker, (void *)(intptr_t)i, 0, 0); if (!g_prep_th[i]) __atomic_sub_fetch(&g_prep_workers_left, 1, __ATOMIC_ACQ_REL); }
+    int to_bg = 0;
+>>>>>>> Stashed changes
     while (__atomic_load_n(&g_prep_workers_left, __ATOMIC_ACQUIRE) > 0) {
         plat_sleep_ms(shown ? 33 : 20);
         u64 now = plat_ticks(), ms = (now - t0) * 1000 / f;
         long done = __atomic_load_n(&g_prep_done, __ATOMIC_ACQUIRE);
         { static long last_done = -1; if (done != last_done) { last_done = done; g_rwd_prog++; } }   /* (replay watchdog: progress) */
         if (!shown && ms >= 500 && done < g_pj_n) { prep_font_load(); shown = 1; shown_at = now;   /* (now: taken before the font load; the elapsed times below never go negative) */ say("    shader preparation: preparing "); say_dec(g_pj_n); say(" pipelines (screen shown; Esc / Circle skips)\n"); }
+<<<<<<< Updated upstream
+=======
+        if (g_prep_bg_mode && !g_prep_exit && (ms >= (u64)g_prep_fg_ms || (shown && prep_skip_pressed()))) { to_bg = 1; break; }   /* t164: the rest in the background */
+>>>>>>> Stashed changes
         if (shown) {
             if (!skipped && (prep_skip_pressed() || (g_prep_skip_after_ms && (now - shown_at) * 1000 / f >= (u64)g_prep_skip_after_ms))) { skipped = 1; __atomic_store_n(&g_prep_stop, 1, __ATOMIC_RELEASE); say("    shader preparation: skipped by the player at "); say_dec(done); say(" of "); say_dec(g_pj_n); say("\n"); }
             if (g_prep_shot == 1 && (now - shown_at) * 1000 / f >= 1500) { g_prep_shot = 2; pm_lock(&g_gpu_lock); prep_save_bmp(); pm_unlock(&g_gpu_lock); }
             prep_present((u32)done, (u32)g_pj_n, (u32)__atomic_load_n(&g_prep_compiled, __ATOMIC_ACQUIRE), (u32)__atomic_load_n(&g_prep_cached, __ATOMIC_ACQUIRE), (now - shown_at) * 1000 / f + 1, skipped);
         }
     }
+<<<<<<< Updated upstream
+=======
+    if (to_bg) {   /* t164 */
+        long bn = nt / 4; if (bn < 2) bn = 2; if (bn > 6) bn = 6;
+        g_prep_bg_n = bn; g_prep_bg_t0 = t0;
+        __atomic_store_n(&g_prep_bg_running, 1, __ATOMIC_RELEASE);
+        for (int i = 0; i < nt; i++) if (g_prep_th[i]) plat_thread_priority(g_prep_th[i], -2 /* THREAD_PRIORITY_LOWEST */);
+        long done = __atomic_load_n(&g_prep_done, __ATOMIC_ACQUIRE);
+        say("    shader preparation (t164): "); say_dec(done); say(" of "); say_dec(g_pj_n); say(" pipelines before the game ("); say_dec((i64)((plat_ticks() - t0) * 1000 / f)); say(" ms); the other ");
+        say_dec(g_pj_n - done); say(" are prepared in the background on "); say_dec(bn); say(" threads\n");
+        if (shown) { pm_lock(&g_gpu_lock); vk_wait_all(); prep_canvas_free(); pm_unlock(&g_gpu_lock); for (int k = 0; k < 500 && prep_skip_pressed(); k++) plat_sleep_ms(10); }
+        g_pcov_start_total = (u64)g_pj_n; g_pcov_start_ms = (plat_ticks() - t0) * 1000 / f;
+        pm_lock(&g_prep_m); g_prep_nrec_start = g_prep_nrec; pm_unlock(&g_prep_m);
+        if (__atomic_load_n(&g_prep_workers_left, __ATOMIC_ACQUIRE) == 0) prep_bg_finish();   /* (all ended in the meantime; it runs once) */
+        return;
+    }
+>>>>>>> Stashed changes
     if (shown) { pm_lock(&g_gpu_lock); vk_wait_all(); prep_canvas_free(); pm_unlock(&g_gpu_lock);
         if (skipped) for (int k = 0; k < 500 && prep_skip_pressed(); k++) plat_sleep_ms(10); }   /* (the skip press does not reach the game) */
     for (int i = 0; i < g_prep_nmod; i++) if (g_prep_vmod[i]) vkDestroyShaderModule(V.dev, g_prep_vmod[i], 0);
@@ -1008,3 +1108,26 @@ static void prep_run(void) {
     pm_lock(&g_prep_m); g_prep_nrec_start = g_prep_nrec; pm_unlock(&g_prep_m);   /* t161: records after this were first seen in this session */
     if (g_prep_compiled) vk_save_pcache_bg();
 }
+<<<<<<< Updated upstream
+=======
+/* t164: the background preparation ended (all done, or stopped at exit): what prep_run does at the end otherwise */
+static void prep_bg_finish(void) {
+    if (__atomic_exchange_n(&g_prep_bg_fin, 1, __ATOMIC_ACQ_REL)) return;
+    u64 f = plat_ticks_per_sec(), ms = (plat_ticks() - g_prep_bg_t0) * 1000 / f;
+    for (int i = 0; i < g_prep_nmod; i++) if (g_prep_vmod && g_prep_vmod[i]) vkDestroyShaderModule(V.dev, g_prep_vmod[i], 0);
+    long left = g_pj_n - __atomic_load_n(&g_prep_done, __ATOMIC_ACQUIRE);
+    free(g_pj_list); free(g_prep_vmod); free((void *)g_prep_vmod_st); g_pj_list = 0; g_prep_vmod = 0; g_prep_vmod_st = 0;
+    for (int i = 0; i < 16; i++) if (g_prep_th[i]) { CloseHandle(g_prep_th[i]); g_prep_th[i] = 0; }
+    g_pcov_start_ok = (u64)(g_prep_cached + g_prep_compiled); g_pcov_start_failed = (u64)g_prep_failed; g_pcov_start_left = (u64)left; g_pcov_start_ms = ms;
+    say("    shader preparation (t164, background): "); say_dec(g_pj_n); say(" recorded pipelines: "); say_dec(g_prep_cached); say(" already prepared, "); say_dec(g_prep_compiled);
+    say(" compiled, "); say_dec(g_prep_failed); say(" failed"); if (left) { say(", "); say_dec(left); say(" not reached (stopped at exit)"); }
+    say("; "); say_dec((i64)ms); say(" ms from the start of the preparation, flip "); say_dec((i64)g_flips); say("\n");
+    __atomic_store_n(&g_prep_bg_running, 0, __ATOMIC_RELEASE);
+    if (g_prep_compiled && !__atomic_load_n(&g_prep_stop, __ATOMIC_ACQUIRE)) vk_save_pcache_bg();   /* (records and modules too, now that the file is free) */
+}
+static void prep_bg_stop(void) {   /* at exit (vk_save_pcache): the workers finish the pipeline they are making */
+    if (!__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&g_prep_stop, 1, __ATOMIC_RELEASE);
+    for (int k = 0; k < 1500 && __atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE); k++) plat_sleep_ms(10);
+}
+>>>>>>> Stashed changes

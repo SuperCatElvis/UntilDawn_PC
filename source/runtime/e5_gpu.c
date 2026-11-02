@@ -373,7 +373,7 @@ static void pm4_parse(const u32 *p, u64 ndw, int engine /*0 graphics DE, 1 const
                 }
                 break;
             case 0x10:                        /* NOP: our tagged driver packets */
-                if (len >= 3 && b[0] == HLE_TAG && b[1] < 32) { g_hle_calls[b[1]]++; if (b[1] == 12 && engine == 0) g_emb_vs = 1; }
+                if (len >= 3 && b[0] == HLE_TAG && b[1] < 32) { g_hle_calls[b[1]]++; if (b[1] == 12 && engine == 0) g_emb_vs = 1; if (b[1] == 20 && engine == 0) st_init_default_hw(); }   /* t162: default state (scissors) */
                 break;
             }
             i += len;
@@ -760,13 +760,14 @@ static void fp_rearm_all(void) {
     PThread *me = cur_thread();
     for (int i = 0; i < g_nthreads; i++) { PThread *t = g_threads[i];
         if (!t || t == me || !t->host || t->done || (t->name[0] == 'E' && t->name[1] == '6' && t->name[2] == ' ')) continue;
-        if (SuspendThread(t->host) == 0xFFFFFFFFu) continue;
+        plat_stop_lock();   /* t165w (review 2, N5): not while another suspender runs */
+        if (SuspendThread(t->host) == 0xFFFFFFFFu) { plat_stop_unlock(); continue; }
         for (u64 z = 0; z < sizeof ctx; z++) ctx[z] = 0;
         *(u32 *)(ctx + 0x30) = 0x100009;   /* CONTEXT_CONTROL | CONTEXT_FLOATING_POINT */
         if (GetThreadContext(t->host, ctx) && !(*(u32 *)(ctx + 0x44) & 0x100)) {   /* not between a trap and its single step */
             u32 *mx1 = (u32 *)(ctx + 0x34), *mx2 = (u32 *)(ctx + 0x118);
             if (*mx2 & 0x280) { u32 v = *mx2 & ~0x2BFu; *mx1 = v; *mx2 = v; SetThreadContext(t->host, ctx); } }
-        ResumeThread(t->host); }
+        ResumeThread(t->host); plat_stop_unlock(); }
     { u32 m; __asm__ volatile("stmxcsr %0" : "=m"(m)); m &= ~0x2BFu; __asm__ volatile("ldmxcsr %0" : : "m"(m)); }
     g_fp_rearms++;
 }
@@ -818,6 +819,7 @@ static void do_flip(int idx, i64 arg) {
             u64 now2 = plat_ticks();
             say("    flips "); say_dec((i64)g_flips); say(", submits "); say_dec((i64)g_submits); say(", draws so far "); say_dec((i64)g_draws); say(", shaders "); say_dec(g_nshaders);
             if (t60) { u64 fps10 = (u64)60 * 10 * tf / (now2 - t60 ? now2 - t60 : 1); say(", fps "); say_dec((i64)(fps10 / 10)); say("."); say_dec((i64)(fps10 % 10)); say(" (slowest frame "); say_dec(worst); say(" ms)"); }
+            if (g_prep_rec_on && !g_rp_running) { char l[300]; Sb t = {l, 0, sizeof l}; sb_s(&t, "; "); prep_counts(&t); say(l); }   /* t163 */
             say("\n");
             if (t60 && !g_rp_running) vkr_perf_window(g_flips, now2 - t60, g_draws);
             if (g_flips % 600 == 0 && !g_rp_running) mem_report("every 10 s");
@@ -1264,13 +1266,14 @@ static void prof_report(void);
 /* one sample of one thread: pause it, read rip / rsp, let it run on, then attribute (game code, our exe by 16-byte block,
    other modules, or the thread's wait / last OS call). t: the game thread (0: the replay thread); i: its index (-1) */
 static void prof_one(ProfT *P, void *h, const PThread *t, int i, u8 *ctx) {
-    if (SuspendThread(h) == 0xFFFFFFFFu) return;
+    plat_stop_lock();   /* t165w (review 2, N5) */
+    if (SuspendThread(h) == 0xFFFFFFFFu) { plat_stop_unlock(); return; }
     for (u64 z = 0; z < 0x40; z++) ctx[z] = 0;
     *(u32 *)(ctx + 0x30) = 0x100001;           /* CONTEXT_CONTROL */
     int ok = GetThreadContext(h, ctx);
     int ix = t ? t->last_ix : 0; const char *wt = t ? t->wait : 0;
     u64 rsp = *(u64 *)(ctx + 0x98);
-    ResumeThread(h);
+    ResumeThread(h); plat_stop_unlock();
     if (!ok) return;
     u64 rip = *(u64 *)(ctx + 0xF8);
     int rend = !t || (t->name[0] == 'E' && t->name[1] == '6');   /* the renderer thread (or the replay thread) */
@@ -1357,7 +1360,12 @@ static void rwd_one(const char *name, int ix, void *h) {
     if (!h) { say(" (no handle)\n"); return; }
     for (u64 z = 0; z < 0x40; z++) ctx[z] = 0;
     *(u32 *)(ctx + 0x30) = 0x100001;           /* CONTEXT_CONTROL */
+<<<<<<< Updated upstream
     if (SuspendThread(h) == 0xFFFFFFFFu) { say(" (could not pause it)\n"); return; }
+=======
+    plat_stop_lock();   /* t165w (review 2, N5) */
+    if (SuspendThread(h) == 0xFFFFFFFFu) { plat_stop_unlock(); say(" (could not pause it)\n"); return; }
+>>>>>>> Stashed changes
     int ok = GetThreadContext(h, ctx);
     u64 rip = *(u64 *)(ctx + 0xF8), rsp = *(u64 *)(ctx + 0x98);
     if (ok && rsp && !(rsp & 7)) {   /* (read while it is paused: the stack cannot change under us) */
@@ -1368,7 +1376,11 @@ static void rwd_one(const char *name, int ix, void *h) {
             for (u64 q = 0; q < nq && nr < 12; q++) { u64 v = sp[q];
                 if (v > g_rwd_exe_lo + 0x1006 && v < g_rwd_exe_hi) { const u8 *c = (const u8 *)v;
                     if (c[-5] == 0xE8 || (c[-6] == 0xFF && (c[-5] == 0x15 || (c[-5] & 0xF8) == 0x90)) || (c[-2] == 0xFF && (c[-1] & 0xF8) == 0xD0) || (c[-3] == 0xFF && (c[-2] & 0xF8) == 0x50)) ret[nr++] = v; } } } }
+<<<<<<< Updated upstream
     ResumeThread(h);
+=======
+    ResumeThread(h); plat_stop_unlock();
+>>>>>>> Stashed changes
     if (!ok) { say(" (no context)\n"); return; }
     say(" at "); rwd_where(rip); say("\n    returns into our code:");
     for (int k = 0; k < nr; k++) { say(" "); rwd_where(ret[k]); }
@@ -1524,9 +1536,12 @@ static void e5_print_gpu_summary(void) {
 static void e5_finish(const char *why) {
     if (__atomic_exchange_n(&g_finishing, 1, __ATOMIC_ACQ_REL)) { for (;;) plat_sleep_ms(1000); }
     say("\n>>> stopping: "); say(why); say("\n");
+    plat_log_flush(0, 2000, 1);   /* t165: the stop reason on disk at once (a stop that hangs later is then visible) */
     g_normal_exit = 1;   /* the player closed the game / the frame limit: no error message */
     rc_wait_writer();
+    say("    (stopping: capture writer idle)\n"); plat_log_flush(0, 2000, 1);
     e5_write_report();
+    say("    (stopping: report files written)\n"); plat_log_flush(0, 2000, 1);
     say("\nwhere each game thread is now:");
     sample_other_threads();
     e5_print_gpu_summary();

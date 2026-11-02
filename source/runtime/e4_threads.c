@@ -82,7 +82,9 @@ static const char *cur_thread_name(void) { PThread *t = cur_thread(); return t ?
    running half-broken behind it (it used to keep rendering until a loading screen waited forever for the dead thread) */
 static void pt_suspend_others(void) {
     PThread *me = cur_thread();
+    plat_stop_lock();   /* t165w: not while another suspender runs (kept: the process is ending) */
     for (int i = 0; i < g_nthreads; i++) { PThread *t = g_threads[i]; if (t && t != me && t->host && !t->done) plat_suspend_thread(t->host); }
+    plat_stop_unlock();   /* t165w (review 2, N14): released - a later stop / resume pair leaves these threads suspended (counts) */
 }
 static void note_thread_call(int idx, u64 ret, u64 a, u64 b, u64 c) {
     PThread *t = cur_thread(); if (!t) return;

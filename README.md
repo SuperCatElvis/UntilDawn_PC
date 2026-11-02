@@ -7,7 +7,11 @@ This project aims to bring the original **Until Dawn (2015)** to PC, running nat
 Development is ongoing. A full play-through was completed on the development PC with WIP 0.1.3 (later versions have so far been tested in shorter sessions), but the port is **not yet a polished or consistently smooth experience**.
 
 > [!WARNING]
+<<<<<<< Updated upstream
 > **Still an early work-in-progress.** Expect graphical glitches, crashes, shader-compilation pauses and frame-rate drops. v0.2.1 prepares the game's shaders before it starts, so the scenes it covers no longer pause to compile them during play. WIP 0.2.0 fixed several long-standing problems — the disappearing arm and collectibles during item inspection, black mouths after the prologue, freezes caused by log writes and a random start-up crash — and added fixes for long sessions and laptops with two GPUs that still need testing. The memory corruption behind most crashes is **not fixed yet**, and the heaviest scenes still run **below 30 FPS**, even on the development PC. Performance, stability and hardware support will keep improving in future releases, but there is no guaranteed timetable.
+=======
+> **Still an early work-in-progress.** Expect graphical glitches, crashes, shader-compilation pauses and frame-rate drops. Since v0.2.1 the game's shaders are prepared before it starts, so the scenes covered by the shader list no longer pause to compile them during play; v0.3.0 extends the list to the opening of every chapter, adds **GPU coherence** (which fixes the lake water vanishing and characters' geometry stretching across the screen in Chapter 10), fixes a crash when loading chapters and the character-introduction letterbox bars. WIP 0.2.0 fixed several long-standing problems — the disappearing arm and collectibles during item inspection, black mouths after the prologue, freezes caused by log writes and a random start-up crash — and added fixes for long sessions and laptops with two GPUs that still need testing. The memory corruption behind most crashes is **not fixed yet**, and the heaviest scenes still run **below 30 FPS**, even on the development PC. Performance, stability and hardware support will keep improving in future releases, but there is no guaranteed timetable.
+>>>>>>> Stashed changes
 
 > [!IMPORTANT]
 > **You must supply your own legally obtained game files.** This project does not provide the original PS4 game. The loader requires a decrypted dump of **Until Dawn (CUSA02636)** with update **01.03** applied, made from your own legally obtained copy of the game. See [Installation](#installation) and [Third-party notices](THIRD_PARTY_NOTICES.md) for details about the runtime package.
@@ -39,7 +43,11 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release from the Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases)**
 
+<<<<<<< Updated upstream
 **Current version:** [v0.2.1](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.2.1) (`v0.2.1`, work in progress): shaders prepared before the game starts (a progress screen on the first start, from a shader list that comes with the program and your own game files), a renderer hang while textures load fixed, faster shader handling. Download **`UntilDawn_0.2.1.zip`** from the release's Assets list (the "Source code" archives hold this repository — documentation and source code — not the program). Release notes: [docs/releases/v0.2.1.md](docs/releases/v0.2.1.md) · previous: [0.2.0](docs/releases/v0.2.0-wip.md) (collectibles and the arm during item inspection, black mouths, garbled X prompts, freezes from log writes), [0.1.5](docs/releases/v0.1.5-wip.md), [0.1.4](docs/releases/v0.1.4-wip.md), [0.1.3](docs/releases/v0.1.3-wip.md).
+=======
+**Current version:** [v0.3.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.3.0) (`v0.3.0`, work in progress): GPU coherence (the CPU and GPU copies of game memory kept consistent: fixes the vanishing lake water and stretched character geometry of Chapter 10), a crash when loading chapters fixed, a shader list covering the opening of every chapter (4,440 shader combinations) complete letterbox bars on the character introductions, and the game's Halloween Hunt 2015 as an optional extra (`halloween_hunt = 1`, off by default). Download **`UntilDawn_0.3.0.zip`** from the release's Assets list (the "Source code" archives hold this repository — documentation and source code — not the program). Release notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md) · previous: [0.2.1](docs/releases/v0.2.1.md) (shaders prepared before the game starts, a renderer hang fixed), [0.2.0](docs/releases/v0.2.0-wip.md) (collectibles and the arm during item inspection, black mouths, garbled X prompts, freezes from log writes), [0.1.5](docs/releases/v0.1.5-wip.md), [0.1.4](docs/releases/v0.1.4-wip.md), [0.1.3](docs/releases/v0.1.3-wip.md).
+>>>>>>> Stashed changes
 
 The download contains the program, a hardware compatibility tester and documentation, but **no game files**.
 
@@ -47,7 +55,11 @@ The download contains the program, a hardware compatibility tester and documenta
 
 ## Features
 
+<<<<<<< Updated upstream
 What is implemented in v0.2.1:
+=======
+What is implemented in v0.3.0:
+>>>>>>> Stashed changes
 
 ### Game
 - A complete play-through from the prologue to the end credits has been achieved on the development PC (with WIP 0.1.3).
@@ -68,10 +80,23 @@ What is implemented in v0.2.1:
 - Configurable frame-rate cap (60 FPS by default). **A 60 FPS cap does not mean the game currently runs at 60 FPS consistently.**
 - The renderer runs on its own thread alongside the game (since 0.1.4; `renderer_thread = 0` switches back).
 - On-disk shader cache (`Cache\`), with shaders (graphics and, since 0.1.5, compute) compiled in parallel in the background.
+<<<<<<< Updated upstream
 - Shader preparation (**new in v0.2.1**): before the brightness screen, the shaders the game will need are compiled behind a
   progress screen (Esc / Circle skips it): on the first start those in `pipelines.udm` (a list of shader locations and
   settings, read together with your own game files; no game code is included), later also everything earlier
   sessions needed.
+=======
+- Shader preparation (since v0.2.1; covering the opening of every chapter since v0.3.0): before the brightness screen,
+  the shaders the game will need are compiled behind a progress screen (Esc / Circle skips it): on the first start
+  those in `pipelines.udm` (a list of shader locations and settings, read together with your own game files; no game
+  code is included), later also everything earlier sessions needed.
+- **GPU coherence** (since v0.3.0, on by default): memory the graphics card has written is guarded, so the game's CPU
+  code reads the graphics card's current bytes and its own writes reach the graphics card in the right order, as on
+  the PS4's shared memory. `gpu_coherence = 0` in `Config\settings.ini` turns it off for troubleshooting.
+- **Halloween Hunt 2015** (optional, since v0.3.0, off by default): `halloween_hunt = 1` in `Config\settings.ini` (or
+  `--halloween-hunt`) brings back the game's original Halloween screen and hidden pumpkins from its 28-31 October 2015
+  event. Only the game's Halloween date checks see 31 October 2015; your Windows date is not changed.
+>>>>>>> Stashed changes
 - Lower memory use (since 0.1.5): the game's many small memory heaps are committed in steps as the game uses
   them, and the renderer's video-memory copies are sized to your graphics card.
 
@@ -129,15 +154,25 @@ The Core Ultra 9 system also detected **Intel integrated graphics** as usable, b
 
 ### 1. Download and extract
 
+<<<<<<< Updated upstream
 1. Download **`UntilDawn_0.2.1.zip`** from the
+=======
+1. Download **`UntilDawn_0.3.0.zip`** from the
+>>>>>>> Stashed changes
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder you can write to, for example `D:\Games\UntilDawn_WIP`. Don't use `Program Files`:
    the program keeps its settings, logs, shader cache and saves in its own folder.
 
 ```
+<<<<<<< Updated upstream
 UntilDawn_0.2.1\
   UntilDawn.exe            <- start the game
   pipelines.udm            <- the shader list for the first start (v0.2.1; keep it next to UntilDawn.exe)
+=======
+UntilDawn_0.3.0\
+  UntilDawn.exe            <- start the game
+  pipelines.udm            <- the shader list for the first start (keep it next to UntilDawn.exe)
+>>>>>>> Stashed changes
   Config\settings.ini      <- settings
   Game\                    <- put your game files here (or set game_dir)
   compat\                  <- hardware compatibility tester
@@ -177,9 +212,17 @@ and your CPU and graphics card, and tells you in plain words if something is mis
 
 The program creates `Logs\`, `Cache\`, `savedata\` (your saves) and `temp0\` itself when it runs.
 
-Settings (frame-rate limit, windowed / borderless, window size, renderer thread, GPU choice, presentation mode) and troubleshooting:
+Settings (frame-rate limit, windowed / borderless, window size, renderer thread, GPU choice, presentation mode, GPU coherence, Halloween Hunt) and troubleshooting:
 **[docs/INSTALLATION.md](docs/INSTALLATION.md)**.
 
+<<<<<<< Updated upstream
+=======
+**Updating from 0.2.1:** copy the new `UntilDawn.exe`, the new `pipelines.udm`, `compat\ud_compat.exe` and the
+text files over your old folder, but **do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves,
+settings and `Cache\` carry over; the first start prepares the new shaders in the list. GPU coherence is on without
+any change to your settings file (`gpu_coherence = 0` turns it off).
+
+>>>>>>> Stashed changes
 **Updating from 0.2.0:** copy the new `UntilDawn.exe`, the new `pipelines.udm`, `compat\ud_compat.exe` and the
 text files over your old folder, but **do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves,
 settings and `Cache\` carry over; the new setting `shader_preparation` uses its default (on) when it is not in your
@@ -192,7 +235,11 @@ not in your file. Every shader is translated anew in 0.2.0, so the old `Cache\` 
 and the first-play-through shader pauses return once.
 
 > [!NOTE]
+<<<<<<< Updated upstream
 > From v0.2.1 the shaders are compiled **before the game starts**, behind a "Preparing shaders" screen: on the first start those in `pipelines.udm` (about 30–40 seconds on the development PC, Core i9-12900KF, 24 threads; longer on CPUs with fewer cores), later also those earlier sessions needed (under a second when nothing changed). On the development PC the first-start sequence (brightness, controls, intro, menu) then compiled no shaders during play. Scenes that are not in the list yet still compile their shaders the first time they appear — with 0.2.0 and an empty cache that meant one pause of about 12 seconds and a few of 3–8 seconds in the first minutes, and 10–20 seconds or more on CPUs with fewer cores — and are prepared from the next start on. Other freezes and crashes are still possible.
+=======
+> From v0.2.1 the shaders are compiled **before the game starts**, behind a "Preparing shaders" screen: on the first start those in `pipelines.udm` (about 2½ minutes on the development PC with v0.3.0's list and nothing cached, Core i9-12900KF, 24 threads; longer on CPUs with fewer cores), later also those earlier sessions needed (under a second when nothing changed). On the development PC the first-start sequence (brightness, controls, intro, menu) then compiled no shaders during play. Scenes that are not in the list yet still compile their shaders the first time they appear — with 0.2.0 and an empty cache that meant one pause of about 12 seconds and a few of 3–8 seconds in the first minutes, and 10–20 seconds or more on CPUs with fewer cores — and are prepared from the next start on. Other freezes and crashes are still possible.
+>>>>>>> Stashed changes
 
 ---
 
@@ -226,9 +273,11 @@ The most important ones — full list in **[docs/KNOWN_ISSUES.md](docs/KNOWN_ISS
 
 - **Occasional crashes — not fixed yet.** Now and then the lowest byte of a pointer in the game's memory is set to
   zero, and the game crashes later when it follows that pointer. It happens on the development PC and on players'
-  PCs with every version so far, including in testing of 0.2.0; WIP 0.2.0 does not fix it. The writer has now been
-  caught: it is the game's own code finishing an object whose memory overlaps another object still in use (two of
-  the game's allocations overlap). Saves are kept. Fixing it is the top stability priority.
+  PCs with every version so far; v0.3.0 does not fix it. The writer has been caught: it is the game's own code
+  finishing an object whose memory overlaps another object still in use (two of the game's allocations overlap).
+  It can now be measured in unattended chapter runs (about 0.8 detections per 2½-minute run, most without a crash),
+  so possible fixes can be tested without playing; v0.3.0 fixes one race (two threads constructing the same shared
+  object), which is not the main cause. Saves are kept. Fixing it is the top stability priority.
 - **Characters occasionally deform ("explode") for a frame or two** (most likely the same problem).
 - **Laptops with two GPUs** (an NVIDIA GPU plus integrated graphics that drive the screen): very slow frame
   presentation, "device lost" crashes and flickering UI in some menus were reported with 0.1.4
@@ -242,10 +291,13 @@ The most important ones — full list in **[docs/KNOWN_ISSUES.md](docs/KNOWN_ISS
   prologue, totem visions that lose their background or UI, a red flash in the Episodes menu, smeared text at the
   start of the end credits, and the Skip prompt's "Skip" text as white boxes on the butterfly tutorial, the
   prologue's opening movie and later recap clips.
-- **Shader-compilation pauses** the first time new content appears (see the note under Installation): on a new
-  install up to about 12 seconds even on the development PC, longer on CPUs with few cores; once per content.
+- **Shader-compilation pauses** the first time content that is not in the shader list appears (see the note under
+  Installation): v0.3.0's list covers the opening of every chapter (98.9% of the shaders used in automated chapter
+  starts were ready), but scenes further into a chapter can still pause the first time, longer on CPUs with few
+  cores; once per content.
 - **Frame-rate drops:** the frame rate still varies by scene, and is similar to 0.1.5. On the development PC (RTX 3090 Ti) light scenes often reach 60 FPS, busy scenes run at about 30–45 FPS, and the heaviest scenes (the "stranger" shots in the prologue) at about 22–29 FPS, lower during shader-compilation pauses. The default 60 FPS cap is a limit, not a guaranteed frame rate.
-- **WIP 0.2.0's changes have only been played on the development PC (NVIDIA).** If 0.2.0 crashes or stutters where 0.1.5 did not, please report it. `renderer_thread = 0` in `Config\settings.ini` (the renderer on the game's thread) is still available for freezes and stutters; it does not prevent the memory-corruption crashes.
+- **v0.3.0's changes have only been tested on the development PC (NVIDIA)**, largely with automated runs; GPU coherence is untested on AMD and Intel graphics. If something looks or runs worse than in 0.2.1, try `gpu_coherence = 0` in `Config\settings.ini` once and report both results. `renderer_thread = 0` (the renderer on the game's thread) is still available for freezes and stutters; neither prevents the memory-corruption crashes.
+- **Fixed in v0.3.0:** the lake water vanishing and characters' geometry stretching across the screen in Chapter 10 (GPU coherence; checked on recorded scenes and automated runs, not yet in a full play-through), a crash when loading chapters (`FIXED mapping moved`), the letterbox bars of the character introductions stopping short of the screen edges, and small textures keeping old contents. Not yet re-checked in play: a black screen in one Chapter 10 scene, red/blue frames in the Matt and Jess scene and exploded geometry in other Chapter 10 sections.
 - **No vibration or light bar** on DualSense / DualShock 4 yet (Xbox controllers vibrate). **Keys cannot be remapped** yet.
 - **Fixed in WIP 0.2.0:** the character's arm and the picked-up clue or totem vanishing during item inspection
   ([issue #3](https://github.com/SuperCatElvis/UntilDawn_PC/issues/3)) and, by the same fix, Mike's lantern arm coming
@@ -341,7 +393,11 @@ The complete source of the port — the Windows runtime and PS4 compatibility la
 GCN → SPIR-V shader translator, the hardware compatibility tester, the build scripts, tests and supporting tools —
 is in **[source/](source/README.md)**, with instructions for building it on Linux with LLVM. It contains no game
 code, data or assets; see [Third-party notices](THIRD_PARTY_NOTICES.md). `data/pipelines.udm` (the shader preparation
+<<<<<<< Updated upstream
 manifest, v0.2.1) holds only locations in the game's files, translator inputs and pipeline state, checked to contain no
+=======
+manifest, since v0.2.1) holds only locations in the game's files, translator inputs and pipeline state, checked to contain no
+>>>>>>> Stashed changes
 shader code. It is the source of the releases from
 v0.2.1 on; for earlier releases see [Third-party notices](THIRD_PARTY_NOTICES.md#earlier-releases-wip-012--020).
 

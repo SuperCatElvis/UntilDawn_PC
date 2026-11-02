@@ -96,8 +96,16 @@ typedef struct {
     int heap_slot_mb;        /* t130: distance between the game's heap address slots: 512 (default), 64..512, or 2048 = the game's own */
     int heap_slot_reuse;     /* t131: 1 = a released heap slot is reused at once (first fit); 0 = the game's round-robin */
     int shader_prep;         /* t159: 1 = shaders of earlier sessions prepared before the game starts (e6_prep.c); 0 = off */
+<<<<<<< Updated upstream
 } UdSettings;
 static UdSettings g_uds = {"", 60, 0, 1280, 720, 0, 1, "", 0, 512, 1, 1};
+=======
+    int gpu_coherence;       /* t165x: 1 = CPU reads / writes of memory the GPU wrote see the GPU's bytes (default); 0 = off */
+    int gpu_coherence_off;   /* t165x: an "off" line was seen (it wins over "on" lines) */
+    int halloween_hunt;      /* v0.3.0: 1 = the game's own Halloween Hunt 2015 (only its date checks see 31 October 2015); default 0 */
+} UdSettings;
+static UdSettings g_uds = {"", 60, 0, 1280, 720, 0, 1, "", 0, 512, 1, 1, 1, 0, 0};
+>>>>>>> Stashed changes
 static int g_ud_release;     /* started as the player-facing program (no command-line arguments) */
 
 static int ud_key_is(const char *a, const char *b) { while (*b) { if ((*a | 0x20) != (*b | 0x20)) return 0; a++; b++; } return *a == 0; }
@@ -148,6 +156,17 @@ static const char *k_ud_ini_default =
     "; when that takes a while (first start, graphics driver update); Esc or Circle skips it. 0 = off.\r\n"
     "shader_preparation = 1\r\n"
     "\r\n"
+<<<<<<< Updated upstream
+=======
+    "; 1 = memory the graphics card wrote is brought back before the game's code reads or writes it (fixes the stretched\r\n"
+    "; geometry and the missing lake water). 0 = off, only for troubleshooting.\r\n"
+    "gpu_coherence = 1\r\n"
+    "\r\n"
+    "; 1 = Halloween Hunt 2015: the game's original Halloween screen and hidden pumpkins (an event that was only active\r\n"
+    "; from 28 to 31 October 2015; your Windows date is not changed). 0 = off, the normal game. Restart after changing.\r\n"
+    "halloween_hunt = 0\r\n"
+    "\r\n"
+>>>>>>> Stashed changes
     "; 1 = developer mode: capture keys (Ctrl+P, Ctrl+O, Ctrl+N, F6, F11), status text, diagnostic files in Logs\\captures\r\n"
     "developer = 0\r\n";
 
@@ -167,8 +186,21 @@ static void ud_parse_ini(char *t) {
         else if (ud_key_is(line, "renderer_thread")) g_uds.renderer_thread = ud_atoi(v) != 0;
         else if (ud_key_is(line, "gpu")) { int n = str_len(v); if (n >= (int)sizeof g_uds.gpu) n = sizeof g_uds.gpu - 1; mem_copy(g_uds.gpu, v, (u64)n); g_uds.gpu[n] = 0; }
         else if (ud_key_is(line, "present_mode")) g_uds.present_mode = ud_key_is(v, "fifo") ? 1 : ud_key_is(v, "mailbox") ? 2 : ud_key_is(v, "immediate") ? 3 : 0;
+        else if (ud_key_is(line, "halloween_hunt")) g_uds.halloween_hunt = ud_atoi(v) == 1 || ud_key_is(v, "on") || ud_key_is(v, "true") || ud_key_is(v, "yes");   /* t167 */
         else if (ud_key_is(line, "heap_slot_reuse")) g_uds.heap_slot_reuse = ud_atoi(v) != 0;   /* t131 */
+<<<<<<< Updated upstream
         else if (ud_key_is(line, "shader_preparation")) g_uds.shader_prep = ud_atoi(v) != 0;   /* t159 */
+=======
+        else if (ud_key_is(line, "gpu_coherence")) {   /* t165x: on / true / yes / 1 = on; 0 / off / false / no = off (an inline ; or # comment
+                                                           ignored). Review 6 X2-2: an "off" line anywhere wins - the switch must work when added above or below the default line */
+            char vb[32]; int k = 0; while (v[k] && v[k] != ';' && v[k] != '#' && !(v[k] == '/' && v[k + 1] == '/') && k < 31) { vb[k] = v[k]; k++; } vb[k] = 0; ud_trim(vb);
+            char *q = vb; if (*q == '"' || *q == '\'') { q++; int m = str_len(q); if (m && (q[m - 1] == '"' || q[m - 1] == '\'')) q[m - 1] = 0; ud_trim(q); while (*q == ' ' || *q == '\t') q++; }   /* (review 7 N4: quotes, // comments, 00, n, disable) */
+            int dz = *q != 0; for (char *c = q; *c; c++) if (*c != '0') dz = 0;
+            int off = dz || ud_key_is(q, "off") || ud_key_is(q, "false") || ud_key_is(q, "no") || ud_key_is(q, "n") || ud_key_is(q, "disable") || ud_key_is(q, "disabled");
+            if (off) g_uds.gpu_coherence_off = 1;
+            g_uds.gpu_coherence = !g_uds.gpu_coherence_off; }
+        else if (ud_key_is(line, "shader_preparation")) { int pv = ud_atoi(v); g_uds.shader_prep = pv == 2 ? 2 : pv != 0; }   /* t159; t164: 2 = background */
+>>>>>>> Stashed changes
         else if (ud_key_is(line, "heap_slot_mb")) { int x = ud_atoi(v); g_uds.heap_slot_mb = x == 2048 ? 2048 : x < 64 ? 64 : x > 512 ? 512 : x; }   /* t130 */
     }
 }

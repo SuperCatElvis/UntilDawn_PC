@@ -75,9 +75,21 @@ static void pad_orientation_step(const float w[3], float dt) {   /* q += 0.5 * q
 }
 /* --press FLIP:BUTTON - a scripted press, held for 8 flips, for unattended runs (x o up down left right options) */
 static u64 g_press_at[64]; static u32 g_press_btn[64]; static int g_npress;
+/* --press-until-recap START:EVERY:BUTTON:LAST (t165w) - BUTTON every EVERY flips from START until the game opens its
+   "previously on" movie (it is resuming the chapter) or flip LAST: menus whose timing varies from run to run are passed
+   without fixed flips; after that no more presses, the game runs on by itself */
+static u64 g_prr_start, g_prr_every, g_prr_last; static u32 g_prr_btn; static volatile int g_prr_state;   /* 0 off, 1 pressing, 2 stopped */
 static u32 press_due(void) {
     u32 b = 0;
     for (int i = 0; i < g_npress; i++) if (g_flips >= g_press_at[i] && g_flips < g_press_at[i] + 8) b |= g_press_btn[i];
+    if (g_prr_state == 1 && g_flips >= g_prr_start) {
+        u64 rf = __atomic_load_n(&g_recap_flip, __ATOMIC_ACQUIRE);
+        if (rf >= g_prr_start || g_flips > g_prr_last) {
+            if (__atomic_exchange_n(&g_prr_state, 2, __ATOMIC_ACQ_REL) == 1) { say("  repeated presses stopped at flip "); say_dec((i64)g_flips); say(rf >= g_prr_start ? ": the game opened its \"previously on\" movie\n" : ": flip limit reached without it\n"); } }
+        else if ((g_flips - g_prr_start) % g_prr_every < 8) {
+            b |= g_prr_btn;
+            if ((g_flips - g_prr_start) % g_prr_every == 0) { static u64 lastlog; if (lastlog != g_flips) { lastlog = g_flips; say("  repeated press at flip "); say_dec((i64)g_flips); say("\n"); } } }
+    }
     return b;
 }
 static u32 g_pad_last;
@@ -234,10 +246,24 @@ static void rtc_from_ns(u64 ns, u16 *dt) {
     dt[3] = (u16)(rem / 3600); dt[4] = (u16)(rem / 60 % 60); dt[5] = (u16)(rem % 60);
     *(u32 *)(dt + 6) = (u32)(ns / 1000ull % 1000000ull);
 }
+/* t167 (experimental, --halloween-hunt / halloween_hunt = 1): the game's Halloween Hunt 2015 is enabled by its own code
+   when the local date is 28-31 October 2015 (or 1 November before 06:00): four places in eboot 01.03 read the clock for
+   it (the frontend's EnterHalloweenScreen, two that set the script value "IsHalloween2015", and an IsHalloween()
+   helper). Only calls returning to those four see 31 October 2015 (time of day kept); every other clock read is real. */
+static volatile u64 g_hh_calls;   /* (g_opt_halloween: e6_state.c) */
+static const u32 k_hh_sites[4] = {0x159a71f, 0x1596dad, 0x159ac3c, 0x159db70};
 static SYSV int rtc_local_time(u16 *dt) {
     TRACE("sceRtcGetCurrentClockLocalTime", dt, 0, 0);
     if (!dt) return (int)0x80020016;   /* null pointer; the library's own error code is not modelled */
-    rtc_from_ns(plat_wall_ns(), dt); return 0;
+    rtc_from_ns(plat_wall_ns(), dt);
+    if (g_opt_halloween) {
+        u64 ra = (u64)__builtin_return_address(0) - (u64)g_eboot.base;
+        for (int i = 0; i < 4; i++) if (ra == k_hh_sites[i]) {
+            dt[0] = 2015; dt[1] = 10; dt[2] = 31;
+            if (__atomic_add_fetch(&g_hh_calls, 1, __ATOMIC_RELAXED) <= 8) { say("  Halloween Hunt (t167): the game's date check at eboot+"); say_hex(k_hh_sites[i]); say(" sees 31 October 2015\n"); }
+            break; }
+    }
+    return 0;
 }
 /* SceRtcTick: microseconds since 0001-01-01 00:00:00 (UTC here, see above). Not reached in Chapter 1; the game's date
    helpers at eboot+0x97b04b..0x97b36c use them. */

@@ -293,6 +293,7 @@ static void hw_print_traps(void) {
 static void hw_scan_region(HwReg *R) {
     u64 n = (R->hi - R->lo) >> 12;
     for (u64 k = 0; k < n; k++) {
+        if (coh_stale4k(R->lo + (k << 12))) continue;   /* t165: a GPU-held page (reading it would copy it back) */
         u64 p = R->lo + (k << 12), v = *(volatile const u64 *)p, o = R->last[k];
         if (v == o) continue;
         R->last[k] = v;
@@ -332,7 +333,7 @@ static void hw_thread(void *arg) {
                 /* regions registered while the game runs (a new 64 MB lump arena, say) start from 0, as fresh memory does:
                    the first pass then classifies what was written before it saw the region (the two crashes of STATUS 46
                    were in arenas created a few flips earlier, and their bad values were taken in as the baseline) */
-                for (u64 k = 0; k < n; k++) R->last[k] = g_hw_scans ? 0 : *(volatile const u64 *)(R->lo + (k << 12));
+                for (u64 k = 0; k < n; k++) R->last[k] = g_hw_scans || coh_stale4k(R->lo + (k << 12)) ? 0 : *(volatile const u64 *)(R->lo + (k << 12));
                 g_hw_pages += n; }
             g_nhwr++;
         }

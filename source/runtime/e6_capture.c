@@ -82,14 +82,16 @@ static void rc_flush_pages(void) {
 static void *g_rc_susp[MAX_THREADS]; static int g_rc_nsusp; static u64 g_rc_susp_total;
 static void rc_suspend_game(void) {
     PThread *me = cur_thread(); g_rc_nsusp = 0;
+    plat_stop_lock();   /* t165w: not while another suspender runs (released in rc_resume_game) */
     for (int i = 0; i < g_nthreads; i++) { PThread *t = g_threads[i];
         if (!t || t == me || !t->host || t->done || (t->name[0] == 'E' && t->name[1] == '6' && t->name[2] == ' ')) continue;
         if (SuspendThread(t->host) != 0xFFFFFFFFu) g_rc_susp[g_rc_nsusp++] = t->host; }
     g_rc_susp_total += (u64)g_rc_nsusp;
 }
-static void rc_resume_game(void) { for (int i = 0; i < g_rc_nsusp; i++) ResumeThread(g_rc_susp[i]); g_rc_nsusp = 0; }
+static void rc_resume_game(void) { for (int i = 0; i < g_rc_nsusp; i++) ResumeThread(g_rc_susp[i]); g_rc_nsusp = 0; plat_stop_unlock(); }
 static void rc_snapshot(int full) {
     vk_submit_wait();   /* the GPU's own writes to game memory are complete and visible */
+    coh_release_all();   /* t165 --gpu-coherence: GPU-held pages back to RAM (the snapshot reads every page) */
     rc_suspend_game();
     for (int r = 0; r < g_nrcr; r++) {
         RcReg *R = &g_rcr[r];
@@ -550,6 +552,11 @@ static int rc_replay(const char *path) {
                 for (int q = 0; q < g_rc_nzero; q++) { if (!mem_ok(g_rc_zero[q][0], g_rc_zero[q][1])) { say("    replay fill: not mapped at "); say_hex(g_rc_zero[q][0]); say("\n"); continue; }
                     h_memset((void *)g_rc_zero[q][0], (int)g_rc_zero[q][2], g_rc_zero[q][1]);
                     say("    replay fill: "); say_hex(g_rc_zero[q][0]); say(" + "); say_dec((i64)g_rc_zero[q][1]); say(" bytes set to "); say_hex(g_rc_zero[q][2]); say("\n"); } } }
+            { static int pd; if (!pd && g_rc_npatch) { pd = 1;   /* t165 --replay-patch ADDR:FILE - an experiment: game memory as if these bytes had been there */
+                for (int q = 0; q < g_rc_npatch; q++) { u64 pn = 0; void *pb = plat_read_file(g_rc_patch_f[q], &pn);
+                    if (!pb || !pn || !mem_ok(g_rc_patch_a[q], pn)) { say("    replay patch: could not apply "); say(g_rc_patch_f[q]); say(" at "); say_hex(g_rc_patch_a[q]); say("\n"); continue; }
+                    mem_copy((void *)g_rc_patch_a[q], pb, pn);
+                    say("    replay patch: "); say_hex(g_rc_patch_a[q]); say(" + "); say_dec((i64)pn); say(" bytes from "); say(g_rc_patch_f[q]); say("\n"); } } }
             { static int sd; if (!sd && g_rc_scan_start && (g_opt_nan_scan || g_opt_nan_hunt)) { sd = 1; say("    replay: NaN scan of the captured images before the frame's work\n"); nan_scan(1); } }   /* t135 --replay-scan-start (test of the scan) */   /* --dump-frames FLIP: the draw-by-draw dump of the replayed frame (STATUS 42) */
             u64 cnt; if (n < 8 || !rc_rd(f, &cnt, 8) || n != 8 * (1 + 4 * cnt) || cnt > 4096) { say("replay: bad submit record\n"); return 2; }
             if (fmtver < 3 && cnt >= 16) {   /* older captures kept only the first 16 command buffers: this frame cannot be run completely */
@@ -619,7 +626,8 @@ static int rc_replay(const char *path) {
     }
     hf_close(f); free(buf);
     frame_end();
-    if (vk_up) { vk_submit_wait(); vk_probe_report(); }   /* --probe / --nan-probe: counters of the replayed frame (STATUS 43) */
+    if (vk_up) { vk_submit_wait(); vk_probe_report(); }
+    if (vk_up && g_opt_coh_test) coh_selftest();   /* t165 --coh-test */   /* --probe / --nan-probe: counters of the replayed frame (STATUS 43) */
     if (g_rct_file) { plat_close(g_rct_file); g_rct_file = 0; say("replay trace: "); say_dec((i64)g_rct_step); say(" draws / dispatches traced\n"); }
     if (!vk_up) return 2;
     char t[400]; Sb s = {t, 0, sizeof t};

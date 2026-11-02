@@ -26,6 +26,8 @@ QueryPerformanceFrequency
 SuspendThread
 ResumeThread
 GetThreadContext
+GetThreadId
+GetExitCodeThread
 SetFilePointerEx
 InitializeCriticalSection
 EnterCriticalSection

@@ -134,8 +134,50 @@ static SYSV void *h_memalign(u64 al, u64 n) {
 }
 
 /* ---------------- C++ runtime ---------------- */
-static SYSV int h_cxa_guard_acquire(u64 *g) { return *(u8 *)g ? 0 : 1; }
-static SYSV void h_cxa_guard_release(u64 *g) { *(u8 *)g = 1; }
+/* t166: function-local statics (Itanium C++ ABI guards). Until t166 acquire only looked at the "done" byte, so two
+   threads reaching a static's first use together both constructed it (a second construction of a static allocator,
+   pool or table while the first thread already uses it). Now as the ABI and the PS4's libc do it: the first thread marks
+   the guard "in progress" (byte 1, its thread id in bytes 4-7) and constructs; the others wait until it is released.
+   --old-cxa-guard: the old behaviour (A/B: such a second thread constructs it too, but is counted). The first 20 logged;
+   a wait over 2 s is logged, over 10 s the waiter constructs it too (as before) rather than hang. */
+static int g_opt_old_guard; static volatile u64 g_guard_calls, g_guard_waits, g_guard_same, g_guard_aborts;
+static volatile u64 g_guard_late, g_guard_gaveup;
+static void guard_log(const char *what, u64 me, u64 owner, u64 *g, u64 ra) {
+    char b[300]; int n = 0;
+#define GL_S(x) do { const char *s_ = (x); while (*s_ && n < (int)sizeof b - 1) b[n++] = *s_++; } while (0)
+#define GL_D(v) do { char t_[24]; fmt_dec(t_, (i64)(v)); GL_S(t_); } while (0)
+#define GL_X(v) do { char t_[20]; fmt_hex(t_, (u64)(v)); GL_S(t_); } while (0)
+    u64 eb = (u64)g_eboot.base;
+    GL_S("  C++ static guard (t166): thread "); GL_D(me); GL_S(" "); GL_S(what); GL_S(" thread "); GL_D(owner); GL_S(" constructing the static of guard "); GL_X((u64)g);
+    GL_S(" (first use from "); if (ra >= eb && ra < eb + g_eboot.size) { GL_S("eboot+"); GL_X(ra - eb); } else GL_X(ra); GL_S(", flip "); GL_D(g_plat_frame); GL_S(")\n");
+#undef GL_S
+#undef GL_D
+#undef GL_X
+    b[n] = 0; say(b);
+}
+static SYSV int h_cxa_guard_acquire(u64 *g) {
+    __atomic_add_fetch(&g_guard_calls, 1, __ATOMIC_RELAXED);
+    u64 me = GetCurrentThreadId(), ra = (u64)__builtin_return_address(0); int waited = 0; u32 spins = 0; u64 t0 = 0;
+    for (;;) {
+        u64 v = __atomic_load_n(g, __ATOMIC_ACQUIRE);
+        if (v & 0xFF) return 0;
+        if (!(v & 0xFF00)) { u64 nv = (v & ~0xFFFFFFFF0000FFFFull) | (me << 32) | 0x100; if (__atomic_compare_exchange_n(g, &v, nv, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 1; continue; }
+        if ((v >> 32) == (me & 0xFFFFFFFFu)) { __atomic_add_fetch(&g_guard_same, 1, __ATOMIC_RELAXED); return 1; }   /* (same thread - recursion, or another fiber of this thread: as before) */
+        if (!waited) { waited = 1; u64 n = __atomic_add_fetch(&g_guard_waits, 1, __ATOMIC_RELAXED);   /* another thread is constructing it: before t166 (and with --old-cxa-guard) both did */
+            if (n <= 20) guard_log(g_opt_old_guard ? "found (old behaviour: constructs it too)" : "waits for", me, v >> 32, g, ra);
+            if (g_opt_old_guard) return 1;
+            t0 = plat_ticks(); }
+        if (++spins < 200) __builtin_ia32_pause();
+        else {
+            u64 dt = plat_ticks() - t0, tps = plat_ticks_per_sec();
+            if (dt > tps * 2 && !(waited & 2)) { waited |= 2; __atomic_add_fetch(&g_guard_late, 1, __ATOMIC_RELAXED); guard_log("still waiting (2 s) for", me, v >> 32, g, ra); }
+            if (dt > tps * 10) { __atomic_add_fetch(&g_guard_gaveup, 1, __ATOMIC_RELAXED); guard_log("gave up after 10 s (constructs it too, as before t166) waiting for", me, v >> 32, g, ra); return 1; }
+            plat_sleep_ms(spins < 2000 ? 0 : 1);
+        }
+    }
+}
+static SYSV void h_cxa_guard_release(u64 *g) { __atomic_store_n(g, 1, __ATOMIC_RELEASE); }
+static SYSV void h_cxa_guard_abort(u64 *g) { __atomic_add_fetch(&g_guard_aborts, 1, __ATOMIC_RELAXED); __atomic_store_n(g, 0, __ATOMIC_RELEASE); }
 static int g_atexit_count;
 static SYSV int h_cxa_atexit(void *f, void *a, void *d) { (void)f; (void)a; (void)d; g_atexit_count++; return 0; }
 static SYSV int h_atexit(void *f) { (void)f; g_atexit_count++; return 0; }
@@ -424,8 +466,34 @@ static i64 g_fd_contended, g_fd_preads;
 static void fd_locks_init(void) { if (g_fd_locks_ready) return; for (int i = 0; i < MAX_FD; i++) pm_init(&g_fd_lock[i]); pm_init(&g_fd_alloc); g_fd_locks_ready = 1; }
 static void fd_lock(int fd) { if (pm_trylock(&g_fd_lock[fd])) { __atomic_add_fetch(&g_fd_contended, 1, __ATOMIC_RELAXED); pm_lock(&g_fd_lock[fd]); } }
 static void fd_unlock(int fd) { pm_unlock(&g_fd_lock[fd]); }
+/* t165s: which part of the game is loading - each new level ("levels.game.actN_M", chapter 10 = act8_*) and each
+   "previously on" movie is noted in the log with the flip, so a test run can show which chapter it really reached */
+static char g_level_now[40];   /* t165w: the last level opened (for the coherence access table) */
+static volatile u64 g_recap_flip;   /* t165w: flip of the last "previously on" movie opened (0: none yet) - --press-until-recap stops there */
+static void note_level_open(const char *p) {
+    static char last[40]; static volatile int busy;
+    const char *k = 0, *pre = 0;
+    for (const char *q = p; *q; q++) {
+        if (!k && q[0] == 'l') { const char *w = "levels.game.act"; int i = 0; while (w[i] && q[i] == w[i]) i++; if (!w[i]) k = q + 12; }
+        if (!pre && q[0] == 'p') { const char *w = "previously_"; int i = 0; while (w[i] && q[i] == w[i]) i++; if (!w[i]) pre = q; }
+    }
+    if (!k && !pre) return;
+    char a[40]; int n = 0; const char *s0 = k ? k : pre;
+    while (s0[n] && s0[n] != '.' && n < 39) { a[n] = s0[n]; n++; } a[n] = 0;
+    if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) return;
+    int same = 1; for (int i = 0; i <= n; i++) if (last[i] != a[i]) { same = 0; break; }
+    if (!same) { for (int i = 0; i <= n; i++) last[i] = a[i]; if (k) for (int i = 0; i <= n; i++) g_level_now[i] = a[i];
+        say(k ? "  game level: " : "  game movie: "); say(a); say(" (flip "); say_dec((i64)g_plat_frame); say(")\n");
+        if (!k) __atomic_store_n(&g_recap_flip, (u64)g_plat_frame ? (u64)g_plat_frame : 1, __ATOMIC_RELEASE); }
+    __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
+}
+static volatile u64 g_hh_opens;   /* t167: game files with "halloween" in their name opened (the pumpkins' assets) */
 static SYSV int h_kopen(const char *p, int flags, int mode) {
     TRACE("sceKernelOpen", p, flags, mode);
+    if (p) note_level_open(p);
+    if (p) { for (const char *q = p; *q; q++) if ((q[0] | 0x20) == 'h' && (q[1] | 0x20) == 'a' && (q[2] | 0x20) == 'l' && (q[3] | 0x20) == 'l' && (q[4] | 0x20) == 'o' && (q[5] | 0x20) == 'w' && (q[6] | 0x20) == 'e') {
+            if (__atomic_add_fetch(&g_hh_opens, 1, __ATOMIC_RELAXED) <= 40) { say("  halloween asset opened (t167): "); say(p); say(" (flip "); say_dec((i64)g_plat_frame); say(")\n"); }
+            break; } }
     char hp[1100];
     tr("    open \""); tr(p); tr("\" flags "); tr_hex((u64)flags); tr("\n");
     int kind = map_path(hp, p);
@@ -918,18 +986,21 @@ static u32 lz_commit_g(LzReg *L, u32 g0, u32 g1) {
 }
 /* the exception handler: a read or write of an address that is reserved here and not committed yet (or committed
    read-only while another thread imports it) */
-static int lz_fault(u64 a) {
+static int lz_fault(u64 a, int write) {
     if (g_lz_in_crash) return 0;   /* (a crash report reading game memory: never commit from there) */
     int i = lz_find(a); if (i < 0) return 0;
     LzReg *L = &g_lz[i]; u32 g = lz_g(L, a);
     pm_lock(&g_lz_m);
-    if (!L->cm[g]) { lz_commit_g(L, g, g); g_lz_faults++; }
+    int now = 0; if (!L->cm[g]) { lz_commit_g(L, g, g); g_lz_faults++; now = 1; }
     int ok = L->cm[g];
     pm_unlock(&g_lz_m);
+    if (ok && !now) {   /* t165w (review 2, N8): committed before - repeat only if the page allows this access now, else a real crash (not an endless repeat) */
+        u32 pr = plat_query_prot(a & ~0xFFFull);
+        ok = !(pr & 0x101) && (write ? (pr & 0xCC) != 0 : (pr & 0xEE) != 0); }
     return ok;   /* 1: repeat the access (committed now, possibly by another thread); 0: a real crash */
 }
 /* commit what [a, a+n) needs in large mappings; returns 1 when something was committed (the renderer then imports it) */
-static int lz_ensure(u64 a, u64 n) {
+static int lz_ensure(u64 a, u64 n) {   /* (t165w: no coherence step here any more - the Windows file calls make their memory current themselves, and the renderer's GPU-side callers must not copy pages back) */
     int nl = __atomic_load_n(&g_nlz, __ATOMIC_ACQUIRE); if (!nl || !n) return 0;
     u64 e = a + n; if (e < a) return 0;
     int did = 0;
@@ -1246,7 +1317,7 @@ static const HleEntry g_hle[] = {
     {"wcsncpy", (void *)h_wcsncpy}, {"rand", (void *)h_rand}, {"srand", (void *)h_srand}, {"qsort", (void *)h_qsort},
     {"malloc", (void *)h_malloc}, {"free", (void *)h_free}, {"calloc", (void *)h_calloc}, {"realloc", (void *)h_realloc},
     {"memalign", (void *)h_memalign},
-    {"__cxa_guard_acquire", (void *)h_cxa_guard_acquire}, {"__cxa_guard_release", (void *)h_cxa_guard_release},
+    {"__cxa_guard_acquire", (void *)h_cxa_guard_acquire}, {"__cxa_guard_release", (void *)h_cxa_guard_release}, {"__cxa_guard_abort", (void *)h_cxa_guard_abort},
     {"__cxa_atexit", (void *)h_cxa_atexit}, {"atexit", (void *)h_atexit}, {"__cxa_pure_virtual", (void *)h_pure_virtual},
     {"_ZSt9terminatev", (void *)h_terminate}, {"__cxa_throw", (void *)h_cxa_throw}, {"__cxa_allocate_exception", (void *)h_cxa_alloc_exc},
     {"_Unwind_Resume", (void *)h_unwind_resume}, {"__stack_chk_fail", (void *)h_stack_chk_fail}, {"_Assert", (void *)h_assert},
@@ -1339,6 +1410,9 @@ static void mem_report(const char *why) {
         say("      heap slots (t130, "); say_dec(g_heap_slot_mb); say(" MB each): in use "); say_dec(nlive); say(", highest in use "); say_dec(hi); say(", highest ever "); say_dec(g_heap_hi_slot);
         say(" of "); say_dec(HEAP_SLOTS); say(", largest heap "); say_dec((i64)(g_heap_largest >> 20)); say(" MB");
         if (g_heap_overflow) { say(", OVERFLOWING THE SLOT "); say_dec((i64)g_heap_overflow); say(" (first at "); say_hex(g_heap_overflow_at); say(")"); }
+        say("; address guard (t163): "); say_dec(g_ngr); say(" ranges, re-reserved around fixed mappings "); say_dec((i64)g_guard_rereserved);
+        if (g_guard_lost) { say(", NOT re-reserved "); say_dec((i64)(g_guard_lost >> 20)); say(" MB"); }
+        if (g_dfixed_moved) { say(", FIXED MAPPINGS MOVED "); say_dec((i64)g_dfixed_moved); }
         say("\n");
     }
     say("      game memory: arenas "); say_dec(g_narena); say(" reserving "); say_dec((i64)(g_arena_reserved >> 20)); say(" MB, committed "); say_dec((i64)(g_arena_committed >> 20));
