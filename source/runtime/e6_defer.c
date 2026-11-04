@@ -21,6 +21,47 @@
 #define DFR_REAL(f) static PFN_##f real_##f;
 DFR_FNS(DFR_REAL)
 
+/* t168: pipeline layouts with more bindings than the device can push (NVIDIA: 32 push descriptors; some of the game's
+   shaders need 33 - their draws were skipped, about 8,500 per hour in Chapters 5 and 6). Those layouts use an ordinary
+   descriptor set: one per bind, allocated from pools of the batch slot whose command buffer is recorded and reset when
+   that slot is used again (vk_begin_cb, after its fence). It happens where the push would have been made, so the
+   deferred recording keeps its order. --desc-sets (test): every layout this way. */
+enum { DSP_MAXL = 1024, DSP_POOLS = 256, DSP_SETS = 1024 };
+static VkPipelineLayout g_dsp_pl[DSP_MAXL]; static VkDescriptorSetLayout g_dsp_dsl[DSP_MAXL]; static int g_dsp_n, g_opt_desc_sets;
+static VkDescriptorPool g_dsp_pool[NSLOT][DSP_POOLS]; static int g_dsp_npool[NSLOT], g_dsp_cur[NSLOT];
+static u64 g_dsp_binds, g_dsp_fail, g_dsp_pools_made, g_dsp_resets;
+static void dsp_slot_reset(int s) {
+    for (int i = 0; i < g_dsp_npool[s] && i <= g_dsp_cur[s]; i++) vkResetDescriptorPool(V.dev, g_dsp_pool[s][i], 0);
+    if (g_dsp_npool[s]) g_dsp_resets++;
+    g_dsp_cur[s] = 0;
+}
+static void dsp_push(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, u32 set, u32 n, const VkWriteDescriptorSet *w) {
+    int k = -1; if (g_dsp_n) for (int i = 0; i < g_dsp_n; i++) if (g_dsp_pl[i] == l) { k = i; break; }
+    if (k < 0) { real_vkCmdPushDescriptorSetKHR(cb, bp, l, set, n, w); return; }
+    int s = -1; for (int i = 0; i < NSLOT; i++) if (g_slot[i].cb == cb) { s = i; break; }
+    if (s < 0 || n > 80) { g_dsp_fail++; return; }   /* (only the batch command buffers bind resources) */
+    VkDescriptorSet ds = 0;
+    for (;;) {
+        if (g_dsp_cur[s] >= g_dsp_npool[s]) {
+            if (g_dsp_npool[s] >= DSP_POOLS) { g_dsp_fail++; return; }
+            VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, DSP_SETS}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DSP_SETS * 8},
+                                          {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, DSP_SETS * 8}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DSP_SETS * 40}};
+            VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, 0, 0, DSP_SETS, 4, ps};
+            VkDescriptorPool p = 0; if (vkCreateDescriptorPool(V.dev, &pci, 0, &p) || !p) { g_dsp_fail++; return; }
+            g_dsp_pool[s][g_dsp_npool[s]++] = p; g_dsp_pools_made++;
+        }
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, 0, g_dsp_pool[s][g_dsp_cur[s]], 1, &g_dsp_dsl[k]};
+        VkResult r = vkAllocateDescriptorSets(V.dev, &ai, &ds);
+        if (r == VK_SUCCESS) break;
+        if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) { g_dsp_cur[s]++; continue; }
+        g_dsp_fail++; return;
+    }
+    VkWriteDescriptorSet c[80]; for (u32 i = 0; i < n; i++) { c[i] = w[i]; c[i].dstSet = ds; }
+    vkUpdateDescriptorSets(V.dev, n, c, 0, 0);
+    vkCmdBindDescriptorSets(cb, bp, l, set, 1, &ds, 0, 0);
+    g_dsp_binds++;
+}
+
 enum { R_BIND = 1, R_DISPATCH, R_DRAW, R_DRAWIDX, R_BINDIDX, R_PUSHC, R_VIEWPORT, R_SCISSOR, R_BARRIER, R_B2I, R_I2B, R_COPYIMG, R_BLIT,
        R_CLRCOL, R_CLRDS, R_BEGINR, R_ENDR, R_PUSHDESC, R_FILL, R_UPDATE, R_COPYBUF, R_CLRATT, R_BLENDC, R_RESETQ, R_TIMESTAMP, R_BEGINQ, R_ENDQ, R_CKPT, R_COPYQ, R_BEGINCOND, R_ENDCOND, R_END_CHUNK };
 
@@ -279,10 +320,10 @@ static void VKAPI_PTR w_EndRendering(VkCommandBuffer cb) {
 static void dfr_drain(void);
 static void VKAPI_PTR w_PushDescriptorSet(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, u32 set, u32 n, const VkWriteDescriptorSet *w) {
     CRUMB(R_PUSHDESC, l, REC_ON(cb) ? 2 : 0); if (cb == V.cb && !V.recording) dfr_outside(__LINE__);
-    if (!REC_ON(cb)) { real_vkCmdPushDescriptorSetKHR(cb, bp, l, set, n, w); return; }
+    if (!REC_ON(cb)) { dsp_push(cb, bp, l, set, n, w); return; }
     u64 need = 40 + sizeof *w * n;
     for (u32 i = 0; i < n; i++) {
-        if (w[i].pNext) { dfr_drain(); real_vkCmdPushDescriptorSetKHR(cb, bp, l, set, n, w); return; }   /* not expected: play safe */
+        if (w[i].pNext) { dfr_drain(); dsp_push(cb, bp, l, set, n, w); return; }   /* not expected: play safe */
         need += 8 + (w[i].pImageInfo ? sizeof(VkDescriptorImageInfo) * w[i].descriptorCount : 0) + (w[i].pBufferInfo ? sizeof(VkDescriptorBufferInfo) * w[i].descriptorCount : 0)
               + (w[i].pTexelBufferView ? sizeof(VkBufferView) * w[i].descriptorCount : 0) + 24;
     }
@@ -409,7 +450,7 @@ static void dfr_replay(VkCommandBuffer cb) {
             case R_CLRDS: real_vkCmdClearDepthStencilImage(cb, *(VkImage *)r, (VkImageLayout)((u32 *)r)[2], (const VkClearDepthStencilValue *)(r + 16), ((u32 *)r)[3], (const VkImageSubresourceRange *)(r + 32)); break;
             case R_BEGINR: real_vkCmdBeginRendering(cb, (const VkRenderingInfo *)r); break;
             case R_ENDR: real_vkCmdEndRendering(cb); break;
-            case R_PUSHDESC: real_vkCmdPushDescriptorSetKHR(cb, (VkPipelineBindPoint)((u32 *)r)[0], *(VkPipelineLayout *)(r + 16), ((u32 *)r)[1], ((u32 *)r)[2], (const VkWriteDescriptorSet *)(r + 24)); break;
+            case R_PUSHDESC: dsp_push(cb, (VkPipelineBindPoint)((u32 *)r)[0], *(VkPipelineLayout *)(r + 16), ((u32 *)r)[1], ((u32 *)r)[2], (const VkWriteDescriptorSet *)(r + 24)); break;
             case R_FILL: real_vkCmdFillBuffer(cb, *(VkBuffer *)r, *(u64 *)(r + 8), *(u64 *)(r + 16), *(u32 *)(r + 24)); break;
             case R_UPDATE: real_vkCmdUpdateBuffer(cb, *(VkBuffer *)r, *(u64 *)(r + 8), *(u64 *)(r + 16), r + 24); break;
             case R_COPYBUF: real_vkCmdCopyBuffer(cb, *(VkBuffer *)r, *(VkBuffer *)(r + 8), ((u32 *)r)[4], (const VkBufferCopy *)(r + 24)); break;

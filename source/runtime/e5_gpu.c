@@ -1360,12 +1360,8 @@ static void rwd_one(const char *name, int ix, void *h) {
     if (!h) { say(" (no handle)\n"); return; }
     for (u64 z = 0; z < 0x40; z++) ctx[z] = 0;
     *(u32 *)(ctx + 0x30) = 0x100001;           /* CONTEXT_CONTROL */
-<<<<<<< Updated upstream
-    if (SuspendThread(h) == 0xFFFFFFFFu) { say(" (could not pause it)\n"); return; }
-=======
     plat_stop_lock();   /* t165w (review 2, N5) */
     if (SuspendThread(h) == 0xFFFFFFFFu) { plat_stop_unlock(); say(" (could not pause it)\n"); return; }
->>>>>>> Stashed changes
     int ok = GetThreadContext(h, ctx);
     u64 rip = *(u64 *)(ctx + 0xF8), rsp = *(u64 *)(ctx + 0x98);
     if (ok && rsp && !(rsp & 7)) {   /* (read while it is paused: the stack cannot change under us) */
@@ -1376,11 +1372,7 @@ static void rwd_one(const char *name, int ix, void *h) {
             for (u64 q = 0; q < nq && nr < 12; q++) { u64 v = sp[q];
                 if (v > g_rwd_exe_lo + 0x1006 && v < g_rwd_exe_hi) { const u8 *c = (const u8 *)v;
                     if (c[-5] == 0xE8 || (c[-6] == 0xFF && (c[-5] == 0x15 || (c[-5] & 0xF8) == 0x90)) || (c[-2] == 0xFF && (c[-1] & 0xF8) == 0xD0) || (c[-3] == 0xFF && (c[-2] & 0xF8) == 0x50)) ret[nr++] = v; } } } }
-<<<<<<< Updated upstream
-    ResumeThread(h);
-=======
     ResumeThread(h); plat_stop_unlock();
->>>>>>> Stashed changes
     if (!ok) { say(" (no context)\n"); return; }
     say(" at "); rwd_where(rip); say("\n    returns into our code:");
     for (int k = 0; k < nr; k++) { say(" "); rwd_where(ret[k]); }

@@ -1210,6 +1210,7 @@ static int g2s_load(const G2SIn *in, G2SOut *out, GInst *ins, GDesc *descs, int 
 #define G2S_CACHE 65536
 typedef struct { u64 key; u32 *spv; u32 n, vs_params, mrt, inputs; int lds, structured, wmem; u8 rel; u8 *z; u32 zn; } G2SCacheEnt;   /* rel: t112, its SPIR-V is (to be) freed; z / zn: t114, the words compressed (spvz.h) */
 static G2SCacheEnt g2s_cache[G2S_CACHE]; static int g2s_ncache;
+int g2s_opt_old_posw;   /* t168 (A/B): POS_W_FLOAT given as SPIR-V FragCoord.w (1 / w), the behaviour before t168 */
 int g2s_cache_bypass;   /* t138 (diagnostic): SPIR-V generated afresh, not looked up in or added to the cache (the caller frees it) */
 int g2s_cache_count(void) { return g2s_ncache; }   /* t107b: SPIR-V modules generated and kept */
 /* hash index over g2s_cache (key -> index + 1; 0 = empty), open addressing; entries are never removed */
@@ -3309,6 +3310,9 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
                     if (!s->in_fragcoord) s->in_fragcoord = em_vin(e, s->t_v4f, 15, 0, 0);
                     if (!fc) fc = ld(s, s->t_v4f, s->in_fragcoord);
                     val = as_u(s, E2(81, s->t_f32, fc, (u32)(bit - 8)));
+                    /* t168: POS_W_FLOAT is the clip-space w (the hardware's own value, as radeonsi / ACO read it), while
+                       SPIR-V FragCoord.w is 1 / w: depth fades and liquid thickness (the strange-skull jar) used 1 / w */
+                    if (bit == 11 && !g2s_opt_old_posw) val = as_u(s, E2(136, s->t_f32, cf(s, 1.0f), E2(81, s->t_f32, fc, 3)));
                 } else if (bit == 12) {
                     if (!s->in_frontface) s->in_frontface = em_vin(e, s->t_bool, 17, 0, 0);
                     val = b2u(s, ld(s, s->t_bool, s->in_frontface));

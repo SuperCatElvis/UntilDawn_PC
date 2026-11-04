@@ -91,6 +91,11 @@ static u32 g_snap_n[16]; static u64 g_snap_a[16]; static int g_nsnap;   /* --sna
 /* --replay-snap STEP:ADDR (replay only): save the newest GPU-written image at ADDR - colour or depth - right after replay
    step STEP (the numbering of --replay-trace and udcap_steps.py). File: replay_snap<STEP>_<addr>_<w>x<h>_f<vkformat>.bin,
    depth as copied by Vulkan (D16: 2 bytes per texel, D32: 4). */
+/* t168b (replays, diagnostic): --replay-dbg-ps STEP:PC:R0,R1,R2,R3 - the draw at STEP gets its pixel shader translated with
+   G2SIn dbg_pc / dbg_regs (the four VGPRs right after the instruction at byte offset PC, as float bits) and its MRT0 sent,
+   unblended, to an RGBA32F image of its own at G_RDBG_ADDR (dump it with --replay-snap STEP:G_RDBG_ADDR). */
+#define G_RDBG_ADDR 0xDB00000000ull
+static u32 g_rdbg_step, g_rdbg_pc, g_rdbg_regs; static int g_tr_dbg;
 static u32 g_rsnap_n[32]; static u64 g_rsnap_a[32]; static int g_nrsnap; static int g_rp_running; static u64 g_rp_step;
 static u64 g_rskip[16][2]; static int g_nrskip;   /* t164f --replay-skip A-B: replay steps not drawn / dispatched (diagnostic; counted with --replay-snap) */
 /* t107b: --replay-dumptex STEP: the textures the draw / dispatch at that replay step samples, saved as the GPU has them */
@@ -1078,6 +1083,7 @@ static void vk_begin_cb(void) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, 0, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (g_slot[g_slot_cur].pending) { T0(); slot_wait_idle(g_slot_cur); TADD1(g_t_wait); g_t_slotw += t1_ - t0_; }   /* normally free already: the other slot is the one in flight */
     V.cb = g_slot[g_slot_cur].cb;
+    if (g_dsp_n) dsp_slot_reset(g_slot_cur);   /* t168: this slot's descriptor sets (its last batch has finished) */
     vkResetCommandBuffer(V.cb, 0); vkBeginCommandBuffer(V.cb, &bi); V.recording = 1;
     if (g_nstmp) stage_tmp_reap(0);   /* t111 */
     /* t110: how much of its staging and ring space the batch before used (memory report) */
@@ -1305,10 +1311,7 @@ static void vk_submit_wait_at(int line) {
     T0();
     vk_submit_async(0, 0);
     vk_wait_all();
-<<<<<<< Updated upstream
-=======
     for (int k = 0; k < 3 && g_coh_post_open; k++) { vk_submit_async(0, 0); vk_wait_all(); }   /* t165w (review 3, NF8): a batch coh_post_submit opened (CPU bytes) - submitted and finished too */
->>>>>>> Stashed changes
     TADD1(g_t_wait);
     g_n_full_waits++; if (line > 0 && line < 16384) { g_wait_line[line]++; g_wait_ticks_line[line] += t1_ - t0_; }
 }
@@ -4198,7 +4201,7 @@ static int g_opt_no_pipe_dedupe;
 static u64 g_n_dup_g, g_n_dup_c; static int g_dup_logged;
 static HIdx g_pipe_cix; static u64 g_pipe_c2[65536];            /* graphics: content key -> V.pipe index; its second hash */
 typedef struct { u32 vs_lo, ps_lo, flip; } VPMeta; static VPMeta g_pipe_meta[65536], g_cpipe_meta[16384];   /* shader addresses (>> 8), flip made */
-typedef struct { u64 h1, h2; int to; } VPAlias; static VPAlias g_palias[16384]; static int g_npalias; static HIdx g_palias_ix;
+typedef struct { u64 h1, h2; int to; } VPAlias; static VPAlias g_palias[65536];   /* t168: was 16384 - full after about an hour of play (sessions 1 and 6 of the shader hunt), after which every such pipeline was made again */ static int g_npalias; static HIdx g_palias_ix;
 static HIdx g_cpipe_cix; static u64 g_cpipe_c2[16384];          /* compute: content key -> g_cpipe index */
 static int mod_words(u64 key, u64 *a, u64 *b) {   /* the two words hashes of the module made for this translation key */
     int mi = hix_get(&V.mod_ix, key);
@@ -4280,16 +4283,17 @@ static VLayout *vk_layout(const u32 *sig) {
     b[0] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, 0};
     for (u32 k = 0; k < sig[0]; k++)
         b[1 + k] = (VkDescriptorSetLayoutBinding){sig[1 + k] >> 8, (sig[1 + k] & 0xFF) == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : (sig[1 + k] & 0xFF) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_ALL, 0};
-    if (g_dev.max_push_desc && sig[0] + 1 > g_dev.max_push_desc) {   /* STATUS 88: more bindings than the device can push */
-        static int said; if (said++ < 5) { vl("  LAYOUT: "); vl_d(sig[0] + 1); vl(" push descriptors needed, device limit "); vl_d(g_dev.max_push_desc); vl("\n"); say("    shader needs "); say_dec(sig[0] + 1); say(" push descriptors, this GPU allows "); say_dec(g_dev.max_push_desc); say(" (draw skipped)\n"); }
-        return 0;
-    }
+    int nopush = g_opt_desc_sets || (g_dev.max_push_desc && sig[0] + 1 > g_dev.max_push_desc);   /* STATUS 88; t168: an ordinary descriptor set (e6_defer.c) */
+    if (nopush && g_dsp_n >= DSP_MAXL) return 0;
+    if (nopush && !g_opt_desc_sets) { static int said; if (said++ < 5) { vl("  LAYOUT: "); vl_d(sig[0] + 1); vl(" bindings, more than the device can push ("); vl_d(g_dev.max_push_desc); vl("): an ordinary descriptor set (t168)\n");
+        say("    shader needs "); say_dec(sig[0] + 1); say(" bindings, this GPU pushes at most "); say_dec(g_dev.max_push_desc); say(": an ordinary descriptor set is used (t168; before: the draw was skipped)\n"); } }
     if (sig[0] + 1 > g_max_bindings_seen) g_max_bindings_seen = sig[0] + 1;
-    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, 0, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, sig[0] + 1, b};
+    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, 0, nopush ? 0 : VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, sig[0] + 1, b};
     CRUMB(106, sig[0], 3); if (vkCreateDescriptorSetLayout(V.dev, &dci, 0, &L->dsl)) return 0;
     VkPushConstantRange pcr = {VK_SHADER_STAGE_ALL, 0, 128};
     VkPipelineLayoutCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 0, 0, 1, &L->dsl, 1, &pcr};
     if (vkCreatePipelineLayout(V.dev, &pci, 0, &L->pl)) return 0;
+    if (nopush) { g_dsp_pl[g_dsp_n] = L->pl; g_dsp_dsl[g_dsp_n] = L->dsl; g_dsp_n++; }   /* t168 */
     V.nlay++;
     return L;
 }
@@ -4409,6 +4413,7 @@ static void vk_tr_device(G2SIn *in) {
 static int vk_tr(int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 base, int fixz, G2SOut *out) {
     G2SIn in; h_memset(&in, 0, sizeof in);
     in.stage = stage; in.code_addr = (u64)lo << 8; in.rsrc1 = rsrc1; in.rsrc2 = rsrc2; in.fix_z = fixz; in.tex_binding_base = base;
+    if (g_tr_dbg && stage == G2S_PS) { in.dbg_pc = g_rdbg_pc + 1; in.dbg_regs = g_rdbg_regs; }   /* t168b */
     in.n_user = (rsrc2 >> 1) & 0x1F; for (u32 i = 0; i < 16 && i < in.n_user; i++) in.user_data[i] = ud[i];   /* t155: only the words the shader gets (g2s_translate zeroed the rest, copying G2SIn to do it) */
     in.ps_input_ena = g_ctx[CTX_SPI_PS_INPUT_ENA]; in.ps_input_addr = g_ctx[CTX_SPI_PS_INPUT_ADDR]; in.ps_in_control = g_ctx[CTX_SPI_PS_IN_CONTROL];
     for (int i = 0; i < 32; i++) in.ps_input_cntl[i] = g_ctx[CTX_SPI_PS_INPUT_CNTL_0 + i];
@@ -5192,6 +5197,8 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     /* render targets */
     VkFormat cf[8]; VkImageView cv[8]; u32 ncol = 0, rw = 16384, rh = 16384, tmask = g_ctx[CTX_CB_TARGET_MASK];
     for (int rt = 0; rt < 8; rt++) { cf[rt] = VK_FORMAT_UNDEFINED; cv[rt] = 0; }
+    int rdbg = g_rp_running && g_rdbg_step && g_rp_step + 1 == g_rdbg_step;   /* t168b */
+    if (rdbg) tmask |= 0xF;
     if (cmode == 1) for (int rt = 0; rt < 8; rt++) {
         if (!((tmask >> (4 * rt)) & 0xF)) continue;
         const u32 *c = &g_ctx[CTX_CB_COLOR0_BASE + rt * 15];
@@ -5204,12 +5211,13 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
             view = swap == 1 ? (nt == 6 ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM) : (nt == 6 ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
         }
         if (view == VK_FORMAT_UNDEFINED || !(fmt_features(view) & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) { vk_skip("render target format not supported"); return; }
-        VImg *m = vk_target((u64)c[0] << 8, pitch, h, base, fmt_bpe(fmt), 0, 0);
+        if (rdbg && rt == 0) { base = view = VK_FORMAT_R32G32B32A32_SFLOAT; }   /* t168b */
+        VImg *m = rdbg && rt == 0 ? vk_target(G_RDBG_ADDR, pitch, h, VK_FORMAT_R32G32B32A32_SFLOAT, 128, 0, 0) : vk_target((u64)c[0] << 8, pitch, h, base, fmt_bpe(fmt), 0, 0);
         if (!m) { vk_skip("render target image failed"); return; }
         cf[rt] = view; cv[rt] = vimg_view(m, view, 0, 0, 1); ncol = (u32)rt + 1;
         if (g_natt < 9) g_att[g_natt++] = m;   /* (only targets with a non-zero write mask get here) */
         if (g_ntgt_img < 9) g_tgt_img[g_ntgt_img++] = m;
-        if ((c[5] & 0x1F) == 8 && !g_opt_nowb) wb_add(m, (u64)c[0] << 8, pitch, pitch, h, fmt_bpe(fmt));
+        if ((c[5] & 0x1F) == 8 && !g_opt_nowb && !(rdbg && rt == 0)) wb_add(m, (u64)c[0] << 8, pitch, pitch, h, fmt_bpe(fmt));
         if (m->w < rw) rw = m->w; if (m->h < rh) rh = m->h;
     }
     u32 zi = g_ctx[CTX_DB_Z_INFO], zf = zi & 3, dc = g_ctx[CTX_DB_DEPTH_CONTROL];
@@ -5286,7 +5294,8 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     int vok = vk_tr(G2S_VS, g_shr[SH_PGM_LO_VS], g_shr[SH_RSRC1_VS], g_shr[SH_RSRC1_VS + 1], &g_shr[SH_USER_DATA_VS], 1, fixz, &vs);
     g_tess.mode = 0; g_gs.mode = 0;
     if (!vok) return;
-    if (!vk_tr(G2S_PS, g_shr[SH_PGM_LO_PS], g_shr[SH_RSRC1_PS], g_shr[SH_RSRC1_PS + 1], &g_shr[SH_USER_DATA_PS], 33, 0, &ps)) return;
+    g_tr_dbg = rdbg; int psok = vk_tr(G2S_PS, g_shr[SH_PGM_LO_PS], g_shr[SH_RSRC1_PS], g_shr[SH_RSRC1_PS + 1], &g_shr[SH_USER_DATA_PS], 33, 0, &ps); g_tr_dbg = 0;
+    if (!psok) return;
     if (g_opt_halloween && hh_stage_outline(ps.ntex)) { if (!g_hh_outline_skips++) vl("  Halloween screen (t167c): its stage outline left out (the yellow edge line; not shown on the PS4)\n"); return; }
     if (g_rw_w || g_nrw) { g_rw_ntex = ps.ntex < G2S_MAX_TEX ? ps.ntex : G2S_MAX_TEX;   /* t107b: for the replay's pixel history */
         for (int k = 0; k < g_rw_ntex; k++) { g_rw_tex[k] = (((u64)ps.tex[k].tsharp[0]) | ((u64)(ps.tex[k].tsharp[1] & 0xFF) << 32)) << 8; g_rw_texf[k] = (ps.tex[k].tsharp[1] >> 20) & 0x3F; } }
@@ -5341,6 +5350,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     /* pipeline */
     u64 h1 = 1469598103934665603ull, h2 = 0x9E3779B97F4A7C15ull;
     u32 blend[8]; for (int rt = 0; rt < 8; rt++) blend[rt] = cv[rt] ? g_ctx[CTX_CB_BLEND0_CONTROL + rt] : 0;
+    if (rdbg) { blend[0] = 0; say("    replay debug (t168b): step "); say_dec((i64)g_rdbg_step); say(": PS "); say_hex((u64)g_shr[SH_PGM_LO_PS] << 8); say(" VGPRs after pc "); say_hex(g_rdbg_pc); say(" -> MRT0 at "); say_hex(G_RDBG_ADDR); say("\n"); }
     u32 su = g_ctx[CTX_PA_SU_SC_MODE_CNTL];
     VkCullModeFlags cullm = g_opt_nocull ? VK_CULL_MODE_NONE : (VkCullModeFlags)(((su & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((su & 2) ? VK_CULL_MODE_BACK_BIT : 0));
     /* stencil: DB_STENCIL_CONTROL (ops), DB_STENCILREFMASK / _BF (reference, masks), functions in DB_DEPTH_CONTROL */
@@ -5380,9 +5390,9 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
                 c2 = hmix(hmix(c2, vb), pb);
                 int me = V.npipe - 1; hix_init(&g_pipe_cix, 131072);
                 int t = hix_get(&g_pipe_cix, c1);
-                if (t >= 0 && t != me && g_pipe_c2[t] == c2 && g_npalias < 16384) {
+                if (t >= 0 && t != me && g_pipe_c2[t] == c2 && g_npalias < 65536) {
                     hix_del(&V.pipe_ix, h1, me); V.npipe--;
-                    hix_init(&g_palias_ix, 32768); hix_put(&g_palias_ix, h1, g_npalias); g_palias[g_npalias].h1 = h1; g_palias[g_npalias].h2 = h2; g_palias[g_npalias].to = t; g_npalias++;
+                    hix_init(&g_palias_ix, 131072); hix_put(&g_palias_ix, h1, g_npalias); g_palias[g_npalias].h1 = h1; g_palias[g_npalias].h2 = h2; g_palias[g_npalias].to = t; g_npalias++;
                     P = &V.pipe[t]; dup = 1; g_n_dup_g++;
                     dup_log("graphics", (u64)g_shr[SH_PGM_LO_VS] << 8, (u64)g_shr[SH_PGM_LO_PS] << 8, vs.key, ps.key, &g_pipe_meta[t], t);
                 } else if (t < 0) { hix_put(&g_pipe_cix, c1, me); g_pipe_c2[me] = c2; }
@@ -7279,7 +7289,9 @@ static void vkr_report(void) {
         say(", textures "); say_dec((i64)(g_t_tex / f / nf)); say(", pipeline builds "); say_dec((i64)(g_t_pipe / f / nf));
         say("), waiting for the GPU "); say_dec((i64)(g_t_wait / f / nf)); say(", present "); say_dec((i64)(g_t_present / f / nf)); say("\n");
         say("    GPU: "); say(g_dev.name); say(" ("); say(dev_vendor_name(g_dev.vendor_id)); say(", driver "); say(g_dev.driver_name); say(" "); say(g_dev.driver_info); say("); subgroup size "); say_dec(g_dev.sg_size);
-        say("; most push descriptors a shader needed "); say_dec(g_max_bindings_seen); say(" (limit "); say_dec(g_dev.max_push_desc); say("); cross-lane shader modules "); say_dec((i64)g_n_xlane_mods);
+        say("; most push descriptors a shader needed "); say_dec(g_max_bindings_seen); say(" (limit "); say_dec(g_dev.max_push_desc); say(")");
+        if (g_dsp_n) { say(", ordinary descriptor sets (t168): layouts "); say_dec(g_dsp_n); say(", binds "); say_dec((i64)g_dsp_binds); say(", pools "); say_dec((i64)g_dsp_pools_made); say(", failures "); say_dec((i64)g_dsp_fail); }
+        say("; cross-lane shader modules "); say_dec((i64)g_n_xlane_mods);
         say(", pipeline stages given 32-lane subgroups "); say_dec((i64)g_n_sgs_stages); say(g_opt_float_controls ? "; fp32 float controls declared" : "; fp32 behaviour left to the driver"); say(g_opt_exact_mad ? "; exact MAD rounding\n" : "; MAD contraction left to the driver\n");
         { u64 mh, mm, mc; g2s_memo_stats(&mh, &mm, &mc); { u64 rl_, x_; g2s_memo_reloc_stats(&rl_, &x_, &x_, &x_, &x_, &x_, &x_, &x_, &x_);
             say("    shader setups reused: "); say_dec((i64)mh); say(" (relocated "); say_dec((i64)rl_); say("), translated in full: "); say_dec((i64)g2s_memo_full()); say(" (t155); lookups without an exact match: "); say_dec((i64)mm); say(" (memo entries compared "); say_dec((i64)mc); say(")\n"); }

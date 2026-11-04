@@ -2213,10 +2213,7 @@ static int ud_player_start(int *pargc, char ***pargv) {
     if (g_uds.present_mode) { av[n++] = "--present-mode"; av[n++] = g_uds.present_mode == 1 ? "fifo" : g_uds.present_mode == 2 ? "mailbox" : "immediate"; }   /* t121 */
     if (!g_uds.heap_slot_reuse) av[n++] = "--heap-slots-roundrobin";   /* t131 */
     if (!g_uds.shader_prep) av[n++] = "--no-prep";   /* t159 */
-<<<<<<< Updated upstream
-=======
     if (g_uds.shader_prep == 2) av[n++] = "--prep-background";   /* t164 */
->>>>>>> Stashed changes
     if (g_uds.heap_slot_mb != 512) { static char hs[16]; char *q = hs + sizeof hs - 1; *q = 0; int v = g_uds.heap_slot_mb; do { *--q = (char)('0' + v % 10); v /= 10; } while (v); av[n++] = "--heap-slot-mb"; av[n++] = q; }   /* t130 */
     if (g_uds.developer) {   /* t107: developer mode only - extra options from Config\dev_options.txt (one line, separated by spaces) */
         static char dop[1100], dbuf[2048]; path_join(dop, cfg, "dev_options.txt");
@@ -2339,6 +2336,7 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--old-cxa-guard")) g_opt_old_guard = 1;   /* t166 A/B: C++ static guards as before (no waiting: two threads can both construct a static) */
         else if (str_eq(argv[i], "--coh-init-fail")) g_ct_init_fail = 1;   /* t165x5 test: coherence set-up fails (the message, the game goes on without it) */
         else if (str_eq(argv[i], "--no-gpu-coherence")) g_coh_mode = 0;       /* t165x: off (troubleshooting; as before t165x) */
+        else if (str_eq(argv[i], "--desc-sets")) g_opt_desc_sets = 1;   /* t168 (test): every pipeline layout with an ordinary descriptor set, not push descriptors */
         else if (str_eq(argv[i], "--gpu-coherence-probe")) g_coh_mode = 1;    /* t165: the same accesses found and logged only */   /* t165 (experimental): one-off GPU writes in VRAM copies go back to RAM */
         else if (str_eq(argv[i], "--depth-sync")) g_opt_depthsync = 1;
         else if (str_eq(argv[i], "--no-defer-gpu-uploads")) g_opt_defer_fill = 0;   /* t107f: textures still being written by the GPU: wait for all GPU work (before t107f) */
@@ -2403,13 +2401,10 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-wait-sync")) g_opt_no_wait_sync = 1;
 #endif
         else if (str_eq(argv[i], "--replay-sum") && i + 1 < argc) g_rc_sum_path = argv[++i];
-<<<<<<< Updated upstream
-=======
         else if (str_eq(argv[i], "--replay-skip") && i + 1 < argc && g_nrskip < 16) { const char *x = argv[++i]; u64 a = 0, b = 0; while (*x >= '0' && *x <= '9') a = a * 10 + (u64)(*x++ - '0'); if (*x == '-') { x++; while (*x >= '0' && *x <= '9') b = b * 10 + (u64)(*x++ - '0'); } else b = a; g_rskip[g_nrskip][0] = a; g_rskip[g_nrskip][1] = b; g_nrskip++; }   /* t164f diagnostic */
         else if (str_eq(argv[i], "--full-hash-max") && i + 1 < argc) g_opt_full_hash_max = str_to_u64(argv[++i]);   /* t164 */
         else if (str_eq(argv[i], "--prep-background")) g_prep_bg_mode = 1;   /* t164: at most --prep-fg-seconds (20) before the game, the rest during play */
         else if (str_eq(argv[i], "--prep-fg-seconds") && i + 1 < argc) g_prep_fg_ms = (int)str_to_u64(argv[++i]) * 1000;   /* t164 */
->>>>>>> Stashed changes
         else if (str_eq(argv[i], "--no-prep")) g_prep_on = 0;   /* t159: no shader preparation records and no preparation at start-up */
         else if (str_eq(argv[i], "--prep")) g_prep_replay = 1;   /* t159 (replays): record, and prepare the recorded pipelines when the replay starts */
         else if (str_eq(argv[i], "--prep-force")) g_prep_force = 1;
@@ -2494,6 +2489,14 @@ int e3_main(int argc, char **argv) {
             if (*x == '-') { x++; while (*x >= '0' && *x <= '9') b = b * 10 + (u64)(*x++ - '0'); } else b = a;
             g_rtl_lo = a; g_rtl_hi = b; }
         else if (str_eq(argv[i], "--replay-dumptex") && i + 1 < argc && g_nrdt < 8) { const char *x = argv[++i]; u32 nn = 0; while (*x >= '0' && *x <= '9') nn = nn * 10 + (u32)(*x++ - '0'); g_rdt_n[g_nrdt++] = nn; }   /* t107b */
+        else if (str_eq(argv[i], "--old-posw")) g2s_opt_old_posw = 1;   /* t168 (A/B): pixel shaders get 1 / w for POS_W_FLOAT, as before */
+        else if (str_eq(argv[i], "--replay-dbg-ps") && i + 1 < argc) {   /* t168b: STEP:PC(hex):R0,R1,R2,R3 (decimal VGPRs), replay only */
+            const char *x = argv[++i]; u32 st = 0, pc = 0, rg = 0; while (*x >= '0' && *x <= '9') st = st * 10 + (u32)(*x++ - '0');
+            if (*x == ':') x++; if (x[0] == '0' && (x[1] == 'x' || x[1] == 'X')) x += 2;
+            for (; *x && *x != ':'; x++) { int d = *x >= '0' && *x <= '9' ? *x - '0' : *x >= 'a' && *x <= 'f' ? *x - 'a' + 10 : *x >= 'A' && *x <= 'F' ? *x - 'A' + 10 : -1; if (d < 0) break; pc = pc * 16 + (u32)d; }
+            if (*x == ':') x++;
+            for (int k = 0; k < 4 && *x; k++) { u32 r = 0; while (*x >= '0' && *x <= '9') r = r * 10 + (u32)(*x++ - '0'); rg |= (r & 0xFF) << (8 * k); if (*x == ',') x++; }
+            g_rdbg_step = st; g_rdbg_pc = pc; g_rdbg_regs = rg; }
         else if (str_eq(argv[i], "--replay-snap") && i + 1 < argc && g_nrsnap < 32) {   /* STEP:ADDR (hex), replay only */
             const char *x = argv[++i]; u32 nn = 0; while (*x >= '0' && *x <= '9') nn = nn * 10 + (u32)(*x++ - '0');
             if (*x == ':') x++; if (x[0] == '0' && (x[1] == 'x' || x[1] == 'X')) x += 2;

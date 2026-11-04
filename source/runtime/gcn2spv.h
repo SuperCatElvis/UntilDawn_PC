@@ -215,6 +215,7 @@ int g2s_cache_count(void);   /* t107b: SPIR-V modules generated so far (kept in 
 int g2s_translate_nomemo(const G2SIn *in, G2SOut *out);   /* t107: no memo lookup or insert */
 int g2s_out_diff(const G2SOut *f, const G2SOut *m, char *what, int cap);
 #define G2S_FOLD_PC (1ull << 63)   /* t143: a fold slot (2 dwords) that holds this value (the shader's PC for S_GETPC_B64), not memory at it */   /* t138 diagnostic */
+extern int g2s_opt_old_posw;   /* t168 */
 extern u64 g2s_memo_skip_addr; extern int g2s_cache_bypass; extern u32 g2s_memo_flip; extern int g2s_memo_last_kind; extern u32 g2s_memo_last_born;   /* t138 */
 const u32 *g2s_spv_get(u64 key, u32 *n);
 void g2s_memo_flush(void);                                 /* t107: forget every memo entry */
