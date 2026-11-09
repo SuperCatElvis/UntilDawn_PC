@@ -8,7 +8,7 @@ typedef signed char i8;
 typedef int i32;
 typedef long long i64;
 #define SYSV __attribute__((sysv_abi))
-#define UD_VERSION "0.3.1"   /* the release this program is (log, file properties, compatibility test) */
+#define UD_VERSION "0.3.2"   /* the release this program is (log, file properties, compatibility test) */
 
 static u64 g_main_va;
 

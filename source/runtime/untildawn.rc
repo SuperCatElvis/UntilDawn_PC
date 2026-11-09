@@ -1,8 +1,8 @@
 // UntilDawn.exe resources. untildawn.ico is made from the player's own sce_sys\icon0.png (make_icon.py) at build time.
 1 ICON "untildawn.ico"
 1 VERSIONINFO
-FILEVERSION 0,3,1,0
-PRODUCTVERSION 0,3,1,0
+FILEVERSION 0,3,2,0
+PRODUCTVERSION 0,3,2,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -11,8 +11,8 @@ BEGIN
       VALUE "FileDescription", "Until Dawn (PC runtime)"
       VALUE "ProductName", "Until Dawn"
       VALUE "OriginalFilename", "UntilDawn.exe"
-      VALUE "FileVersion", "0.3.1"
-      VALUE "ProductVersion", "0.3.1"
+      VALUE "FileVersion", "0.3.2"
+      VALUE "ProductVersion", "0.3.2"
     END
   END
   BLOCK "VarFileInfo"

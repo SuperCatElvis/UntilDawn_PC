@@ -23,15 +23,22 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release](https://github.com/SuperCatElvis/UntilDawn_PC/releases/latest)**
 
-**Current version: [v0.3.1](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.3.1)** — Released 4 November 2026
+**Current version: [v0.3.2](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.3.2)** — Released 9 November 2026
 
-Download `UntilDawn_0.3.1.zip` from the release's Assets section.
+Download `UntilDawn_0.3.2.zip` from the release's Assets section.
 
 The download includes the program, shader list, compatibility tester and documentation. Game files are not included.
 
-### What's new in v0.3.1
+### What's new in v0.3.2
 
-v0.3.1 is a focused graphics and shader update:
+v0.3.2 is a hotfix for v0.3.1:
+
+- Fixed the black, flickering screen on AMD graphics cards ([issue #5](https://github.com/SuperCatElvis/UntilDawn_PC/issues/5)); fix contributed by [Pedro-Castro31](https://github.com/Pedro-Castro31).
+- Fixed the stranger's clothing disappearing in Chapter 5 (simulated cloth could break after a few seconds).
+
+See the [v0.3.2 changelog](docs/releases/v0.3.2.md) for details.
+
+### Previously in v0.3.1
 
 - Fixed see-through and depth-faded surfaces, including the black icicles, the solid liquid in the "strange skull" clue jar, the squares on the cable car windows in Chapter 1 and a pale glow along the edges of hair.
 - Fixed draws that were left out in parts of Chapters 5 and 6.
@@ -116,7 +123,7 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 
 The project has been tested on several different PCs. Results include both gameplay testing and hardware compatibility checks.
 
-A successful compatibility test does not guarantee that the game will run without issues. Most results are from earlier versions, and not all systems have been tested with v0.3.1.
+A successful compatibility test does not guarantee that the game will run without issues. Most results are from earlier versions, and not all systems have been tested with v0.3.2.
 
 | CPU | GPU | Driver | OS | RAM | Results |
 |---|---|---|---|---|---|
@@ -135,6 +142,7 @@ A successful compatibility test does not guarantee that the game will run withou
 - **GTX 1660 Ti:** Gameplay confirmed with WIP 0.1.4, although occasional crashes and shader compilation pauses were reported.
 - **RTX 5050 Laptop:** Gameplay tested with WIP 0.1.4. Performance and display issues were reported when the integrated GPU handled the display.
 - **AMD Radeon RX 9070 XT:** Graphical issues reported in WIP 0.1.2 were fixed and verified in WIP 0.1.3.
+- **AMD Radeon RX 7800 XT:** Most of the screen black and flickering in v0.3.1 ([issue #5](https://github.com/SuperCatElvis/UntilDawn_PC/issues/5)); fixed in v0.3.2 with the fix contributed by Pedro-Castro31, who tested it on that card.
 
 **Important:** the GPU coherence system (new in v0.3.0) has primarily been tested on the development NVIDIA RTX 3090 Ti. AMD and Intel testing is still needed.
 
@@ -144,7 +152,7 @@ If you have different hardware, please consider submitting a [compatibility repo
 
 ### 1. Download the program
 
-Download `UntilDawn_0.3.1.zip` from the [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
+Download `UntilDawn_0.3.2.zip` from the [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 
 Extract the ZIP into a folder of your choice, such as:
 
@@ -196,7 +204,7 @@ For more details, see the [Installation Guide](docs/INSTALLATION.md).
 
 ### Updating from an earlier version
 
-If you're updating from v0.3.0 or an earlier release, replace the program files with the new versions.
+If you're updating from v0.3.1 or an earlier release, replace the program files with the new versions.
 
 Make sure to update:
 

@@ -1,4 +1,4 @@
-# Known issues — v0.3.1
+# Known issues — v0.3.2
 
 [← Back to README](../README.md)
 
@@ -73,6 +73,20 @@ GPUs, and the flickering menus may remain. Things to try:
 3. `present_mode = fifo` in `Config\settings.ini`.
 
 Please report what happened, with `Logs\UntilDawn.log`.
+
+## New in v0.3.2
+
+v0.3.2 is a hotfix for 0.3.1, described in the [release notes](releases/v0.3.2.md). Nothing else has changed.
+
+- **Fixed: black squares and flickering on AMD graphics cards** ([issue #5](https://github.com/SuperCatElvis/UntilDawn_PC/issues/5),
+  RX 7800 XT). The end-of-frame copy to the window was not ordered after the frame's drawing, and the black border fill
+  was not ordered before the copy; NVIDIA's driver happened to run them in the right order. Fix contributed by
+  Pedro-Castro31, who tested it on an RX 7800 XT and an RX 5700 XT. Other AMD cards have not been tested with it yet.
+- **Fixed: the stranger's clothing disappearing in Chapter 5** (the thin strips hanging from his coat in every session,
+  his waist in about half). A spare number in each simulated cloth point grew until it overflowed and broke the
+  cloth's bones. The program now keeps it at 1; the cloth's movement is unchanged (checked on recorded cloth from three
+  scenes). The same overflow was found in other cloth too, so other clothing that sometimes vanished may be
+  fixed as well - please report it if you still see that.
 
 ## New in v0.3.1
 
@@ -170,6 +184,8 @@ where 0.1.5 did not, please [report it](../README.md#reporting-bugs) with `Logs\
 
 | Issue | Status |
 | --- | --- |
+| Black squares, most of the screen black and flickering on AMD graphics cards (RX 7800 XT, issue #5) | **Fixed in v0.3.2** (fix contributed by Pedro-Castro31 and tested by its author on AMD; unchanged on NVIDIA) |
+| The stranger's clothing disappearing in Chapter 5 (the strips on his coat, sometimes his waist) | **Fixed in v0.3.2** (simulated cloth kept from overflowing; whole in all 4 encounters in testing) |
 | Black icicles; the liquid of the "strange skull" clue solid; squares on the cable car's frosted windows; a pale glow along hair edges | **Fixed in v0.3.1** (pixel shaders get the distance the PS4 hardware gives; checked on 14 recorded scenes and against a PS4 screenshot of the clue) |
 | Draws left out in parts of Chapters 5 and 6 (NVIDIA: shaders needing 33 resource slots) | **Fixed in v0.3.1** (checked on recorded scenes; not yet seen in play) |
 | Chapter 10: huge stretched triangles across the screen over Sam and the scene (the Josh section) | **Fixed in v0.3.0** (GPU coherence; checked on the recorded scene and with the automated tests, not yet in a full play-through). The graphics card had moved character model data, and the CPU then copied the hair's index data from the old, outdated place. |

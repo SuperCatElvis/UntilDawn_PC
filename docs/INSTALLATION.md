@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This guide covers v0.3.1 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
+This guide covers v0.3.2 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
 copy of the original PS4 game**. The download does not contain the game.
 
 ---
@@ -23,7 +23,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 
 ## 2. Download and extract the release
 
-1. Download `UntilDawn_0.3.1.zip` from the
+1. Download `UntilDawn_0.3.2.zip` from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder **you can write to**, for example `D:\Games\UntilDawn_WIP`.
    Don't use `C:\Program Files`: the program keeps its settings, logs, shader cache and saves in its own folder.
@@ -31,7 +31,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 After extracting you have:
 
 ```
-UntilDawn_0.3.1\
+UntilDawn_0.3.2\
   UntilDawn.exe                     the game
   pipelines.udm                     the shader list prepared on the first start (keep it here)
   Config\settings.ini               settings (see section 5)
@@ -51,9 +51,14 @@ UntilDawn_0.3.1\
 
 ### Updating from an earlier release
 
+**From 0.3.1:** copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files into your old folder
+(`pipelines.udm` is the same as in 0.3.1). **Do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves,
+settings and the shader cache (`Cache\`) carry over; v0.3.2 has no new settings. As after every update, the first
+start shows the "Preparing shaders" screen once more.
+
 **From 0.3.0:** copy the new `UntilDawn.exe`, the new `pipelines.udm`, `compat\ud_compat.exe` and the text files
 into your old folder. **Do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. Saves, settings and the
-shader cache (`Cache\`) carry over; v0.3.1 has no new settings. The first start shows the "Preparing shaders" screen
+shader cache (`Cache\`) carry over; v0.3.1 and v0.3.2 have no new settings. The first start shows the "Preparing shaders" screen
 once for the new list (about 2 minutes on the development PC).
 
 **From 0.2.1:** copy the new `UntilDawn.exe`, the new `pipelines.udm`, `compat\ud_compat.exe` and the text files
@@ -71,7 +76,7 @@ Circle skips it (the rest is then compiled during play, as before).
 **From 0.1.5 or earlier:**
 
 Copy the new `UntilDawn.exe`, `pipelines.udm`, `compat\ud_compat.exe` and the text files into your old folder. **Do not
-overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.3.1 to a
+overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.3.2 to a
 new folder and copy your `settings.ini`, `savedata` and game files over.
 
 - Saves and settings from earlier WIP releases work as they are. WIP 0.2.0 added four settings (`gpu`,
@@ -109,7 +114,7 @@ Choose **one** of these three ways:
 Copy the contents of your game folder into the release's `Game` folder, so that this file exists:
 
 ```
-UntilDawn_0.3.1\Game\eboot.bin
+UntilDawn_0.3.2\Game\eboot.bin
 ```
 
 ### Option B — point `settings.ini` at your game
@@ -158,7 +163,7 @@ Double-click **`UntilDawn.exe`**.
 - It also checks your CPU and graphics card. If a requirement is missing, a message explains what it is.
 - **Shader preparation (since v0.2.1).** Before the brightness screen, a "Preparing shaders" screen compiles the shaders
   the game will need: on the first start those listed in `pipelines.udm` (read together with your own game files;
-  about 2 minutes on the development PC with 24 threads for v0.3.1's list, longer with fewer cores), later also those earlier
+  about 2 minutes on the development PC with 24 threads for the current list (the same since v0.3.1), longer with fewer cores), later also those earlier
   sessions needed - under a second when nothing changed, longer after a graphics driver update. Esc or Circle skips
   it. Scenes that are not in the list yet still compile their shaders the first time they appear (with an empty
   cache in 0.2.0 that meant pauses of 3–12 seconds on the development PC, 10–20 seconds or more with fewer cores).

@@ -1809,6 +1809,59 @@ static void patch_skin_check(Module *m) {
     say("  skin-table check on (eboot+0xe12fc0, STATUS 68): a skinning call whose records do not add up is repaired when one count lost its low byte, otherwise limited; logged\n");
 }
 
+/* ------------------------------------------------------------------ v0.3.2: Havok Cloth particle w lanes (STATUS 238)
+   Havok Cloth keeps its particles as 4-lane vectors. The constraint solvers apply their corrections to all four lanes
+   but measure lengths with 3-lane dot products, so the unused w lane has no restoring force: the fixed particles get
+   w = 1 (MoveParticles, through the instance's 4x4 transform), rounding seeds tiny differences, and every link that
+   stays compressed multiplies them until w overflows to inf. Where inf meets a 0 coefficient (the volume constraint's
+   frame) it becomes NaN in the cloth's output transforms: the stranger's waist and coat strips vanished. x / y / z never
+   depend on w (offline replays bit-identical with and without this reset), so w of the position and previous-position
+   arrays is set back to 1 at the start of every cloth instance update (entry of eboot+0x73f190, rdi = hclClothInstance);
+   a non-finite w in the third particle array (0 when healthy) is cleared. --no-cloth-fix turns it off. */
+static int g_opt_no_cloth_fix; static volatile int g_cloth_state; static u64 g_cloth_vt, g_cloth_name, g_cloth_lo, g_cloth_hi, g_cloth_calls, g_cloth_drift, g_cloth_nonfinite;
+static void cloth_probe(u64 *P, u32 id) {
+    (void)id; u64 ci = P[32 + 8];   /* rdi */
+    if (g_cloth_state <= 0) {   /* first call (relocations are applied by now): the vtable's typeinfo must name hclSimClothInstance */
+        if (g_cloth_state < 0) return;
+        u64 ti = *(const u64 *)(g_cloth_vt - 8); int ok = ti >= g_cloth_lo && ti + 16 <= g_cloth_hi && *(const u64 *)(ti + 8) == g_cloth_name;   /* typeinfo inside the eboot */
+        __atomic_store_n(&g_cloth_state, ok ? 1 : -1, __ATOMIC_RELEASE);
+        if (!ok) { say("  cloth fix: the cloth type's vtable does not match - off\n"); return; } }
+    if (!mem_ok(ci, 0x30)) return;
+    u64 arr = *(const u64 *)(ci + 0x20); u32 ns = *(const u32 *)(ci + 0x28);   /* the simulation instances */
+    if (!ns || ns > 64 || !arr || (arr & 7) || !mem_ok(arr, 8ull * ns)) return;
+    u64 drift = 0, nonfin = 0;
+    for (u32 i = 0; i < ns; i++) {
+        u64 sim = ((const u64 *)arr)[i];
+        if (!sim || (sim & 7) || !mem_ok(sim, 0x48) || *(const u64 *)sim != g_cloth_vt) continue;   /* hclSimClothInstance only */
+        for (int k = 0; k < 3; k++) {   /* three hkArray<hkVector4> {data, size, capacity} at +0x18 / +0x28 / +0x38 */
+            u64 a = *(const u64 *)(sim + 0x18 + 16 * k); u32 n = *(const u32 *)(sim + 0x20 + 16 * k);
+            if (!a || (a & 15) || !n || n > 65536 || !mem_ok(a, 16ull * n)) continue;
+            u32 *u = (u32 *)a;
+            for (u32 j = 3; j < 4 * n; j += 4) { u32 v = u[j];
+                if (k < 2) { if (v == 0x3f800000u) continue;
+                    if (((v >> 23) & 0xff) == 0xff) nonfin++; else if (v > 0x3f8147aeu || v < 0x3f7d70a4u) drift++;   /* outside 0.99 .. 1.01 (bit compare) */
+                    u[j] = 0x3f800000u; }
+                else if (((v >> 23) & 0xff) == 0xff) { u[j] = 0; nonfin++; } } } }
+    __atomic_add_fetch(&g_cloth_calls, 1, __ATOMIC_RELAXED);
+    if (drift) __atomic_add_fetch(&g_cloth_drift, drift, __ATOMIC_RELAXED);
+    if (nonfin) __atomic_add_fetch(&g_cloth_nonfinite, nonfin, __ATOMIC_RELAXED);
+}
+static void patch_cloth_fix(Module *m) {
+    static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};   /* push rbp; mov rbp,rsp; push r15 */
+    const u32 va = 0x73f190, vt = 0x1fd25d0;
+    if (!g_stub_w || m->size < vt + 8) return;
+    for (int i = 0; i < 6; i++) if (m->base[va + i] != e[i]) { say("  cloth fix: the code does not match this eboot (01.03 expected) - not applied\n"); return; }
+    { static const char want[] = "19hclSimClothInstance"; const u32 nm = 0x1839df0;   /* the type's RTTI name (typeinfo +8) */
+      int ok = m->size >= nm + sizeof want; for (int i = 0; ok && i < (int)sizeof want; i++) ok = m->base[nm + i] == (u8)want[i];
+      if (!ok) { say("  cloth fix: the cloth type does not match this eboot (01.03 expected) - not applied\n"); return; }
+      g_cloth_name = (u64)m->base + nm; }
+    g_cloth_vt = (u64)m->base + vt; g_cloth_lo = (u64)m->base; g_cloth_hi = (u64)m->base + m->size;
+    u8 *s = m->base + va, *st = g_stub_w;
+    g_stub_w = probe_emit_stub(g_stub_w, 1, e, 6, s + 6, (void *)&cloth_probe);
+    s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90;
+    say("  cloth fix on (STATUS 238): Havok Cloth particle w lanes reset to 1 at each cloth update (eboot+0x73f190); --no-cloth-fix turns it off\n");
+}
+
 
 /* ------------------------------------------------------------------ t127: the game's arena allocator under a lock
    eboot+0x164f2e0 is a bump allocator (blocks {start, end, cur}; cur += size) with no lock of its own; it is called from
@@ -2117,6 +2170,7 @@ static void print_summary(void) {
     say("\nwall-clock reads (time, gettimeofday, CLOCK_REALTIME): "); say_dec(g_wall_reads);
     if (g_opt_trace_vis) { say("\nvisibility trace: Entity::SetVisible "); say_dec((i64)g_vis_calls[1]); say(", SkinnedMeshComponent::SetVisible "); say_dec((i64)g_vis_calls[2]); say(", StaticMeshComponent::SetVisible "); say_dec((i64)g_vis_calls[3]); say(", prop attach "); say_dec((i64)g_vis_calls[4]); say(", detach "); say_dec((i64)g_vis_calls[5]); say(", drawIndexOffset calls "); say_dec((i64)g_vis_draw_calls); if (g_opt_big_bounds) { say(", culling boxes made huge "); say_dec((i64)g_vis_big_n); } say(" (lines in captures\\visible_trace.txt: "); say_dec((i64)g_vis_lines); say(")"); }
     if (!g_opt_no_skin_check) { say("\nskin-table check: skinning calls "); say_dec((i64)g_skin_calls); say(", whose records did not add up: "); say_dec((i64)g_skin_bad); say(", repaired (a count-0 record restored): "); say_dec((i64)g_skin_repaired); say(" (details in skin_check.txt)"); }
+    if (!g_opt_no_cloth_fix && g_cloth_vt) { say(g_cloth_state < 0 ? "\ncloth fix (STATUS 238): off (the cloth type's vtable did not match); cloth updates " : "\ncloth fix (STATUS 238): cloth updates "); say_dec((i64)g_cloth_calls); say(", particle w values reset after drifting more than 1%: "); say_dec((i64)g_cloth_drift); say(", non-finite: "); say_dec((i64)g_cloth_nonfinite); }
     say("\n"); mem_report("at exit");
     say("direct-memory mappings: "); say_dec(g_dmaps_total); say(" (live "); say_dec(g_ndmap); say(", releases "); say_dec((i64)g_dreleases); say(", virtual queries "); say_dec((i64)g_vq_calls); say(" answered "); say_dec((i64)g_vq_hits);
     say("), mapping pools "); say_dec((i64)(g_pool_bytes >> 20)); say(" MB, in use "); say_dec((i64)(g_pool_used >> 20)); say(" MB, memory regions "); say_dec(g_nmem); say(", second mappings of the same physical memory: "); say_dec(g_dalias);
@@ -2350,6 +2404,7 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--trace-visible")) g_opt_trace_vis = 1;   /* diagnostic: STATUS 83 */
         else if (str_eq(argv[i], "--big-bounds")) { g_opt_trace_vis = 1; g_opt_big_bounds = 1; }   /* experiment: STATUS 83 */
         else if (str_eq(argv[i], "--no-skin-check")) g_opt_no_skin_check = 1;   /* STATUS 68 */
+        else if (str_eq(argv[i], "--no-cloth-fix")) g_opt_no_cloth_fix = 1;   /* v0.3.2, STATUS 238 */
         else if (str_eq(argv[i], "--no-arena-lock")) g_opt_no_arena_lock = 1;   /* t127 */
         else if (str_eq(argv[i], "--heap-slots-roundrobin")) g_opt_heap_rr = 1;   /* t131 */
         else if (str_eq(argv[i], "--ps4-sched")) g_opt_ps4_sched = 1;   /* t133 experiment */
@@ -2633,6 +2688,7 @@ int e3_main(int argc, char **argv) {
     if (g_opt_trace_atm) patch_atm_probes(&g_eboot);
     if (g_opt_trace_vis) patch_vis_probes(&g_eboot);
     if (!g_opt_no_skin_check) patch_skin_check(&g_eboot);
+    if (!g_opt_no_cloth_fix) patch_cloth_fix(&g_eboot);   /* v0.3.2 */
     if (!g_opt_no_arena_lock) { patch_arena_lock(&g_eboot); g_hw_explain_fn = arena_explain; }   /* t127 / t128 */
     patch_heap_slots(&g_eboot);   /* t130 */
     patch_heap_slot_reuse(&g_eboot);   /* t131 */
