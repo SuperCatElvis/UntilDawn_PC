@@ -7023,10 +7023,13 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
         vk_present_slow(1);
         V.gds_reset = 1;   /* the append counters start at 0 for the next frame, as after a present */
         V.frame++; pm_unlock(&g_gpu_lock); return; }
-    vk_begin_cb();
+    vk_begin_cb(); vk_end_rendering();
+    /* Present may share a command buffer with the last draw. Ending dynamic rendering does not publish its
+       attachment writes. The swapchain transition only covers the destination, not the image we read below. */
+    VkMemoryBarrier src_ready = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, 0, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, V.simg[idx], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, &b);
+    vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &src_ready, 0, 0, 1, &b);
     if (src) {
         u32 sw = w < src->w ? w : src->w, sh = h < src->h ? h : src->h;
         /* letterbox to the window, keeping the aspect ratio */
@@ -7035,8 +7038,14 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
         i32 ox = (i32)(V.ext.width - dw) / 2, oy = (i32)(V.ext.height - dh) / 2;
         VkClearColorValue black = {{0, 0, 0, 1}};
         vkCmdClearColorImage(V.cb, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &b.subresourceRange);
+        /* Clear and blit overlap in the destination. Submission order, even within one transfer stage, does not
+           order these writes: without a memory dependency the black clear can overwrite the copied frame. */
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, &b);
         VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(i32)sw, (i32)sh, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{ox, oy, 0}, {ox + (i32)dw, oy + (i32)dh, 1}}};
         vkCmdBlitImage(V.cb, src->img, VK_IMAGE_LAYOUT_GENERAL, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+        src->r_ep = V.bar_ep + 1; src->use_seq = g_sub_seq + 1; src->last_use = V.frame;
         skp_overlay(V.simg[idx], ox, oy, dw, dh);
     } else {
         VkClearColorValue c = {{0.05f, 0.0f, 0.1f, 1}};
