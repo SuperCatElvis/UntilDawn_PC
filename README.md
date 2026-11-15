@@ -8,7 +8,7 @@ This project brings the original PlayStation 4 version of Until Dawn to PC using
 The game is playable from start to finish, although development is still ongoing. A complete playthrough was achieved with an earlier build, but the latest release has not yet been fully playtested.
 
 > [!WARNING]
-> **This is still a work-in-progress.** Expect occasional crashes, graphical issues, frame-rate drops and shader compilation stutters. Some demanding scenes still run below 30 FPS. Improvements to stability, performance and compatibility are ongoing.
+> **This is still a work-in-progress.** While stability, graphics and performance have improved significantly, occasional crashes, graphical issues and frame-rate drops may still occur. Performance will vary depending on your hardware, and some scenes may experience brief stutters while loading. Further improvements to stability, performance and compatibility are ongoing.
 
 > [!IMPORTANT]
 > **You must provide your own legally obtained copy of Until Dawn (2015) for PlayStation 4 (CUSA02636), with update 1.03 applied.**
