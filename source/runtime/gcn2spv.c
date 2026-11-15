@@ -65,6 +65,17 @@ static u16 g2s_iflags(int enc, int op, const char *nm) {
 enum { SP_MOV32 = 1u << 0, SP_MOV64 = 1u << 1, SP_ADD = 1u << 2, SP_SUB = 1u << 3, SP_MUL = 1u << 4, SP_AND = 1u << 5, SP_OR = 1u << 6, SP_LSHL = 1u << 7,
        SP_LSHR = 1u << 8, SP_ADDC = 1u << 9, SP_B64CLR = 1u << 10, SP_MOVK = 1u << 11, SP_SBUF = 1u << 12, SP_LANE = 1u << 13, SP_RFL = 1u << 14,
        SP_V3CARRY = 1u << 15, SP_SWAPPC = 1u << 16, SP_NOFOLD = 1u << 17, SP_SETPC = 1u << 18, SP_WBINVL1 = 1u << 19, SP_DONE = 1u << 21 };
+/* w4_hill: an SMRD load (s_load_dword / s_buffer_load_dword) whose offset operand is the 32-bit literal (IMM = 0, OFFSET
+   = 255) gives the offset in DWORDS on this GPU generation (Sea Islands; byte offsets came with the next one), like
+   the 8-bit immediate; only a real SGPR operand holds a byte offset. The compiler uses the literal form exactly
+   when the dword offset does not fit 8 bits, i.e. for constant buffers larger than 1024 bytes: Dr Hill's head material
+   (1264 bytes) reads dwords 256..315 with literals 256, 272, 288, 304, 312. Taken as bytes, those loads returned
+   rows 16..19 of the buffer (0 / 1 pairs) in place of the wrinkle / blood-flow layer weights at its end - the red
+   chin on the main menu. --smrd-lit-bytes: as before. */
+int g2s_opt_smrd_lit_bytes;
+#define SMRD_LIT_OFF(l) (g2s_opt_smrd_lit_bytes ? (u32)(l) : (u32)(l) * 4u)
+/* w5_smrd (--smrd-log, diagnostic): every literal-offset SMRD load the per-draw scalar walk meets, with its resolved base */
+void (*g2s_smrd_lit_hook)(int stage, u64 code_addr, u32 pc, u32 lit, int cnt, int sbuf, u64 base, int base_known, u32 vs1, u32 vs2);
 #define SP_CNT_A(sp) ((int)(((sp) >> 22) & 31))   /* ss_exec's SMRD dword count */
 #define SP_CNT_B(sp) ((int)(((sp) >> 27) & 31))   /* g2s_load's SMRD dword count */
 static u32 g2s_spred_calc(int enc, const char *n) {
@@ -166,6 +177,7 @@ typedef struct {
     u32 id;
     u32 atom_fn[16], atom_op[16]; int natom; u32 t_fn_atom;
     u32 in_sglid; int cap_shuffle, cap_ballot, cap_quad, cap_gext; u32 in_helper;
+    u32 rs_gate;   /* t196: private u32, 0 for an invocation whose memory writes are left out (pixel shaders on scaled targets: all but the representative physical pixel of each logical one); 0 = no such variable */
     int nan_kind, nan_idx; u32 nan_seen, nan_rec_fn, nan_a64, nan_vidx;   /* diagnostic NaN probe (G2SIn nan_probe): kind of the instruction being emitted (0 none, 1 float op, 2 load), its index, the lane's "seen" flag */
     u32 sdata_var, t_sb_u32;
     int stage;
@@ -182,6 +194,8 @@ typedef struct {
     u32 sg[128], vg[256];     /* register variables (0 = unused) */
     u32 interface[512]; int nif;
     u32 fn_ld32, fn_st32;     /* helper functions */
+    u32 pc_page, pc_dev;   /* w6_gpu (g2s_ld_cache): the invocation's last page-table hit (Private u64s) */
+    u32 fn_ldg[5]; u32 fc_raw[4]; int fc_have;   /* t196 (g2s_ld_group): group loads of 2..4 dwords; a format load's dwords, loaded as one group */
     u32 helper_fc;            /* t154 experiment (g2s_gs_fc): SPIR-V function control of the E6 memory helpers */
     int vrel_lo1, vrel_n; u32 vrel_arr;   /* t156: VGPRs vrel_lo1 - 1 .. that V_MOVREL* may address live in one array (vrel_arr, vrel_n + 1 entries: the last is a sink) */
     u32 gs_hl, gs_hh;         /* t154 experiment (g2s_gs_hoist): the ring base noted in the geometry header, loaded once at the start of main */
@@ -228,6 +242,19 @@ int g2s_gs_notes_all;
    the driver compiles the two forms of the arithmetic differently. --movrel-array turns the array on (cold compile of
    that shader 3.5 s less, same GPU time). */
 int g2s_movrel_sel = 1;
+/* t196 (ws_gpu): every dword a shader loads from game memory goes through ld32 = one page-table entry read + the data
+   read (and the checks around them). A scalar load of 16 dwords, a vertex attribute of 3 floats, a 4-dword buffer load
+   each made that many page-table lookups - per invocation: the tiled lighting pass (CS 0x24f35e800) loads 30-60 dwords
+   of light data per light per pixel that way. g2s_ld_group = 1: the dwords of one instruction are loaded in groups of
+   up to 4 with ONE page-table lookup when the group lies inside one 64 KB page (checked in the shader; otherwise, and
+   whenever the page table has no entry, the same ld32 calls as before). Same values; set once before any translation. */
+int g2s_ld_group;
+/* w6_gpu: g2s_ld_cache = 1: each invocation remembers the last page the page table resolved (page number, device
+   address) in two private variables; a load from the same 64 KB page (the other attributes of a vertex, the next field
+   of a light record, the next element of a list) skips the table: one compare instead of the range checks and the
+   8-byte table read. The table does not change while a shader runs, so the values are the same. Loads only (ld32 and
+   the group loads); set once before any translation (the SPIR-V changes: pipelines are prepared again). */
+int g2s_ld_cache;
 
 static u32 nid(SB *s) { return ++s->id; }
 /* a variable with an initial value (t105 zero_regs); the constant is made first, so it precedes the variable */
@@ -381,6 +408,17 @@ static u32 scc_bool(SB *s) { return E2(171, s->t_bool, ld(s, s->t_u32, sreg_var(
 static void emit_pt_fast(SB *s, u32 addr, int store, u32 val, u32 act) {
     u32 B = s->t_bool, U64 = s->t_u64;
     u32 t_psb_u64 = ty_ptr(s, SC_PSB, U64);
+    u32 pg = 0;
+    if (s->pc_page && !store) {   /* w6_gpu: the page of the last hit */
+        pg = E2(194, U64, addr, cu(s, 16));
+        u32 chit = E2(170, B, pg, ld(s, U64, s->pc_page)), l_c = nid(s), l_cm = nid(s);
+        sb_op(&s->code, 247, 2, (u32[]){l_cm, 0});
+        brc(s, chit, l_c, l_cm);
+        label_id(s, l_c);
+        u32 cda = E2(128, U64, ld(s, U64, s->pc_dev), E2(199, U64, addr, cu64(s, 0xFFFF)));
+        u32 cv = op1(s, &s->code, 61, s->t_u32, 3, (u32[]){E1(120, s->t_psb_u32, cda), 2, 4}); sb_op(&s->code, 254, 1, (u32[]){cv});
+        label_id(s, l_cm);
+    }
     u32 pt = ld(s, U64, E2(65, s->t_regions_ptr_u64, s->regions_var, cu(s, 1)));
     u32 rel = E2(130, U64, addr, cu64(s, G2S_PT_BASE));
     u32 fast = E2(167, B, E2(171 + 0, B, pt, cu64(s, 0)), E2(176, B, rel, cu64(s, G2S_PT_SIZE)));
@@ -395,6 +433,7 @@ static void emit_pt_fast(SB *s, u32 addr, int store, u32 val, u32 act) {
     sb_op(&s->code, 247, 2, (u32[]){l_fm, 0});
     brc(s, ok, l_hit, l_fm);
     label_id(s, l_hit);
+    if (pg) { sb_op(&s->code, 62, 2, (u32[]){s->pc_page, pg}); sb_op(&s->code, 62, 2, (u32[]){s->pc_dev, ent}); }
     u32 da = E2(128, U64, ent, E2(199, U64, addr, cu64(s, 0xFFFF)));
     u32 ptr = E1(120, s->t_psb_u32, da);
     if (store) { sb_op(&s->code, 62, 4, (u32[]){ptr, val, 2, 4}); sb_op(&s->code, 253, 0, 0); }
@@ -435,6 +474,8 @@ static void emit_mem_helpers(SB *s) {
     s->t_ub_u32 = ty_ptr(s, SC_Uniform, s->t_u32);
     s->t_regions_ptr_u64 = ty_ptr(s, SC_Uniform, s->t_u64);
     u32 t_pf_u32 = ty_ptr(s, SC_Function, s->t_u32);
+    s->pc_page = s->pc_dev = 0;
+    if (g2s_ld_cache) { u32 t_pp_u64 = ty_ptr(s, SC_Private, s->t_u64); u32 c1 = cu64(s, ~0ull), c0 = cu64(s, 0); s->pc_page = gvar_init(s, t_pp_u64, SC_Private, c1); s->pc_dev = gvar_init(s, t_pp_u64, SC_Private, c0); }
 
     /* u32 ld32(u64 addr): translate through the region table, then load */
     u32 t_fn_ld = ty(s, 33, 2, (u32[]){s->t_u32, s->t_u64});
@@ -522,6 +563,52 @@ static void emit_mem_helpers(SB *s) {
     label_id(s, l_merge);
     sb_op(&s->code, 253, 0, 0);
     sb_op(&s->code, 56, 0, 0);
+
+    /* t196: uvec4 ldgN(u64 addr), N = 2..4: N consecutive dwords with one page-table lookup (components past N are 0) */
+    for (int n = 2; g2s_ld_group && n <= 4; n++) {
+        u32 B = s->t_bool, U = s->t_u32, U64 = s->t_u64, t_psb_u64 = ty_ptr(s, SC_PSB, U64);
+        u32 t_fn = ty(s, 33, 2, (u32[]){s->t_v4u, U64});
+        u32 fn = s->fn_ldg[n] = nid(s);
+        sb_op(&s->code, 54, 4, (u32[]){s->t_v4u, fn, s->helper_fc, t_fn});
+        u32 pa = nid(s); sb_op(&s->code, 55, 2, (u32[]){U64, pa});
+        label(s);
+        u32 inpg = E2(199, U64, pa, cu64(s, 0xFFFF)), gpg = 0;
+        if (s->pc_page) {   /* w6_gpu: the page of the last hit */
+            gpg = E2(194, U64, pa, cu(s, 16));
+            u32 chit = E2(167, B, E2(170, B, gpg, ld(s, U64, s->pc_page)), E2(178, B, inpg, cu64(s, 0x10000ull - 4ull * (u64)n))), l_c = nid(s), l_cm = nid(s);
+            sb_op(&s->code, 247, 2, (u32[]){l_cm, 0});
+            brc(s, chit, l_c, l_cm);
+            label_id(s, l_c);
+            u32 cda = E2(128, U64, ld(s, U64, s->pc_dev), inpg); u32 cv[4];
+            for (int i = 0; i < 4; i++) cv[i] = i < n ? op1(s, &s->code, 61, U, 3, (u32[]){E1(120, s->t_psb_u32, i ? E2(128, U64, cda, cu64(s, 4ull * (u64)i)) : cda), 2, 4}) : cu(s, 0);
+            sb_op(&s->code, 254, 1, (u32[]){op1(s, &s->code, 80, s->t_v4u, 4, cv)});
+            label_id(s, l_cm);
+        }
+        u32 pt = ld(s, U64, E2(65, s->t_regions_ptr_u64, s->regions_var, cu(s, 1)));
+        u32 rel = E2(130, U64, pa, cu64(s, G2S_PT_BASE));
+        u32 fast = E2(167, B, E2(167, B, E2(171, B, pt, cu64(s, 0)), E2(176, B, rel, cu64(s, G2S_PT_SIZE))), E2(178, B, inpg, cu64(s, 0x10000ull - 4ull * (u64)n)));
+        u32 l_fast = nid(s), l_slow = nid(s), l_hit = nid(s), l_fm = nid(s);
+        sb_op(&s->code, 247, 2, (u32[]){l_slow, 0});
+        brc(s, fast, l_fast, l_slow);
+        label_id(s, l_fast);
+        u32 ea = E2(128, U64, pt, E2(199, U64, E2(194, U64, rel, cu(s, 13)), cu64(s, ~7ull)));
+        u32 ent = op1(s, &s->code, 61, U64, 3, (u32[]){E1(120, t_psb_u64, ea), 2, 8});
+        u32 ok = E2(171, B, ent, cu64(s, 0));
+        sb_op(&s->code, 247, 2, (u32[]){l_fm, 0});
+        brc(s, ok, l_hit, l_fm);
+        label_id(s, l_hit);
+        if (gpg) { sb_op(&s->code, 62, 2, (u32[]){s->pc_page, gpg}); sb_op(&s->code, 62, 2, (u32[]){s->pc_dev, ent}); }
+        u32 da = E2(128, U64, ent, inpg);
+        u32 v[4];
+        for (int i = 0; i < 4; i++) v[i] = i < n ? op1(s, &s->code, 61, U, 3, (u32[]){E1(120, s->t_psb_u32, i ? E2(128, U64, da, cu64(s, 4ull * (u64)i)) : da), 2, 4}) : cu(s, 0);
+        sb_op(&s->code, 254, 1, (u32[]){op1(s, &s->code, 80, s->t_v4u, 4, v)});
+        label_id(s, l_fm);
+        br(s, l_slow);
+        label_id(s, l_slow);
+        for (int i = 0; i < 4; i++) v[i] = i < n ? E2(57, U, s->fn_ld32, i ? E2(128, U64, pa, cu64(s, 4ull * (u64)i)) : pa) : cu(s, 0);
+        sb_op(&s->code, 254, 1, (u32[]){op1(s, &s->code, 80, s->t_v4u, 4, v)});
+        sb_op(&s->code, 56, 0, 0);
+    }
 }
 /* ---- native binding mode: storage buffers addressed as (binding << 40) + byte offset ---- */
 static int nat_find(const G2SNative *n, u32 pc, u32 use) { for (int i = 0; i < n->nuse; i++) if (n->use[i].pc == pc && n->use[i].use == use) return n->use[i].binding; return -1; }
@@ -606,8 +693,25 @@ static u32 ld32(SB *s, u32 a64) {
     if (s->nat_mode) { int k = nat_idx(s); return k < 0 ? cu(s, 0) : E2(57, s->t_u32, s->nat_fld[k], a64); }
     return E2(57, s->t_u32, s->fn_ld32, a64);
 }
+/* t196: cnt consecutive dwords from a64 (E6 memory, not native): groups of up to 4 share one page-table lookup */
+static u32 add64c(SB *s, u32 a64, u32 off);
+static void ld32n(SB *s, u32 a64, int cnt, u32 *out) {
+    if (s->nat_mode || !g2s_ld_group || cnt < 2 || !s->fn_ldg[2]) { for (int i = 0; i < cnt; i++) out[i] = ld32(s, i ? add64c(s, a64, cu(s, (u32)(4 * i))) : a64); return; }
+    for (int i = 0; i < cnt; ) {
+        int n = cnt - i > 4 ? 4 : cnt - i; u32 a = i ? add64c(s, a64, cu(s, (u32)(4 * i))) : a64;
+        if (n == 1) { out[i] = ld32(s, a); i++; continue; }
+        u32 v = E2(57, s->t_v4u, s->fn_ldg[n], a);
+        for (int k = 0; k < n; k++) out[i + k] = E2(81, s->t_u32, v, (u32)k);
+        i += n;
+    }
+}
 static u32 rd_exec(SB *s);
+static u32 rs_act(SB *s, u32 act) {   /* t196: an activity word (non-zero = on) with the render-scale gate applied */
+    if (!s->rs_gate) return act;
+    return E3(169, s->t_u32, E2(171, s->t_bool, ld(s, s->t_u32, s->rs_gate), cu(s, 0)), act, cu(s, 0));
+}
 static void st32a(SB *s, u32 a64, u32 v, u32 act) {
+    act = rs_act(s, act);
     if (s->nat_mode) { int k = nat_idx(s); if (k >= 0) op1(s, &s->code, 57, s->t_void, 4, (u32[]){s->nat_fst[k], a64, v, act}); return; }
     op1(s, &s->code, 57, s->t_void, 4, (u32[]){s->fn_st32, a64, v, act});
 }
@@ -731,7 +835,12 @@ static void dbg_why(const SState *t, int sb, int constoff, u32 pc) { extern int 
 static void ss_setp(SState *t, int r, u32 v, int k, Prov p) { if (r >= 0 && r < 128) { DBG_SET(r); t->v[r] = v; t->known[r] = (u8)k; t->wr[r] = 1; t->tg[r] = k ? t->cur : 0; t->pu[r] = k ? t->curu : 0; t->pv[r] = k ? p : PROV_T; } }
 static void ss_set(SState *t, int r, u32 v, int k) { ss_setp(t, r, v, k, PROV_T); }
 /* the recorder of the relocatable memo (below); no-ops when not recording */
-static void rec_content(const SState *t, int r); static void rec_noreloc(const char *why); static void rec_fold(u32 i, const AExp *a); static void rec_rd(u32 slot, const AExp *a, u32 cnt);
+static void rec_content(const SState *t, int r); static void rec_noreloc(const char *why); static void rec_fold(u32 i, const AExp *a); static void rec_rd(u32 slot, const AExp *a, u32 cnt); static int rec_rd_dup(const AExp *a, u32 cnt);
+/* w3_perf (--memo-rd-dups): two scalar loads the GPU makes from the same 64 KB page made the whole translation
+   non-relocatable ("duplicate read range": 128,074 of 161,701 non-relocatable entries in a cave run, each needing a full
+   translation whenever a pointer in its inputs changed - ~25 a frame). Now every such load is recorded, in order, and a
+   relocation rebuilds the list of ranges exactly as a fresh translation lists them (first occurrence only, 16 at most). */
+int g2s_rd_dups; int g2s_reloc_any; int g2s_gw_pred;
 static void ss_use(SState *t, int r) { if (r >= 0 && r < 128 && t->known[r]) { t->rel |= t->tg[r]; rec_content(t, r); } }   /* value r decides an address or descriptor */
 /* t107b (relocatable memo v2): a descriptor word. The exact-key path is as ss_use; for a relocated reuse only the bits in
    mask decide the translation (texture type, number format, buffer format), the rest only passes into the result
@@ -817,7 +926,7 @@ static void ss_exec(const G2SIn *in, SState *t, const GInst *I) {
     } else if (I->enc == E_SMRD) {
         int dst = (int)((d >> 15) & 0x7F), sb = (int)(((d >> 9) & 0x3F) * 2), cnt = SP_CNT_A(I->sp);
         u32 off; int ko = 1; Prov po = PROV_C;
-        if ((d >> 8) & 1) off = (d & 0xFF) * 4; else if ((d & 0xFF) == 255) off = I->lit; else ko = ss_srcp(t, d & 0xFF, 0, &off, &po);
+        if ((d >> 8) & 1) off = (d & 0xFF) * 4; else if ((d & 0xFF) == 255) off = SMRD_LIT_OFF(I->lit); else ko = ss_srcp(t, d & 0xFF, 0, &off, &po);
         u64 base; int kb; u32 himask = (I->sp & SP_SBUF) ? 0xFFF : 0xFFFF;
         base = t->v[sb] | ((u64)(t->v[sb + 1] & himask) << 32); kb = t->known[sb] && t->known[sb + 1];
         u32 buf[16]; AExp ax = {0};
@@ -834,6 +943,7 @@ static void ss_exec(const G2SIn *in, SState *t, const GInst *I) {
             if (dbg_rec_on()) { g_dbg_po = po; g_dbg_off = off; dbg_why(t, sb, po.k == PK_CONST, I->pc); }
 #endif
             rec_noreloc("address of unknown provenance"); } } }
+        if (g2s_smrd_lit_hook && I->has_lit) g2s_smrd_lit_hook(in->stage, in->code_addr, I->pc, I->lit, cnt, (I->sp & SP_SBUF) != 0, base, kb, t->known[sb + 1] ? t->v[sb + 1] : 0, (sb + 2 < 104 && t->known[sb + 2]) ? t->v[sb + 2] : 0);   /* w5_smrd */
         u32 grp = ss_newgrp(t);
         g_ss_tag = grp; g_ss_last_ev = -1; if (kb && ko) rec_set_aexp(&ax);
         int ok = kb && ko && cnt <= 16 && ss_read(in, base + off, buf, (u32)cnt);
@@ -890,7 +1000,7 @@ static u32 fetch_component(SB *s, u32 a64, u32 dfmt, u32 nfmt, int c) {
         return cu(s, 0);
     }
     u32 raw; int pbits = 0;
-    if (csize == 4) raw = ld32(s, add64c(s, a64, cu(s, (u32)(4 * c))));
+    if (csize == 4) raw = c < s->fc_have ? s->fc_raw[c] : ld32(s, add64c(s, a64, cu(s, (u32)(4 * c))));
     else if (csize == 0) {
         /* packed formats, named most-significant field first (as in Mesa's mapping):
            8 = 10_10_10_2: X is the 2-bit field at bit 0;  9 = 2_10_10_10 (RGB10A2): X is 10 bits at bit 0, W 2 bits at 30;
@@ -1063,7 +1173,11 @@ static void ss_merge(SState *d, const SState *b) {
     d->wr_lane |= b->wr_lane; d->rel |= b->rel; d->cur |= b->cur; d->curu |= b->curu; if (b->ngrp > d->ngrp) d->ngrp = b->ngrp;
 }
 #define G2S_MAXJOIN 64
+static unsigned long long g2s_n_taint_unfold; unsigned long long g2s_n_taint_unfold_get(void);
+unsigned long long g2s_n_taint_unfold_get(void) { return g2s_n_taint_unfold; }
+/* (declared above) */ //   /* w2: scalar loads left to the GPU because an earlier load of the shader was over a GPU write in flight */
 static int g2s_load(const G2SIn *in, G2SOut *out, GInst *ins, GDesc *descs, int *nins, int *ndesc) {
+    int gw_taint = 0;   /* w2: see the fold decision below */
     static SState join_st[G2S_MAXJOIN]; u32 join_pc[G2S_MAXJOIN]; int njoin = 0, fall = 1;
     u32 buf[4];
     int n = 0, nd = 0;
@@ -1145,7 +1259,7 @@ static int g2s_load(const G2SIn *in, G2SOut *out, GInst *ins, GDesc *descs, int 
             u32 d = I.w0; int sb = (int)(((d >> 9) & 0x3F) * 2), cnt = SP_CNT_B(I.sp); const char *nm = I.name; (void)nm;
             u32 off; int ko = 1; Prov po = PROV_C;
             t.cur = 0; t.curu = 0;
-            if ((d >> 8) & 1) off = (d & 0xFF) * 4; else if ((d & 0xFF) == 255) off = I.lit; else ko = ss_srcp(&t, d & 0xFF, 0, &off, &po);
+            if ((d >> 8) & 1) off = (d & 0xFF) * 4; else if ((d & 0xFF) == 255) off = SMRD_LIT_OFF(I.lit); else ko = ss_srcp(&t, d & 0xFF, 0, &off, &po);
             int kb = t.known[sb] && t.known[sb + 1];
             u32 himask = (I.sp & SP_SBUF) ? 0xFFFu : 0xFFFFu;
             u64 base = t.v[sb] | ((u64)(t.v[sb + 1] & himask) << 32);
@@ -1165,7 +1279,17 @@ static int g2s_load(const G2SIn *in, G2SOut *out, GInst *ins, GDesc *descs, int 
 #ifdef G2S_DEBUG
             { extern int printf(const char *, ...); printf("SMRD pc %x %s sb s%d kb %d ko %d\n", I.pc, nm, sb, kb, ko); }
 #endif
-            if (kb && ko && cnt <= 16 && out->nfold < 256 && out->fold_dw + (u32)cnt <= 4096 && ((in->exp_flags & 64) || !(in->gpu_written && in->gpu_written(in->ctx, base + off, (u32)cnt))) && (g_ss_tag = ss_newgrp(&t), ss_read(in, base + off, tmp, (u32)cnt))) {
+            /* w2: a load over a GPU write that is still in flight (answer 2) is made by the GPU, as before - but its value
+               in RAM is the one from BEFORE that write, and the loads after it may use it as their address (a table pointer
+               written by an earlier pass). They were folded from that old address: the draw then read another table's
+               constants whenever the GPU was a few batches behind (the "cold pipeline cache" picture of capture 7514, and
+               in play any frame with a backlog). From the first such load on, the shader's scalar loads are left to the
+               GPU, which uses the registers it really loaded (what --no-fold does for every load). */
+            int pre_ = kb && ko && cnt <= 16 && out->nfold < 256 && out->fold_dw + (u32)cnt <= 4096;
+            int gwr_ = pre_ && !(in->exp_flags & 64) && in->gpu_written ? in->gpu_written(in->ctx, base + off, (u32)cnt) : 0;
+            int tainted_ = gw_taint; if (gwr_ == 2) gw_taint = 1;
+            if (pre_ && !gwr_ && tainted_) g2s_n_taint_unfold++;
+            if (pre_ && !gwr_ && !tainted_ && (g_ss_tag = ss_newgrp(&t), ss_read(in, base + off, tmp, (u32)cnt))) {
                 g_ss_tag = 0;
                 I.fold = (int)out->fold_dw;
                 rec_fold(out->nfold, &ax);
@@ -1174,6 +1298,7 @@ static int g2s_load(const G2SIn *in, G2SOut *out, GInst *ins, GDesc *descs, int 
                 u64 lo = (base + off) & ~0xFFFFull, hi = (base + off + 4ull * (u32)cnt + 0xFFFF) & ~0xFFFFull; int dup = 0;
                 for (u32 k = 0; k < out->nrd; k++) if (out->rd_lo[k] == lo && out->rd_hi[k] == hi) dup = 1;
                 if (!dup && out->nrd < 16) { rec_rd(out->nrd, &ax, (u32)cnt); out->rd_lo[out->nrd] = lo; out->rd_hi[out->nrd] = hi; out->nrd++; }
+                else if (dup && g2s_rd_dups && rec_rd_dup(&ax, (u32)cnt)) { }   /* w3_perf: recorded without a slot; a relocation rebuilds the list in order (memo_reloc_try) */
                 else if (dup) rec_noreloc("duplicate read range");   /* (the slot would stand for two addresses after relocation) */
             }
         }
@@ -1208,7 +1333,7 @@ static int g2s_load(const G2SIn *in, G2SOut *out, GInst *ins, GDesc *descs, int 
 
 /* ================================================================ translation cache */
 #define G2S_CACHE 65536
-typedef struct { u64 key; u32 *spv; u32 n, vs_params, mrt, inputs; int lds, structured, wmem; u8 rel; u8 *z; u32 zn; } G2SCacheEnt;   /* rel: t112, its SPIR-V is (to be) freed; z / zn: t114, the words compressed (spvz.h) */
+typedef struct { u64 key; u32 *spv; u32 n, vs_params, mrt, inputs; int lds, structured, wmem; u8 rel, zq; u8 *z; u32 zn; } G2SCacheEnt;   /* rel: t112, its SPIR-V is (to be) freed; z / zn: t114, the words compressed (spvz.h) */
 static G2SCacheEnt g2s_cache[G2S_CACHE]; static int g2s_ncache;
 int g2s_opt_old_posw;   /* t168 (A/B): POS_W_FLOAT given as SPIR-V FragCoord.w (1 / w), the behaviour before t168 */
 int g2s_cache_bypass;   /* t138 (diagnostic): SPIR-V generated afresh, not looked up in or added to the cache (the caller frees it) */
@@ -1231,6 +1356,7 @@ typedef struct {
     SB *s; const G2SIn *in; G2SOut *out;
     GInst *ins; int n; GDesc *descs;
     int bind_of_desc[4096];       /* desc index -> texture binding */
+    int mipfb_n;                  /* popin: instrumented sample sites */
     u32 t_img[G2S_MAX_TEX], t_simg[G2S_MAX_TEX];
     u16 tex_nb[G2S_MAX_TEX][2];   /* native mode: image and sampler binding of each texture group */
     u32 nat_smp[G2S_MAX_TEX];
@@ -1239,7 +1365,7 @@ typedef struct {
     int *blk_of_ins; int nblk; u8 *blk_sync; int probe_store; u32 tess_lds_base;
     u32 gs_gid, gs_cnt_var;   /* GS emulation (gs_mode 2): invocation number, emitted-vertex counter */
     u32 gs_mlo_var, gs_mhi_var;   /* E6 GS emulation: vertices that start a new strip (cut mask, vertices 0..63) */
-    u32 pushvar, t_pp_push_u32;
+    u32 pushvar, t_pp_push_u32, t_rs_mulx /* w7_prep */;
     int fix_z;
     int wave_sync; u32 vote_var, lidx_var, vote_n;   /* compute + LDS: emulate 64-lane lockstep (uniform branches, LDS barriers) */
     int vote_borrow; u32 vote_save, lds_dw;          /* t104: votes in the last LDS dword (G2SIn.max_shared) */
@@ -1293,6 +1419,166 @@ static int ps_live_exec(EM *e) { return e->in->stage == G2S_PS && !e->in->native
 static int ps_needs_live_exec(const GInst *ins, int nins) {   /* the opcode list is in g2s_iflags_calc (GF_LIVE) */
     for (int i = 0; i < nins; i++) if (ins[i].fl & GF_LIVE) return 1;
     return 0;
+}
+/* ---- t196: render scale (the renderer's --render-scale; G2SIn.diag_salt = G2S_RS_TAG | num << 8 | den, see gcn2spv.h) ----
+   Render targets and storage images the size of the screen are num / den times larger than the game thinks. The shader
+   keeps working in the game's (logical) pixels; what changes is told per draw / dispatch in six extra push-constant
+   words (32..37): word 32 bit 0 = this pixel shader's targets are scaled / this dispatch runs once per physical pixel;
+   word 33 (VS / CS) and 34 (PS) = one bit per texture binding whose image is scaled; words 35, 36 = a scaled dispatch's
+   logical extent in threads (x, y).
+   Physical pixel p belongs to logical pixel L(p) = floor((p + 0.5) * den / num); the representative physical pixel of
+   logical pixel l is R(l) = floor((l + 0.5) * num / den) (L(R(l)) == l); the first physical pixel of l is
+   F(l) = ceil((l * num - den / 2) / den). */
+static int g2s_rs(const G2SIn *in, u32 *num, u32 *den) {
+    if ((in->diag_salt & 0xFFFF0000u) != G2S_RS_TAG) return 0;
+    if (in->diag_salt & G2S_RS_GEN) { *num = 0; *den = 0; return 1; }   /* w7_prep: the values come from push constants (rs_gen) */
+    *num = (in->diag_salt >> 8) & 0x7F; *den = in->diag_salt & 0x7F;   /* (bit 15: w3, G2S_RS_SUB) */
+    return *den && *num > *den;
+}
+static int rs_plain_cs(const G2SIn *in) { return in->stage == G2S_CS && !in->tess_mode && !in->gs_mode && !in->native; }
+static u32 rs_pc(EM *e, u32 i) { SB *s = e->s; return ld(s, s->t_u32, E3(65, e->t_pp_push_u32, e->pushvar, cu(s, 0), cu(s, i))); }
+static u32 rs_own(EM *e) { SB *s = e->s; return E2(171, s->t_bool, E2(199, s->t_u32, rs_pc(e, 32), cu(s, 1)), cu(s, 0)); }   /* bool: scaled targets / scaled dispatch */
+static u32 rs_tex(EM *e, int b) { SB *s = e->s; return E2(171, s->t_bool, E2(199, s->t_u32, rs_pc(e, e->in->stage == G2S_PS ? 34 : 33), cu(s, 1u << (b & 31))), cu(s, 0)); }
+/* w2 (t198): with an even denominator (3/2, 5/4 ...) every den-th physical pixel centre would lie exactly on the border of
+   two logical pixels: a shader that makes texel coordinates from an interpolated attribute (not from the pixel position)
+   then lands on either side by rounding, and its fetches jump by a whole logical pixel - the "pixelated" 150 % picture.
+   For those ratios everything drawn on scaled targets is shifted by RS_E / (2 den) of a physical pixel (the renderer's
+   viewport; g2s_rs_shift), so that no centre is nearer than 1 / (2 num) to a border:
+   L(p) = floor(((2p + 1) den - RS_E) / (2 num)), R(l) = floor(((2l + 1) num + RS_E) / (2 den)),
+   F(l) = ceil((2 num l + RS_E - den) / (2 den)); RS_E = 1 for an even den, else 0 (the formulas above). Sampling a scaled
+   image by normalised coordinates adds the shift (rs_map_uv). */
+/* w7_prep (G2S_RS_GEN): the ratio from push constants. x / m as the high word of x * (floor(2^32 / m) + 1): exact for x < 2^32 / m
+   (m <= 2 * 127; x is a pixel coordinate times a small factor) */
+static int rs_gen(const G2SIn *in) { return (in->diag_salt & (0xFFFF0000u | G2S_RS_GEN)) == (G2S_RS_TAG | G2S_RS_GEN); }
+static u32 rs_mulhi(EM *e, u32 x, u32 m) { SB *s = e->s; u32 U = s->t_u32; if (!e->t_rs_mulx) e->t_rs_mulx = ty(s, 30, 2, (u32[]){U, U}); return E2(81, U, E2(151, e->t_rs_mulx, x, m), 1); }
+static u32 rs_vn(EM *e) { return rs_pc(e, 38); }
+static u32 rs_vd(EM *e) { return rs_pc(e, 39); }
+static u32 rs_vE(EM *e) { return rs_pc(e, 40); }
+static u32 rs_vf(EM *e, u32 k) { SB *s = e->s; return E1(124, s->t_f32, rs_pc(e, 43 + k)); }   /* 0: num / den, 1: den / num, 2: the shift */
+static u32 rs_L(EM *e, u32 p) { SB *s = e->s; u32 n, d; g2s_rs(e->in, &n, &d); u32 U = s->t_u32;
+    if (rs_gen(e->in)) return rs_mulhi(e, E2(130, U, E2(132, U, E2(128, U, E2(132, U, p, cu(s, 2)), cu(s, 1)), rs_vd(e)), rs_vE(e)), rs_pc(e, 41));
+    return E2(134, U, E2(130, U, E2(132, U, E2(128, U, E2(132, U, p, cu(s, 2)), cu(s, 1)), cu(s, d)), cu(s, RS_E(d))), cu(s, 2 * n)); }
+static u32 rs_R(EM *e, u32 l) { SB *s = e->s; u32 n, d; g2s_rs(e->in, &n, &d); u32 U = s->t_u32;
+    if (rs_gen(e->in)) return rs_mulhi(e, E2(128, U, E2(132, U, E2(128, U, E2(132, U, l, cu(s, 2)), cu(s, 1)), rs_vn(e)), rs_vE(e)), rs_pc(e, 42));
+    return E2(134, U, E2(128, U, E2(132, U, E2(128, U, E2(132, U, l, cu(s, 2)), cu(s, 1)), cu(s, n)), cu(s, RS_E(d))), cu(s, 2 * d)); }
+static u32 rs_F(EM *e, u32 l) { SB *s = e->s; u32 n, d; g2s_rs(e->in, &n, &d); u32 U = s->t_u32;
+    if (rs_gen(e->in)) return rs_mulhi(e, E2(128, U, E2(132, U, l, E2(132, U, rs_vn(e), cu(s, 2))), E2(128, U, E2(130, U, rs_vd(e), cu(s, 1)), rs_vE(e))), rs_pc(e, 42));
+    return E2(134, U, E2(128, U, E2(132, U, l, cu(s, 2 * n)), cu(s, d - 1 + RS_E(d))), cu(s, 2 * d)); }
+/* this invocation's own physical pixel P and logical pixel L (u32 ids); 0 when the stage has none (then every scaled
+   image is read at the representative pixel) */
+static int rs_self(EM *e, u32 P[2], u32 L[2]) {
+    SB *s = e->s; u32 U = s->t_u32;
+    if (e->in->stage == G2S_PS) {
+        if (!s->in_fragcoord) s->in_fragcoord = em_vin(e, s->t_v4f, 15, 0, 0);
+        u32 fc = ld(s, s->t_v4f, s->in_fragcoord);
+        for (u32 a = 0; a < 2; a++) { P[a] = E1(109, U, E2(81, s->t_f32, fc, a)); L[a] = rs_L(e, P[a]); }
+        return 1;
+    }
+    if (rs_plain_cs(e->in)) {
+        if (!s->in_lid) s->in_lid = em_vin(e, s->t_v3u, 27, 0, 0);
+        if (!s->in_wgid) s->in_wgid = em_vin(e, s->t_v3u, 26, 0, 0);
+        u32 lid = ld(s, s->t_v3u, s->in_lid), wg = ld(s, s->t_v3u, s->in_wgid);
+        for (u32 a = 0; a < 2; a++) {
+            u32 loc = e->in->cs_threads[a] ? e->in->cs_threads[a] : 1;
+            P[a] = E2(128, U, E2(132, U, E2(81, U, wg, a), cu(s, loc)), E2(81, U, lid, a));
+            u32 l = rs_L(e, P[a]), top = E2(130, U, rs_pc(e, 35 + a), cu(s, 1));   /* (a rounded-up group count: the extra threads repeat the last logical one) */
+            L[a] = E3(169, U, E2(176, s->t_bool, top, l), top, l); }
+        return 1;
+    }
+    return 0;
+}
+/* a plain compute shader's thread ids as the game's program sees them: of the logical pixel when the dispatch is scaled */
+static void rs_cs_ids(EM *e, u32 lid3, u32 wg3, u32 lid[3], u32 wg[3]) {
+    SB *s = e->s; u32 U = s->t_u32, P[2], L[2], own = rs_own(e);
+    rs_self(e, P, L);
+    for (u32 a = 0; a < 3; a++) { lid[a] = E2(81, U, lid3, a); wg[a] = E2(81, U, wg3, a); }
+    for (u32 a = 0; a < 2; a++) {
+        u32 loc = e->in->cs_threads[a] ? e->in->cs_threads[a] : 1;
+        u32 g = E3(169, U, own, L[a], P[a]);
+        lid[a] = E2(137, U, g, cu(s, loc)); wg[a] = E2(134, U, g, cu(s, loc)); }
+}
+static u32 cs_lid_x(EM *e) {   /* a compute thread's x id in its group, as the game's program sees it */
+    SB *s = e->s; u32 n_, d_;
+    if (!s->in_lid) s->in_lid = em_vin(e, s->t_v3u, 27, 0, 0);
+    if (g2s_rs(e->in, &n_, &d_) && rs_plain_cs(e->in)) {
+        if (!s->in_wgid) s->in_wgid = em_vin(e, s->t_v3u, 26, 0, 0);
+        u32 l[3], w[3]; rs_cs_ids(e, ld(s, s->t_v3u, s->in_lid), ld(s, s->t_v3u, s->in_wgid), l, w); return l[0]; }
+    return E2(81, s->t_u32, ld(s, s->t_v3u, s->in_lid), 0);
+}
+/* w3 (G2S_RS_SUB, salt bit 15; compute shaders): a dispatch that cannot run once per physical pixel (it shares LDS between the
+   threads of a group) is run several times as the game issued it - once per position (i, j) inside a logical pixel's block of
+   physical pixels. Push word 37 = 0x10000 | i | j << 8 in such a run: every load from a scaled image then reads physical
+   texel min(F(c) + i, F(c + 1) - 1) of logical texel c, a sample by normalised coordinates is moved from the thread's
+   logical pixel centre to that physical pixel's centre, and a store writes that one physical texel (not at all when the
+   block has no such texel: the run with a smaller i / j has written it). */
+static int rs_sub(EM *e) { return (e->in->diag_salt & 0xFFFF8000u) == (G2S_RS_TAG | 0x8000u) && rs_plain_cs(e->in); }
+static u32 rs_sub_on(EM *e) { SB *s = e->s; return E2(171, s->t_bool, E2(199, s->t_u32, rs_pc(e, 37), cu(s, 0x10000)), cu(s, 0)); }
+static u32 rs_sub_off(EM *e, int a) { SB *s = e->s; return E2(199, s->t_u32, E2(194, s->t_u32, rs_pc(e, 37), cu(s, 8u * (u32)a)), cu(s, 0xFF)); }
+/* texel coordinates cc[0], cc[1] (i32 ids) of binding b for a load / fetch, replaced by the image's own when it is scaled:
+   this invocation's physical pixel plus the scaled offset from its logical pixel (pixel shaders on scaled targets,
+   scaled dispatches), else the representative physical pixel */
+static void rs_map_load(EM *e, int b, u32 *cc) {
+    SB *s = e->s; u32 U = s->t_u32, I = s->t_i32, B = s->t_bool, n, d; g2s_rs(e->in, &n, &d);
+    u32 P[2], L[2], texs = rs_tex(e, b); int self = rs_self(e, P, L); u32 own = self ? rs_own(e) : 0;
+    for (int a = 0; a < 2; a++) {
+        u32 r = bc(s, I, rs_R(e, bc(s, U, cc[a])));
+        if (rs_sub(e)) {   /* w3 */
+            u32 cu_ = bc(s, U, cc[a]), lo_ = rs_F(e, cu_), hi_ = E2(130, U, rs_F(e, E2(128, U, cu_, cu(s, 1))), cu(s, 1)), c_ = E2(128, U, lo_, rs_sub_off(e, a));
+            c_ = E3(169, U, E2(172, B, c_, hi_), hi_, c_);
+            r = E3(169, I, E2(167, B, rs_sub_on(e), E2(175, B, cc[a], bc(s, I, cu(s, 0)))), bc(s, I, c_), r); }
+        if (self) {
+            int gen_ = rs_gen(e->in);   /* w7_prep */
+            u32 t = E2(132, I, E2(130, I, cc[a], bc(s, I, L[a])), bc(s, I, gen_ ? rs_vn(e) : cu(s, n)));
+            u32 neg = E2(177, B, t, bc(s, I, cu(s, 0)));
+            u32 q = gen_ ? rs_mulhi(e, E2(128, U, E2(132, U, bc(s, U, E3(169, I, neg, E1(126, I, t), t)), cu(s, 2)), E2(132, U, E2(194, U, rs_vd(e), cu(s, 1)), cu(s, 2))), rs_pc(e, 42))   /* (|t| + d / 2) / d = (2 |t| + 2 (d / 2)) / 2d */
+                         : E2(134, U, E2(128, U, bc(s, U, E3(169, I, neg, E1(126, I, t), t)), cu(s, d / 2)), cu(s, d));
+            u32 off = E3(169, I, neg, E1(126, I, bc(s, I, q)), bc(s, I, q));
+            /* w2: ... but always a physical texel OF logical texel cc (F(cc) .. F(cc + 1) - 1): with a ratio that is not a whole
+               number the rounded offset can land in a neighbour's texel, and data the game keeps per pixel parity (the 2x2
+               interleaved transparency / particle buffers) was then read from the wrong pixel */
+            /* w5 (no_tex_offsets bit 2, set per program by the renderer: the temporal anti-aliasing pass): the offset from the own
+               pixel is taken in physical texels as it is - a 3x3 neighbourhood is the 3x3 physical pixels around this one, not
+               pixels 2 away (150 / 200 percent) */
+            int unit_ = (e->in->no_tex_offsets & 4) != 0;
+            if (unit_) off = E2(130, I, cc[a], bc(s, I, L[a]));
+            u32 po = E2(128, I, bc(s, I, P[a]), off);
+            if ((d > 1 || gen_) && !unit_) {   /* (w7_prep: with den 1 the clamp changes nothing - P + (cc - L) num is in cc's block) */
+                u32 cu_ = bc(s, U, cc[a]), lo_ = bc(s, I, rs_F(e, cu_)), hi_ = E2(130, I, bc(s, I, rs_F(e, E2(128, U, cu_, cu(s, 1)))), bc(s, I, cu(s, 1)));
+                u32 cl = E3(169, I, E2(177, B, po, lo_), lo_, po); cl = E3(169, I, E2(173, B, cl, hi_), hi_, cl);
+                po = E3(169, I, E2(177, B, cc[a], bc(s, I, cu(s, 0))), po, cl); }
+            r = E3(169, I, own, po, r);
+        }
+        cc[a] = E3(169, I, texs, r, cc[a]);
+    }
+}
+/* a store: c0[] = the first texel to write; for an unscaled writer of a scaled image also the block of physical texels
+   of the logical one: lo[] = F(c), hi[] = F(c + 1) (u32 ids), *blk = bool id "write the whole block" */
+static void rs_map_store(EM *e, int b, const u32 *cc, u32 *c0, u32 *lo, u32 *hi, u32 *blk, u32 *mainok) {
+    SB *s = e->s; u32 U = s->t_u32, I = s->t_i32, B = s->t_bool;
+    u32 P[2], L[2], texs = rs_tex(e, b); int self = rs_self(e, P, L); u32 own = self ? rs_own(e) : 0;
+    u32 m[2] = {cc[0], cc[1]};
+    if (self) rs_map_load(e, b, m);   /* (own pixel + offset when the writer is scaled; else R(c), not used below) */
+    for (int a = 0; a < 2; a++) {
+        u32 cu_ = bc(s, U, cc[a]);
+        lo[a] = rs_F(e, cu_); hi[a] = rs_F(e, E2(128, U, cu_, cu(s, 1)));
+        u32 first = bc(s, I, lo[a]);
+        u32 sc = self ? E3(169, I, own, m[a], first) : first;
+        c0[a] = E3(169, I, texs, sc, cc[a]);
+    }
+    *blk = self ? E2(167, B, texs, E1(168, B, own)) : texs;
+    u32 subok = 0;
+    if (rs_sub(e)) {   /* w3: one physical texel per run */
+        u32 on_ = rs_sub_on(e); subok = E1(168, B, E2(167, B, on_, texs));
+        for (int a = 0; a < 2; a++) { u32 c_ = E2(128, U, lo[a], rs_sub_off(e, a));
+            c0[a] = E3(169, I, E2(167, B, on_, texs), bc(s, I, c_), c0[a]);
+            subok = E2(166, B, subok, E2(176, B, c_, hi[a])); }
+        *blk = E2(167, B, *blk, E1(168, B, on_)); }
+    /* a scaled writer of an unscaled image: only the representative physical pixel of each logical one writes (the value
+       an unscaled pass reading at the representative pixel would write; no race between the pixels of one logical pixel) */
+    if (self) { u32 isrep = E2(167, B, E2(170, B, P[0], rs_R(e, L[0])), E2(170, B, P[1], rs_R(e, L[1])));
+        *mainok = E2(166, B, E2(166, B, texs, E1(168, B, own)), isrep); }
+    else *mainok = 0;
+    if (subok) *mainok = *mainok ? E2(167, B, *mainok, subok) : subok;
 }
 static u32 ps_is_helper(EM *e) {   /* this invocation is a helper (gl_HelperInvocation) */
     SB *s = e->s;
@@ -1437,7 +1723,7 @@ static int em_smrd(EM *e, const GInst *I) {
     if (g2s_starts(n, "S_DCACHE") || g2s_starts(n, "S_MEMTIME")) return 1;
     { const char *x = n; while (*x && *x != 'X') x++; if (*x == 'X') { cnt = 0; x++; while (*x >= '0' && *x <= '9') cnt = cnt * 10 + (*x++ - '0'); } }
     u32 off;
-    if ((d >> 8) & 1) off = cu(s, (d & 0xFF) * 4); else if ((d & 0xFF) == 255) off = cu(s, I->lit); else off = rd_src(s, d & 0xFF, 0);
+    if ((d >> 8) & 1) off = cu(s, (d & 0xFF) * 4); else if ((d & 0xFF) == 255) off = cu(s, SMRD_LIT_OFF(I->lit)); else off = rd_src(s, d & 0xFF, 0);
     if (I->fold >= 0) {   /* value known per draw: read it from the scalar data buffer */
         sdata_decl(s, e, t);
         for (int i = 0; i < cnt; i++) st(s, sreg_var(s, dst + i), ld(s, t, E3(65, s->t_sb_u32, s->sdata_var, cu(s, 0), cu(s, (u32)(I->fold + i)))));
@@ -1464,6 +1750,7 @@ static int em_smrd(EM *e, const GInst *I) {
     u32 lo = ld(s, t, sreg_var(s, sb)), hi = ld(s, t, sreg_var(s, sb + 1));
     hi = E2(199, t, hi, cu(s, g2s_starts(n, "S_BUFFER") ? 0xFFFu : 0xFFFFu));
     u32 base = add64c(s, addr64(s, lo, hi), off);
+    if (g2s_ld_group && cnt >= 2 && cnt <= 16) { u32 v[16]; ld32n(s, base, cnt, v); for (int i = 0; i < cnt; i++) st(s, sreg_var(s, dst + i), v[i]); return 1; }   /* t196 */
     for (int i = 0; i < cnt; i++) st(s, sreg_var(s, dst + i), ld32(s, add64c(s, base, cu(s, (u32)(4 * i)))));
     return 1;
 }
@@ -1753,7 +2040,7 @@ static int em_gs_ring(EM *e, const GInst *I, int store, int cnt) {
     u32 ES = E2(196, U, cu(s, 2), E3(203, U, w3, cu(s, 19), cu(s, 2)));
     u32 stride = E3(203, U, w1, cu(s, 16), cu(s, 14));
     u32 tid = cu(s, 0);
-    if (s->stage == G2S_CS) { if (!s->in_lid) s->in_lid = em_vin(e, s->t_v3u, 27, 0, 0); tid = E2(199, U, E2(81, U, ld(s, s->t_v3u, s->in_lid), 0), cu(s, 63)); }
+    if (s->stage == G2S_CS) { tid = E2(199, U, cs_lid_x(e), cu(s, 63)); }
     u32 vidx = idxen ? ld(s, U, vreg_var(s, vaddr)) : cu(s, 0);
     u32 ridx = E2(128, U, vidx, E3(169, U, tidf, tid, cu(s, 0)));
     u32 voff = E2(128, U, cu(s, ioff), offen ? ld(s, U, vreg_var(s, vaddr + idxen)) : cu(s, 0));
@@ -1840,7 +2127,7 @@ static int em_buffer(EM *e, const GInst *I) {
         if (swz || addtid) {
             sIS = 8u << ((Dw->r[3] >> 21) & 3); sES = 2u << ((Dw->r[3] >> 19) & 3); sstride = (Dw->r[1] >> 16) & 0x3FFF;
             u32 tid;
-            if (s->stage == G2S_CS) { if (!s->in_lid) s->in_lid = em_vin(e, s->t_v3u, 27, 0, 0); tid = E2(199, U, E2(81, U, ld(s, s->t_v3u, s->in_lid), 0), cu(s, 63)); }
+            if (s->stage == G2S_CS) { tid = E2(199, U, cs_lid_x(e), cu(s, 63)); }
             else { if (!s->cap_shuffle) { sb_op(&s->caps, 17, 1, (u32[]){61}); sb_op(&s->caps, 17, 1, (u32[]){65}); s->cap_shuffle = 1; }
                    if (!s->in_sglid) s->in_sglid = em_vin(e, U, 41, 0, s->stage == G2S_PS); tid = ld(s, U, s->in_sglid); }
             s_idx = idxen ? ld(s, U, vreg_var(s, vaddr)) : cu(s, 0);
@@ -1873,7 +2160,12 @@ static int em_buffer(EM *e, const GInst *I) {
           const char *f = n; while (*f && !(f[0] == 'T' && f[1] == '_')) f++; f += 2; ncomp = 0; while (*f >= 'W' && *f <= 'Z') { ncomp++; f++; } } }
     if (swz && !g2s_starts(n, "BUFFER_LOAD_DWORD") && !g2s_starts(n, "BUFFER_STORE_DWORD")) { nat_fail(s, "swizzled buffer access other than DWORD load / store"); return 1; }
     if (g2s_starts(n, "BUFFER_LOAD_FORMAT_") || g2s_starts(n, "TBUFFER_LOAD_FORMAT_")) {
+        s->fc_have = 0;
+        if (g2s_ld_group && !s->nat_mode) {   /* t196: an element of 2..4 whole dwords: one group load */
+            int nd = dfmt == 11 ? 2 : dfmt == 13 ? 3 : (dfmt == 14 || dfmt == 0 || dfmt == 15) ? 4 : 0;
+            if (nd) { ld32n(s, a, nd, s->fc_raw); s->fc_have = nd; } }
         u32 c[4]; for (int i = 0; i < 4; i++) c[i] = fetch_component(s, a, dfmt, nfmt, i);
+        s->fc_have = 0;
         u32 r[4]; for (int i = 0; i < 4; i++) r[i] = sel_comp(s, (dsel >> (3 * i)) & 7, c);
         if (s->nan_rec_fn && !s->nat_mode) { s->nan_a64 = a; s->nan_vidx = ld(s, U, vreg_var(s, vaddr)); }
         for (int i = 0; i < ncomp; i++) wr_vreg(s, vdata + i, r[i]);
@@ -1882,6 +2174,10 @@ static int em_buffer(EM *e, const GInst *I) {
     }
     if (g2s_starts(n, "BUFFER_LOAD_DWORD")) {
         int cnt = n[17] == 'X' ? n[18] - '0' : 1;
+        if (g2s_ld_group && cnt >= 2 && !swz && !s->nat_mode) {   /* t196 */
+            u32 v[4]; ld32n(s, a, cnt, v);
+            for (int i = 0; i < cnt; i++) wr_vreg(s, vdata + i, E3(169, U, INB(i), v[i], cu(s, 0)));
+            return 1; }
         for (int i = 0; i < cnt; i++) wr_vreg(s, vdata + i, E3(169, U, INB(i), ld32(s, SWZ_ADDR(i)), cu(s, 0)));
         return 1;
     }
@@ -1901,7 +2197,7 @@ static int em_buffer(EM *e, const GInst *I) {
             {"AND", 240}, {"OR", 241}, {"XOR", 242}, {"SWAP", 229}};
         for (unsigned i = 0; i < sizeof at / sizeof at[0]; i++) if (g2s_streq(n + 14, at[i].nm)) {
             u32 fn = atom_helper(s, at[i].op); if (!fn) return 0;
-            u32 r = op1(s, &s->code, 57, U, 4, (u32[]){fn, a, ld(s, U, vreg_var(s, vdata)), rd_exec(s)});
+            u32 r = op1(s, &s->code, 57, U, 4, (u32[]){fn, a, ld(s, U, vreg_var(s, vdata)), rs_act(s, rd_exec(s))});
             if ((d >> 14) & 1) wr_vreg(s, vdata, r);   /* GLC: return the pre-op value */
             return 1;
         }
@@ -1949,6 +2245,52 @@ static u32 tex_img(EM *e, int b) {
     if (s->nat) return ld(s, e->t_img[b], s->tex_var[b]);
     return E1(100, e->t_img[b], ld(s, e->t_simg[b], s->tex_var[b]));
 }
+/* popin (g2s_mip_fb, the renderer's --mip-stats gpu): what the PS4's mip statistics counters measure. At every sample of a
+   pixel shader that lets the hardware choose the level (implicit LOD, with or without bias) or names it (SAMPLE_L / LZ),
+   one pixel in 64 (x & 7 == 3, y & 7 == 5) notes into the feedback table at G2S_MIPFB_BASE (16 bytes per slot, slot =
+   hash of T# word 0): dword 0 the smallest level wanted (absolute level of the texture = the level the view starts at +
+   the LOD relative to it, 4 fraction bits; atomic minimum), dword 1 the number of samples, dword 2 the samples that
+   wanted a finer level than the view starts at, dword 3 the T# word 0 (which texture the slot holds). The T# words are
+   the scalar registers of the instruction's descriptor, so nothing per draw is needed on the CPU. */
+int g2s_mip_fb;
+int g2s_mip_test;   /* w3_perf (--mip-test N, cost isolation only): 1 no per-frame table copy (e6_vk.c), 2 one pixel in 256, 4 one plain store instead of the three atomics, 32 no LOD query */
+static void mipfb_note(EM *e, const GInst *I, int b, const u32 *cc, int dim, u32 bias, u32 xlod, int has_x) {
+    SB *s = e->s; u32 U = s->t_u32, F = s->t_f32, B = s->t_bool;
+    if (!g2s_mip_fb || s->nat || e->in->stage != G2S_PS || e->mipfb_n >= 24) return;
+    if (g2s_mip_fb == 3 && !e->in->ps_early_z) return;   /* --mip-early-only: a shader that is depth-tested late is not instrumented (writing memory makes the driver run it for hidden pixels too) */
+    u32 fmin = atom_helper(s, 237), fadd = atom_helper(s, 234); if (!fmin || !fadd) return;
+    e->mipfb_n++;
+    if (!s->in_fragcoord) s->in_fragcoord = em_vin(e, s->t_v4f, 15, 0, 0);
+    u32 lod;
+    if (has_x) lod = xlod;
+    else if (g2s_mip_test & 32) lod = bias ? bias : cf(s, 0);
+    else {
+        u32 coord = dim == 2 ? E3(80, s->t_v3f, cc[0], cc[1], cc[2]) : E2(80, s->t_v2f, cc[0], cc[1]);
+        u32 q = op1(s, &s->code, 105, s->t_v2f, 2, (u32[]){tex_simg(e, b), coord});
+        lod = E2(81, F, q, 1); if (bias) lod = E2(129, F, lod, bias);
+    }
+    u32 fc = ld(s, s->t_v4f, s->in_fragcoord);
+    u32 fx = E1(109, U, E2(81, F, fc, 0)), fy = E1(109, U, E2(81, F, fc, 1));
+    u32 m = E2(197, U, E2(199, U, fx, cu(s, 7)), E2(196, U, E2(199, U, fy, cu(s, 7)), cu(s, 3)));
+    if (g2s_mip_test & 2) m = E2(197, U, m, E2(196, U, E2(199, U, E2(197, U, fx, fy), cu(s, 8)), cu(s, 3)));   /* and bit 3 of x and of y clear: one pixel in 256 */
+    u32 hit = E2(167, B, E2(170, B, m, cu(s, 3 | (5 << 3))), E2(171, B, rd_exec(s), cu(s, 0)));
+    u32 lm = gate_begin(s, E3(169, U, hit, cu(s, 1), cu(s, 0)));
+    int tb = (int)((I->w1 >> 16) & 0x1F) * 4;
+    u32 w0 = ld(s, U, sreg_var(s, tb)), w1 = ld(s, U, sreg_var(s, tb + 1)), w3 = ld(s, U, sreg_var(s, tb + 3));
+    u32 lb = GL2(41 /*UMax*/, U, E2(199, U, E2(194, U, w3, cu(s, 12)), cu(s, 15)), E2(199, U, E2(194, U, w1, cu(s, 16)), cu(s, 15)));
+    u32 al = GL3(43 /*FClamp*/, F, E2(129, F, E1(112, F, lb), lod), cf(s, 0.0f), cf(s, 14.0f));
+    u32 fix = E1(109, U, E2(133, F, al, cf(s, 16.0f)));
+    u32 slot = E2(194, U, E2(132, U, w0, cu(s, 0x9E3779B1u)), cu(s, 16));
+    u32 a64 = E2(128, s->t_u64, cu64(s, G2S_MIPFB_BASE), E1(113, s->t_u64, E2(196, U, slot, cu(s, 4))));
+    if (g2s_mip_test & 4) st32a(s, a64, E2(197, U, fix, E2(196, U, w0, cu(s, 8))), cu(s, 1));
+    else {
+    op1(s, &s->code, 57, U, 4, (u32[]){fmin, a64, fix, cu(s, 1)});
+    op1(s, &s->code, 57, U, 4, (u32[]){fadd, add64c(s, a64, cu(s, 4)), cu(s, 1), cu(s, 1)});
+    op1(s, &s->code, 57, U, 4, (u32[]){fadd, add64c(s, a64, cu(s, 8)), cu(s, 1), E3(169, U, E2(184, B, lod, cf(s, 0.0f)), cu(s, 1), cu(s, 0))});
+    st32a(s, add64c(s, a64, cu(s, 12)), w0, cu(s, 1));
+    }
+    gate_end(s, lm);
+}
 static int em_mimg(EM *e, const GInst *I) {
     SB *s = e->s; const char *n = I->name; u32 d = I->w0, w = I->w1; u32 U = s->t_u32, F = s->t_f32;
     if (e->in->exp_flags) {   /* diagnostic experiment */
@@ -1986,7 +2328,7 @@ static int em_mimg(EM *e, const GInst *I) {
             u32 ov = bc(s, t_i, ld(s, U, vreg_var(s, k++)));
             /* gathers only: Vulkan allows a non-constant Offset on OpImage*Gather alone (sampling needs maintenance8);
                IMAGE_SAMPLE*_O (9 programs of the corpus) still ignores its offset - open */
-            if (!e->in->no_tex_offsets && n[6] == 'G') {
+            if ((e->in->no_tex_offsets & 3) != 1 && n[6] == 'G') {
                 u32 c26 = cu(s, 26);
                 u32 ox = E2(195, t_i, E2(196, t_i, ov, c26), c26), oy = E2(195, t_i, E2(196, t_i, ov, cu(s, 18)), c26);
                 if (dim == 2) { u32 oz = E2(195, t_i, E2(196, t_i, ov, cu(s, 10)), c26); offv = E3(80, t_vec(s, t_i, 3), ox, oy, oz); }
@@ -2003,6 +2345,30 @@ static int em_mimg(EM *e, const GInst *I) {
             cc[0] = E2(131, F, cc[0], cf(s, 1.0f)); cc[1] = E2(131, F, cc[1], cf(s, 1.0f)); }
         u32 lod = 0; if (has_l) lod = as_f(s, ld(s, U, vreg_var(s, k++)));
         (void)has_cl;
+        /* w5 (no_tex_offsets == 2): IMAGE_SAMPLE*_O. Vulkan takes only a constant Offset when sampling, so the texel offset is
+           added to the coordinates as offset / size of the base level (of the Vulkan image: on a scaled image one physical
+           texel). Exact for the single-level screen images the game's post-processing reads this way (the anti-aliasing
+           pass's NE / SW taps); before, the offset was dropped and such a tap read the centre texel. */
+        if (has_o && (e->in->no_tex_offsets & 3) == 2 && n[6] != 'G' && dim != 2 && !arrayed && !s->nat && ncoord >= 2) {
+            u32 ov_ = bc(s, t_i, ld(s, U, vreg_var(s, vaddr))), c26_ = cu(s, 26);
+            u32 o2_[2] = {E2(195, t_i, E2(196, t_i, ov_, c26_), c26_), E2(195, t_i, E2(196, t_i, ov_, cu(s, 18)), c26_)};
+            u32 sz_ = E2(103, t_vec(s, t_i, 2), tex_img(e, b), bc(s, t_i, cu(s, 0)));
+            for (u32 a = 0; a < 2; a++) cc[a] = E2(129, F, cc[a], E2(136, F, E1(111, F, o2_[a]), E1(111, F, E2(81, t_i, sz_, a)))); }
+        { u32 n_, d_;   /* w2: a scaled image's contents are shifted (even denominators, see RS_E): sample where they are */
+          if (g2s_rs(e->in, &n_, &d_) && (RS_E(d_) || rs_gen(e->in)) && dim != 2 && !arrayed && !s->nat) {   /* (w7_prep generic: always; a shift of 0 adds 0) */
+            u32 ts_ = rs_tex(e, b), sz_ = E2(103, t_vec(s, t_i, 2), tex_img(e, b), bc(s, t_i, cu(s, 0)));
+            for (u32 a = 0; a < 2; a++)
+                cc[a] = E2(129, F, cc[a], E3(169, F, ts_, E2(136, F, rs_gen(e->in) ? rs_vf(e, 2) : cf(s, g2s_rs_shift(d_)), E1(111, F, E2(81, t_i, sz_, a))), cf(s, 0.0f))); } }
+        { u32 n_, d_;   /* w3: a sub-pixel run samples a scaled image at its physical pixel's centre */
+          if (g2s_rs(e->in, &n_, &d_) && rs_sub(e) && dim != 2 && !arrayed && !s->nat) {
+            u32 P_[2], L_[2], B_ = s->t_bool; rs_self(e, P_, L_);
+            u32 on_ = E2(167, B_, rs_sub_on(e), rs_tex(e, b)), sz_ = E2(103, t_vec(s, t_i, 2), tex_img(e, b), bc(s, t_i, cu(s, 0)));
+            for (u32 a = 0; a < 2; a++) {
+                u32 lo_ = rs_F(e, P_[a]), hi_ = E2(130, U, rs_F(e, E2(128, U, P_[a], cu(s, 1))), cu(s, 1)), c_ = E2(128, U, lo_, rs_sub_off(e, (int)a));
+                c_ = E3(169, U, E2(172, B_, c_, hi_), hi_, c_);
+                /* the physical centre (c + 0.5 - shift) minus the logical centre in physical units ((P + 0.5) num / den), over the image's width */
+                u32 dp_ = E2(131, F, E2(131, F, E2(129, F, E1(112, F, c_), cf(s, 0.5f)), rs_gen(e->in) ? rs_vf(e, 2) : cf(s, g2s_rs_shift(d_))), E2(133, F, E2(129, F, E1(112, F, P_[a]), cf(s, 0.5f)), rs_gen(e->in) ? rs_vf(e, 0) : cf(s, (float)n_ / (float)d_)));
+                cc[a] = E2(129, F, cc[a], E3(169, F, on_, E2(136, F, dp_, E1(111, F, E2(81, t_i, sz_, a))), cf(s, 0.0f))); } } }
         u32 coord = ncoord == 3 ? E3(80, vecf, cc[0], cc[1], cc[2]) : E2(80, vecf, cc[0], cc[1]);
         u32 img = tex_simg(e, b);
         u32 res;
@@ -2043,15 +2409,19 @@ static int em_mimg(EM *e, const GInst *I) {
             u32 dy = ng == 3 ? E3(80, gv, gd[1][0], gd[1][1], gd[1][2]) : E2(80, gv, gd[1][0], gd[1][1]);
             res = offv ? op1(s, &s->code, 88, rtype, 6, (u32[]){img, coord, 4 | 0x10 /*Grad, Offset*/, dx, dy, offv})
                        : op1(s, &s->code, 88, rtype, 5, (u32[]){img, coord, 4 /*Grad*/, dx, dy});
-        } else if (has_l || has_lz || e->in->stage != G2S_PS)
+        } else if (has_l || has_lz || e->in->stage != G2S_PS) {
+            if (g2s_mip_fb && !tx->storage) mipfb_note(e, I, b, cc, dim, 0, has_l ? lod : cf(s, 0), 1);
             res = offv ? op1(s, &s->code, 88, rtype, 5, (u32[]){img, coord, 2 | 0x10 /*Lod, Offset*/, has_l ? lod : cf(s, 0), offv})
                        : op1(s, &s->code, 88, rtype, 4, (u32[]){img, coord, 2 /*Lod*/, has_l ? lod : cf(s, 0)});
-        else if (has_b)
+        } else if (has_b) {
+            if (g2s_mip_fb && !tx->storage) mipfb_note(e, I, b, cc, dim, bias, 0, 0);
             res = offv ? op1(s, &s->code, 87, rtype, 5, (u32[]){img, coord, 1 | 0x10 /*Bias, Offset*/, bias, offv})
                        : op1(s, &s->code, 87, rtype, 4, (u32[]){img, coord, 1 /*Bias*/, bias});
-        else
+        } else {
+            if (g2s_mip_fb && !tx->storage) mipfb_note(e, I, b, cc, dim, 0, 0, 0);
             res = offv ? op1(s, &s->code, 87, rtype, 4, (u32[]){img, coord, 0x10 /*Offset*/, offv})
                        : op1(s, &s->code, 87, rtype, 2, (u32[]){img, coord});
+        }
         int o = 0;
         for (int i = 0; i < 4; i++) if (dmask & (1u << i)) { u32 c = E2(81, tx->is_int ? U : F, res, (u32)i); wr_vreg(s, vdata + o++, tx->is_int ? c : as_u(s, c)); }
         return 1;
@@ -2059,6 +2429,10 @@ static int em_mimg(EM *e, const GInst *I) {
     if (g2s_starts(n, "IMAGE_LOAD") || g2s_starts(n, "IMAGE_STORE")) {
         int mip = g2s_streq(n, "IMAGE_LOAD_MIP") || g2s_streq(n, "IMAGE_STORE_MIP");
         u32 cc[3]; for (int i = 0; i < ncoord; i++) cc[i] = bc(s, t_i, ld(s, U, vreg_var(s, vaddr + i)));
+        u32 rs_n_, rs_d_; int rs_ = g2s_rs(e->in, &rs_n_, &rs_d_) && dim != 2 && !arrayed && !s->nat;   /* t196 */
+        u32 rs_lo[2] = {0, 0}, rs_hi[2] = {0, 0}, rs_blk = 0, rs_c0[2] = {0, 0}, rs_main = 0;
+        if (rs_ && n[6] == 'L') rs_map_load(e, b, cc);
+        if (rs_ && n[6] != 'L') { rs_map_store(e, b, cc, rs_c0, rs_lo, rs_hi, &rs_blk, &rs_main); cc[0] = rs_c0[0]; cc[1] = rs_c0[1]; }
         u32 coord = ncoord == 3 ? E3(80, t_vi, cc[0], cc[1], cc[2]) : E2(80, t_vi, cc[0], cc[1]);
         if (n[6] == 'L') {
             u32 lod = mip ? bc(s, t_i, ld(s, U, vreg_var(s, vaddr + ncoord))) : bc(s, t_i, cu(s, 0));
@@ -2075,7 +2449,18 @@ static int em_mimg(EM *e, const GInst *I) {
             }
             u32 texel = op1(s, &s->code, 80, rtype, 4, comp);
             u32 lm = gate_begin(s, rd_exec(s));
-            sb_op(&s->code, 99, 3, (u32[]){ld(s, e->t_img[b], s->tex_var[b]), coord, texel});
+            { u32 lm0 = rs_ && rs_main ? gate_begin(s, b2u(s, rs_main)) : 0;
+              sb_op(&s->code, 99, 3, (u32[]){ld(s, e->t_img[b], s->tex_var[b]), coord, texel});
+              if (lm0) gate_end(s, lm0); }
+            if (rs_) {   /* t196: an unscaled writer fills every physical texel of the logical one */
+                int nb_ = rs_gen(e->in) ? 2 /* w7_prep: ratio-generic shaders serve scales up to 2 (the renderer falls back to baked ones above) */ : (int)((rs_n_ + rs_d_ - 1) / rs_d_); u32 B_ = s->t_bool;
+                for (int j = 0; j < nb_; j++) for (int i = 0; i < nb_; i++) {
+                    if (!i && !j) continue;
+                    u32 px_ = E2(128, U, rs_lo[0], cu(s, (u32)i)), py_ = E2(128, U, rs_lo[1], cu(s, (u32)j));
+                    u32 ok_ = E2(167, B_, rs_blk, E2(167, B_, E2(176, B_, px_, rs_hi[0]), E2(176, B_, py_, rs_hi[1])));
+                    u32 lm2 = gate_begin(s, b2u(s, ok_));
+                    sb_op(&s->code, 99, 3, (u32[]){ld(s, e->t_img[b], s->tex_var[b]), E2(80, t_vi, bc(s, t_i, px_), bc(s, t_i, py_)), texel});
+                    gate_end(s, lm2); } }
             if (e->in->probe) probe_count(s, 0x800u + (u32)(e->probe_store++ & 0xFF), cu(s, 1));
             gate_end(s, lm);
         }
@@ -2105,6 +2490,9 @@ static int em_mimg(EM *e, const GInst *I) {
         u32 sz = tx->storage ? E1(104, t_vi, img) : E2(103, t_vi, img, lod);
         u32 r[4];
         r[0] = bc(s, U, E2(81, t_i, sz, 0)); r[1] = bc(s, U, E2(81, t_i, sz, 1));
+        { u32 n_, d_; if (g2s_rs(e->in, &n_, &d_) && dim != 2 && !arrayed && !s->nat) {   /* t196: the game sees the logical size of a scaled image */
+            u32 ts_ = rs_tex(e, b);
+            for (int a = 0; a < 2; a++) r[a] = E3(169, U, ts_, E2(134, U, E2(132, U, r[a], rs_gen(e->in) ? rs_vd(e) : cu(s, d_)), rs_gen(e->in) ? rs_vn(e) : cu(s, n_)), r[a]); } }
         r[2] = ncoord == 3 ? bc(s, U, E2(81, t_i, sz, 2)) : cu(s, 1);
         r[3] = tx->storage ? cu(s, 1) : bc(s, U, E1(106, t_i, img));
         int o = 0;
@@ -2370,6 +2758,7 @@ static int em_ds_body(EM *e, const GInst *I) {
         if (!s->in_sglid) s->in_sglid = em_vin(e, U, 41, 0, s->stage == G2S_PS);
         u32 act = E2(171, B, rd_exec(s), cu(s, 0));
         if (s->stage == G2S_PS) { if (!s->in_helper) s->in_helper = em_vin(e, B, 23, 0, 0); act = E2(167, B, act, E1(168, B, ld(s, B, s->in_helper))); }
+        if (s->rs_gate) act = E2(167, B, act, E2(171, B, ld(s, U, s->rs_gate), cu(s, 0)));   /* t196 */
         u32 ballot = op1(s, &s->code, 339, s->t_v4u, 2, (u32[]){cu(s, 3), act});
         u32 total = op1(s, &s->code, 342, U, 3, (u32[]){cu(s, 3), 0 /*Reduce*/, ballot});
         u32 prefix = op1(s, &s->code, 342, U, 3, (u32[]){cu(s, 3), 2 /*ExclusiveScan*/, ballot});
@@ -2906,7 +3295,7 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
         kpi = 0; HM(in->stage); HM(in->rsrc1); HM(in->rsrc2); kpi = 9; HM(in->ps_input_ena); HM(in->ps_input_addr); HM(in->ps_in_control);
         kpi = 10; HM(in->cs_threads[0]); HM(in->cs_threads[1]); HM(in->cs_threads[2]); kpi = 0; HM(in->tex_binding_base); HM(in->fix_z); HM(in->n_user);
         kpi = 9; for (int i = 0; i < 32; i++) HM(in->ps_input_cntl[i]);
-        kpi = 1; HM(in->exp_flags); HM(in->quad_branch_all); HM(in->max_shared); HM(in->zero_regs); HM(in->diag_salt); HM(in->helpers_auto); HM(in->no_tex_offsets); HM(in->fp_ctl); HM(in->exact_mad); HM(in->ps_early_z);
+        kpi = 1; HM(in->exp_flags); HM(in->quad_branch_all); HM(in->max_shared); HM(in->zero_regs); HM(in->diag_salt); HM(in->helpers_auto); HM(in->no_tex_offsets); HM(in->fp_ctl); HM(in->exact_mad); HM(in->ps_early_z); if (g2s_mip_fb) HM(0x6d6970666200ull + (u64)g2s_mip_fb + ((u64)g2s_mip_test << 8));
         kpi = 2; HM(in->tess_mode); HM(in->tess_stride); HM(in->tess_ppt); HM(in->tess_cp); HM(in->tess_base); HM(in->tess_ocp); HM(in->tess_shared_max); HM(in->tess_tf_bytes);
         kpi = 1; HM(in->sdata_binding); HM(in->allow_append); HM(in->no_bounds); HM(in->no_wave_sync); HM(in->no_structure); HM(in->dbg_pc); HM(in->dbg_regs); HM(in->nan_probe);
         kpi = 2; HM(in->gs_mode); HM(in->gs_vpp); HM(in->gs_esgs_itemsize); HM(in->gs_maxv); HM(in->gs_wave_bytes); HM(in->gs_out_prim); HM(in->gs_base); HM(in->gs_ring_is); HM(in->gs_ring_es); HM(in->gs_ring_stride);
@@ -2922,6 +3311,7 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
         /* t143: no longer - S_GETPC_B64 reads its value from the per-draw data now (the SPIR-V has no address in it); only
            without per-draw data (sdata_binding 0) is the address still a constant in the SPIR-V, and then in the key */
         if (!in->sdata_binding || in->native) for (int i = 0; i < nins; i++) if (ins[i].enc == E_SOP1 && g2s_streq(ins[i].name, "S_GETPC_B64")) { HM(in->code_addr); HM(0x5047455450ull); break; }
+        if (!g2s_opt_smrd_lit_bytes) for (int i = 0; i < nins; i++) if (ins[i].enc == E_SMRD && ins[i].has_lit && ins[i].fold < 0) { HM(0x534D52444C4954ull); break; }   /* w4_hill: a literal offset left in the SPIR-V - not the module made with byte offsets (folded loads: same module, other per-draw data) */
         HM(in->ps_helpers_on); HM(0x5345363532ull); HM(in->mem_slow_count);   /* E6 pixel-shader helper semantics of STATUS 52 */
         if (in->native) { HM(0x6E6174697665ull); HM(in->nat_no_contract); HM(in->nat_quad_branch); for (int i = 0; i < in->native->nuse; i++) { HM(in->native->use[i].pc); HM(in->native->use[i].use); HM(in->native->use[i].binding); }
             for (int i = 0; i < in->native->nshape; i++) { HM(in->native->shape[i].binding); for (int k = 0; k < 8; k++) HM(in->native->shape[i].w[k]); } }
@@ -3044,12 +3434,12 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
 
     /* push constants: user data, VS/CS at offset 0, PS at offset 64 */
     {
-        u32 t_arr = ty(s, 28, 2, (u32[]){s->t_u32, cu(s, 32)});
+        u32 t_arr = ty(s, 28, 2, (u32[]){s->t_u32, cu(s, (in->diag_salt & 0xFFFF0000u) == G2S_RS_TAG ? ((in->diag_salt & G2S_RS_GEN) ? 46 : 38) : 32)});   /* t196: six more words with a render scale */
         deco(s, t_arr, 6, 1, (u32[]){4});
         u32 t_blk = ty(s, 30, 1, (u32[]){t_arr});
         mdeco(s, t_blk, 0, 35, 0); deco(s, t_blk, 2, 0, 0);
         e->pushvar = gvar(s, ty_ptr(s, SC_PushConstant, t_blk), SC_PushConstant, 1);
-        e->t_pp_push_u32 = ty_ptr(s, SC_PushConstant, s->t_u32);
+        e->t_pp_push_u32 = ty_ptr(s, SC_PushConstant, s->t_u32); e->t_rs_mulx = 0;
     }
     /* textures */
     for (int b = 0; b < out->ntex; b++) {
@@ -3133,6 +3523,13 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
     }
     /* EXEC: this lane is on; an E6 pixel shader's helper invocations start off, as on the PS4 (S_WQM_B64 turns them on) */
     st(s, sreg_var(s, 126), ps_live_exec(e) ? E3(169, s->t_u32, ps_is_helper(e), cu(s, 0), cu(s, 1)) : cu(s, 1)); st(s, sreg_var(s, 127), cu(s, 0));
+    { u32 n_, d_;   /* t196: on scaled targets a pixel shader's buffer stores, atomics and appends (per-pixel lists, counters: indexed by the game's pixel) happen once per logical pixel - at its representative physical pixel; everything else (colour, depth, discard) is per physical pixel */
+      if (g2s_rs(in, &n_, &d_) && in->stage == G2S_PS && !s->nat) {
+        u32 P[2], L[2], B = s->t_bool; rs_self(e, P, L);
+        u32 isrep = E2(167, B, E2(170, B, P[0], rs_R(e, L[0])), E2(170, B, P[1], rs_R(e, L[1])));
+        u32 gv = gvar(s, s->t_pp_u32, SC_Private, 1);
+        st(s, gv, b2u(s, E2(166, B, E1(168, B, rs_own(e)), isrep)));
+        s->rs_gate = gv; } }
     st(s, sreg_var(s, 106), cu(s, 0)); st(s, sreg_var(s, 107), cu(s, 0));
     st(s, sreg_var(s, 125), cu(s, 0));
     st(s, e->itervar, cu(s, 0));
@@ -3310,6 +3707,12 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
                     if (!s->in_fragcoord) s->in_fragcoord = em_vin(e, s->t_v4f, 15, 0, 0);
                     if (!fc) fc = ld(s, s->t_v4f, s->in_fragcoord);
                     val = as_u(s, E2(81, s->t_f32, fc, (u32)(bit - 8)));
+                    { u32 n_, d_; if (g2s_rs(in, &n_, &d_) && bit <= 9) {   /* t196: the pixel position in the game's pixels; its integer part is L(p) exactly */
+                        u32 F_ = s->t_f32, raw = E2(81, F_, fc, (u32)(bit - 8)), lf = E1(112, F_, rs_L(e, E1(109, s->t_u32, raw)));
+                        u32 fr = E2(131, F_, E2(133, F_, E2(131, F_, raw, rs_gen(in) ? rs_vf(e, 2) : cf(s, g2s_rs_shift(d_))), rs_gen(in) ? rs_vf(e, 1) : cf(s, (float)d_ / (float)n_)), lf);
+                        fr = E3(169, F_, E2(184, s->t_bool, fr, cf(s, 0.0f)), cf(s, 0.0f), fr);
+                        fr = E3(169, F_, E2(186, s->t_bool, fr, cf(s, 0.999f)), cf(s, 0.999f), fr);
+                        val = as_u(s, E3(169, F_, rs_own(e), E2(129, F_, lf, fr), raw)); } }
                     /* t168: POS_W_FLOAT is the clip-space w (the hardware's own value, as radeonsi / ACO read it), while
                        SPIR-V FragCoord.w is 1 / w: depth fades and liquid thickness (the strange-skull jar) used 1 / w */
                     if (bit == 11 && !g2s_opt_old_posw) val = as_u(s, E2(136, s->t_f32, cf(s, 1.0f), E2(81, s->t_f32, fc, 3)));
@@ -3415,9 +3818,11 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
         s->in_lid = em_vin(e, s->t_v3u, 27, 0, 0); s->in_wgid = em_vin(e, s->t_v3u, 26, 0, 0);
         u32 lid = ld(s, s->t_v3u, s->in_lid), wg = ld(s, s->t_v3u, s->in_wgid);
         u32 tcnt = (in->rsrc2 >> 11) & 3;
-        for (u32 k = 0; k <= tcnt; k++) st(s, vreg_var(s, (int)k), E2(81, s->t_u32, lid, k));
+        u32 rs_n_, rs_d_, rs_lid[3], rs_wg[3]; int rs_ = g2s_rs(in, &rs_n_, &rs_d_) && rs_plain_cs(in);   /* t196 */
+        if (rs_) rs_cs_ids(e, lid, wg, rs_lid, rs_wg);
+        for (u32 k = 0; k <= tcnt; k++) st(s, vreg_var(s, (int)k), rs_ && k < 3 ? rs_lid[k] : E2(81, s->t_u32, lid, k));
         u32 sg = in->n_user;
-        for (u32 k = 0; k < 3; k++) if ((in->rsrc2 >> (7 + k)) & 1) st(s, sreg_var(s, (int)sg++), E2(81, s->t_u32, wg, k));
+        for (u32 k = 0; k < 3; k++) if ((in->rsrc2 >> (7 + k)) & 1) st(s, sreg_var(s, (int)sg++), rs_ ? rs_wg[k] : E2(81, s->t_u32, wg, k));
         if ((in->rsrc2 >> 10) & 1) st(s, sreg_var(s, (int)sg++), cu(s, 0));
     }
 
@@ -3583,7 +3988,11 @@ int g2s_memo_reloc = 1;   /* t107b: on by default (v2: descriptors pass into the
 #ifndef MEMO_SAMEKEY
 #define MEMO_SAMEKEY 8   /* t107h: entries kept per exact key (see the slot choice in g2s_translate) */
 #endif
-enum { MEMO_N = G2S_MEMO_N, MEMO_B = 65536 };
+enum { MEMO_B = 65536 };
+/* w2: the number of entries is a variable (--memo-entries N, 8192..65536; set before the first translation). The cave
+   run translated 263,221 setups in full and evicted 230,453 entries in 14,000 frames with 32,768. */
+int g2s_memo_n = G2S_MEMO_N;
+#define MEMO_N g2s_memo_n
 /* Code ranges (read group 0: the shader's and fetch shader's instructions) are hashed again once per epoch, not at every
    use (STATUS 60: hashing them was most of the ~1.4 us per reused setup). An epoch ends at each game submit (the CPU may
    have written anything since the last one) and whenever a write that our side makes or logs (command-processor writes,
@@ -3593,10 +4002,87 @@ static volatile u64 g_memo_ep = 1; static u8 *g_code_pg; static u64 g_memo_code_
 #define CODE_PG_BASE 0x200000000ull
 #define CODE_PG_SH 12   /* 4 KB pages (STATUS 62: at 64 KB, writes next to shader code ended 2 of the station frame's 3 epochs) */
 #define CODE_PG_N (0x3E00000000ull >> CODE_PG_SH)
-void g2s_memo_epoch(void) { __atomic_add_fetch(&g_memo_ep, 1, __ATOMIC_RELAXED); }
+/* t181: lookups made ahead of time read the memo while the renderer uses it. The renderer is its only writer: it
+   changes chains and frees entries (inserting a translation, evicting one, emptying the memo) only with no such lookup
+   running (mrw_*), and counts every change per chain and entry slot, so a result made before one is not taken. Moving a
+   relocatable entry to the front of its chain is done without the lock (the indices stay valid). */
+static volatile int g_mrw_w, g_mrw_r, g_memo_ready; void (*g2s_yield)(void);
+static void mrw_spin(u32 *k) { if (++*k > 2048 && g2s_yield) { g2s_yield(); *k = 0; } else __builtin_ia32_pause(); }
+static void mrw_wlock(void) { u32 k = 0; __atomic_store_n(&g_mrw_w, 1, __ATOMIC_SEQ_CST); while (__atomic_load_n(&g_mrw_r, __ATOMIC_SEQ_CST)) mrw_spin(&k); }
+static void mrw_wunlock(void) { __atomic_store_n(&g_mrw_w, 0, __ATOMIC_SEQ_CST); }
+static void mrw_rlock(void) { u32 k = 0; for (;;) { while (__atomic_load_n(&g_mrw_w, __ATOMIC_SEQ_CST)) mrw_spin(&k);
+    __atomic_add_fetch(&g_mrw_r, 1, __ATOMIC_SEQ_CST); if (!__atomic_load_n(&g_mrw_w, __ATOMIC_SEQ_CST)) return; __atomic_sub_fetch(&g_mrw_r, 1, __ATOMIC_SEQ_CST); } }
+static void mrw_runlock(void) { __atomic_sub_fetch(&g_mrw_r, 1, __ATOMIC_SEQ_CST); }
+static u32 g_mgen[1 << 16], g_mb1[1 << 16], g_mb2[1 << 16];   /* per entry slot / exact chain / relocatable chain: changes */
+/* t181: our writes into game memory (everything g2s_memo_wrote is told: labels, WRITE_DATA, constant-RAM dumps, DMA,
+   file reads, logged GPU writes), in order: a result made ahead is checked against the writes since it read */
+enum { WL_N = 8192 };
+static struct { u64 lo, hi; } g_wl[WL_N]; static volatile u64 g_wl_res, g_wl_pub; int g2s_wlog_on;
+static void wlog_add(u64 lo, u64 hi) {
+    u64 k = __atomic_fetch_add(&g_wl_res, 1, __ATOMIC_ACQ_REL); g_wl[k % WL_N].lo = lo; g_wl[k % WL_N].hi = hi;
+    u32 n = 0; while (__atomic_load_n(&g_wl_pub, __ATOMIC_ACQUIRE) != k) mrw_spin(&n);   /* (published in order) */
+    __atomic_store_n(&g_wl_pub, k + 1, __ATOMIC_RELEASE);
+}
+u64 g2s_wlog_pos(void) { return __atomic_load_n(&g_wl_pub, __ATOMIC_ACQUIRE); }
+int g2s_wlog_since(u64 since, u64 lo, u64 hi, const u64 *ra, const u32 *rn, const u8 *rof, u32 nr) {
+    u64 now = g2s_wlog_pos();
+    if (now - since > WL_N - 64) return -1;
+    for (u64 k = since; k < now; k++) { u64 a = g_wl[k % WL_N].lo, b = g_wl[k % WL_N].hi;
+        if (b <= lo || a >= hi) continue;
+        for (u32 i = 0; i < nr; i++) if (!rof[i] && a < ra[i] + 4ull * rn[i] && b > ra[i]) return 1; }
+    if (g2s_wlog_pos() - since > WL_N - 64) return -1;   /* (overwritten while looking) */
+    return 0;
+}
+/* t181a (--lookup-stats, diagnostic): what the shader-setup lookups cost and how often memory they read was written by
+   our own writes (labels, WRITE_DATA, constant-RAM dumps, DMA, file reads, logged GPU writes) shortly before them in
+   the same submit - how often a lookup computed ahead of time on another thread would have to be made again. Distances
+   are in lookups (a draw makes two: VS and PS). Writes are kept per 256-byte block (64 KB for larger writes). */
+int g2s_ls_on; u64 g2s_ls[G2S_LS_N];
+static volatile u64 g_ls_n, g_ls_sub0;
+typedef struct { volatile u64 k, s; } LsB;
+enum { LSB_N = 1 << 20, LS_HUGE = 64 };
+static LsB *g_lsf, *g_lsc; static struct { u64 lo, hi, s; } g_ls_huge[LS_HUGE]; static volatile u64 g_ls_nhuge;
+static const struct MEnt *g_ls_E; static int g_ls_rnum = -1; static u64 g_ls_ra[512]; static u32 g_ls_rn[512];
+static void lsb_mark(LsB *T, u64 blk, u64 s) {
+    u64 h = (blk * 0x9E3779B97F4A7C15ull) >> 44, sub0 = g_ls_sub0;
+    for (int pr = 0; pr < 16; pr++, h++) { LsB *e = &T[h & (LSB_N - 1)];
+        if (e->k == blk + 1) { e->s = s; return; }
+        if (!e->k || e->s < sub0) { e->k = blk + 1; e->s = s; return; } }
+    g2s_ls[G2S_LS_OVER]++;
+}
+static u64 lsb_get(const LsB *T, u64 blk) {
+    u64 h = (blk * 0x9E3779B97F4A7C15ull) >> 44, sub0 = g_ls_sub0;
+    for (int pr = 0; pr < 16; pr++, h++) { const LsB *e = &T[h & (LSB_N - 1)];
+        if (!e->k) return 0;
+        if (e->k == blk + 1 && e->s >= sub0) return e->s + 1; }
+    return 0;
+}
+static void ls_wrote(u64 lo, u64 hi) {
+    if (!g2s_ls_on || hi <= lo) return;
+    if (!g_lsf || !g_lsc) return;
+    u64 s = g_ls_n; g2s_ls[G2S_LS_WRITES]++;
+    if (hi - lo <= (64u << 10)) { for (u64 b = lo >> 8; b <= (hi - 1) >> 8; b++) lsb_mark(g_lsf, b, s); }
+    else if (hi - lo <= (64ull << 20)) { for (u64 b = lo >> 16; b <= (hi - 1) >> 16; b++) lsb_mark(g_lsc, b, s); }
+    else { u64 k = __atomic_fetch_add(&g_ls_nhuge, 1, __ATOMIC_RELAXED) % LS_HUGE; g_ls_huge[k].lo = lo; g_ls_huge[k].hi = hi; g_ls_huge[k].s = s; }
+}
+static u64 ls_latest(u64 a, u64 n) {   /* the newest write stamp + 1 over [a, a + n) in this submit, 0 = none */
+    u64 best = 0, hi = a + n, sub0 = g_ls_sub0;
+    if (!g_lsf || !n) return 0;
+    for (u64 b = a >> 8; b <= (hi - 1) >> 8; b++) { u64 x = lsb_get(g_lsf, b); if (x > best) best = x; }
+    for (u64 b = a >> 16; b <= (hi - 1) >> 16; b++) { u64 x = lsb_get(g_lsc, b); if (x > best) best = x; }
+    for (int k = 0; k < LS_HUGE; k++) if (g_ls_huge[k].hi > a && g_ls_huge[k].lo < hi && g_ls_huge[k].s >= sub0 && g_ls_huge[k].s + 1 > best) best = g_ls_huge[k].s + 1;
+    return best;
+}
+void g2s_ls_enable(void) {   /* (at start-up, before any other thread writes) */
+    g_lsc = (LsB *)calloc(LSB_N, sizeof(LsB)); g_lsf = (LsB *)calloc(LSB_N, sizeof(LsB)); g2s_ls_on = g_lsf && g_lsc;
+}
+void g2s_ls_get(u64 o[G2S_LS_N]) { for (int i = 0; i < G2S_LS_N; i++) o[i] = g2s_ls[i]; }
+void g2s_memo_epoch(void) { __atomic_add_fetch(&g_memo_ep, 1, __ATOMIC_RELAXED); g_ls_sub0 = g_ls_n + 1; }
 void (*g2s_memo_wrote_hook)(u64 lo, u64 hi);   /* t107: the translation trace records these */
 void g2s_memo_wrote(u64 lo, u64 hi) {
     if (g2s_memo_wrote_hook) g2s_memo_wrote_hook(lo, hi);
+    if (g2s_ls_on) ls_wrote(lo, hi);   /* t181a */
+    if (g2s_wlog_on && hi > lo) wlog_add(lo, hi);   /* t181 */
     if (!g_code_pg || hi <= lo || hi <= CODE_PG_BASE || lo >= CODE_PG_BASE + (CODE_PG_N << CODE_PG_SH)) return;
     if (lo < CODE_PG_BASE) lo = CODE_PG_BASE;
     if (hi > CODE_PG_BASE + (CODE_PG_N << CODE_PG_SH)) hi = CODE_PG_BASE + (CODE_PG_N << CODE_PG_SH);
@@ -3616,9 +4102,16 @@ enum { CR_N = 16384 };
 static CRc *g_cr; static u64 g_cr_hits, g_cr_hashed;
 typedef u64 __attribute__((may_alias)) u64a; typedef u32 __attribute__((may_alias)) u32a;   /* (also below, with the hash) */
 static u64 mh_words(u64 h, const u32a *p, u32 n);
-static u64 code_hash_now(const G2SIn *in, u64 a, u32 n) {
-    static u32 *buf; static u32 cap;
-    if (n > cap) { free(buf); cap = n + 1024; buf = (u32 *)malloc(4ull * cap); if (!buf) { cap = 0; return ~0ull; } }
+/* t181: a lookup made ahead of time on another thread (g2s_spec_lookup) uses its own scratch memory and never changes
+   anything shared; X == 0 is the renderer's own lookup (the static buffers, as before) */
+typedef struct LkCr { u64 a, ep, h; u32 n; } LkCr;
+struct LkX { u32 (*vals)[16]; u8 *valok; G2STex *nt_tex; u32 *hbuf; u32 hcap; u32 *cbuf; u32 ccap; LkCr *cr; G2SSpec *S; };
+typedef struct LkX LkX;
+static u64 code_hash_now_x(const G2SIn *in, u64 a, u32 n, u32 **pbuf, u32 *pcap);
+static u64 code_hash_now(const G2SIn *in, u64 a, u32 n) { static u32 *buf; static u32 cap; return code_hash_now_x(in, a, n, &buf, &cap); }
+static u64 code_hash_now_x(const G2SIn *in, u64 a, u32 n, u32 **pbuf, u32 *pcap) {
+    u32 *buf = *pbuf, cap = *pcap;
+    if (n > cap) { free(buf); cap = n + 1024; buf = (u32 *)malloc(4ull * cap); *pbuf = buf; *pcap = buf ? cap : 0; if (!buf) return ~0ull; }
     if (!in->read || !in->read(in->ctx, a, buf, n)) return ~0ull - 1;   /* unreadable: never equal to a recorded hash */
     u64 h = mh_words(0x5EED0000C0DEull ^ a, buf, n);
     return h >= ~0ull - 1 ? h - 2 : h;
@@ -3737,10 +4230,41 @@ static int spv_compress_entry(G2SCacheEnt *ce) {
     ce->z = z; ce->zn = (u32)zn; g_spv_z_n++; g_spv_z_bytes += zn; g_spv_z_raw += 4ull * ce->n;
     return 1;
 }
+/* w2 (stutter): the compression (0.17-0.3 ms a module) ran inside the draw that first used a shader: in a burst of new
+   shaders (a camera cut: 300-900 in one frame) it was the largest single cost of the renderer (hitch profile of the
+   cave / Chapter 1 runs: 60% of the samples of an 89 ms frame). With g2s_spv_compress_lazy (the default) a release
+   only queues the entry; g2s_spv_compress_step, called by the renderer between frames on the same thread, compresses
+   a few per frame and only then marks them released (their words stay valid until then, so nothing else changes).
+   --spv-compress-inline: as before. */
+int g2s_spv_compress_lazy = 1;
+static int *g_spv_cq; static int g_spv_cqn, g_spv_cqcap, g_spv_cqh; static u64 g_spv_cq_peak, g_spv_cq_done;
+static int spv_rel_push(int c) {
+    if (g_spv_reln == g_spv_relcap) { int nc = g_spv_relcap ? 2 * g_spv_relcap : 256; int *q = (int *)realloc(g_spv_relq, sizeof(int) * (size_t)nc); if (!q) return 0; g_spv_relq = q; g_spv_relcap = nc; }
+    g2s_cache[c].rel = 1; g_spv_relq[g_spv_reln++] = c; return 1;
+}
+/* compresses up to max_n queued entries; returns how many are still queued */
+int g2s_spv_compress_step(int max_n) {
+    while (max_n-- > 0 && g_spv_cqh < g_spv_cqn) {
+        int c = g_spv_cq[g_spv_cqh++]; G2SCacheEnt *ce = &g2s_cache[c]; ce->zq = 0;
+        if (!ce->spv || ce->rel) continue;
+        if (!spv_compress_entry(ce)) continue;   /* (kept as words) */
+        spv_rel_push(c); g_spv_cq_done++;
+    }
+    if (g_spv_cqh == g_spv_cqn) g_spv_cqh = g_spv_cqn = 0;
+    return g_spv_cqn - g_spv_cqh;
+}
+void g2s_spv_lazy_stats(u64 *queued, u64 *peak, u64 *done) { *queued = (u64)(g_spv_cqn - g_spv_cqh); *peak = g_spv_cq_peak; *done = g_spv_cq_done; }
 void g2s_spv_release(u64 key) {
     if (g2s_keep_spirv) return;
     int c = g2s_cfind(key);
     if (c < 0 || !g2s_cache[c].spv || g2s_cache[c].rel) return;
+    if (g2s_spv_compress && g2s_spv_compress_lazy && !g2s_cache[c].z) {
+        if (g2s_cache[c].zq) return;
+        if (g_spv_cqn == g_spv_cqcap) { int nc = g_spv_cqcap ? 2 * g_spv_cqcap : 1024; int *q = (int *)realloc(g_spv_cq, sizeof(int) * (size_t)nc); if (!q) goto inline_; g_spv_cq = q; g_spv_cqcap = nc; }
+        g2s_cache[c].zq = 1; g_spv_cq[g_spv_cqn++] = c;
+        if ((u64)(g_spv_cqn - g_spv_cqh) > g_spv_cq_peak) g_spv_cq_peak = (u64)(g_spv_cqn - g_spv_cqh);
+        return; }
+inline_:
     if (g2s_spv_compress && !spv_compress_entry(&g2s_cache[c])) return;   /* (kept as words: the module can be made again from them) */
     if (g_spv_reln == g_spv_relcap) { int nc = g_spv_relcap ? 2 * g_spv_relcap : 256; int *q = (int *)realloc(g_spv_relq, sizeof(int) * (size_t)nc); if (!q) return; g_spv_relq = q; g_spv_relcap = nc; }
     g2s_cache[c].rel = 1; g_spv_relq[g_spv_reln++] = c;
@@ -3812,7 +4336,7 @@ static void memo_verify(const G2SIn *in, const G2SOut *m, const struct MEnt *E) 
         /* which inputs the check could not hold still: the "GPU-written?" answers depend on GPU progress (another thread) */
         int racy = 0;
         for (int k = 0; E && k < E->ngw && !racy; k++) { u64 a = g_memo_last_reloc && k < 256 ? g_rl_gw_addr[k] : E->gw[k].a;   /* (relocated: the addresses the replay queried) */
-            int r = in->gpu_written ? in->gpu_written(in->ctx, a, E->gw[k].n) != 0 : 0; if ((u8)r != E->gw[k].r) racy = 1; }
+            int r = in->gpu_written ? in->gpu_written(in->ctx, a, E->gw[k].n) : 0; if ((u8)r != E->gw[k].r) racy = 1; }
         char what[200]; int w = 0;
 #define WS(str) do { const char *q_ = (str); while (*q_ && w < 190) what[w++] = *q_++; } while (0)
         WS(g_memo_last_reloc ? "relocated reuse differs: " : "exact reuse differs: ");
@@ -3876,6 +4400,7 @@ void g2s_memo_last_masks(u32 *udaddr, u32 *udcontent, int *noreloc) { *udaddr = 
 static void rec_noreloc(const char *why) { if (g_rec && !g_rec->noreloc) { g_rec->noreloc = 1; g_rec->why = why; } }
 static void rec_set_aexp(const AExp *a) { if (g_rec) { g_rec->cur = *a; g_rec->has_cur = 1; } }
 static void rec_fold(u32 i, const AExp *a) { if (g_rec && i < 256) { g_rec->fx[i] = *a; if (i + 1 > g_rec->nfx) g_rec->nfx = (u16)(i + 1); } }
+static int rec_rd_dup(const AExp *a, u32 cnt) { if (!g_rec) return 1; if (g_rec->nrd >= 16) return 0; g_rec->rd[g_rec->nrd].slot = 0xFF; g_rec->rd[g_rec->nrd].cnt = (u8)cnt; g_rec->rd[g_rec->nrd].x = *a; g_rec->nrd++; return 1; }
 static void rec_rd(u32 slot, const AExp *a, u32 cnt) { if (g_rec && slot < 16 && g_rec->nrd < 16) { g_rec->rd[g_rec->nrd].slot = (u8)slot; g_rec->rd[g_rec->nrd].cnt = (u8)cnt; g_rec->rd[g_rec->nrd].x = *a; g_rec->nrd++; } }
 static void rec_addr_use(const SState *t, int lo, const AExp *a) {
     (void)t; (void)lo;
@@ -3988,7 +4513,7 @@ static int memo_gw(void *ctx, u64 a, u32 n) {
     MRec *R = (MRec *)ctx; int r = R->orig->gpu_written ? R->orig->gpu_written(R->orig->ctx, a, n) : 0;
     AExp x; if (R->has_cur) x = R->cur; else { x.kind = PK_TAINT; x.abs = a; x.off = 0; x.dl = 0; x.b = x.d = 0; x.himask12 = 0; x.okind = 0; x.od = 0; x.ob = 0; x.omul = 0; }
     if (R->ngw == R->gcap) { R->gcap = R->gcap ? R->gcap * 2 : 16; MGw *ng = (MGw *)realloc(R->gw, (size_t)R->gcap * sizeof(MGw)); if (!ng) { R->overflow = 1; return r; } R->gw = ng; }
-    R->gw[R->ngw] = (MGw){a, n, (u8)(r != 0), x}; R->ngw++;
+    R->gw[R->ngw] = (MGw){a, n, (u8)r, x}; R->ngw++;   /* (w2: the answer's class, not just yes / no - see G2SIn.gpu_written) */
     return r;
 }
 /* the address of an expression under the current inputs; vals: the dwords read so far in this replay (per range) */
@@ -4052,15 +4577,19 @@ static void memo_out_copy(G2SOut *d, const G2SOut *s) {
 #undef MO
 /* hash of the current contents of the recorded ranges; ~0 when a range's readability changed. part 1: code ranges
    only (read group 0, inside the code-page window); part 2: everything else; part 0: all */
-static u64 memo_hash(const G2SIn *in, const MRange *rg, int nrg, u32 rel, int part) {
-    static u32 *buf; static u32 cap;
+static u64 memo_hash_x(const G2SIn *in, const MRange *rg, int nrg, u32 rel, int part, LkX *X);
+static u64 memo_hash(const G2SIn *in, const MRange *rg, int nrg, u32 rel, int part) { return memo_hash_x(in, rg, nrg, rel, part, 0); }
+static u64 memo_hash_x(const G2SIn *in, const MRange *rg, int nrg, u32 rel, int part, LkX *X) {
+    static u32 *sbuf; static u32 scap;
+    u32 *buf = X ? X->hbuf : sbuf, cap = X ? X->hcap : scap;
     u64 h = 1469598103934665603ull;
     for (int i = 0; i < nrg; i++) {
         if (part && (part == 1) != (!rg[i].tag && code_in_window(rg[i].a, rg[i].n))) continue;
         if (rg[i].dup1 && !g2s_memo_nodups && rg[rg[i].dup1 - 1].tag == rg[i].tag) continue;   /* t155: the same memory as an earlier range (read once) */
-        if (rg[i].n > cap) { free(buf); cap = rg[i].n + 1024; buf = (u32 *)malloc(4ull * cap); if (!buf) { cap = 0; return ~0ull; } }
+        if (rg[i].n > cap) { free(buf); cap = rg[i].n + 1024; buf = (u32 *)malloc(4ull * cap); if (X) { X->hbuf = buf; X->hcap = buf ? cap : 0; } else { sbuf = buf; scap = buf ? cap : 0; } if (!buf) { cap = 0; return ~0ull; } }
         int ok = in->read && in->read(in->ctx, rg[i].a, buf, rg[i].n);
         if (ok != rg[i].ok) return ~0ull;
+        if (X && X->S && ok && rg[i].tag && !(rg[i].tag & rel) && X->S->nr && X->S->rof[X->S->nr - 1] == 0) X->S->rof[X->S->nr - 1] = 1;   /* t181: only its readability decides */
         if (!ok || (rg[i].tag && !(rg[i].tag & rel))) continue;   /* only readability matters for values that are just copied per draw */
         h = mh_words(h, buf, rg[i].n);
         h = mh_mix(h, rg[i].a);
@@ -4142,13 +4671,14 @@ static int msrc_val(const MSrc *m, const G2SIn *in, const MRange *rg, int nrg, u
 /* t107b: the parts of the result that come from descriptor words, under the current inputs (as g2s_translate_full makes
    them: texture bindings by first use of each distinct T# + S#, then the written and read buffer ranges); 0 when the
    texture binding pattern is not the recorded one */
-static int memo_reloc_rebuild(const MEnt *E, const G2SIn *in, G2SOut *out, u32 (*vals)[16], const u8 *valok) {
+static int memo_reloc_rebuild(const MEnt *E, const G2SIn *in, G2SOut *out, u32 (*vals)[16], const u8 *valok, LkX *X) {
     if (!E->ndi) return 1;
     u32 v[12]; int nt = 0;
-    static G2STex nt_tex[G2S_MAX_TEX];
+    static G2STex snt_tex[G2S_MAX_TEX]; G2STex *nt_tex = X ? X->nt_tex : snt_tex;
+#define RLS(x) do { if (!X) { x; } } while (0)   /* t181: statistics only for the renderer's own lookups */
     for (int i = 0; i < E->ndi; i++) {
         const MDi *d = &E->di[i]; if (!(d->kind & 1)) continue;
-        for (int k = 0; k < 12; k++) if (!msrc_val(&E->src[d->si * 12 + k], in, E->rg, E->nrg, vals, valok, &v[k])) { g_memo_rl_eval++; return 0; }
+        for (int k = 0; k < 12; k++) if (!msrc_val(&E->src[d->si * 12 + k], in, E->rg, E->nrg, vals, valok, &v[k])) { RLS(g_memo_rl_eval++); return 0; }
         int storage = (d->kind & 2) != 0, found = -1;
         for (int b = 0; b < nt && found < 0; b++) {
             int same = nt_tex[b].storage == storage;
@@ -4156,89 +4686,121 @@ static int memo_reloc_rebuild(const MEnt *E, const G2SIn *in, G2SOut *out, u32 (
             for (int k = 0; k < 4 && same && !storage; k++) same = nt_tex[b].ssharp[k] == v[8 + k];
             if (same) found = b;
         }
-        if (found < 0) { if (nt >= G2S_MAX_TEX || nt >= out->ntex) { g_memo_rl_tex++; return 0; } found = nt++; nt_tex[found] = out->tex[found];
+        if (found < 0) { if (nt >= G2S_MAX_TEX || nt >= out->ntex) { RLS(g_memo_rl_tex++); return 0; } found = nt++; nt_tex[found] = out->tex[found];
             for (int k = 0; k < 8; k++) nt_tex[found].tsharp[k] = v[k]; for (int k = 0; k < 4; k++) nt_tex[found].ssharp[k] = v[8 + k]; nt_tex[found].storage = storage; }
-        if (found != d->bind) { g_memo_rl_tex++; return 0; }
+        if (found != d->bind) { RLS(g_memo_rl_tex++); return 0; }
     }
-    if (nt != out->ntex) { g_memo_rl_tex++; return 0; }
+    if (nt != out->ntex) { RLS(g_memo_rl_tex++); return 0; }
     for (int b = 0; b < nt; b++) out->tex[b] = nt_tex[b];
     int nbw = 0, nbr = 0; for (int i = 0; i < E->ndi; i++) { nbw += (E->di[i].kind & 8) != 0; nbr += (E->di[i].kind & 4) != 0; }
     if (nbw) { out->nwr = 0;
         for (int i = 0; i < E->ndi; i++) { const MDi *d = &E->di[i]; if (!(d->kind & 8)) continue;
-            for (int k = 0; k < 3; k++) if (!msrc_val(&E->src[d->si * 12 + k], in, E->rg, E->nrg, vals, valok, &v[k])) { g_memo_rl_eval++; return 0; }
+            for (int k = 0; k < 3; k++) if (!msrc_val(&E->src[d->si * 12 + k], in, E->rg, E->nrg, vals, valok, &v[k])) { RLS(g_memo_rl_eval++); return 0; }
             u64 base = v[0] | ((u64)(v[1] & 0xFFF) << 32), stride = (v[1] >> 16) & 0x3FFF, bytes = stride ? stride * (u64)v[2] : (u64)v[2];
             if (!base || !bytes || bytes > (1ull << 30)) continue;
             int dup = 0; for (u32 k = 0; k < out->nwr; k++) if (out->wr_lo[k] == base && out->wr_hi[k] == base + bytes) dup = 1;
             if (!dup && out->nwr < 16) { out->wr_lo[out->nwr] = base; out->wr_hi[out->nwr] = base + bytes; out->nwr++; } } }
-    if (nbr) { out->nrd = E->nrd;   /* the scalar loads' ranges (rebuilt from their expressions) come first */
+    if (nbr) { if (!g2s_rd_dups || !E->nrd) out->nrd = E->nrd;   /* the scalar loads' ranges (rebuilt from their expressions) come first; w3_perf: with --memo-rd-dups their count is already in out->nrd */
         for (int i = 0; i < E->ndi; i++) { const MDi *d = &E->di[i]; if (!(d->kind & 4)) continue;
-            for (int k = 0; k < 3; k++) if (!msrc_val(&E->src[d->si * 12 + k], in, E->rg, E->nrg, vals, valok, &v[k])) { g_memo_rl_eval++; return 0; }
+            for (int k = 0; k < 3; k++) if (!msrc_val(&E->src[d->si * 12 + k], in, E->rg, E->nrg, vals, valok, &v[k])) { RLS(g_memo_rl_eval++); return 0; }
             u64 base = v[0] | ((u64)(v[1] & 0xFFF) << 32), stride = (v[1] >> 16) & 0x3FFF, bytes = stride ? stride * (u64)v[2] : (u64)v[2];
             if (!base || !bytes || bytes > (1ull << 28)) continue;
             int dup = 0; for (u32 k = 0; k < out->nrd; k++) if (out->rd_lo[k] == base && out->rd_hi[k] == base + bytes) dup = 1;
             if (!dup && out->nrd < 16) { out->rd_lo[out->nrd] = base; out->rd_hi[out->nrd] = base + bytes; out->nrd++; } } }
     return 1;
 }
-static int memo_reloc_try(MEnt *E, const G2SIn *in, G2SOut *out) {
-    enum { RL_MAX = 512 };
-    static u32 vals[RL_MAX][16]; static u8 valok[RL_MAX];
-    if (E->nrg > RL_MAX) { g_memo_rl_eval++; return 0; }
+static u64 code_hash_spec(LkX *X, const G2SIn *in, u64 a, u32 n);
+static int spec_gw(G2SSpec *S, u64 a, u32 n, u8 r);
+enum { RL_MAX = 512 };
+static int memo_reloc_try_x(MEnt *E, const G2SIn *in, G2SOut *out, LkX *X);
+static int memo_reloc_try(MEnt *E, const G2SIn *in, G2SOut *out) { return memo_reloc_try_x(E, in, out, 0); }
+static int memo_reloc_try_x0(MEnt *E, const G2SIn *in, G2SOut *out, LkX *X);
+extern int g2s_gw_pred; static int gwp_get(u64 a, u32 n, u32 ord);
+static int memo_reloc_try_x(MEnt *E, const G2SIn *in, G2SOut *out, LkX *X) {
+    if (!X || !g2s_gw_pred) return memo_reloc_try_x0(E, in, out, X);
+    u32 g0 = X->S->ngw; int r = memo_reloc_try_x0(E, in, out, X);
+    if (!r && !X->S->bad) X->S->ngw = g0;   /* w5_perf: the answers a candidate that did not fit assumed are not conditions of the result */
+    return r;
+}
+static int memo_reloc_try_x0(MEnt *E, const G2SIn *in, G2SOut *out, LkX *X) {
+    static u32 svals[RL_MAX][16]; static u8 svalok[RL_MAX];
+    u32 (*vals)[16] = X ? X->vals : svals; u8 *valok = X ? X->valok : svalok;
+    if (E->nrg > RL_MAX) { RLS(g_memo_rl_eval++); return 0; }
     u64 ep = g_memo_ep; int code_ok = 1;
+    if (g2s_ls_on && !X) g_ls_rnum = E->nrg;   /* t181a */
     for (int k = 0; k < E->nrg; k++) {
         MRange *g = &E->rg[k]; valok[k] = 0;
         if (!g->tag) {   /* code: as the exact path (once per epoch) */
-            if (E->ep != ep && code_ok) code_ok = code_hash_cached(in, g->a, g->n) == g->h;
-            if (!code_ok) { g_memo_rl_code++; return 0; }
+            if (X ? code_ok : (E->ep != ep && code_ok)) code_ok = (X ? code_hash_spec(X, in, g->a, g->n) : code_hash_cached(in, g->a, g->n)) == g->h;
+            if (!code_ok) { RLS(g_memo_rl_code++); return 0; }
             continue;
         }
         int ok;
+        if (g2s_ls_on && !X) g_ls_rn[k & 511] = 0;
         if (g->dup1 && !g2s_memo_nodups) {   /* t155: the address and size of an earlier range: its values (read moments ago) */
             int j = g->dup1 - 1; ok = g->ok;   /* (range j was read with this readability, or the reuse has failed already) */
             typedef struct { u32 w[16]; } V16_; if (ok) *(V16_ *)vals[k] = *(const V16_ *)vals[j];   /* (all 16: one block copy) */
         } else {
-        u64 a; if (!aexp_eval(&g->x, in, E->rg, E->nrg, vals, valok, &a)) { g_memo_rl_eval++; return 0; }
+        u64 a; if (!aexp_eval(&g->x, in, E->rg, E->nrg, vals, valok, &a)) { RLS(g_memo_rl_eval++); return 0; }
         ok = in->read && in->read(in->ctx, a, vals[k], g->n);
-        if ((u8)ok != g->ok) { g_memo_rl_read++; return 0; }
+        if (g2s_ls_on && ok && !X) { g_ls_ra[k & 511] = a; g_ls_rn[k & 511] = g->n; }   /* t181a */
+        if ((u8)ok != g->ok) { RLS(g_memo_rl_read++); return 0; }
         }
         if (!ok) continue;
         valok[k] = 1;
-        if ((g->full || g->cmask) && range_content_hash(vals[k], g->n, g->cmask, g->full) != g->ch) { g_memo_rl_content++;
+        if ((g->full || g->cmask) && range_content_hash(vals[k], g->n, g->cmask, g->full) != g->ch) { RLS(g_memo_rl_content++);
 #ifdef RELOC_WHY
             { extern int fprintf(void *, const char *, ...); extern void *stderr; fprintf(stderr, "CONT stage %d code %llx k %d/%d n %u cmask %x full %d xkind %d xb %d xd %d\n", in->stage, (unsigned long long)in->code_addr, k, E->nrg, g->n, g->cmask, g->full, g->x.kind, g->x.b, g->x.d); }
 #endif
             return 0; }
     }
     for (int k = 0; k < E->ngw; k++) {
-        u64 a; if (!aexp_eval(&E->gw[k].x, in, E->rg, E->nrg, vals, valok, &a)) { g_memo_rl_eval++; return 0; }
-        if (k < 256) g_rl_gw_addr[k] = a;
-        int r = in->gpu_written ? in->gpu_written(in->ctx, a, E->gw[k].n) != 0 : 0;
-        if ((u8)r != E->gw[k].r) { g_memo_rl_gw++; return 0; }
+        u64 a; if (!aexp_eval(&E->gw[k].x, in, E->rg, E->nrg, vals, valok, &a)) { RLS(g_memo_rl_eval++); return 0; }
+        if (k < 256 && !X) g_rl_gw_addr[k] = a;
+        int r;
+        if (X) { r = E->gw[k].r; if (g2s_gw_pred) { int p_ = gwp_get(a, E->gw[k].n, X->S->pord); if (p_ >= 0 && (u8)p_ != (u8)r) { X->S->npred++; return 0; } } if (!spec_gw(X->S, a, E->gw[k].n, (u8)r)) return 0; }   /* t181: the answer as recorded, checked again when the result is taken */
+        else r = in->gpu_written ? in->gpu_written(in->ctx, a, E->gw[k].n) : 0;
+        if ((u8)r != E->gw[k].r) { RLS(g_memo_rl_gw++); return 0; }
     }
     for (int k = 0; k < E->ndc; k++) {   /* t107b: the descriptor bits that decided the translation */
-        u32 x; if (!msrc_val(&E->dc[k].s, in, E->rg, E->nrg, vals, valok, &x)) { g_memo_rl_eval++; return 0; }
-        if ((x & E->dc[k].mask) != E->dc[k].val) { g_memo_rl_desc++; return 0; } }
-    if (E->ep != ep) E->ep = ep;
+        u32 x; if (!msrc_val(&E->dc[k].s, in, E->rg, E->nrg, vals, valok, &x)) { RLS(g_memo_rl_eval++); return 0; }
+        if ((x & E->dc[k].mask) != E->dc[k].val) { RLS(g_memo_rl_desc++); return 0; } }
+    if (!X && E->ep != ep) E->ep = ep;
     memo_out_unpack(out, E->outp);
-    for (int k = 0; k < E->nfx && (u32)k < out->nfold; k++) { u64 a; if (!aexp_eval(&E->fx[k], in, E->rg, E->nrg, vals, valok, &a)) { g_memo_rl_eval++; return 0; } out->fold_addr[k] = a; }
-    for (int k = 0; k < E->nrd; k++) { const MRd *r = &E->rd[k]; u64 a; if (r->slot >= out->nrd || !aexp_eval(&r->x, in, E->rg, E->nrg, vals, valok, &a)) { g_memo_rl_eval++; return 0; }
+    for (int k = 0; k < E->nfx && (u32)k < out->nfold; k++) { u64 a; if (!aexp_eval(&E->fx[k], in, E->rg, E->nrg, vals, valok, &a)) { RLS(g_memo_rl_eval++); return 0; } out->fold_addr[k] = a; }
+    if (g2s_rd_dups) {   /* w3_perf: the scalar loads' ranges in order, each listed once - as g2s_load lists them */
+        u32 n = 0;
+        for (int k = 0; k < E->nrd; k++) { const MRd *r = &E->rd[k]; u64 a; if (!aexp_eval(&r->x, in, E->rg, E->nrg, vals, valok, &a)) { RLS(g_memo_rl_eval++); return 0; }
+            u64 lo = a & ~0xFFFFull, hi = (a + 4ull * r->cnt + 0xFFFF) & ~0xFFFFull; int dup = 0;
+            for (u32 q = 0; q < n; q++) if (out->rd_lo[q] == lo && out->rd_hi[q] == hi) dup = 1;
+            if (!dup && n < 16) { out->rd_lo[n] = lo; out->rd_hi[n] = hi; n++; } }
+        if (E->nrd) { u32 s0 = 0; int nbr2 = 0; for (int k = 0; k < E->nrd; k++) s0 += E->rd[k].slot != 0xFF; for (int i = 0; i < E->ndi; i++) nbr2 += (E->di[i].kind & 4) != 0;
+            if (!nbr2 && out->nrd != s0) { RLS(g_memo_rl_dup++); return 0; }   /* (ranges in the stored list that nothing here rebuilds) */
+            out->nrd = n; }   /* (memo_reloc_rebuild appends the buffers' ranges) */
+    } else {
+    for (int k = 0; k < E->nrd; k++) { const MRd *r = &E->rd[k]; u64 a; if (r->slot >= out->nrd || !aexp_eval(&r->x, in, E->rg, E->nrg, vals, valok, &a)) { RLS(g_memo_rl_eval++); return 0; }
         out->rd_lo[r->slot] = a & ~0xFFFFull; out->rd_hi[r->slot] = (a + 4ull * r->cnt + 0xFFFF) & ~0xFFFFull; }
-    for (int k = 0; k < E->nrd; k++) for (int q = 0; q < k; q++) if (out->rd_lo[E->rd[k].slot] == out->rd_lo[E->rd[q].slot] && out->rd_hi[E->rd[k].slot] == out->rd_hi[E->rd[q].slot]) { g_memo_rl_dup++; return 0; }   /* (a fresh translation lists such a range once) */
-    if (!memo_reloc_rebuild(E, in, out, vals, valok)) return 0;
+    }
+    if (!g2s_rd_dups) for (int k = 0; k < E->nrd; k++) for (int q = 0; q < k; q++) if (out->rd_lo[E->rd[k].slot] == out->rd_lo[E->rd[q].slot] && out->rd_hi[E->rd[k].slot] == out->rd_hi[E->rd[q].slot]) { RLS(g_memo_rl_dup++); return 0; }   /* (a fresh translation lists such a range once) */
+    if (!memo_reloc_rebuild(E, in, out, vals, valok, X)) return 0;
     return 1;
 }
+#undef RLS
 /* t107: a translation without the memo (the translation trace replays the reads of a full translation; the replay
    benchmark empties the memo between repeats) */
 int g2s_translate_nomemo(const G2SIn *in, G2SOut *out) { return g2s_translate_full(in, out); }
 void g2s_memo_flush(void) {
     if (!g_memo) return;
+    mrw_wlock(); for (int i = 0; i < (1 << 16); i++) { g_mgen[i]++; g_mb1[i]++; g_mb2[i]++; }   /* t181 */
     for (int i = 0; i < MEMO_N; i++) { MEnt *E = &g_memo[i]; free(E->outp); free(E->rg); free(E->gw); free(E->fx); free(E->rd); free(E->src); free(E->dc); free(E->di); h0_memo_ent(E); }
     if (g_ml) for (int i = 0; i < MEMO_N; i++) { MLink z = {0}; g_ml[i] = z; }
     for (int i = 0; i < MEMO_B; i++) { g_memo_head[i] = -1; g_memo_head2[i] = -1; }
     g_memo_clock = 0;
     if (g_cfgm) for (int i = 0; i < CFG_N; i++) g_cfgm[i].kc = 0;
+    mrw_wunlock();
 }
 #ifdef G2S_MEMO_STATS   /* t155 (offline harness): what relocated reuses go through, weighted by use */
-static u32 g_dbg_use[MEMO_N];
+static u32 g_dbg_use[65536];
 void g2s_memo_dbg_stats(void) {
     extern int printf(const char *, ...);
     double w = 0, nrg = 0, tag = 0, dup = 0, gw = 0, dc = 0, fx = 0, rd = 0, src = 0, di = 0, rdw = 0, gwdup = 0;
@@ -4253,7 +4815,37 @@ void g2s_memo_dbg_stats(void) {
 }
 #endif
 u64 g2s_memo_skip_addr;   /* t141 (diagnostic): the shader at this address is translated without the memo (same key, cached SPIR-V) */
+static int g2s_translate_m(const G2SIn *in0, G2SOut *out);
 int g2s_translate(const G2SIn *in0, G2SOut *out) {
+    if (!g2s_ls_on) return g2s_translate_m(in0, out);
+    u64 j = ++g_ls_n; g_ls_E = 0; g_ls_rnum = -1; g2s_memo_last_kind = 3;
+    u64 f0 = g_memo_full, t0 = __builtin_ia32_rdtsc();
+    int ok = g2s_translate_m(in0, out);
+    u64 t1 = __builtin_ia32_rdtsc(), dt = t1 - t0;
+    int kind = g_memo_full != f0 ? 0 : g2s_memo_last_kind;
+    u64 *L = g2s_ls;
+    L[G2S_LS_LOOKUPS]++; L[G2S_LS_CYC] += dt;
+    if (in0->stage <= 2) L[G2S_LS_VS + in0->stage]++;
+    if (in0->tess_mode || in0->gs_mode) L[G2S_LS_TESSGS]++;
+    if (kind == 0) { L[G2S_LS_FULL]++; L[G2S_LS_CYC_FULL] += dt; }
+    else if (kind == 3) { L[G2S_LS_OTHER]++; }
+    else {
+        u64 newest = 0; u32 nr = 0, ndw = 0, ngwt = 0;
+        if (kind == 1 && g_ls_E) { const MEnt *E = g_ls_E; L[G2S_LS_EXACT]++; L[G2S_LS_CYC_EXACT] += dt;
+            for (int k = 0; k < E->nrg; k++) { const MRange *r = &E->rg[k]; if (!r->tag || !r->ok) continue; nr++; ndw += r->n; u64 x = ls_latest(r->a, 4ull * r->n); if (x > newest) newest = x; }
+            for (int k = 0; k < E->ngw; k++) ngwt += E->gw[k].r != 0; }
+        else if (kind == 2 && g_ls_rnum >= 0) { L[G2S_LS_RELOC]++; L[G2S_LS_CYC_RELOC] += dt;
+            for (int k = 0; k < g_ls_rnum && k < 512; k++) { if (!g_ls_rn[k]) continue; nr++; ndw += g_ls_rn[k]; u64 x = ls_latest(g_ls_ra[k], 4ull * g_ls_rn[k]); if (x > newest) newest = x; } }
+        else L[G2S_LS_OTHER]++;
+        L[G2S_LS_RANGES] += nr; L[G2S_LS_DWORDS] += ndw; if (ngwt) L[G2S_LS_GWTRUE]++;
+        if (!newest) L[G2S_LS_D_NONE]++;
+        else { u64 d = j - (newest - 1);   /* 1: written just before this lookup */
+            L[d <= 1 ? G2S_LS_D1 : d <= 3 ? G2S_LS_D3 : d <= 15 ? G2S_LS_D15 : d <= 63 ? G2S_LS_D63 : d <= 255 ? G2S_LS_D255 : G2S_LS_DMORE]++; }
+    }
+    L[G2S_LS_CYC_STATS] += __builtin_ia32_rdtsc() - t1;
+    return ok;
+}
+static int g2s_translate_m(const G2SIn *in0, G2SOut *out) {
     /* t107b: user-data words past n_user are never read by the translation, but callers pass all 16 SPI user-data
        registers, whose unused words still hold earlier draws' values: they made otherwise equal setups miss the memo
        (57% of the relocatable lookups without a candidate in the stranger scene, and many exact ones) */
@@ -4269,6 +4861,7 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
         g_memo = (MEnt *)calloc(MEMO_N, sizeof(MEnt)); g_memo_head = (int *)malloc(MEMO_B * sizeof(int)); g_memo_head2 = (int *)malloc(MEMO_B * sizeof(int)); g_ml = (MLink *)calloc(MEMO_N, sizeof(MLink));
         if (!g_memo || !g_memo_head || !g_memo_head2 || !g_ml) { free(g_memo); free(g_memo_head); free(g_memo_head2); free(g_ml); g_memo = 0; g_memo_head = 0; g_memo_head2 = 0; g_ml = 0; return g2s_translate_full(in, out); }
         for (int i = 0; i < MEMO_B; i++) { g_memo_head[i] = -1; g_memo_head2[i] = -1; }
+        __atomic_store_n(&g_memo_ready, 1, __ATOMIC_RELEASE);   /* t181: lookups ahead may read it now */
     }
     u64 kc = memo_key_cfg_cached(in), key = memo_key3(kc, in, 0xFFFF); int b = (int)(key & (MEMO_B - 1)); int why = 0;   /* t107b: one hash of the configuration, then the user data mixed in */
     for (int i = g_memo_head[b]; i >= 0; i = g_ml[i].next) {
@@ -4276,7 +4869,7 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
         MEnt *E = &g_memo[i];
         if (!memo_same_in(&E->in, in)) continue;
         int same = 1; g_memo_chk++; g_mpath[0]++;
-        for (int k = 0; k < E->ngw && same; k++) same = (in->gpu_written ? in->gpu_written(in->ctx, E->gw[k].a, E->gw[k].n) != 0 : 0) == E->gw[k].r;
+        for (int k = 0; k < E->ngw && same; k++) same = (u8)(in->gpu_written ? in->gpu_written(in->ctx, E->gw[k].a, E->gw[k].n) : 0) == E->gw[k].r;
         if (!same) { why |= 1; continue; }
         u64 ep = g_memo_ep;
         int code_ok = 1;
@@ -4290,7 +4883,7 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
         else {
             if (E->ep == ep) g_memo_code_skips++; else E->ep = ep;
             memo_out_unpack(out, E->outp);
-            E->used = 1; g_memo_hit++; g2s_memo_last_kind = 1; g2s_memo_last_born = E->born;
+            E->used = 1; g_memo_hit++; g2s_memo_last_kind = 1; g2s_memo_last_born = E->born; g_ls_E = E;
             if (g2s_memo_verify) memo_verify(in, out, E);
             return 1;
         }
@@ -4298,7 +4891,7 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
     g_memo_miss++; g2s_memo_last_kind = 0; g2s_memo_last_born = g2s_memo_flip;
     if (why & 2) g_memo_m_mem++; else if (why & 1) g_memo_m_gw++; else g_memo_m_new++;
     /* STATUS 78: an entry for the same shader and settings whose user data differs only in relocatable pointers */
-    if (g2s_memo_reloc && (why == 0)) {
+    if (g2s_memo_reloc && (why == 0 || g2s_reloc_any)) {   /* w5_perf --memo-reloc-any: also when an entry with these exact inputs exists but its memory differs and it cannot be relocated itself */
         CfgM *C = cfg_get(kc, 0); int found = 0, tries = 0;
         for (int mi = 0; C && mi < C->n && tries <= 6; mi++) {
             u16 m = C->m[mi]; u64 k3 = memo_key3(kc, in, m); int b2 = (int)(k3 & (MEMO_B - 1)), prev = -1;
@@ -4369,6 +4962,7 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
         if (vh != ~0ull && vhc != ~0ull && (ob = memo_out_pack(out, &obn)) == 0) g_memo_nokeep[5]++;   /* t154: no memory for the packed result */
         if (vh != ~0ull && vhc != ~0ull && ob != 0) {   /* (t113: no memory for the packed result: not kept) */
             code_mark(R.rg, R.nrg);
+            mrw_wlock();   /* t181: no lookup ahead reads the chains while they change */
             /* pick a slot: t107h: when MEMO_SAMEKEY entries with this exact key exist already (same inputs, other memory
                contents: each one failed for this setup), the oldest of them is replaced - otherwise every lookup of
                the key walked and checked all of them (they stayed until the clock came round: tens per key in play);
@@ -4381,9 +4975,11 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
                 if (slot < 0) slot = g_memo_clock;
             }
             MEnt *E = &g_memo[slot]; MLink *L = &g_ml[slot];
+            g_mgen[slot & 0xFFFF]++; g_mb1[b & 0xFFFF]++;   /* t181 */
             if (E->rg || E->gw || E->key) {
                 g_memo_evict++;
                 int ob = (int)(L->key & (MEMO_B - 1));
+                g_mb1[ob & 0xFFFF]++; if (!L->noreloc) g_mb2[(L->key2 & (MEMO_B - 1)) & 0xFFFF]++;   /* t181 */
                 if (L->prev >= 0) g_ml[L->prev].next = L->next; else if (g_memo_head[ob] == slot) g_memo_head[ob] = L->next;
                 if (L->next >= 0) g_ml[L->next].prev = L->prev;
                 if (!L->noreloc) { int ob2 = (int)(L->key2 & (MEMO_B - 1));
@@ -4409,16 +5005,192 @@ int g2s_translate(const G2SIn *in0, G2SOut *out) {
                 if (R.ndi && !E->noreloc) { E->di = (MDi *)malloc(sizeof(MDi) * R.ndi); if (E->di) { for (int k = 0; k < R.ndi; k++) E->di[k] = R.di[k]; E->ndi = R.ndi; } else E->noreloc = 1; }
             }
             if (E->noreloc) { g_memo_noreloc++; if (R.why) { int w = 0; const char *tab[] = {"address of unknown provenance", "fetch address of unknown provenance", "duplicate read range", "read without an address expression", "code outside the window", "range not re-readable", "fold expressions incomplete"}; for (w = 0; w < 7; w++) if (tab[w] == R.why) break; g_memo_noreloc_why[w < 7 ? w : 7]++; } }
-            else { g_memo_reloc_ok++; int b2 = (int)(E->key2 & (MEMO_B - 1)); L->key2 = E->key2; L->cmpm = E->cmpm; L->noreloc = 0;
+            else { g_memo_reloc_ok++; int b2 = (int)(E->key2 & (MEMO_B - 1)); L->key2 = E->key2; L->cmpm = E->cmpm; L->noreloc = 0; g_mb2[b2 & 0xFFFF]++;   /* t181 */
                    L->next2 = g_memo_head2[b2]; L->prev2 = -1; if (L->next2 >= 0) g_ml[L->next2].prev2 = slot; g_memo_head2[b2] = slot; }
 #ifdef MEMO_DEBUG
             { u64 tot = 0; for (int k = 0; k < R.nrg; k++) tot += R.rg[k].n; printf("memo: %d ranges, %llu dwords, %d gw\n", R.nrg, (unsigned long long)tot, R.ngw); }
 #endif
+            mrw_wunlock();
             return ok;
         }
     }
     free(R.rg); free(R.gw);
     return ok;
+}
+
+/* ---- t181: lookups made ahead of time (g2s_spec_lookup, any thread) and taken at the draw (g2s_spec_accept) ----
+   The lookup is the renderer's (g2s_translate_m: the exact chain, then relocatable entries of the same configuration),
+   made without changing anything shared: its own scratch memory and code hashes, no statistics, no chain changes.
+   Every read is recorded (G2SSpec ra / rn); the "GPU-written?" answers cannot be asked from another thread, so the
+   recorded answers are assumed and listed (gw) - the renderer asks them again before it takes the result. */
+G2SSpecScratch *g2s_spec_scratch_new(void) {
+    LkX *X = (LkX *)calloc(1, sizeof(LkX)); if (!X) return 0;
+    X->vals = (u32 (*)[16])calloc(RL_MAX, 64); X->valok = (u8 *)calloc(RL_MAX, 1); X->nt_tex = (G2STex *)calloc(G2S_MAX_TEX, sizeof(G2STex)); X->cr = (LkCr *)calloc(1024, sizeof(LkCr));
+    if (!X->vals || !X->valok || !X->nt_tex || !X->cr) { free(X->vals); free(X->valok); free(X->nt_tex); free(X->cr); free(X); return 0; }
+    return X;
+}
+/* w5_perf --gw-pred: the look-ahead takes the first memo entry that fits and assumes the "GPU-written?" answers recorded
+   in it; ~370 results a frame (Chapter 10 cave) were then thrown away at the draw because an answer was the other one
+   (the write had finished / a write had been recorded since) and the renderer looked up again itself - finding the
+   entry recorded with the other answers. The renderer now notes every answer it gets (by address and by the draw's
+   number in its submit: the same draw of the frame before asked the same question), and the look-ahead skips entries
+   whose recorded answers contradict the noted ones. Only a choice between entries: every answer of the entry taken is
+   still asked again by the renderer before the result is used (g2s_spec_accept), and two entries that both pass give
+   the same result (the translation is a function of the inputs, the memory read and the answers). */
+static volatile u64 g_gwp[2][65536];
+static u64 gwp_key(u64 a, u32 n, u32 ord) { u64 h = (a ^ ((u64)n << 48) ^ ((u64)ord << 20)) * 0x9E3779B97F4A7C15ull; return h ^ (h >> 31); }
+void g2s_gwp_note(u64 a, u32 n, u32 ord, int r) {
+    u64 k = gwp_key(a, n, ord); g_gwp[0][k & 0xFFFF] = (k & ~0xFFull) | (u8)r;
+    k = gwp_key(a, n, 0xFFFFFFFFu); g_gwp[1][k & 0xFFFF] = (k & ~0xFFull) | (u8)r;
+}
+static int gwp_get(u64 a, u32 n, u32 ord) {
+    u64 k = gwp_key(a, n, ord), v = g_gwp[0][k & 0xFFFF]; if ((v & ~0xFFull) == (k & ~0xFFull)) return (int)(v & 0xFF);
+    k = gwp_key(a, n, 0xFFFFFFFFu); v = g_gwp[1][k & 0xFFFF]; if ((v & ~0xFFull) == (k & ~0xFFull)) return (int)(v & 0xFF);
+    return -1;
+}
+static int spec_gw(G2SSpec *S, u64 a, u32 n, u8 r) {
+    if (S->ngw >= G2S_SPEC_NGW) { S->bad = 1; return 0; }
+    S->gw[S->ngw].a = a; S->gw[S->ngw].n = n; S->gw[S->ngw].r = r; S->ngw++; return 1;
+}
+static int spec_rd(void *ctx, u64 a, u32 *o, u32 n) {
+    G2SSpec *S = (G2SSpec *)ctx;
+    int r = S->rd(S->rctx, a, o, n);
+    if (r < 0) { S->bad = 1; return 0; }   /* (the thread could not tell: the renderer looks up itself) */
+    if (!S->norec) {   /* (t181e: unreadable reads too - rof 2: still unreadable when the result is taken) */
+        if (S->nr >= G2S_SPEC_NR) { S->bad = 1; return r; }
+        S->ra[S->nr] = a; S->rn[S->nr] = n; S->rof[S->nr] = r ? 0 : 2; S->rh[S->nr] = r ? mh_words(0x5EC5EC, o, n) : 0; S->nr++;
+        if (a < S->rlo) S->rlo = a; if (a + 4ull * n > S->rhi) S->rhi = a + 4ull * n;
+    }
+    return r;
+}
+static u64 code_hash_spec(LkX *X, const G2SIn *in, u64 a, u32 n) {
+    u64 ep = g_memo_ep; LkCr *c = &X->cr[(u32)(((a ^ ((u64)n << 40)) * 0x9E3779B97F4A7C15ull) >> 54) & 1023];
+    if (c->a == a && c->n == n && c->ep == ep) return c->h;
+    G2SSpec *S = X->S; int nr0 = S ? S->norec : 0; if (S) S->norec = 1;   /* (code: the epoch covers it) */
+    u64 h = code_hash_now_x(in, a, n, &X->cbuf, &X->ccap);
+    if (S) S->norec = nr0;
+    c->a = a; c->n = n; c->ep = ep; c->h = h;
+    return h;
+}
+static void spec_bucket(G2SSpec *S, u8 k, u32 b) { if (S->nb < G2S_SPEC_NB) { S->bk[S->nb] = k; S->bix[S->nb] = b; S->bmod[S->nb] = __atomic_load_n(k == 1 ? &g_mb1[b & 0xFFFF] : &g_mb2[b & 0xFFFF], __ATOMIC_ACQUIRE); S->nb++; } else S->bad = 1; }
+int g2s_spec_lookup(G2SSpec *S, const G2SIn *in0, G2SSpecScratch *X) {
+    S->kind = 0; S->nr = 0; S->ngw = 0; S->npred = 0; S->nb = 0; S->bad = 0; S->nchk = 0; S->ntries = 0; S->rlo = ~0ull; S->rhi = 0; S->norec = 0; S->slot = -1; S->b2 = -1;
+    G2SIn *in = &S->in; *in = *in0;
+    if (in->n_user < 16) for (u32 q = in->n_user; q < 16; q++) in->user_data[q] = 0;   /* (as g2s_translate) */
+    if (!X || in->native || (g2s_memo_skip_addr && in->code_addr == g2s_memo_skip_addr) || !__atomic_load_n(&g_memo_ready, __ATOMIC_ACQUIRE)) return 0;
+    S->ep = __atomic_load_n(&g_memo_ep, __ATOMIC_ACQUIRE);
+    S->wseq = g2s_wlog_pos();
+    G2SIn rin = *in; rin.read = spec_rd; rin.ctx = S;
+    X->S = S;
+    mrw_rlock();
+    u64 kc = memo_key_cfg(in), key = memo_key3(kc, in, 0xFFFF); int b = (int)(key & (MEMO_B - 1)); int why = 0;
+    spec_bucket(S, 1, (u32)b);
+    for (int i = g_memo_head[b], steps = 0; i >= 0 && i < MEMO_N && steps < 4096; i = g_ml[i].next, steps++) {
+        if (g_ml[i].key != key) continue;
+        MEnt *E = &g_memo[i];
+        if (!memo_same_in(&E->in, in)) continue;
+        S->nchk++;
+        if (g2s_gw_pred) { int skip = 0; for (int k = 0; k < E->ngw && !skip; k++) { int p_ = gwp_get(E->gw[k].a, E->gw[k].n, S->pord); skip = p_ >= 0 && (u8)p_ != E->gw[k].r; }
+            if (skip) { S->npred++; why |= 1; continue; } }
+        u32 g0_ = S->ngw;
+        for (int k = 0; k < E->ngw; k++) if (!spec_gw(S, E->gw[k].a, E->gw[k].n, E->gw[k].r)) goto out;
+        int code_ok = 1;
+        for (int k = 0; k < E->nrg && code_ok; k++) { const MRange *r = &E->rg[k];
+            if (!r->tag && code_in_window(r->a, r->n)) code_ok = code_hash_spec(X, &rin, r->a, r->n) == r->h; }
+        if (!code_ok || memo_hash_x(&rin, E->rg, E->nrg, E->rel, 2, X) != E->vh) {
+            why |= 2;
+            if (g2s_memo_reloc && !E->noreloc) { S->ntries++; if (memo_reloc_try_x(E, &rin, &S->out, X)) { S->kind = 2; S->slot = i; goto out; } }
+        } else { memo_out_unpack(&S->out, E->outp); S->kind = 1; S->slot = i; goto out; }
+        if (S->bad) goto out;
+        if (g2s_gw_pred) S->ngw = g0_;
+    }
+    if (g2s_memo_reloc && (why == 0 || g2s_reloc_any)) {
+        CfgM *C = cfg_get(kc, 0); int tries = 0;
+        for (int mi = 0; C && mi < C->n && mi < 4 && tries <= 6; mi++) {
+            u16 m = C->m[mi]; u64 k3 = memo_key3(kc, in, m); int b2 = (int)(k3 & (MEMO_B - 1));
+            spec_bucket(S, 2, (u32)b2);
+            for (int i = g_memo_head2[b2], steps = 0; i >= 0 && i < MEMO_N && steps < 4096; i = g_ml[i].next2, steps++) {
+                if (g_ml[i].key2 != k3 || g_ml[i].cmpm != m || g_ml[i].noreloc) continue;
+                MEnt *E = &g_memo[i];
+                int sameud = 1;
+                for (int q = 0; q < 16 && sameud; q++) if ((m >> q) & 1) sameud = E->in.user_data[q] == in->user_data[q];
+                if (!sameud || !memo_same_cfg(&E->in, in)) continue;
+                if (++tries > 6) break;
+                S->ntries++;
+                if (memo_reloc_try_x(E, &rin, &S->out, X)) { S->kind = 3; S->slot = i; S->b2 = b2; goto out; }
+                if (S->bad) goto out;
+            }
+        }
+    }
+out:
+    if (S->slot >= 0) S->gen = __atomic_load_n(&g_mgen[S->slot & 0xFFFF], __ATOMIC_ACQUIRE);
+    S->whynone = S->kind ? 0 : why ? 1 : S->ntries ? 2 : 3;
+    for (int q = 0; q < S->nb; q++) if (__atomic_load_n(S->bk[q] == 1 ? &g_mb1[S->bix[q] & 0xFFFF] : &g_mb2[S->bix[q] & 0xFFFF], __ATOMIC_ACQUIRE) != S->bmod[q]) S->bad = 1;   /* (changed while it looked) */
+    mrw_runlock();
+    X->S = 0;
+    if (S->bad) S->kind = 0;
+    return S->kind != 0;
+}
+/* the renderer, at the draw (after checking the memory it read: g2s_wlog_since and its own checks): the result is
+   taken only when the inputs, the code epoch, the memo entries and chains it used and every "GPU-written?" answer it
+   assumed are as they were; then the memo's bookkeeping is done as for the renderer's own lookup */
+u64 g2s_sa_gwdir[2];   /* t198: "GPU-written?" answers that changed between the look-ahead and the draw: [0] the write finished meanwhile, [1] a write was recorded meanwhile */
+u64 g2s_sa_cyc[4];   /* t181c: TSC cycles in g2s_spec_accept: inputs compared, GPU-written answers asked again, bookkeeping + copy */
+int g2s_spec_accept(G2SSpec *S, const G2SIn *in0, G2SOut *out, int *why) {
+    u64 t0 = __builtin_ia32_rdtsc();
+    G2SIn inz; const G2SIn *in = in0;
+    if (in0->n_user < 16) { u32 nz = 0; for (u32 q = in0->n_user; q < 16; q++) nz |= in0->user_data[q];
+        if (nz) { inz = *in0; for (u32 q = in0->n_user; q < 16; q++) inz.user_data[q] = 0; in = &inz; } }
+    if (!S->kind || S->bad || S->slot < 0) { *why = G2S_SA_NONE; return 0; }
+    if (S->ep != g_memo_ep) { *why = G2S_SA_EPOCH; return 0; }
+    if (!memo_same_in(&S->in, in)) { *why = G2S_SA_INPUT; return 0; }
+    if (g_mgen[S->slot & 0xFFFF] != S->gen) { *why = G2S_SA_MEMO; return 0; }
+    for (int q = 0; q < S->nb; q++) if ((S->bk[q] == 1 ? g_mb1[S->bix[q] & 0xFFFF] : g_mb2[S->bix[q] & 0xFFFF]) != S->bmod[q]) { *why = G2S_SA_MEMO; return 0; }
+    u64 t1 = __builtin_ia32_rdtsc(); g2s_sa_cyc[0] += t1 - t0;
+    for (u32 q = 0; q < S->ngw; q++) { int r = in->gpu_written ? in->gpu_written(in->ctx, S->gw[q].a, S->gw[q].n) : 0; if ((u8)r != S->gw[q].r) { g2s_sa_gwdir[r ? 1 : 0]++; *why = G2S_SA_GW; return 0; } }
+    u64 t2 = __builtin_ia32_rdtsc(); g2s_sa_cyc[1] += t2 - t1;
+    MEnt *E = &g_memo[S->slot]; u64 ep = g_memo_ep;
+    g_memo_chk += S->nchk; g_mpath[0] += S->nchk;
+    if (S->kind == 1) { if (E->ep == ep) g_memo_code_skips++; else E->ep = ep; g2s_memo_last_kind = 1; }
+    else if (S->kind == 2) { g_mpath[1]++; g_mpath[2]++; g_memo_hit_reloc++; E->ep = ep; g2s_memo_last_kind = 2; }
+    else {
+        g_memo_miss++; g_memo_m_new++; g_memo_rl_try += S->ntries; g_mpath[3] += S->ntries; g_mpath[4]++; g_memo_hit_reloc++; E->ep = ep; g2s_memo_last_kind = 2;
+        int b2 = S->b2, prev = -1, i = S->slot;   /* to the front of its chain (as g2s_translate) */
+        if (b2 >= 0) { int j = g_memo_head2[b2], steps = 0; while (j >= 0 && j != i && steps++ < 4096) { prev = j; j = g_ml[j].next2; }
+            if (j == i && prev >= 0) { MLink *L = &g_ml[i];
+                g_ml[prev].next2 = L->next2; if (L->next2 >= 0) g_ml[L->next2].prev2 = prev;
+                L->next2 = g_memo_head2[b2]; L->prev2 = -1; if (L->next2 >= 0) g_ml[L->next2].prev2 = i; g_memo_head2[b2] = i; } }
+    }
+    E->used = 1; g_memo_hit++; g2s_memo_last_born = E->born;
+    memo_out_copy(out, &S->out);
+    out->spv = memo_pack_spv(E->outp);   /* (the module's words may have been freed since: as the renderer's own unpack) */
+    if (g2s_memo_verify) { g_memo_last_reloc = S->kind != 1; memo_verify(in, out, E); g_memo_last_reloc = 0; }
+    g2s_sa_cyc[2] += __builtin_ia32_rdtsc() - t2; g2s_sa_cyc[3] += S->ngw;
+    *why = G2S_SA_OK;
+    return 1;
+}
+/* t181b: the ranges our writes since `since` touched (flag[i] = 1); -1: the log no longer reaches back */
+u64 g2s_words_hash(const u32 *p, u32 n) { return mh_words(0x5EC5EC, p, n); }
+int g2s_wlog_flags(u64 since, const G2SSpec *S, u8 *flag) {
+    u64 now = g2s_wlog_pos(); int nf = 0;
+    if (now - since > WL_N - 64) return -1;
+    for (u64 k = since; k < now; k++) { u64 a = g_wl[k % WL_N].lo, b = g_wl[k % WL_N].hi;
+        if (b <= S->rlo || a >= S->rhi) continue;
+        for (u32 i = 0; i < S->nr; i++) if (!S->rof[i] && !flag[i] && a < S->ra[i] + 4ull * S->rn[i] && b > S->ra[i]) { flag[i] = 1; nf++; } }
+    if (g2s_wlog_pos() - since > WL_N - 64) return -1;
+    return nf;
+}
+/* t181 --par-verify: the result taken against the renderer's own lookup (the fields the renderer uses) */
+int g2s_out_same(const G2SOut *a, const G2SOut *m) {
+    int same = a->spv == m->spv && a->key == m->key && a->n == m->n && a->ntex == m->ntex && a->nfold == m->nfold && a->fold_dw == m->fold_dw && a->nwr == m->nwr && a->fetch_addr == m->fetch_addr
+               && a->nrd == m->nrd && a->wr_unknown == m->wr_unknown && a->writes_mem == m->writes_mem && a->uses_lds == m->uses_lds && a->vs_params == m->vs_params
+               && a->ps_mrt_mask == m->ps_mrt_mask && a->ps_inputs == m->ps_inputs && a->n_inst == m->n_inst && a->structured == m->structured && a->cached == m->cached;
+    for (int i = 0; same && i < a->ntex && i < G2S_MAX_TEX; i++) { for (int k = 0; k < 8; k++) same &= a->tex[i].tsharp[k] == m->tex[i].tsharp[k]; for (int k = 0; k < 4; k++) same &= a->tex[i].ssharp[k] == m->tex[i].ssharp[k];
+        same &= a->tex[i].storage == m->tex[i].storage && a->tex[i].is_int == m->tex[i].is_int; }
+    for (u32 i = 0; same && i < a->nfold && i < 256; i++) same = a->fold_addr[i] == m->fold_addr[i] && a->fold_cnt[i] == m->fold_cnt[i];
+    for (u32 i = 0; same && i < a->nwr && i < 16; i++) same = a->wr_lo[i] == m->wr_lo[i] && a->wr_hi[i] == m->wr_hi[i];
+    for (u32 i = 0; same && i < a->nrd && i < 16; i++) same = a->rd_lo[i] == m->rd_lo[i] && a->rd_hi[i] == m->rd_hi[i];
+    return same;
 }
 
 #ifdef G2S_MEMO_CHECK

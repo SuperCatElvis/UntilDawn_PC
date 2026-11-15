@@ -82,6 +82,7 @@ static void hw_line(const char *s) { say(s); }
 static u64 g_hw_found3, g_hw_reported3;
 static int g_lump_repair; static u64 g_lump_repaired_scan, g_lump_repaired_call;
 static u64 g_hw_found4, g_hw_reported4, g_hw_found5, g_hw_reported5;
+static u64 g_hw_live, g_hw_dead, g_hw_unk;   /* w2: reports whose page start was a live heap block / freed or tail memory / not recognised */
 static void hw_report(u64 page, u64 old, u64 nw, int cls) {
     if (cls == 1 ? g_hw_reported1 >= 40 : cls == 3 ? g_hw_reported3 >= 40 : cls == 4 ? g_hw_reported4 >= 60 : cls == 5 ? g_hw_reported5 >= 40 : g_hw_reported2 >= 10) return;   /* separate limits: looser reports never hide a match */
     if (cls == 1) g_hw_reported1++; else if (cls == 3) g_hw_reported3++; else if (cls == 4) g_hw_reported4++; else if (cls == 5) g_hw_reported5++; else g_hw_reported2++;
@@ -98,6 +99,34 @@ static void hw_report(u64 page, u64 old, u64 nw, int cls) {
         const u32 *w = (const u32 *)(page + 16 * (u64)r); Sb u = {b, 0, sizeof b}; sb_s(&u, "    "); sb_x(&u, page + 16 * (u64)r); sb_s(&u, ":");
         for (int k = 0; k < 4; k++) { sb_s(&u, " "); sb_x(&u, w[k]); } sb_s(&u, "\n"); hw_line(b);
     }
+    /* w2: was the object alive? The reports of t195-t197 all show a 1-byte zero over a pointer, but the dump taken a flip
+       later often looks like freed heap memory (a chunk header at page+8, sizes of free neighbours) - a stale pointer in
+       memory that a new owner legitimately wrote would give the same report. The bytes around the page start and the
+       heap chunk headers on both readings (the game's heap is dlmalloc: user data is preceded by an 8-byte head = size |
+       1 "previous chunk in use" | 2 "this chunk in use") say which it was. */
+    if (hw_readable(page - 0x20, 0x20)) { const u32 *w = (const u32 *)(page - 0x20); Sb u = {b, 0, sizeof b}; sb_s(&u, "    before the page ("); sb_x(&u, page - 0x20); sb_s(&u, "):");
+        for (int k = 0; k < 8; k++) { sb_s(&u, " "); sb_x(&u, w[k]); } sb_s(&u, "\n"); hw_line(b); }
+    if (hw_readable(page + 0x40, 0x40)) for (int r = 4; r < 8; r++) {
+        const u32 *w = (const u32 *)(page + 16 * (u64)r); Sb u = {b, 0, sizeof b}; sb_s(&u, "    "); sb_x(&u, page + 16 * (u64)r); sb_s(&u, ":");
+        for (int k = 0; k < 4; k++) { sb_s(&u, " "); sb_x(&u, w[k]); } sb_s(&u, "\n"); hw_line(b); }
+    {   int live = -1;   /* 1: an in-use heap block starts at the page, 0: the page start is the tail of the block before / free memory, -1: cannot tell */
+        Sb u = {b, 0, sizeof b}; sb_s(&u, "    heap reading (w2): ");
+        u64 hA = hw_readable(page - 8, 8) ? *(const u64 *)(page - 8) : 0, sA = hA & ~7ull;   /* A: a block's user data starts at the page */
+        int okA = 0, useA = (int)((hA >> 1) & 1);
+        if (sA >= 0x20 && sA < (64ull << 20) && !(sA & 15) && hw_readable(page - 0x10 + sA, 0x10)) { u64 nh = *(const u64 *)(page - 0x10 + sA + 8), ns = nh & ~7ull;
+            okA = ns >= 0x20 && !(ns & 15) && (int)(nh & 1) == useA && (useA || *(const u64 *)(page - 0x10 + sA) == sA); }
+        u64 hB = *(const u64 *)(page + 8), sB = hB & ~7ull;   /* B: a block begins AT the page (its head at page+8): the page's first qword is the last 8 bytes of the block before */
+        int okB = 0, useB = (int)((hB >> 1) & 1);
+        if (sB >= 0x20 && sB < (64ull << 20) && !(sB & 15) && hw_readable(page + sB, 0x10)) { u64 nh = *(const u64 *)(page + sB + 8), ns = nh & ~7ull;
+            okB = ns >= 0x20 && !(ns & 15) && (int)(nh & 1) == useB && (useB || *(const u64 *)(page + sB) == sB); }
+        if (okA && !okB) { live = useA; sb_s(&u, "a heap block of "); sb_x(&u, sA); sb_s(&u, " bytes has its data at the page start and is "); sb_s(&u, useA ? "IN USE: the changed qword is a live object's first field" : "FREE now: the object had been freed (stale pointer)"); }
+        else if (okB && !okA) { live = 0; sb_s(&u, "a heap block of "); sb_x(&u, sB); sb_s(&u, useB ? " bytes (in use)" : " bytes (free)"); sb_s(&u, " BEGINS at the page: the changed qword is the last 8 bytes of the block before it"); sb_s(&u, (hB & 1) ? " (in use: its owner may write there - a stale pointer overwritten, not damage)" : " (free)"); }
+        else if (okA && okB) sb_s(&u, "both readings fit (block before the page and block at the page)");
+        else sb_s(&u, "no heap block headers recognised around the page start");
+        sb_s(&u, "; head before the page "); sb_x(&u, hA); sb_s(&u, ", qword after "); sb_x(&u, hB);
+        if (hw_readable(page + 0x30, 4)) { u32 st = *(const u32 *)(page + 0x30); if (st == 0x7111beefu || st == 0x3000beefu) { sb_s(&u, "; job object state at +0x30: "); sb_s(&u, st == 0x7111beefu ? "finished" : "running"); } }
+        sb_s(&u, "\n"); hw_line(b);
+        if (cls == 5 || cls == 1 || cls == 3) { if (live == 1) g_hw_live++; else if (live == 0) g_hw_dead++; else g_hw_unk++; } }
     /* its mapping and the mappings of it that went away */
     pm_lock(&g_dmap_lock);
     for (int i = 0; i < g_ndmap; i++) { const DMap *d = &g_dmap[i]; if (page < d->va || page >= d->va + d->len) continue;
@@ -294,6 +323,9 @@ static void hw_scan_region(HwReg *R) {
     u64 n = (R->hi - R->lo) >> 12;
     for (u64 k = 0; k < n; k++) {
         if (coh_stale4k(R->lo + (k << 12))) continue;   /* t165: a GPU-held page (reading it would copy it back) */
+#ifdef HAVE_WBG_GUARDED
+        if (g_wbg_guarded_fn && g_wbg_guarded_fn(R->lo + (k << 12))) continue;   /* w3_perf: guarded under label policy 4 (reading it would open it) */
+#endif
         u64 p = R->lo + (k << 12), v = *(volatile const u64 *)p, o = R->last[k];
         if (v == o) continue;
         R->last[k] = v;
@@ -500,5 +532,6 @@ static void hw_summary(void) {
     sb_s(&t, ", looser matches "); sb_d(&t, (i64)g_hw_found2); sb_s(&t, ", vtable starts "); sb_d(&t, (i64)g_hw_found3); sb_s(&t, ", low bytes cleared "); sb_d(&t, (i64)g_hw_found4); sb_s(&t, " (of eboot pointers "); sb_d(&t, (i64)g_hw_found5); sb_s(&t, ")");
     sb_s(&t, "; watchpoint traps: damage-shaped "); sb_d(&t, (i64)g_hw_ntrap); sb_s(&t, ", ordinary "); sb_d(&t, (i64)g_hw_ntrap_ord); sb_s(&t, " (damage writes printed: "); sb_d(&t, (i64)g_hw_suspect); sb_s(&t, ")"); sb_s(&t, "; lump repairs by the scanner "); sb_d(&t, (i64)g_lump_repaired_scan); sb_s(&t, ", at calls "); sb_d(&t, (i64)g_lump_repaired_call); sb_s(&t, "; our CPU writes journalled "); sb_d(&t, (i64)g_hw_nev); sb_s(&t, "\n");
     say(b);
+    { Sb u = {b, 0, sizeof b}; sb_s(&u, "watch-heap (w2): of the reported pointer changes, a live heap block at the page start "); sb_d(&u, (i64)g_hw_live); sb_s(&u, ", freed memory / the tail of the block before "); sb_d(&u, (i64)g_hw_dead); sb_s(&u, ", not recognised "); sb_d(&u, (i64)g_hw_unk); sb_s(&u, "\n"); say(b); }
 }
 #endif

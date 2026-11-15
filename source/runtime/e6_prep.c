@@ -29,7 +29,7 @@ typedef struct {
     u32 gen;                  /* generation that last used it */
     u64 h1, h2;               /* content hashes (everything below) */
     u64 mw[2][2];             /* each stage's SPIR-V words hashes (VMod wh, wh2) */
-    u8 x[2], pad[6];          /* each stage's module declares cross-lane operations (32-lane subgroups where needed) */
+    u8 x[2], pad[6];          /* each stage's module declares cross-lane operations (32-lane subgroups where needed); t203: pad[0] = PREP_F_* (0 in every older record) */
     u32 sig[72];              /* binding signature (vk_layout) */
     VkPipelineInputAssemblyStateCreateInfo ia; VkPipelineRasterizationStateCreateInfo rs; VkPipelineMultisampleStateCreateInfo ms;
     VkPipelineDepthStencilStateCreateInfo dss; VkPipelineColorBlendAttachmentState ba[8]; VkPipelineColorBlendStateCreateInfo cbs;
@@ -37,8 +37,9 @@ typedef struct {
 } PrepRec;
 typedef struct { u64 wa, wb; i64 off; u32 zlen, n; } PrepMod;   /* a module in prep_shaders.bin (off: its compressed bytes) */
 typedef struct { u64 wa, wb; u32 n; u32 *w; } PrepNewMod;            /* a module not yet written */
-enum { PREP_MAXREC = 32768, PREP_MAXMOD = 32768, PREP_MAXNEW = 8192 };
+enum { PREP_MAXREC = 65536, PREP_MAXMOD = 65536, PREP_MAXNEW = 8192 };   /* w13_prep: were 32768 (a cache with four configurations reached 29,581 records) */
 #define PREP_FILE_VER 1u
+#define PREP_F_CONSRASTER 1u   /* t203: pad[0] - a --fb-cover copy pipeline: conservative rasterisation (overestimate) in the rasterisation state; prepared only when the device has it */
 #define PREP_MREC 0x4345524Du   /* 'MREC' */
 static int g_prep_on = 1, g_prep_rec_on, g_prep_replay, g_prep_exit, g_prep_inited, g_prep_in_replay, g_prep_rec_req;   /* (replays: nothing unless --prep / --prep-record) */
 static const char *g_prep_dir;   /* --cache-dir */
@@ -49,7 +50,7 @@ static PrepRec *g_prep_rec; static int g_prep_nrec, g_prep_dirty; static HIdx g_
 static PrepMod *g_prep_mod; static int g_prep_nmod; static HIdx g_prep_mix; static i64 g_prep_sfile_end;
 static PrepNewMod *g_prep_new; static int g_prep_nnew; static u64 g_prep_new_bytes;
 static u32 g_prep_gen; static u64 g_prep_build;
-static u64 g_prep_n_noted, g_prep_n_new, g_prep_n_newmod, g_prep_n_nomod;
+static u64 g_prep_n_noted, g_prep_n_new, g_prep_n_newmod, g_prep_n_nomod, g_prep_n_cov_rec;   /* (t203: g_prep_n_cov_rec = --fb-cover copy pipelines recorded new this session) */
 /* t161: coverage. Per record: g_prep_st (this start's preparation: 1 prepared - compiled or already in the cache, 2 failed),
    g_prep_mf (1: the shipped manifest has it). g_prep_nrec_start: the records there were when the preparation ended. */
 static u8 *g_prep_st, *g_prep_mf; static int g_prep_nrec_start = -1;
@@ -64,13 +65,40 @@ static u64 g_pcov_start_total, g_pcov_start_ok, g_pcov_start_failed, g_pcov_star
    background then finds them in the pipeline cache). While it runs, the records are not saved (their file is open for
    reading); the exit waits for the workers (each finishes the pipeline it is making). */
 static int g_prep_bg_mode, g_prep_fg_ms = 20000;
-static volatile long g_prep_bg_running, g_prep_bg_n, g_prep_bg_fin; static void *g_prep_th[16]; static u64 g_prep_bg_t0;
+static volatile long g_prep_bg_running, g_prep_bg_n, g_prep_bg_fin; static void *g_prep_th[32]; static u64 g_prep_bg_t0;
 static void prep_bg_finish(void);
+/* ---------------- w13_prep (release v0.4.0: a cold first run inside 2-5 minutes), every part behind an option ----------------
+   --prep-variant-only: a record is prepared only when it carries the mark of the configuration in use (the translation
+     variant - render scale mode, translator switches, this GPU's features - and the build). Marks live in a file of their
+     own (prep_variants.bin: 8 configurations, least recently used replaced), set when the manifest is taken in and when
+     the game makes a pipeline. Records without the mark stay in memory and on disk untouched; they are only left out
+     of the list of work. A cache of four configurations (22,784 records) prepared 16,000 pipelines nobody needed.
+   --prep-order: the first pipeline of every heavy shader module (compute of 50,000 words and more, pixel shaders of
+     40,000 and more) first, largest first - the driver compiles a module once, so these are the long poles and they
+     run side by side from the first second; the other pipelines of those modules last (they wait for the module);
+     everything else in the records' order in between.
+   --prep-all-threads: a worker per logical processor (t202: processors - 1, at most 16 = 16 of 24 here).
+   --prep-eta: bar and time left from estimated work (module sizes), since the heavy pipelines come first.
+   --prep-import-fast: the manifest import runs on its own thread and the calling thread only draws the screen (before,
+     every screen frame - a software-drawn canvas, an acquire with a 200 ms time-out and a present - sat between two
+     translations); the code ranges are read in file order (each LZ4 block unpacked once).
+   --prep-fast: all five. --prep-budget-s N: N seconds on the screen, the rest in the background (experiments only:
+     the background compiles gave frames of 1-3.5 s in w9_prep's L1).
+   Always: the exit during a preparation (prep_bg_stop). */
+static int g_prep_variant_only = 1, g_prep_order, g_prep_all_threads = 1, g_prep_eta, g_prep_imp_thread = 1, g_prep_close_after_ms, g_prep_min_words;   /* t203: variant-only and import-fast ON by default (w13_prep verdicts); --no-prep-variant-only / --no-prep-import-fast = t202 behaviour */
+static int g_prep_exit_wait_ms = 2000;
+static volatile long g_prep_exiting, g_prep_saving, g_prep_imp_busy, g_prep_exit_done;
+typedef struct { char magic[4]; u32 ver; u64 key[8]; u32 stamp[8]; u32 clock, count; } PrepVHdr;
+typedef struct { u64 h1, h2; u32 mask, pad; } PrepVEnt;
+static PrepVHdr g_prep_vh; static u8 *g_prep_vmask; static int g_prep_vslot = -1, g_prep_vnew, g_prep_vdirty; static char g_prep_vpath[1200], g_prep_vtmp[1200];
+static u32 *g_pj_w; static volatile long long g_prep_wdone; static u64 g_prep_wtotal, g_prep_w_t0;   /* --prep-eta: estimated work per job (ms of one processor) */
+#define PREP_VMARK(q) do { if (g_prep_variant_only && g_prep_vslot >= 0 && g_prep_vmask && !(g_prep_vmask[q] & (1u << g_prep_vslot))) { g_prep_vmask[q] |= (u8)(1u << g_prep_vslot); g_prep_vdirty = 1; } } while (0)
 static u32 prep_rd16(const u8 *p) { return (u32)p[0] | (u32)p[1] << 8; }
 static u32 prep_rd32(const u8 *p) { return prep_rd16(p) | prep_rd16(p + 2) << 16; }
 #define PREP_NST(r) ((r)->kind == 1 ? 2u : 1u)   /* stages: graphics VS + PS, compute CS */
 static int prep_memeq(const void *a, const void *b, u64 n) { const u8 *x = (const u8 *)a, *y = (const u8 *)b; for (u64 i = 0; i < n; i++) if (x[i] != y[i]) return 0; return 1; }
 static void prep_tinit(void); static void prep_tsave(void);   /* t160 (below) */
+static void prep_hint(int q);   /* w7_prep (below) */
 static u64 prep_fnv(const void *p, u64 n, u64 h) { const u8 *b = (const u8 *)p; for (u64 i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; } return h; }
 static void prep_hash(PrepRec *r) {
     const u8 *b = (const u8 *)&r->mw; u64 n = sizeof *r - (u64)((const u8 *)&r->mw - (const u8 *)r);
@@ -104,12 +132,14 @@ static void prep_init(void) {
       Sb a = {g_prep_lpath, 0, sizeof g_prep_lpath}; sb_s(&a, d); sb_s(&a, "prep_pipelines.bin");
       Sb b = {g_prep_ltmp, 0, sizeof g_prep_ltmp}; sb_s(&b, d); sb_s(&b, "prep_pipelines.tmp");
       Sb c = {g_prep_spath, 0, sizeof g_prep_spath}; sb_s(&c, d); sb_s(&c, "prep_shaders.bin");
-      Sb e = {g_prep_tpath, 0, sizeof g_prep_tpath}; sb_s(&e, d); sb_s(&e, "prep_translations.bin"); }
+      Sb e = {g_prep_tpath, 0, sizeof g_prep_tpath}; sb_s(&e, d); sb_s(&e, "prep_translations.bin");
+      Sb v1 = {g_prep_vpath, 0, sizeof g_prep_vpath}; sb_s(&v1, d); sb_s(&v1, "prep_variants.bin");
+      Sb v2 = {g_prep_vtmp, 0, sizeof g_prep_vtmp}; sb_s(&v2, d); sb_s(&v2, "prep_variants.tmp"); }
     pm_init(&g_prep_m);
     g_prep_rec = (PrepRec *)calloc(PREP_MAXREC, sizeof(PrepRec)); g_prep_mod = (PrepMod *)calloc(PREP_MAXMOD, sizeof(PrepMod)); g_prep_new = (PrepNewMod *)calloc(PREP_MAXNEW, sizeof(PrepNewMod));
-    g_prep_st = (u8 *)calloc(PREP_MAXREC, 1); g_prep_mf = (u8 *)calloc(PREP_MAXREC, 1);
-    if (!g_prep_rec || !g_prep_mod || !g_prep_new || !g_prep_st || !g_prep_mf) { g_prep_on = 0; return; }
-    hix_init(&g_prep_rix, 65536); hix_init(&g_prep_mix, 65536);
+    g_prep_st = (u8 *)calloc(PREP_MAXREC, 1); g_prep_mf = (u8 *)calloc(PREP_MAXREC, 1); g_prep_vmask = (u8 *)calloc(PREP_MAXREC, 1);
+    if (!g_prep_rec || !g_prep_mod || !g_prep_new || !g_prep_st || !g_prep_mf || !g_prep_vmask) { g_prep_on = 0; return; }
+    hix_init(&g_prep_rix, 262144); hix_init(&g_prep_mix, 262144);
     g_prep_build = prep_build_id(); g_prep_gen = 1;
     u64 n = 0; u8 *d = (u8 *)plat_read_file(g_prep_lpath, &n);
     if (d && n >= 32 && prep_memeq(d, "UDPP", 4) && *(const u32 *)(d + 4) == PREP_FILE_VER && *(const u32 *)(d + 8) == (u32)sizeof(PrepRec)) {
@@ -124,6 +154,17 @@ static void prep_init(void) {
         } else say("    shader preparation: the pipeline records are damaged - started again\n");
     }
     if (d) plat_free_pages(d);   /* (plat_read_file: VirtualAlloc) */
+    if (g_prep_variant_only) {   /* w13_prep: the configuration marks */
+        u64 vn = 0; u8 *vd = (u8 *)plat_read_file(g_prep_vpath, &vn); int marked = 0;
+        if (vd && vn >= sizeof(PrepVHdr) && prep_memeq(vd, "UDPV", 4) && ((const PrepVHdr *)vd)->ver == 1 && sizeof(PrepVHdr) + (u64)((const PrepVHdr *)vd)->count * sizeof(PrepVEnt) <= vn) {
+            h_memcpy(&g_prep_vh, vd, sizeof g_prep_vh);
+            for (u32 i = 0; i < g_prep_vh.count; i++) { PrepVEnt e_; h_memcpy(&e_, vd + sizeof(PrepVHdr) + (u64)i * sizeof(PrepVEnt), sizeof e_);
+                int q = prep_find_rec(e_.h1, e_.h2); if (q >= 0 && (e_.mask & 0xFF)) { g_prep_vmask[q] = (u8)e_.mask; marked++; } }
+        } else { h_memset(&g_prep_vh, 0, sizeof g_prep_vh); }
+        h_memcpy(g_prep_vh.magic, "UDPV", 4); g_prep_vh.ver = 1;
+        if (vd) plat_free_pages(vd);
+        say("    shader preparation (w13, --prep-variant-only): "); say_dec(g_prep_nrec); say(" records, "); say_dec(marked); say(" carry a configuration mark\n");
+    }
     /* the shaders file: record headers only; a damaged or cut-off end is cut off before anything is appended */
     void *f = hf_open_rb(g_prep_spath);
     if (f) {
@@ -148,6 +189,26 @@ static void prep_init(void) {
 }
 
 /* a pipeline the renderer is about to create (renderer thread): recorded if new, marked as used by this generation */
+/* the graphics pipeline's fixed-function state, member by member into a zeroed record (prep_note, prep_note_cov) */
+static void prep_fill_gfx(PrepRec *r, const PJob *j) {
+        /* member by member into the zeroed record: the structs' padding stays 0 (the content hash must not see it) */
+        r->ia.sType = j->ia.sType; r->ia.flags = j->ia.flags; r->ia.topology = j->ia.topology; r->ia.primitiveRestartEnable = j->ia.primitiveRestartEnable;
+        r->rs.sType = j->rs.sType; r->rs.flags = j->rs.flags; r->rs.depthClampEnable = j->rs.depthClampEnable; r->rs.rasterizerDiscardEnable = j->rs.rasterizerDiscardEnable;
+        r->rs.polygonMode = j->rs.polygonMode; r->rs.cullMode = j->rs.cullMode; r->rs.frontFace = j->rs.frontFace; r->rs.depthBiasEnable = j->rs.depthBiasEnable;
+        r->rs.depthBiasConstantFactor = j->rs.depthBiasConstantFactor; r->rs.depthBiasClamp = j->rs.depthBiasClamp; r->rs.depthBiasSlopeFactor = j->rs.depthBiasSlopeFactor; r->rs.lineWidth = j->rs.lineWidth;
+        r->ms.sType = j->ms.sType; r->ms.flags = j->ms.flags; r->ms.rasterizationSamples = j->ms.rasterizationSamples; r->ms.sampleShadingEnable = j->ms.sampleShadingEnable;
+        r->ms.minSampleShading = j->ms.minSampleShading; r->ms.alphaToCoverageEnable = j->ms.alphaToCoverageEnable; r->ms.alphaToOneEnable = j->ms.alphaToOneEnable;
+        r->dss.sType = j->dss.sType; r->dss.flags = j->dss.flags; r->dss.depthTestEnable = j->dss.depthTestEnable; r->dss.depthWriteEnable = j->dss.depthWriteEnable;
+        r->dss.depthCompareOp = j->dss.depthCompareOp; r->dss.depthBoundsTestEnable = j->dss.depthBoundsTestEnable; r->dss.stencilTestEnable = j->dss.stencilTestEnable;
+        r->dss.front = j->dss.front; r->dss.back = j->dss.back; r->dss.minDepthBounds = j->dss.minDepthBounds; r->dss.maxDepthBounds = j->dss.maxDepthBounds;   /* (VkStencilOpState: 4-byte members, no padding) */
+        for (u32 k = 0; k < j->cbs.attachmentCount && k < 8; k++) r->ba[k] = j->ba[k];   /* (4-byte members, no padding) */
+        r->cbs.sType = j->cbs.sType; r->cbs.flags = j->cbs.flags; r->cbs.logicOpEnable = j->cbs.logicOpEnable; r->cbs.logicOp = j->cbs.logicOp; r->cbs.attachmentCount = j->cbs.attachmentCount;
+        for (int k = 0; k < 4; k++) r->cbs.blendConstants[k] = j->cbs.blendConstants[k];
+        r->ndyn = j->dys.dynamicStateCount > 3 ? 3 : j->dys.dynamicStateCount; for (u32 k = 0; k < r->ndyn; k++) r->dyn[k] = j->dyn[k];
+        for (u32 k = 0; k < j->pri.colorAttachmentCount && k < 8; k++) r->cf[k] = j->cf[k];
+        r->pri.sType = j->pri.sType; r->pri.viewMask = j->pri.viewMask; r->pri.colorAttachmentCount = j->pri.colorAttachmentCount;
+        r->pri.depthAttachmentFormat = j->pri.depthAttachmentFormat; r->pri.stencilAttachmentFormat = j->pri.stencilAttachmentFormat;
+}
 static void prep_note(PJob *j) {
     j->prep_cls = PCOV_NONE;
     if (!g_prep_rec_on || g_opt_cold_pipes || g_diag_mode || g_xs_pipe || g_opt_nan_hunt) return;
@@ -160,23 +221,7 @@ static void prep_note(PJob *j) {
     if (j->compute) { r.kind = 2; keys[0] = j->P->h1; }
     else {
         r.kind = 1; keys[0] = j->vs_key; keys[1] = j->ps_key; ns = 2;
-        /* member by member into the zeroed record: the structs' padding stays 0 (the content hash must not see it) */
-        r.ia.sType = j->ia.sType; r.ia.flags = j->ia.flags; r.ia.topology = j->ia.topology; r.ia.primitiveRestartEnable = j->ia.primitiveRestartEnable;
-        r.rs.sType = j->rs.sType; r.rs.flags = j->rs.flags; r.rs.depthClampEnable = j->rs.depthClampEnable; r.rs.rasterizerDiscardEnable = j->rs.rasterizerDiscardEnable;
-        r.rs.polygonMode = j->rs.polygonMode; r.rs.cullMode = j->rs.cullMode; r.rs.frontFace = j->rs.frontFace; r.rs.depthBiasEnable = j->rs.depthBiasEnable;
-        r.rs.depthBiasConstantFactor = j->rs.depthBiasConstantFactor; r.rs.depthBiasClamp = j->rs.depthBiasClamp; r.rs.depthBiasSlopeFactor = j->rs.depthBiasSlopeFactor; r.rs.lineWidth = j->rs.lineWidth;
-        r.ms.sType = j->ms.sType; r.ms.flags = j->ms.flags; r.ms.rasterizationSamples = j->ms.rasterizationSamples; r.ms.sampleShadingEnable = j->ms.sampleShadingEnable;
-        r.ms.minSampleShading = j->ms.minSampleShading; r.ms.alphaToCoverageEnable = j->ms.alphaToCoverageEnable; r.ms.alphaToOneEnable = j->ms.alphaToOneEnable;
-        r.dss.sType = j->dss.sType; r.dss.flags = j->dss.flags; r.dss.depthTestEnable = j->dss.depthTestEnable; r.dss.depthWriteEnable = j->dss.depthWriteEnable;
-        r.dss.depthCompareOp = j->dss.depthCompareOp; r.dss.depthBoundsTestEnable = j->dss.depthBoundsTestEnable; r.dss.stencilTestEnable = j->dss.stencilTestEnable;
-        r.dss.front = j->dss.front; r.dss.back = j->dss.back; r.dss.minDepthBounds = j->dss.minDepthBounds; r.dss.maxDepthBounds = j->dss.maxDepthBounds;   /* (VkStencilOpState: 4-byte members, no padding) */
-        for (u32 k = 0; k < j->cbs.attachmentCount && k < 8; k++) r.ba[k] = j->ba[k];   /* (4-byte members, no padding) */
-        r.cbs.sType = j->cbs.sType; r.cbs.flags = j->cbs.flags; r.cbs.logicOpEnable = j->cbs.logicOpEnable; r.cbs.logicOp = j->cbs.logicOp; r.cbs.attachmentCount = j->cbs.attachmentCount;
-        for (int k = 0; k < 4; k++) r.cbs.blendConstants[k] = j->cbs.blendConstants[k];
-        r.ndyn = j->dys.dynamicStateCount > 3 ? 3 : j->dys.dynamicStateCount; for (u32 k = 0; k < r.ndyn; k++) r.dyn[k] = j->dyn[k];
-        for (u32 k = 0; k < j->pri.colorAttachmentCount && k < 8; k++) r.cf[k] = j->cf[k];
-        r.pri.sType = j->pri.sType; r.pri.viewMask = j->pri.viewMask; r.pri.colorAttachmentCount = j->pri.colorAttachmentCount;
-        r.pri.depthAttachmentFormat = j->pri.depthAttachmentFormat; r.pri.stencilAttachmentFormat = j->pri.stencilAttachmentFormat;
+        prep_fill_gfx(&r, j);
     }
     for (int s = 0; s < ns; s++) {
         int mi = hix_get(&V.mod_ix, keys[s]);
@@ -189,6 +234,8 @@ static void prep_note(PJob *j) {
     int q = prep_find_rec(r.h1, r.h2);
     if (q >= 0) { if (g_prep_rec[q].gen != g_prep_gen) { g_prep_rec[q].gen = g_prep_gen; g_prep_dirty = 1; }
         j->prep_cls = (q >= g_prep_nrec_start ? PCOV_AGAIN : g_prep_st[q] == 1 ? PCOV_PREPARED : PCOV_KNOWN) | (g_prep_mf[q] ? PCOV_MF : 0);   /* t161 */
+        prep_hint(q);   /* w7_prep */
+        PREP_VMARK(q);   /* w13_prep */
         pm_unlock(&g_prep_m); return; }
     if (g_prep_nrec >= PREP_MAXREC) { pm_unlock(&g_prep_m); return; }
     j->prep_cls = PCOV_NEW;   /* t161 */
@@ -202,7 +249,39 @@ static void prep_note(PJob *j) {
         PrepNewMod *N = &g_prep_new[g_prep_nnew++]; N->wa = r.mw[s][0]; N->wb = r.mw[s][1]; N->n = wn; N->w = c; g_prep_new_bytes += 4ull * wn; g_prep_n_newmod++;
     }
     r.gen = g_prep_gen;
-    g_prep_rec[g_prep_nrec] = r; hix_put(&g_prep_rix, r.h1, g_prep_nrec); g_prep_nrec++; g_prep_dirty = 1; g_prep_n_new++;
+    g_prep_rec[g_prep_nrec] = r; hix_put(&g_prep_rix, r.h1, g_prep_nrec); g_prep_vmask[g_prep_nrec] = 0; PREP_VMARK(g_prep_nrec); g_prep_nrec++; g_prep_dirty = 1; g_prep_n_new++;
+    pm_unlock(&g_prep_m);
+}
+/* t203: a --fb-cover copy pipeline (e6_vk.c cov_pipe) as an ordinary graphics record: the draw's vertex shader + the
+   generated copy pixel shader (its words kept with the other modules in prep_shaders.bin), flagged PREP_F_CONSRASTER.
+   The next start's preparation makes it with the other pipelines, so play finds it in the pipeline cache. */
+static void prep_note_cov(const PJob *j, const u32 *pw, u32 pn) {
+    if (!g_prep_rec_on || g_opt_cold_pipes || g_diag_mode || g_xs_pipe || g_opt_nan_hunt || !pw || !pn) return;
+    const VLayout *L = 0; for (int i = 0; i < V.nlay; i++) if (V.lay[i].pl == j->gci.layout) { L = &V.lay[i]; break; }
+    if (!L) return;
+    static PrepRec r; h_memset(&r, 0, sizeof r);
+    for (u32 k = 0; k <= L->sig[0] && k < 72; k++) r.sig[k] = L->sig[k];
+    r.kind = 1; prep_fill_gfx(&r, j); r.pad[0] = (u8)PREP_F_CONSRASTER;
+    int mi = hix_get(&V.mod_ix, j->vs_key);
+    if (mi < 0 || V.mods[mi].key != j->vs_key || !V.mods[mi].wh) { g_prep_n_nomod++; return; }
+    r.mw[0][0] = V.mods[mi].wh; r.mw[0][1] = V.mods[mi].wh2; r.x[0] = V.mods[mi].xlane;
+    r.mw[1][0] = words_hash2(pw, pn, &r.mw[1][1]); r.x[1] = 0;
+    prep_hash(&r);
+    g_prep_n_noted++;
+    pm_lock(&g_prep_m);
+    int q = prep_find_rec(r.h1, r.h2);
+    if (q >= 0) { if (g_prep_rec[q].gen != g_prep_gen) { g_prep_rec[q].gen = g_prep_gen; g_prep_dirty = 1; } PREP_VMARK(q); pm_unlock(&g_prep_m); return; }
+    if (g_prep_nrec >= PREP_MAXREC) { pm_unlock(&g_prep_m); return; }
+    for (int s = 0; s < 2; s++) {
+        if (prep_find_mod(r.mw[s][0], r.mw[s][1]) >= 0 || prep_new_has(r.mw[s][0], r.mw[s][1])) continue;
+        u32 wn = 0; const u32 *w = s ? pw : g2s_spv_get(j->vs_key, &wn); if (s) wn = pn;
+        if (!w || !wn || g_prep_nnew >= PREP_MAXNEW || g_prep_new_bytes > (512ull << 20)) { pm_unlock(&g_prep_m); g_prep_n_nomod++; return; }
+        u32 *c = (u32 *)malloc(4ull * wn); if (!c) { pm_unlock(&g_prep_m); return; }
+        h_memcpy(c, w, 4ull * wn);
+        PrepNewMod *N = &g_prep_new[g_prep_nnew++]; N->wa = r.mw[s][0]; N->wb = r.mw[s][1]; N->n = wn; N->w = c; g_prep_new_bytes += 4ull * wn; g_prep_n_newmod++;
+    }
+    r.gen = g_prep_gen;
+    g_prep_rec[g_prep_nrec] = r; hix_put(&g_prep_rix, r.h1, g_prep_nrec); g_prep_vmask[g_prep_nrec] = 0; PREP_VMARK(g_prep_nrec); g_prep_nrec++; g_prep_dirty = 1; g_prep_n_new++; g_prep_n_cov_rec++;
     pm_unlock(&g_prep_m);
 }
 
@@ -271,7 +350,10 @@ static int prep_tgw(void *ctx, u64 a, u32 n) {
 /* a translation the renderer made (renderer thread): recorded when its SPIR-V has no record yet */
 static void prep_tnote(const G2SIn *in, const G2SOut *out) {
     if (!g_prep_trec_on || !out->key || g_diag_mode || g_xs_pipe || g_opt_nan_hunt || in->native || in->diag_salt) return;
-    { int q = hix_get(&g_prep_kix, out->key); if (q >= 0 && g_prep_keys[q] == out->key) return;
+    /* w5_perf: every shader lookup of every draw comes here (~4,000 a frame); the index lookup below was 2.9 % of the renderer's own code. Keys found in it are remembered in a small table first. */
+    static u64 seen_[2048]; u32 sh_ = (u32)((out->key * 0x9E3779B97F4A7C15ull) >> 53);
+    if (seen_[sh_] == out->key) return;
+    { int q = hix_get(&g_prep_kix, out->key); if (q >= 0 && g_prep_keys[q] == out->key) { seen_[sh_] = out->key; return; }
       if (g_prep_nkeys < PREP_MAXKEYS) { g_prep_keys[g_prep_nkeys] = out->key; hix_put(&g_prep_kix, out->key, g_prep_nkeys); g_prep_nkeys++; } }
     u32 wn = out->n; const u32 *w = out->spv; if (!w || !wn) w = g2s_spv_get(out->key, &wn);
     if (!w || !wn) return;
@@ -325,7 +407,28 @@ static void prep_tsave(void) {   /* (from prep_save) */
 }
 
 /* write what is new (with the pipeline cache saves: background thread, and at exit) */
-static void prep_save(void) {
+static void prep_save_body(void);
+static void prep_vsave(void) {   /* w13_prep: the configuration marks (whole file, replaced) */
+    if (!g_prep_variant_only || !g_prep_vmask) return;
+    pm_lock(&g_prep_m);
+    if (!g_prep_vdirty) { pm_unlock(&g_prep_m); return; }
+    u32 cnt = 0; for (int i = 0; i < g_prep_nrec; i++) if (g_prep_vmask[i]) cnt++;
+    u8 *b = (u8 *)malloc(sizeof(PrepVHdr) + (u64)cnt * sizeof(PrepVEnt) + 8); u32 k = 0;
+    if (b) { for (int i = 0; i < g_prep_nrec && k < cnt; i++) if (g_prep_vmask[i]) { PrepVEnt e_ = {g_prep_rec[i].h1, g_prep_rec[i].h2, g_prep_vmask[i], 0}; h_memcpy(b + sizeof(PrepVHdr) + (u64)k * sizeof(PrepVEnt), &e_, sizeof e_); k++; }
+        g_prep_vh.count = k; h_memcpy(b, &g_prep_vh, sizeof g_prep_vh); g_prep_vdirty = 0; }
+    pm_unlock(&g_prep_m);
+    if (!b) return;
+    void *f = plat_open_write(g_prep_vtmp);
+    if (f) { plat_write_bin(f, b, sizeof(PrepVHdr) + (u64)k * sizeof(PrepVEnt)); plat_close(f); plat_replace_file(g_prep_vtmp, g_prep_vpath); }
+    free(b);
+}
+static void prep_save(void) {   /* w13_prep: one save at a time (the exit path can meet the manifest import's save) */
+    if (!g_prep_rec_on) return;
+    for (int k = 0; k < 3000 && __atomic_exchange_n(&g_prep_saving, 1, __ATOMIC_ACQ_REL); k++) plat_sleep_ms(1);
+    prep_save_body(); prep_vsave();
+    __atomic_store_n(&g_prep_saving, 0, __ATOMIC_RELEASE);
+}
+static void prep_save_body(void) {
     if (!g_prep_rec_on) return;
     if (__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE)) return;   /* t164: the background preparation reads the module file (saved once it ends) */
     prep_tsave();   /* t160 */
@@ -580,15 +683,24 @@ static void prep_draw(PrepCanvas *C, u32 done, u32 total, u32 compiled, u32 cach
     prep_rect(C, bx - s, by - s, bx + bw + s, by + bh + s, 70, 70, 76);
     prep_rect(C, bx, by, bx + bw, by + bh, 24, 24, 28);
     i32 fill = total ? (i32)((u64)bw * done / total) : 0;
+    u64 wd_ = (u64)__atomic_load_n(&g_prep_wdone, __ATOMIC_RELAXED), wt_ = g_prep_wtotal; int eta_ = g_prep_eta && wt_ && !g_prep_phase;   /* w13_prep */
+    if (eta_) { if (wd_ > wt_) wd_ = wt_; fill = (i32)((u64)bw * wd_ / wt_); }
     prep_rect(C, bx, by, bx + fill, by + bh, 0x10, 0x41, 0x69);   /* #104169 */
     char t[160]; Sb b = {t, 0, sizeof t};
-    sb_d(&b, done); sb_s(&b, F ? " of " : " OF "); sb_d(&b, total); sb_s(&b, " ("); sb_d(&b, total ? (i64)((u64)done * 100 / total) : 100); sb_s(&b, "%)");
+    sb_d(&b, done); sb_s(&b, F ? " of " : " OF "); sb_d(&b, total);
+    if (eta_) sb_s(&b, F ? " shaders" : " SHADERS"); else { sb_s(&b, " ("); sb_d(&b, total ? (i64)((u64)done * 100 / total) : 100); sb_s(&b, "%)"); }
     if (compiled) { sb_s(&b, " - "); sb_d(&b, compiled); sb_s(&b, F ? " compiled" : " COMPILED"); }
     t[b.n < (int)sizeof t ? b.n : (int)sizeof t - 1] = 0;
     if (F) prep_ftext_c(C, F, t, by + bh + 52 * u, 34 * u, 200); else prep_text_c(C, t, by + bh + 8 * s, s, 200);
     const char *l2 = 0;
     if (g_prep_phase && !skipping) l2 = g_prep_phase;
     else if (skipping) l2 = F ? "Skipping - finishing the shaders being compiled" : "SKIPPING - FINISHING THE SHADERS BEING COMPILED";
+    else if (eta_) {   /* w13_prep: time left from the estimated work; rounded up so it does not flicker */
+        u64 el_ = (plat_ticks() - g_prep_w_t0) * 1000 / plat_ticks_per_sec();
+        if (el_ >= 4000 && wd_ * 50 >= wt_ && done < total) { u64 left = el_ * (wt_ - wd_) / wd_ / 1000 + 1; Sb e = {t, 0, sizeof t};
+            sb_s(&e, F ? "About " : "ABOUT "); if (left > 90) { sb_d(&e, (i64)((left + 59) / 60)); sb_s(&e, F ? " min left" : " MIN LEFT"); } else { sb_d(&e, (i64)((left + 9) / 10 * 10)); sb_s(&e, F ? " s left" : " S LEFT"); }
+            t[e.n < (int)sizeof t ? e.n : (int)sizeof t - 1] = 0; l2 = t; }
+    }
     else if (done > total / 20 && done > 8 && elapsed_ms > 2000 && done < total) {
         u64 left = elapsed_ms * (total - done) / done / 1000 + 1; Sb e = {t, 0, sizeof t};
         sb_s(&e, F ? "About " : "ABOUT "); if (left >= 60) { sb_d(&e, (i64)(left / 60)); sb_s(&e, F ? " min " : " MIN "); } sb_d(&e, (i64)(left % 60)); sb_s(&e, F ? " s left" : " S LEFT");
@@ -642,8 +754,9 @@ static int prep_present(u32 done, u32 total, u32 compiled, u32 cached, u64 elaps
     prep_draw(&C, done, total, compiled, cached, elapsed_ms, skipping);
     vk_begin_cb();
     VSlot *PS = &g_slot[g_slot_cur]; u32 idx = 0;
+    bk_wait_presents();   /* t182 (review): acquire and the back-end's present never at the same time */
     VkResult r = vkAcquireNextImageKHR(V.dev, V.sw, 200000000ull, PS->acq, 0, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_submit_async(0, 0); vk_wait_all(); { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); pm_unlock(&g_gpu_lock); return 0; } }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_submit_async(0, 0); vk_wait_all(); { bk_flush(); qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); pm_unlock(&g_gpu_lock); return 0; } }
     if (r < 0 || r == VK_TIMEOUT || r == VK_NOT_READY) { vk_submit_async(0, 0); vk_wait_all(); pm_unlock(&g_gpu_lock); return 0; }
     VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, 0, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_prep_img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
@@ -661,9 +774,10 @@ static int prep_present(u32 done, u32 total, u32 compiled, u32 cached, u64 elaps
     if (!g_prep_done_sem[idx & 7]) { VkSemaphoreCreateInfo semi = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; vkCreateSemaphore(V.dev, &semi, 0, &g_prep_done_sem[idx & 7]); }
     vk_submit_async(PS->acq, g_prep_done_sem[idx & 7]);
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, 0, 1, &g_prep_done_sem[idx & 7], 1, &V.sw, &idx, 0};
+    bk_flush();   /* t180 */
     qm_lock(); r = vkQueuePresentKHR(V.q, &pi); qm_unlock();
     vk_wait_all();   /* (the canvas buffer is written again for the next frame) */
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { { bk_flush(); qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); }
     pm_unlock(&g_gpu_lock);
     return 1;
 }
@@ -688,6 +802,89 @@ static PrepJob *g_pj_list; static int g_pj_n;
 static volatile long g_prep_next, g_prep_done, g_prep_compiled, g_prep_cached, g_prep_failed, g_prep_stop, g_prep_workers_left;
 static VkShaderModule *g_prep_vmod; static volatile long *g_prep_vmod_st;   /* per module: 0 not made, 1 being made, 2 made, 3 failed */
 static u64 g_prep_compile_ticks, g_prep_check_ticks;
+/* ---------------- w7_prep: where the preparation time goes; fewer / better ordered compiles ----------------
+   --prep-threads N (workers, 1..32; default processors - 1, at most 16), --prep-bg-threads N (background workers; default a
+   quarter, 2..6), --prep-limit N (test: stop after N compiled pipelines), --prep-split-cache (test: each worker compiles
+   into a pipeline cache of its own, merged at the end - is the shared cache's lock the limit?), --prep-follow (background
+   preparation: when the game needs a recorded pipeline that is not prepared yet, the workers go on from that record -
+   the records are in first-seen order, so its neighbours are the same level's pipelines), --prep-done-old (the manifest's
+   "taken in" mark without the translation variant, as t201).
+   Every start with compiles logs: per-thread wall and CPU time inside vkCreate*Pipelines, the process's CPU time, module
+   creation time, a histogram of compile times and the slowest pipelines with their SPIR-V sizes. */
+static int g_prep_threads_req, g_prep_bg_threads_req, g_prep_limit, g_prep_split, g_prep_follow, g_prep_done_old;
+typedef struct { u64 wall, cpu, n, mod_ticks, nmod, chk; } PrepTStat;
+static PrepTStat g_prep_ts[32]; static VkPipelineCache g_prep_pc[32];
+static volatile long g_prep_hist[10]; static const u32 g_prep_hist_ms[10] = {50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 0xFFFFFFFFu};
+typedef struct { u32 ms, cpu_ms; int job; } PrepSlow; static PrepSlow g_prep_slow[16]; static int g_prep_nslow; static volatile long g_prep_slow_min;
+static volatile char *g_pj_taken; static int *g_pj_of_rec; static volatile long g_prep_hcur = -1, g_prep_hend = -1, g_prep_hlo = -1; static u64 g_prep_n_hint, g_prep_n_hint_jobs;
+static u64 g_prep_proc_cpu0, g_prep_wall0;
+__declspec(dllimport) int WINAPI GetProcessTimes(void *, u64 *, u64 *, u64 *, u64 *);
+__declspec(dllimport) void *WINAPI GetCurrentProcess(void);
+static u64 prep_thr_cpu(void) { u64 c, e, k, u; return GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u) ? k + u : 0; }   /* 100 ns units */
+static u64 prep_proc_cpu(void) { u64 c, e, k, u; return GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) ? k + u : 0; }
+static void prep_stat_one(long job, u64 dt, u64 dc) {
+    u32 ms = (u32)(dt * 1000 / plat_ticks_per_sec()); int b = 0; while (ms >= g_prep_hist_ms[b]) b++;
+    __atomic_add_fetch(&g_prep_hist[b], 1, __ATOMIC_RELAXED);
+    if ((long)ms <= __atomic_load_n(&g_prep_slow_min, __ATOMIC_RELAXED)) return;
+    pm_lock(&g_prep_m);
+    int k = g_prep_nslow < 16 ? g_prep_nslow++ : 15;   /* (sorted, slowest first; the last one is replaced) */
+    if (k == 15 && g_prep_nslow == 16 && g_prep_slow[15].ms >= ms) { pm_unlock(&g_prep_m); return; }
+    while (k > 0 && g_prep_slow[k - 1].ms < ms) { g_prep_slow[k] = g_prep_slow[k - 1]; k--; }
+    g_prep_slow[k].ms = ms; g_prep_slow[k].cpu_ms = (u32)(dc / 10000); g_prep_slow[k].job = (int)job;
+    if (g_prep_nslow == 16) __atomic_store_n(&g_prep_slow_min, (long)g_prep_slow[15].ms, __ATOMIC_RELAXED);
+    pm_unlock(&g_prep_m);
+}
+/* the next job: inside the window a hint opened (--prep-follow) first, else in the records' order */
+static long prep_claim(void) {
+    for (;;) { long h = __atomic_load_n(&g_prep_hcur, __ATOMIC_ACQUIRE), e = __atomic_load_n(&g_prep_hend, __ATOMIC_ACQUIRE); if (h < 0 || h >= e || h >= g_pj_n) break;
+        if (!__atomic_compare_exchange_n(&g_prep_hcur, &h, h + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+        if (__atomic_exchange_n(&g_pj_taken[h], 1, __ATOMIC_ACQ_REL) == 0) { g_prep_n_hint_jobs++; return h; } }
+    for (;;) { long i = __atomic_fetch_add(&g_prep_next, 1, __ATOMIC_ACQ_REL); if (i >= g_pj_n) return -1;
+        if (__atomic_exchange_n(&g_pj_taken[i], 1, __ATOMIC_ACQ_REL) == 0) return i; }
+}
+/* (prep_note, g_prep_m held) the game is making recorded pipeline q, which the preparation has not reached */
+static void prep_hint(int q) {
+    if (!g_prep_follow || !g_pj_of_rec || !__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE) || g_prep_st[q]) return;
+    long ji = g_pj_of_rec[q]; if (ji < 0) return;
+    long lo = __atomic_load_n(&g_prep_hlo, __ATOMIC_ACQUIRE), e = __atomic_load_n(&g_prep_hend, __ATOMIC_ACQUIRE);
+    if (lo >= 0 && ji >= lo && ji < e) return;   /* (inside the window the workers are on) */
+    long a = ji - 48 < 0 ? 0 : ji - 48, b = ji + 400 > g_pj_n ? g_pj_n : ji + 400;
+    __atomic_store_n(&g_prep_hend, -1, __ATOMIC_RELEASE); __atomic_store_n(&g_prep_hcur, a, __ATOMIC_RELEASE); __atomic_store_n(&g_prep_hlo, a, __ATOMIC_RELEASE); __atomic_store_n(&g_prep_hend, b, __ATOMIC_RELEASE);
+    g_prep_n_hint++;
+}
+static void prep_stats_log(int nt, u64 wall_ms) {
+    u64 f = plat_ticks_per_sec(), w = 0, c = 0, n = 0, mt = 0, nm = 0, ck = 0; int used = 0;
+    for (int i = 0; i < 32; i++) { w += g_prep_ts[i].wall; c += g_prep_ts[i].cpu; n += g_prep_ts[i].n; mt += g_prep_ts[i].mod_ticks; nm += g_prep_ts[i].nmod; ck += g_prep_ts[i].chk; if (g_prep_ts[i].n) used++; }
+    if (!n) return;
+    u64 pc = (prep_proc_cpu() - g_prep_proc_cpu0) / 10000, pw = (plat_ticks() - g_prep_wall0) * 1000 / f;
+    say("    shader preparation timing (w7): "); say_dec((i64)n); say(" pipelines compiled on "); say_dec(used); say(" of "); say_dec(nt); say(" threads in "); say_dec((i64)wall_ms);
+    say(" ms; inside the driver's create calls: wall "); say_dec((i64)(w * 1000 / f)); say(" ms, CPU "); say_dec((i64)(c / 10000)); say(" ms ("); say_dec((i64)(w ? c / 100 * f / w / 1000 : 0));   /* c/1e7 s over w/f s, in percent */
+    say("% of the wall time on a processor - the rest waiting: locks, other programs); mean "); say_dec((i64)(w * 1000 / f / n)); say(" ms wall, "); say_dec((i64)(c / 10000 / n)); say(" ms CPU a pipeline; whole process CPU ");
+    say_dec((i64)pc); say(" ms in "); say_dec((i64)pw); say(" ms = "); say_dec((i64)(pw ? pc * 10 / pw / 10 : 0)); say("."); say_dec((i64)(pw ? pc * 10 / pw % 10 : 0)); say(" processors busy of "); say_dec(plat_ncpu());
+    say("; found in the cache "); say_dec((i64)ck); say("; shader modules made "); say_dec((i64)nm); say(" in "); say_dec((i64)(mt * 1000 / f)); say(" ms (thread time: read, unpack, vkCreateShaderModule)"); say(g_prep_split ? "; a pipeline cache per worker (--prep-split-cache)" : ""); say("\n");
+    say("      compile time histogram (ms: pipelines):");
+    for (int b = 0; b < 10; b++) { say(b == 9 ? " more: " : " <"); if (b < 9) { say_dec(g_prep_hist_ms[b]); say(": "); } say_dec(g_prep_hist[b]); }
+    say("\n      per thread (pipelines / wall ms / CPU ms):");
+    for (int i = 0; i < 32; i++) if (g_prep_ts[i].n) { say(" "); say_dec((i64)g_prep_ts[i].n); say("/"); say_dec((i64)(g_prep_ts[i].wall * 1000 / f)); say("/"); say_dec((i64)(g_prep_ts[i].cpu / 10000)); }
+    say("\n");
+    pm_lock(&g_prep_m);
+    for (int k = 0; k < g_prep_nslow && g_pj_list; k++) { const PrepSlow *S = &g_prep_slow[k]; const PrepJob *J = &g_pj_list[S->job]; const PrepRec *R = &g_prep_rec[J->rec];
+        say("      slow "); say_dec(S->ms); say(" ms (CPU "); say_dec(S->cpu_ms); say(") "); say(R->kind == 2 ? "compute, words " : "graphics, VS / PS words ");
+        say_dec(J->mi[0] >= 0 ? g_prep_mod[J->mi[0]].n : 0); if (R->kind == 1) { say(" / "); say_dec(J->mi[1] >= 0 ? g_prep_mod[J->mi[1]].n : 0); } say(", record "); say_dec(J->rec); say("\n"); }
+    pm_unlock(&g_prep_m);
+    if (g_prep_follow) { say("      --prep-follow: windows opened by the game's own pipelines "); say_dec((i64)g_prep_n_hint); say(", pipelines prepared from them "); say_dec((i64)g_prep_n_hint_jobs); say("\n"); }
+}
+/* the translation variant the manifest is taken in for: what the renderer puts into every translation's inputs on this
+   PC with these options (render scale, float controls ...) and the translator's own switches. t201 marked a manifest as
+   taken in for a build only: after a change of the internal resolution (or --ld-group) nothing was translated for the
+   new variant, nothing prepared, and every pipeline was compiled during play. */
+static u64 prep_variant(void) {
+    u64 h = 0xcbf29ce484222325ull;
+    for (int st = 0; st < 3; st++) { G2SIn in; h_memset(&in, 0, sizeof in); in.stage = st; in.native = (const G2SNative *)(const void *)&in /* (not null: no program is looked at) */; vk_tr_device(&in);
+        u32 v[4] = {(u32)in.no_tex_offsets, (u32)in.fp_ctl, (u32)in.max_shared, (u32)in.diag_salt}; h = prep_fnv(v, sizeof v, h); }
+    u32 o[12] = {(u32)g2s_gs_fc, (u32)g2s_gs_hoist, (u32)g2s_ld_cache, (u32)g2s_ld_group, (u32)g2s_mip_fb, (u32)g2s_mip_test, (u32)g2s_movrel_sel, (u32)g2s_opt_old_posw, (u32)g2s_opt_rs_noshift, (u32)g2s_opt_smrd_lit_bytes, (u32)g_opt_rs_aa, (u32)g_opt_rs_sub};
+    return prep_fnv(o, sizeof o, h) | 1;
+}
 /* prep_pcc (declared in e6_vk.c): the device takes FAIL_ON_PIPELINE_COMPILE_REQUIRED (pipelineCreationCacheControl) */
 static int prep_skip_pressed(void);   /* (e5_system.c: Esc, or Circle on a controller) */
 static VkShaderModule prep_module(int mi, void *fh, u8 **zb, size_t *zcap, u32 **wb, size_t *wcap, u8 **work, size_t *workcap) {
@@ -714,16 +911,22 @@ static u32 WINAPI prep_worker(void *arg) {
     long me = (long)(intptr_t)arg;
     void *fh = hf_open_rb(g_prep_spath);
     u8 *zb = 0, *work = 0; u32 *wb = 0; size_t zcap = 0, wcap = 0, workcap = 0;
+    PrepTStat *TS = &g_prep_ts[me & 31]; VkPipelineCache mypc = V.pcache;   /* w7_prep */
+    if (g_prep_split) { VkPipelineCacheCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, 0, 0, 0, 0}; VkPipelineCache c_ = 0; if (!vkCreatePipelineCache(V.dev, &pci, 0, &c_) && c_) { mypc = c_; g_prep_pc[me & 31] = c_; } }
     for (;;) {
         if (__atomic_load_n(&g_prep_stop, __ATOMIC_ACQUIRE)) break;
         if (__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE) && me >= __atomic_load_n(&g_prep_bg_n, __ATOMIC_ACQUIRE)) break;   /* t164: fewer threads in the background */
-        long i = __atomic_fetch_add(&g_prep_next, 1, __ATOMIC_ACQ_REL);
-        if (i >= g_pj_n) break;
+        if (g_prep_limit && __atomic_load_n(&g_prep_compiled, __ATOMIC_ACQUIRE) >= g_prep_limit) { __atomic_store_n(&g_prep_stop, 1, __ATOMIC_RELEASE); break; }   /* w7_prep test */
+        long i = prep_claim();
+        if (i < 0) break;
         const PrepRec *R = &g_prep_rec[g_pj_list[i].rec];
         VkShaderModule m[2] = {0, 0}; int ok = fh != 0;
+        { u64 tm_ = plat_ticks();
         for (u32 s = 0; s < PREP_NST(R) && ok; s++) { int mi = g_pj_list[i].mi[s]; m[s] = mi >= 0 ? prep_module(mi, fh, &zb, &zcap, &wb, &wcap, &work, &workcap) : 0; if (!m[s]) ok = 0; }
-        if (!ok) { g_prep_st[g_pj_list[i].rec] = 2; __atomic_add_fetch(&g_prep_failed, 1, __ATOMIC_ACQ_REL); __atomic_add_fetch(&g_prep_done, 1, __ATOMIC_ACQ_REL); continue; }
+        TS->mod_ticks += plat_ticks() - tm_; TS->nmod += PREP_NST(R); }
+        if (!ok) { g_prep_st[g_pj_list[i].rec] = 2; __atomic_add_fetch(&g_prep_failed, 1, __ATOMIC_ACQ_REL); if (g_pj_w) __atomic_add_fetch(&g_prep_wdone, (long long)g_pj_w[i], __ATOMIC_RELAXED); __atomic_add_fetch(&g_prep_done, 1, __ATOMIC_ACQ_REL); continue; }
         PJob j; h_memset(&j, 0, sizeof j);   /* the create info as the renderer builds it (e6_vk.c), from the record */
+        VkPipelineRasterizationConservativeStateCreateInfoEXT crs_ = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT, 0, 0, VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT, 0.0f};
         VkPipeline p = 0; VkResult r;
         if (R->kind == 2) {
             j.cci = (VkComputePipelineCreateInfo){VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, 0, 0,
@@ -740,20 +943,23 @@ static u32 WINAPI prep_worker(void *arg) {
             j.pri = R->pri;
             j.gci = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, g_pj_list[i].pl, 0, 0, 0, -1};
             pj_fix(&j);
+            if (R->pad[0] & PREP_F_CONSRASTER) j.rs.pNext = &crs_;   /* t203: a --fb-cover copy pipeline (as cov_fill builds it) */
         }
         u64 t0 = plat_ticks();
         if (prep_pcc && !g_prep_force) {   /* already in the pipeline cache? (then nothing is compiled) */
             if (R->kind == 2) { j.cci.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT; r = vkCreateComputePipelines(V.dev, V.pcache, 1, &j.cci, 0, &p); j.cci.flags = 0; }
             else { j.gci.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT; r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &j.gci, 0, &p); j.gci.flags = 0; }
-            if (r == VK_SUCCESS) { if (p) vkDestroyPipeline(V.dev, p, 0); g_prep_st[g_pj_list[i].rec] = 1; __atomic_add_fetch(&g_prep_cached, 1, __ATOMIC_ACQ_REL); __atomic_add_fetch(&g_prep_done, 1, __ATOMIC_ACQ_REL);
-                __atomic_add_fetch(&g_prep_check_ticks, plat_ticks() - t0, __ATOMIC_RELAXED); continue; }
+            if (r == VK_SUCCESS) { if (p) vkDestroyPipeline(V.dev, p, 0); g_prep_st[g_pj_list[i].rec] = 1; __atomic_add_fetch(&g_prep_cached, 1, __ATOMIC_ACQ_REL); if (g_pj_w) __atomic_add_fetch(&g_prep_wdone, (long long)g_pj_w[i], __ATOMIC_RELAXED); __atomic_add_fetch(&g_prep_done, 1, __ATOMIC_ACQ_REL);
+                __atomic_add_fetch(&g_prep_check_ticks, plat_ticks() - t0, __ATOMIC_RELAXED); TS->chk++; continue; }
             p = 0;
         }
-        u64 t1 = plat_ticks();
-        r = R->kind == 2 ? vkCreateComputePipelines(V.dev, V.pcache, 1, &j.cci, 0, &p) : vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &j.gci, 0, &p);
+        u64 t1 = plat_ticks(), c1 = prep_thr_cpu();
+        r = R->kind == 2 ? vkCreateComputePipelines(V.dev, mypc, 1, &j.cci, 0, &p) : vkCreateGraphicsPipelines(V.dev, mypc, 1, &j.gci, 0, &p);
+        { u64 dt_ = plat_ticks() - t1, dc_ = prep_thr_cpu() - c1; TS->wall += dt_; TS->cpu += dc_; TS->n++; prep_stat_one(i, dt_, dc_); }
         if (r == VK_SUCCESS && p) { vkDestroyPipeline(V.dev, p, 0); g_prep_st[g_pj_list[i].rec] = 1; __atomic_add_fetch(&g_prep_compiled, 1, __ATOMIC_ACQ_REL); }
         else { g_prep_st[g_pj_list[i].rec] = 2; __atomic_add_fetch(&g_prep_failed, 1, __ATOMIC_ACQ_REL); }
         __atomic_add_fetch(&g_prep_compile_ticks, plat_ticks() - t1, __ATOMIC_RELAXED);
+        if (g_pj_w) __atomic_add_fetch(&g_prep_wdone, (long long)g_pj_w[i], __ATOMIC_RELAXED);
         __atomic_add_fetch(&g_prep_done, 1, __ATOMIC_ACQ_REL);
     }
     free(zb); free(wb); free(work); if (fh) hf_close(fh);
@@ -875,8 +1081,23 @@ static void pm_free(void) {
     free(g_pmp); free(g_pmt); g_pmp = 0; g_pmt = 0; g_pmf_nprog = g_pmf_ntrans = 0;
 }
 static u64 g_pmf_n_match, g_pmf_n_diff, g_pmf_n_fail, g_pmf_n_prog_bad, g_pmf_n_pipes, g_pmf_n_pipes_new, g_pmf_n_gen;
-static void prep_manifest_import(int *shown, u64 t0, int *skipped) {
+static void prep_vslot_get(void) {   /* w13_prep: the mark slot of the configuration in use (needs the device: from prep_run) */
+    if (!g_prep_variant_only || g_prep_vslot >= 0) return;
+    u64 key = prep_fnv(&g_prep_build, 8, prep_variant()) | 1; int s = -1;
+    pm_lock(&g_prep_m);
+    for (int k = 0; k < 8; k++) if (g_prep_vh.key[k] == key) s = k;
+    if (s < 0) { s = 0; for (int k = 0; k < 8; k++) { if (!g_prep_vh.key[k]) { s = k; break; } if (g_prep_vh.stamp[k] < g_prep_vh.stamp[s]) s = k; }
+        for (int i = 0; i < PREP_MAXREC; i++) g_prep_vmask[i] &= (u8)~(1u << s);
+        g_prep_vh.key[s] = key; g_prep_vnew = 1; }
+    g_prep_vh.stamp[s] = ++g_prep_vh.clock; g_prep_vdirty = 1;
+    g_prep_vslot = s;
+    pm_unlock(&g_prep_m);
+    vl("  shader preparation (w13): configuration "); vl_x(key); vl(g_prep_vnew ? ", new here: mark slot " : ", known: mark slot "); vl_d(s); vl("\n");
+}
+static volatile long g_pmi_on, g_pmi_wdone, g_pmi_work, g_pmi_fin, g_pmi_skip; static u64 g_pmi_t0; static int g_pmi_skipped;
+static void prep_manifest_import_run(int *shown, u64 t0, int *skipped) {
     if (!g_prep_manifest_path || !g_prep_rec_on || !g_game_dir) return;
+    u64 tk_files = 0, tk_tr = 0, tk_save = 0, tk_rec = 0, tk_;
     u64 n = 0; u8 *d = (u8 *)plat_read_file(g_prep_manifest_path, &n);
     if (!d) { vl("  pipeline manifest: none at the given path\n"); return; }
     u64 f = plat_ticks_per_sec();
@@ -885,7 +1106,15 @@ static void prep_manifest_import(int *shown, u64 t0, int *skipped) {
     u32 nfiles = prep_rd32(d + 16), nprog = prep_rd32(d + 20), ntrans = prep_rd32(d + 24), npipe = prep_rd32(d + 28); u64 id = *(const u64 *)(d + 32);
     char done_path[1200]; { int k = 0, cut = 0; for (; g_prep_lpath[k]; k++) if (g_prep_lpath[k] == '\\' || g_prep_lpath[k] == '/') cut = k + 1;
         Sb a = {done_path, 0, sizeof done_path}; for (int i = 0; i < cut; i++) { char c[2] = {g_prep_lpath[i], 0}; sb_s(&a, c); } sb_s(&a, "prep_manifest.done"); }
-    int same; { u64 dn = 0; u8 *dd = (u8 *)plat_read_file(done_path, &dn); same = dd && dn >= 16 && *(const u64 *)dd == id && *(const u64 *)(dd + 8) == g_prep_build; if (dd) plat_free_pages(dd); }
+    /* w7_prep: the mark holds up to 16 entries of 24 bytes (manifest id, build, translation variant); t201's 16-byte mark (no variant) is not trusted: taken in once more */
+    u64 variant = prep_variant(); static u64 done_ent[16][3]; int done_n = 0;
+    int same; { u64 dn = 0; u8 *dd = (u8 *)plat_read_file(done_path, &dn); same = dd && dn >= 16 && *(const u64 *)dd == id && *(const u64 *)(dd + 8) == g_prep_build;
+        if (!g_prep_done_old) { same = 0;
+            if (dd && dn >= 24 && dn % 24 == 0) for (u64 k = 0; k < dn / 24 && done_n < 16; k++) { const u64 *e_ = (const u64 *)(dd + 24 * k); if (e_[0] != id || e_[1] != g_prep_build) continue;
+                if (e_[2] == variant) same = 1; done_ent[done_n][0] = e_[0]; done_ent[done_n][1] = e_[1]; done_ent[done_n][2] = e_[2]; done_n++; } }
+        if (dd) plat_free_pages(dd); }
+    if (g_prep_variant_only && g_prep_vnew && same) { same = 0; vl("  pipeline manifest: no marks for this configuration yet (w13) - taken in again\n"); }
+    vl("  pipeline manifest: translation variant "); vl_x(variant); vl(same ? " - taken in before\n" : " - not taken in yet\n");
     /* parse */
     const u8 *p = d + 40, *end = d + n; int bad = 0;
     char **fname = (char **)calloc(nfiles ? nfiles : 1, sizeof(char *));
@@ -911,21 +1140,29 @@ static void prep_manifest_import(int *shown, u64 t0, int *skipped) {
     g_pmf_nprog = nprog; g_pmf_ntrans = ntrans;
     g_prep_phase = "Reading shaders from your game files";
     u32 work = nprog + ntrans, wdone = 0;
-    #define PM_TICK() do { u64 nw_ = plat_ticks(), ms_ = (nw_ - t0) * 1000 / f; if (!*shown && ms_ >= 500) { prep_font_load(); *shown = 1; say("    shader preparation: taking in the pipeline manifest (screen shown)\n"); } \
+    #define PM_TICK() do { if (__atomic_load_n(&g_prep_exiting, __ATOMIC_ACQUIRE)) *skipped = 1; \
+        if (g_pmi_on) { g_pmi_wdone = (long)wdone; g_pmi_work = (long)work; if (g_pmi_skip) *skipped = 1; break; } \
+        u64 nw_ = plat_ticks(), ms_ = (nw_ - t0) * 1000 / f; if (!*shown && ms_ >= 500) { prep_font_load(); *shown = 1; say("    shader preparation: taking in the pipeline manifest (screen shown)\n"); } \
         if (*shown && (nw_ - last_) * 1000 / f >= 33) { last_ = nw_; if (!*skipped && prep_skip_pressed()) *skipped = 1; prep_present(wdone, work, 0, 0, ms_, *skipped); } } while (0)
     u64 last_ = 0;
     /* 1. the code ranges from the player's files, file by file */
+    tk_ = plat_ticks();
+    u32 *ord = g_prep_imp_thread ? (u32 *)malloc(4ull * (nprog ? nprog : 1)) : 0;   /* w13_prep: in file order (each LZ4 block read and unpacked once) */
     for (u32 fi = 0; fi < nfiles && !*skipped; fi++) {
         int any = 0; for (u32 i = 0; i < nprog && !any; i++) any = g_pmp[i].file == fi;
         if (!any || !fname[fi]) continue;
         char path[1100]; path_join(path, g_game_dir, fname[fi]); PmFile F; int ok = pm_file_open(&F, path);
-        for (u32 i = 0; i < nprog; i++) { PmProg *P = &g_pmp[i]; if (P->file != fi) continue;
+        u32 no = 0;
+        if (ord) { for (u32 i = 0; i < nprog; i++) if (g_pmp[i].file == fi) ord[no++] = i;
+            for (u32 gap = no / 2; gap > 0; gap /= 2) for (u32 a = gap; a < no; a++) { u32 v_ = ord[a], b_ = a; while (b_ >= gap && g_pmp[ord[b_ - gap]].off > g_pmp[v_].off) { ord[b_] = ord[b_ - gap]; b_ -= gap; } ord[b_] = v_; } }
+        for (u32 i0 = 0; i0 < (ord ? no : nprog); i0++) { u32 i = ord ? ord[i0] : i0; PmProg *P = &g_pmp[i]; if (P->file != fi) continue;
             u8 *b = ok && P->nbytes <= (1u << 20) ? (u8 *)malloc(P->nbytes + 8) : 0;
             if (b && pm_file_read(&F, P->off, P->nbytes, b) && prep_fnv(b, P->nbytes, 0xcbf29ce484222325ull) == P->hash) P->bytes = b; else { free(b); g_pmf_n_prog_bad++; }
             wdone++; if ((wdone & 63) == 0) PM_TICK(); }
         pm_file_close(&F);
     }
-    for (u32 i = 0; i < nfiles; i++) free(fname[i]); free(fname);
+    for (u32 i = 0; i < nfiles; i++) free(fname[i]); free(fname); free(ord);
+    tk_files = plat_ticks() - tk_;
     /* t161: fetch shaders the game makes at run time (no file holds them): made again from their description */
     for (u32 i = 0; i < nprog && !*skipped; i++) { PmProg *P = &g_pmp[i]; if (P->file != 0xFFFFFFFFu) continue;
         u8 *b = P->nbytes <= 4096 ? (u8 *)malloc(P->nbytes + 8) : 0; u32 k = b ? fsg_make(P->off, (u32 *)b, P->nbytes / 4) : 0;
@@ -933,6 +1170,7 @@ static void prep_manifest_import(int *shown, u64 t0, int *skipped) {
         wdone++; }
     /* 2. the translations, as the renderer makes them (the translation cache bypassed: nothing of this stays there) */
     int byp = g2s_cache_bypass; g2s_cache_bypass = 1;
+    tk_ = plat_ticks();
     for (u32 i = 0; i < ntrans && !*skipped; i++) {
         PmTrans *t = &g_pmt[i]; G2SIn in; h_memcpy(&in, t->in, sizeof in);
         in.read = pm_rd; in.gpu_written = pm_gw; in.ctx = 0; in.native = 0; in.fetch_code = 0; g_pmf_cur = t;
@@ -948,9 +1186,10 @@ static void prep_manifest_import(int *shown, u64 t0, int *skipped) {
         } else g_pmf_n_fail++;
         if (ok && !o.cached) g2s_free(&o);
         wdone++; if ((wdone & 7) == 0) PM_TICK();
-        if (g_prep_new_bytes > (192ull << 20)) prep_save();   /* (the words go to disk compressed as they pile up) */
+        if (g_prep_new_bytes > (192ull << 20)) { u64 ts_ = plat_ticks(); prep_save(); tk_save += plat_ticks() - ts_; }   /* (the words go to disk compressed as they pile up) */
     }
     g2s_cache_bypass = byp;
+    tk_tr = plat_ticks() - tk_ - tk_save; tk_ = plat_ticks();
     /* 3. the pipelines, with the hashes of the SPIR-V made here */
     if (!*skipped) {
         pm_lock(&g_prep_m);
@@ -962,61 +1201,149 @@ static void prep_manifest_import(int *shown, u64 t0, int *skipped) {
             g_pmf_n_pipes++;
             prep_hash(&r); r.gen = g_prep_gen;
             int qx = prep_find_rec(r.h1, r.h2);
-            if (qx >= 0) { if (g_prep_rec[qx].gen != g_prep_gen) { g_prep_rec[qx].gen = g_prep_gen; g_prep_dirty = 1; } if (!g_prep_mf[qx]) { g_prep_mf[qx] = 1; g_pcov_mf_records++; } continue; }
+            if (qx >= 0) { if (g_prep_rec[qx].gen != g_prep_gen) { g_prep_rec[qx].gen = g_prep_gen; g_prep_dirty = 1; } if (!g_prep_mf[qx]) { g_prep_mf[qx] = 1; g_pcov_mf_records++; } PREP_VMARK(qx); continue; }
             if (g_prep_nrec >= PREP_MAXREC) break;
             g_prep_mf[g_prep_nrec] = 1; g_pcov_mf_records++;
-            g_prep_rec[g_prep_nrec] = r; hix_put(&g_prep_rix, r.h1, g_prep_nrec); g_prep_nrec++; g_prep_dirty = 1; g_pmf_n_pipes_new++;
+            g_prep_rec[g_prep_nrec] = r; hix_put(&g_prep_rix, r.h1, g_prep_nrec); g_prep_vmask[g_prep_nrec] = 0; PREP_VMARK(g_prep_nrec); g_prep_nrec++; g_prep_dirty = 1; g_pmf_n_pipes_new++;
         }
         pm_unlock(&g_prep_m);
     }
+    tk_rec = plat_ticks() - tk_; tk_ = plat_ticks();
     prep_save();   /* (modules and records on disk: the preparation reads the modules from there) */
-    if (!*skipped) { void *df = plat_open_write(done_path); if (df) { u64 m2[2] = {id, g_prep_build}; plat_write_bin(df, m2, 16); plat_close(df); } }
+    tk_save += plat_ticks() - tk_;
+    if (!*skipped) { void *df = plat_open_write(done_path); if (df) { u64 m2[2] = {id, g_prep_build};
+        if (g_prep_done_old) plat_write_bin(df, m2, 16);
+        else { if (done_n >= 16) { for (int k = 1; k < 16; k++) for (int q2 = 0; q2 < 3; q2++) done_ent[k - 1][q2] = done_ent[k][q2]; done_n = 15; }
+            done_ent[done_n][0] = id; done_ent[done_n][1] = g_prep_build; done_ent[done_n][2] = variant; done_n++; plat_write_bin(df, done_ent, 24ull * (u64)done_n); }
+        plat_close(df); } }
     g_prep_phase = 0;
     say("    pipeline manifest (t160): "); say_dec(nprog); say(" code ranges ("); say_dec((i64)(nprog - g_pmf_n_gen - g_pmf_n_prog_bad)); say(" read from the game files, "); say_dec((i64)g_pmf_n_gen); say(" fetch shaders made again, "); say_dec((i64)g_pmf_n_prog_bad); say(" not as expected), ");
     say_dec(ntrans); say(" translations ("); say_dec((i64)g_pmf_n_match); say(" as recorded, "); say_dec((i64)g_pmf_n_diff); say(" different, "); say_dec((i64)g_pmf_n_fail); say(" failed), ");
     say_dec((i64)g_pmf_n_pipes); say(" pipelines ("); say_dec((i64)g_pmf_n_pipes_new); say(" new here)"); say(*skipped ? "; skipped - taken in again on the next start" : ""); say("; ");
-    say_dec((i64)((plat_ticks() - t0) * 1000 / f)); say(" ms\n");
+    say_dec((i64)((plat_ticks() - t0) * 1000 / f)); say(" ms (w13: game files "); say_dec((i64)(tk_files * 1000 / f)); say(", translating "); say_dec((i64)(tk_tr * 1000 / f));
+    say(", pipeline records "); say_dec((i64)(tk_rec * 1000 / f)); say(", packing and writing modules and records "); say_dec((i64)(tk_save * 1000 / f)); say(" ms; ");
+    say(g_pmi_on ? "on its own thread, files read in file order" : "on the screen's thread"); say(")\n");
     #undef PM_TICK
     pm_free(); plat_free_pages(d);
 }
+static void prep_park(void) { for (;;) plat_sleep_ms(200); }   /* w13_prep: the process is ending - this thread never goes back into the game */
+static u32 WINAPI pmi_thread(void *a) { int sh = 0, sk = 0; (void)a; prep_manifest_import_run(&sh, g_pmi_t0, &sk); g_pmi_skipped = sk; __atomic_store_n(&g_pmi_fin, 1, __ATOMIC_RELEASE); return 0; }
+static void prep_manifest_import(int *shown, u64 t0, int *skipped) {
+    __atomic_store_n(&g_prep_imp_busy, 1, __ATOMIC_RELEASE);
+    void *th = 0;
+    if (g_prep_imp_thread && g_prep_manifest_path && g_prep_rec_on && g_game_dir) {
+        g_pmi_t0 = t0; g_pmi_fin = 0; g_pmi_skip = 0; g_pmi_wdone = 0; g_pmi_work = 1; __atomic_store_n(&g_pmi_on, 1, __ATOMIC_RELEASE);
+        th = CreateThread(0, 16u << 20, (void *)pmi_thread, 0, 0, 0);
+        if (!th) __atomic_store_n(&g_pmi_on, 0, __ATOMIC_RELEASE);
+    }
+    if (!th) prep_manifest_import_run(shown, t0, skipped);
+    else {
+        u64 f = plat_ticks_per_sec(); long lastw = -1; int told = 0;
+        while (!__atomic_load_n(&g_pmi_fin, __ATOMIC_ACQUIRE)) {
+            plat_sleep_ms(*shown ? 40 : 10);
+            if (__atomic_load_n(&g_prep_exiting, __ATOMIC_ACQUIRE)) prep_park();
+            u64 ms = (plat_ticks() - t0) * 1000 / f; long w = g_pmi_wdone;
+            if (w != lastw) { lastw = w; g_rwd_prog++; }
+            if (!*shown && ms >= 500 && !__atomic_load_n(&g_pmi_fin, __ATOMIC_ACQUIRE)) { prep_font_load(); *shown = 1; told = 1; }
+            if (*shown) { if (!g_pmi_skip && prep_skip_pressed()) g_pmi_skip = 1; prep_present((u32)w, (u32)g_pmi_work, 0, 0, ms, (int)g_pmi_skip); }
+        }
+        WaitForSingleObject(th, 0xFFFFFFFFu); CloseHandle(th); __atomic_store_n(&g_pmi_on, 0, __ATOMIC_RELEASE); *skipped = g_pmi_skipped;
+        if (told) say("    shader preparation: taking in the pipeline manifest (screen shown)\n");
+    }
+    __atomic_store_n(&g_prep_imp_busy, 0, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&g_prep_exiting, __ATOMIC_ACQUIRE)) prep_park();
+}
+static u32 WINAPI prep_close_thread(void *a) { (void)a; say("    shader preparation (w13 test, --prep-close-after): the window-close path now\n"); if (g_on_window_close) g_on_window_close(); return 0; }
 /* at start-up: every recorded pipeline made (into the pipeline cache), with the screen when it takes a while */
 static void prep_run(void) {
     prep_init();
     if (!g_prep_on || !V.dev || !V.pcache || g_opt_cold_pipes || g_diag_mode || g_opt_nan_hunt) return;
     u64 f = plat_ticks_per_sec(), t0 = plat_ticks();
     int shown = 0, skipped = 0; u64 shown_at = 0;
+    prep_vslot_get();   /* w13_prep */
     prep_manifest_import(&shown, t0, &skipped);   /* t160 */
     if (shown) shown_at = plat_ticks();
     if (skipped) { pm_lock(&g_gpu_lock); vk_wait_all(); prep_canvas_free(); pm_unlock(&g_gpu_lock); for (int k = 0; k < 500 && prep_skip_pressed(); k++) plat_sleep_ms(10); g_prep_nrec_start = g_prep_nrec; return; }
     pm_lock(&g_prep_m);
-    int nrec = g_prep_nrec;
+    int nrec = g_prep_nrec, n_other = 0, n_cov_off = 0, n_cov_on = 0;
     g_pj_list = (PrepJob *)calloc((u64)(nrec ? nrec : 1), sizeof(PrepJob)); g_pj_n = 0;
+    g_pj_taken = (volatile char *)calloc((u64)(nrec ? nrec : 1), 1); g_pj_of_rec = (int *)malloc(sizeof(int) * (u64)(nrec ? nrec : 1));   /* w7_prep */
+    if (!g_pj_taken || !g_pj_of_rec) { free(g_pj_list); g_pj_list = 0; } else for (int i = 0; i < nrec; i++) g_pj_of_rec[i] = -1;
     g_prep_vmod = (VkShaderModule *)calloc((u64)(g_prep_nmod ? g_prep_nmod : 1), sizeof(VkShaderModule)); g_prep_vmod_st = (volatile long *)calloc((u64)(g_prep_nmod ? g_prep_nmod : 1), sizeof(long));
     if (g_pj_list && g_prep_vmod && (void *)g_prep_vmod_st)
         for (int i = 0; i < nrec; i++) {   /* the layouts here (vk_layout is the renderer's; not thread-safe) */
             const PrepRec *R = &g_prep_rec[i]; int ok = 1;
+            if (g_prep_variant_only && g_prep_vslot >= 0 && !(g_prep_vmask[i] & (1u << g_prep_vslot))) { n_other++; continue; }   /* w13_prep: another configuration's (or unmarked): left alone */
+            if ((R->pad[0] & PREP_F_CONSRASTER) && !g_has_consraster) { n_cov_off++; continue; }   /* t203: --fb-cover copy pipelines only when this run uses them */
             for (u32 s = 0; s < PREP_NST(R); s++) if (prep_find_mod(R->mw[s][0], R->mw[s][1]) < 0) ok = 0;
             if (!ok) continue;
+            if (g_prep_min_words) { int big = 0; for (u32 s = 0; s < PREP_NST(R); s++) if (g_prep_mod[prep_find_mod(R->mw[s][0], R->mw[s][1])].n >= (u32)g_prep_min_words) big = 1; if (!big) continue; }
             VLayout *L = vk_layout(R->sig); if (!L) continue;
-            g_pj_list[g_pj_n].rec = i; g_pj_list[g_pj_n].pl = L->pl;
+            g_pj_list[g_pj_n].rec = i; g_pj_list[g_pj_n].pl = L->pl; g_pj_of_rec[i] = g_pj_n;
             for (u32 s = 0; s < 2; s++) g_pj_list[g_pj_n].mi[s] = s < PREP_NST(R) ? prep_find_mod(R->mw[s][0], R->mw[s][1]) : -1;
+            if (R->pad[0] & PREP_F_CONSRASTER) n_cov_on++;
             g_pj_n++;
         }
+    if (n_cov_on || n_cov_off) { say("    shader preparation (t203): --fb-cover copy pipelines "); say_dec(n_cov_on); say(" in the work"); if (n_cov_off) { say(", "); say_dec(n_cov_off); say(" left alone (--fb-cover not in use)"); } say("\n"); }
+    /* w13_prep: order and estimated work. Heavy module of a job: its compute shader of 50,000 words and more, or its pixel
+       shader of 40,000 and more. Class 0: the first job of each heavy module (largest first); 1: the rest; 2: further jobs
+       of the heavy modules. Work estimate (ms of one processor, from w9_prep's 2full_nold: 3,080 ms mean for class 0 at
+       ~88,000 words, 215 ms class 1, 240 ms class 2). */
+    int n_c0 = 0, n_c2 = 0; g_prep_wtotal = 0; __atomic_store_n(&g_prep_wdone, 0, __ATOMIC_RELEASE); free(g_pj_w); g_pj_w = 0;
+    if (g_pj_list && g_pj_n && (g_prep_order || g_prep_eta)) {
+        u8 *cls = (u8 *)calloc((u64)g_pj_n, 1), *seen = (u8 *)calloc((u64)(g_prep_nmod ? g_prep_nmod : 1), 1); u32 *hw = (u32 *)calloc((u64)g_pj_n, 4);
+        PrepJob *nl = (PrepJob *)calloc((u64)g_pj_n, sizeof(PrepJob)); u32 *w = (u32 *)calloc((u64)g_pj_n, 4), *nw = (u32 *)calloc((u64)g_pj_n, 4);
+        if (cls && seen && hw && nl && w && nw) {
+            for (int k = 0; k < g_pj_n; k++) { const PrepJob *J = &g_pj_list[k]; const PrepRec *R = &g_prep_rec[J->rec];
+                int hm = R->kind == 2 ? (g_prep_mod[J->mi[0]].n >= 50000u ? J->mi[0] : -1) : (g_prep_mod[J->mi[1]].n >= 40000u ? J->mi[1] : -1);
+                u32 words = g_prep_mod[J->mi[0]].n + (R->kind == 1 ? g_prep_mod[J->mi[1]].n : 0);
+                if (hm < 0) { cls[k] = 1; w[k] = 100 + words / 80; if (w[k] > 1500) w[k] = 1500; }
+                else if (!seen[hm]) { seen[hm] = 1; cls[k] = 0; hw[k] = g_prep_mod[hm].n; w[k] = 200 + hw[k] / 28; n_c0++; }
+                else { cls[k] = 2; w[k] = 240; n_c2++; }
+                g_prep_wtotal += w[k]; }
+            if (g_prep_order) {
+                int o = 0;
+                for (int k = 0; k < g_pj_n; k++) if (cls[k] == 0) { int a = o++; while (a > 0 && hw[k] > nw[a - 1]) { nl[a] = nl[a - 1]; nw[a] = nw[a - 1]; a--; } nl[a] = g_pj_list[k]; nw[a] = hw[k]; }   /* (nw: the sort key here) */
+                for (int a = 0; a < o; a++) nw[a] = 200 + nw[a] / 28;
+                for (int c = 1; c <= 2; c++) for (int k = 0; k < g_pj_n; k++) if (cls[k] == c) { nl[o] = g_pj_list[k]; nw[o] = w[k]; o++; }
+                for (int k = 0; k < g_pj_n; k++) { g_pj_list[k] = nl[k]; g_pj_of_rec[nl[k].rec] = k; }
+                free(w); w = nw; nw = 0;
+            }
+            g_pj_w = w; w = 0;
+        }
+        free(cls); free(seen); free(hw); free(nl); free(w); free(nw);
+    }
     pm_unlock(&g_prep_m);
-    if (!g_pj_n) { free(g_pj_list); free(g_prep_vmod); free((void *)g_prep_vmod_st); g_pj_list = 0; g_prep_vmod = 0; g_prep_vmod_st = 0;
+    if (g_prep_variant_only || g_prep_order || g_prep_all_threads) {
+        say("    shader preparation (w13): "); say_dec(nrec); say(" records: "); say_dec(g_pj_n); say(" to prepare");
+        if (g_prep_variant_only) { say(" for the configuration in use (mark slot "); say_dec(g_prep_vslot); say(g_prep_vnew ? ", new here), " : "), "); say_dec(n_other); say(" of other configurations or without a mark left alone (kept on disk)"); }
+        if (g_prep_order) { say("; order: heavy shader modules first "); say_dec(n_c0); say(", then "); say_dec(g_pj_n - n_c0 - n_c2); say(", their other pipelines last "); say_dec(n_c2); }
+        say("; estimated work "); say_dec((i64)(g_prep_wtotal / 1000)); say(" processor-seconds\n"); }
+    if (!g_pj_n) { free(g_pj_list); free(g_prep_vmod); free((void *)g_prep_vmod_st); g_pj_list = 0; g_prep_vmod = 0; g_prep_vmod_st = 0; free((void *)g_pj_taken); free(g_pj_of_rec); g_pj_taken = 0; g_pj_of_rec = 0;
         if (shown) { pm_lock(&g_gpu_lock); vk_wait_all(); prep_canvas_free(); pm_unlock(&g_gpu_lock); }
-        if (nrec) { say("    shader preparation: "); say_dec(nrec); say(" records, none usable\n"); } g_prep_nrec_start = g_prep_nrec; return; }
+        if (nrec && !(g_prep_variant_only && n_other)) { say("    shader preparation: "); say_dec(nrec); say(" records, none usable\n"); } g_prep_nrec_start = g_prep_nrec; return; }
     g_prep_next = g_prep_done = g_prep_compiled = g_prep_cached = g_prep_failed = g_prep_stop = 0;
     int nt = plat_ncpu() - 1; if (nt < 2) nt = 2; if (nt > 16) nt = 16;
+    if (g_prep_all_threads) { nt = (int)plat_ncpu(); if (nt < 2) nt = 2; if (nt > 32) nt = 32; }   /* w13_prep */
+    if (g_prep_threads_req) { nt = g_prep_threads_req; if (nt < 1) nt = 1; if (nt > 32) nt = 32; }   /* w7_prep */
+    g_prep_w_t0 = plat_ticks(); int close_sent = 0;
+    if (g_prep_bg_mode) g_prep_split = 0;   /* (the merge needs every worker ended) */
+    g_prep_proc_cpu0 = prep_proc_cpu(); g_prep_wall0 = plat_ticks(); u64 prog_at = 0;
     g_prep_workers_left = nt;
     for (int i = 0; i < nt; i++) { g_prep_th[i] = CreateThread(0, 1u << 20, (void *)prep_worker, (void *)(intptr_t)i, 0, 0); if (!g_prep_th[i]) __atomic_sub_fetch(&g_prep_workers_left, 1, __ATOMIC_ACQ_REL); }
     int to_bg = 0;
     while (__atomic_load_n(&g_prep_workers_left, __ATOMIC_ACQUIRE) > 0) {
         plat_sleep_ms(shown ? 33 : 20);
+        if (__atomic_load_n(&g_prep_exiting, __ATOMIC_ACQUIRE)) prep_park();   /* w13_prep */
         u64 now = plat_ticks(), ms = (now - t0) * 1000 / f;
+        if (g_prep_close_after_ms && !close_sent && (now - g_prep_w_t0) * 1000 / f >= (u64)g_prep_close_after_ms) { close_sent = 1; CreateThread(0, 1u << 20, (void *)prep_close_thread, 0, 0, 0); }
         long done = __atomic_load_n(&g_prep_done, __ATOMIC_ACQUIRE);
         { static long last_done = -1; if (done != last_done) { last_done = done; g_rwd_prog++; } }   /* (replay watchdog: progress) */
         if (!shown && ms >= 500 && done < g_pj_n) { prep_font_load(); shown = 1; shown_at = now;   /* (now: taken before the font load; the elapsed times below never go negative) */ say("    shader preparation: preparing "); say_dec(g_pj_n); say(" pipelines (screen shown; Esc / Circle skips)\n"); }
+        if (ms >= prog_at + 15000) { prog_at = ms; say("    shader preparation progress (w7): "); say_dec((i64)(ms / 1000)); say(" s: "); say_dec(done); say(" of "); say_dec(g_pj_n); say(" done, "); say_dec(g_prep_compiled); say(" compiled");
+            if (g_prep_wtotal) { u64 wd_ = (u64)__atomic_load_n(&g_prep_wdone, __ATOMIC_RELAXED), el_ = (now - g_prep_w_t0) * 1000 / f; say("; estimated work done (w13) "); say_dec((i64)(wd_ * 100 / g_prep_wtotal)); say("%");
+                if (wd_ * 50 >= g_prep_wtotal && wd_ < g_prep_wtotal) { say(", about "); say_dec((i64)(el_ * (g_prep_wtotal - wd_) / wd_ / 1000)); say(" s left"); } }
+            say("\n"); }
         if (g_prep_bg_mode && !g_prep_exit && (ms >= (u64)g_prep_fg_ms || (shown && prep_skip_pressed()))) { to_bg = 1; break; }   /* t164: the rest in the background */
         if (shown) {
             if (!skipped && (prep_skip_pressed() || (g_prep_skip_after_ms && (now - shown_at) * 1000 / f >= (u64)g_prep_skip_after_ms))) { skipped = 1; __atomic_store_n(&g_prep_stop, 1, __ATOMIC_RELEASE); say("    shader preparation: skipped by the player at "); say_dec(done); say(" of "); say_dec(g_pj_n); say("\n"); }
@@ -1026,6 +1353,7 @@ static void prep_run(void) {
     }
     if (to_bg) {   /* t164 */
         long bn = nt / 4; if (bn < 2) bn = 2; if (bn > 6) bn = 6;
+        if (g_prep_bg_threads_req) { bn = g_prep_bg_threads_req; if (bn < 1) bn = 1; if (bn > nt) bn = nt; }   /* w7_prep */
         g_prep_bg_n = bn; g_prep_bg_t0 = t0;
         __atomic_store_n(&g_prep_bg_running, 1, __ATOMIC_RELEASE);
         for (int i = 0; i < nt; i++) if (g_prep_th[i]) plat_thread_priority(g_prep_th[i], -2 /* THREAD_PRIORITY_LOWEST */);
@@ -1038,19 +1366,32 @@ static void prep_run(void) {
         if (__atomic_load_n(&g_prep_workers_left, __ATOMIC_ACQUIRE) == 0) prep_bg_finish();   /* (all ended in the meantime; it runs once) */
         return;
     }
+    if (__atomic_load_n(&g_prep_exiting, __ATOMIC_ACQUIRE)) prep_park();   /* w13_prep */
     if (shown) { pm_lock(&g_gpu_lock); vk_wait_all(); prep_canvas_free(); pm_unlock(&g_gpu_lock);
         if (skipped) for (int k = 0; k < 500 && prep_skip_pressed(); k++) plat_sleep_ms(10); }   /* (the skip press does not reach the game) */
     for (int i = 0; i < g_prep_nmod; i++) if (g_prep_vmod[i]) vkDestroyShaderModule(V.dev, g_prep_vmod[i], 0);
-    free(g_pj_list); free(g_prep_vmod); free((void *)g_prep_vmod_st); g_pj_list = 0; g_prep_vmod = 0; g_prep_vmod_st = 0;
+    if (g_prep_split) { u64 tm_ = plat_ticks(); VkPipelineCache pcs_[32]; u32 k_ = 0; for (int i = 0; i < 32; i++) if (g_prep_pc[i]) pcs_[k_++] = g_prep_pc[i];   /* w7_prep */
+        if (k_) vkMergePipelineCaches(V.dev, V.pcache, k_, pcs_);
+        for (u32 i = 0; i < k_; i++) vkDestroyPipelineCache(V.dev, pcs_[i], 0);
+        for (int i = 0; i < 32; i++) g_prep_pc[i] = 0;
+        say("    shader preparation (w7): "); say_dec(k_); say(" worker pipeline caches merged in "); say_dec((i64)((plat_ticks() - tm_) * 1000 / f)); say(" ms\n"); }
     u64 ms = (plat_ticks() - t0) * 1000 / f;
+    prep_stats_log(nt, ms);
+    pm_lock(&g_prep_m); free(g_pj_of_rec); g_pj_of_rec = 0; pm_unlock(&g_prep_m);
+    free(g_pj_list); free(g_prep_vmod); free((void *)g_prep_vmod_st); g_pj_list = 0; g_prep_vmod = 0; g_prep_vmod_st = 0; free((void *)g_pj_taken); g_pj_taken = 0;
     say("    shader preparation (t159): "); say_dec(g_pj_n); say(" recorded pipelines: "); say_dec(g_prep_cached); say(" already prepared, "); say_dec(g_prep_compiled);
     say(" compiled, "); say_dec(g_prep_failed); say(" failed"); if (skipped) { say(", "); say_dec(g_pj_n - g_prep_done); say(" left for play (skipped)"); }
+    else if (g_prep_done < g_pj_n) { say(", "); say_dec(g_pj_n - g_prep_done); say(" left (--prep-limit)"); }
     say("; "); say_dec((i64)ms); say(" ms (compile time "); say_dec((i64)(g_prep_compile_ticks * 1000 / f)); say(" ms, cache checks "); say_dec((i64)(g_prep_check_ticks * 1000 / f)); say(" ms on ");
     say_dec(nt); say(" threads)"); say(prep_pcc ? "" : " - no cache check on this driver: every pipeline made"); say("\n");
     vl("  shader preparation (t159): "); vl_d(g_pj_n); vl(" pipelines, "); vl_d(g_prep_cached); vl(" in the cache, "); vl_d(g_prep_compiled); vl(" compiled, "); vl_d(g_prep_failed); vl(" failed, "); vl_d((i64)ms); vl(" ms\n");
     g_pcov_start_total = (u64)g_pj_n; g_pcov_start_ok = (u64)(g_prep_cached + g_prep_compiled); g_pcov_start_failed = (u64)g_prep_failed;
     g_pcov_start_left = (u64)(g_pj_n - g_prep_done); g_pcov_start_ms = ms;
     pm_lock(&g_prep_m); g_prep_nrec_start = g_prep_nrec; pm_unlock(&g_prep_m);   /* t161: records after this were first seen in this session */
+    if (g_prep_compiled && g_pc_early && !g_prep_replay) {   /* w11_load: written now, before the game starts - not in the background during the first scenes */
+        u64 t0_ = plat_ticks(); vk_save_pcache_now();
+        say("    pipeline cache written before the game starts (w11_load, --pc-save-early): "); say_dec((i64)(g_pc_saved_bytes >> 20)); say(" MB in "); say_dec((i64)((plat_ticks() - t0_) * 1000 / f)); say(" ms\n");
+    } else
     if (g_prep_compiled) vk_save_pcache_bg();
 }
 /* t164: the background preparation ended (all done, or stopped at exit): what prep_run does at the end otherwise */
@@ -1059,8 +1400,10 @@ static void prep_bg_finish(void) {
     u64 f = plat_ticks_per_sec(), ms = (plat_ticks() - g_prep_bg_t0) * 1000 / f;
     for (int i = 0; i < g_prep_nmod; i++) if (g_prep_vmod && g_prep_vmod[i]) vkDestroyShaderModule(V.dev, g_prep_vmod[i], 0);
     long left = g_pj_n - __atomic_load_n(&g_prep_done, __ATOMIC_ACQUIRE);
-    free(g_pj_list); free(g_prep_vmod); free((void *)g_prep_vmod_st); g_pj_list = 0; g_prep_vmod = 0; g_prep_vmod_st = 0;
-    for (int i = 0; i < 16; i++) if (g_prep_th[i]) { CloseHandle(g_prep_th[i]); g_prep_th[i] = 0; }
+    prep_stats_log((int)g_prep_bg_n, ms);   /* w7_prep */
+    pm_lock(&g_prep_m); free(g_pj_of_rec); g_pj_of_rec = 0; pm_unlock(&g_prep_m);
+    free(g_pj_list); free(g_prep_vmod); free((void *)g_prep_vmod_st); g_pj_list = 0; g_prep_vmod = 0; g_prep_vmod_st = 0; free((void *)g_pj_taken); g_pj_taken = 0;
+    for (int i = 0; i < 32; i++) if (g_prep_th[i]) { CloseHandle(g_prep_th[i]); g_prep_th[i] = 0; }
     g_pcov_start_ok = (u64)(g_prep_cached + g_prep_compiled); g_pcov_start_failed = (u64)g_prep_failed; g_pcov_start_left = (u64)left; g_pcov_start_ms = ms;
     say("    shader preparation (t164, background): "); say_dec(g_pj_n); say(" recorded pipelines: "); say_dec(g_prep_cached); say(" already prepared, "); say_dec(g_prep_compiled);
     say(" compiled, "); say_dec(g_prep_failed); say(" failed"); if (left) { say(", "); say_dec(left); say(" not reached (stopped at exit)"); }
@@ -1068,8 +1411,31 @@ static void prep_bg_finish(void) {
     __atomic_store_n(&g_prep_bg_running, 0, __ATOMIC_RELEASE);
     if (g_prep_compiled && !__atomic_load_n(&g_prep_stop, __ATOMIC_ACQUIRE)) vk_save_pcache_bg();   /* (records and modules too, now that the file is free) */
 }
-static void prep_bg_stop(void) {   /* at exit (vk_save_pcache): the workers finish the pipeline they are making */
-    if (!__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE)) return;
+/* at exit (vk_save_pcache). t164: a background preparation's workers finish the pipeline they are making (15 s at most).
+   w13_prep: the same for a preparation still on its screen (window closed, Alt+F4, a time-out) - before, the process
+   ended with up to 24 workers inside the driver's compiler (w9_prep: access violation). Now: no new pipeline is
+   started, the manifest import stops after the translation it is in, the thread that runs the screen never returns into
+   the game, and the workers get g_prep_exit_wait_ms (2 s) to finish. A pipeline being compiled cannot be interrupted
+   (up to 16 s for the largest): if some are still at it, the caches are saved all the same - vkGetPipelineCacheData and
+   the create calls may run side by side, the records are written whole and replaced, the manifest's "taken in" mark is
+   only written by a completed import - and the process is ended by TerminateProcess instead of unloading the driver
+   under its own threads. What the workers had finished is in the saved cache: the next start finds it there. */
+static void prep_bg_stop(void) {
+    if (__atomic_exchange_n(&g_prep_exit_done, 1, __ATOMIC_ACQ_REL)) return;
+    int bg = (int)__atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE);
+    long wl = __atomic_load_n(&g_prep_workers_left, __ATOMIC_ACQUIRE), ib = __atomic_load_n(&g_prep_imp_busy, __ATOMIC_ACQUIRE);
+    if (!bg && wl <= 0 && !ib) return;
+    __atomic_store_n(&g_prep_exiting, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&g_prep_stop, 1, __ATOMIC_RELEASE);
-    for (int k = 0; k < 1500 && __atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE); k++) plat_sleep_ms(10);
+    u64 t0 = plat_ticks(), f = plat_ticks_per_sec(); int lim = bg ? 15000 : g_prep_exit_wait_ms;
+    for (;;) { wl = __atomic_load_n(&g_prep_workers_left, __ATOMIC_ACQUIRE); ib = __atomic_load_n(&g_prep_imp_busy, __ATOMIC_ACQUIRE);
+        int imp = __atomic_load_n(&g_pmi_on, __ATOMIC_ACQUIRE) ? !__atomic_load_n(&g_pmi_fin, __ATOMIC_ACQUIRE) : ib != 0;   /* (the import thread ends by itself; the screen's thread parks) */
+        if (wl <= 0 && !imp) break;
+        if ((plat_ticks() - t0) * 1000 / f >= (u64)lim) break;
+        plat_sleep_ms(10); }
+    if (bg && wl <= 0) for (int k = 0; k < 200 && __atomic_load_n(&g_prep_bg_running, __ATOMIC_ACQUIRE); k++) plat_sleep_ms(10);
+    if (wl > 0 || (__atomic_load_n(&g_pmi_on, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_pmi_fin, __ATOMIC_ACQUIRE))) g_plat_hard_exit = 1;
+    say("    shader preparation (w13): stopped for the exit at "); say_dec(__atomic_load_n(&g_prep_done, __ATOMIC_ACQUIRE)); say(" of "); say_dec(g_pj_n); say(" pipelines ("); say_dec(__atomic_load_n(&g_prep_compiled, __ATOMIC_ACQUIRE));
+    say(" compiled, "); say_dec(__atomic_load_n(&g_prep_cached, __ATOMIC_ACQUIRE)); say(" already prepared)"); say(ib ? ", during the manifest import" : ""); say("; waited "); say_dec((i64)((plat_ticks() - t0) * 1000 / f)); say(" ms; ");
+    say_dec(wl > 0 ? wl : 0); say(wl > 0 ? " workers still inside the driver's compiler: caches saved now, the process ends without them\n" : " workers left: all ended\n");
 }

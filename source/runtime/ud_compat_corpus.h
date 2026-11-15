@@ -18,8 +18,8 @@ typedef struct { u32 total, uniq, translated, not_translatable, modules_ok, modu
 static CorpStats CS_;
 static u32 g_corp_fpctl; static int g_corp_exact;   /* the translator options for this run (--fpctl / --exact-mad) */
 #define CH_N (1 << 20)
-static u64 g_ch[CH_N];
-static int ch_add(u64 h) { u64 i = h & (CH_N - 1); while (g_ch[i]) { if (g_ch[i] == h) return 0; i = (i + 1) & (CH_N - 1); } g_ch[i] = h; return 1; }
+static u64 g_corpus_ch[CH_N];
+static int ch_add(u64 h) { u64 i = h & (CH_N - 1); while (g_corpus_ch[i]) { if (g_corpus_ch[i] == h) return 0; i = (i + 1) & (CH_N - 1); } g_corpus_ch[i] = h; return 1; }
 
 /* a Decima container -> its decompressed data (0 = not one; then the caller uses the file as it is) */
 static u8 *corp_load_core(const u8 *d, u64 n, u64 *outlen) {

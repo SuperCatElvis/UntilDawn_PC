@@ -8,6 +8,18 @@ typedef int i32; typedef long long i64;
 
 enum { G2S_VS = 0, G2S_PS = 1, G2S_CS = 2 };
 #define G2S_MAX_TEX 32
+/* t196 render scale: G2SIn.diag_salt = G2S_RS_TAG | num << 8 | den (scale num / den > 1); the shader then has 38 push-constant
+   words (see "render scale" in gcn2spv.c) */
+#define G2S_RS_TAG 0x52540000u
+/* w7_prep: salt bit 14 = ratio-generic (--rs-generic): num, den and what is derived from them are not constants of the
+   shader but eight more push-constant words (38..45: num, den, RS_E, floor(2^32 / 2num) + 1, floor(2^32 / 2den) + 1, and
+   as floats num / den, den / num, the shift) - one SPIR-V module, one driver pipeline for every scale; the salt's num /
+   den bits are 0 */
+#define G2S_RS_GEN 0x4000u
+/* w2: the sub-pixel shift of even denominators (see RS_E in gcn2spv.c); salt bit 7 = translated without it (--rs-no-shift) */
+static int g2s_opt_rs_noshift;
+#define RS_E(d) (g2s_opt_rs_noshift ? 0u : (u32)!((d) & 1u))
+static float g2s_rs_shift(unsigned den) { return RS_E(den) ? 0.5f / (float)den : 0.0f; }   /* in physical pixels */
 #define G2S_MAX_INST 32768
 
 /* Native binding mode (udshaderc, RENDERER_PLAN stage 2). The SPIR-V does not depend on descriptor values or game
@@ -55,7 +67,7 @@ typedef struct {
     int no_structure;              /* keep the state-machine translation (diagnostic) */
     int no_wave_sync;              /* compute+LDS: do not emulate wave lockstep */              /* translate DS_APPEND / DS_CONSUME (emulated GDS counters) */             /* != 0: scalar loads from addresses known on the CPU read a per-draw buffer at this binding */
     /* != 0 when [addr, addr+4*n) is written by GPU shaders (its values exist only on the GPU: do not fold scalar loads from it) */
-    int (*gpu_written)(void *ctx, u64 addr, u32 n);
+    int (*gpu_written)(void *ctx, u64 addr, u32 n);   /* w2: 0 no; 1 held in a VRAM copy (always read by the GPU); 2 a GPU write is in flight and RAM still has the old bytes; 3 in flight, but the CPU reads the new bytes (WRITE_DATA overlay). The memo keeps the class. */
     /* memory reader: returns 1 when [addr, addr+4*n) is readable game memory */
     int (*read)(void *ctx, u64 addr, u32 *out, u32 n);
     void *ctx;
@@ -184,6 +196,9 @@ typedef struct {
 #define G2S_PT_BASE 0x200000000ull
 #define G2S_PT_SIZE 0x4B00000000ull   /* covers 8 GB .. 308 GB (38.5 MB of table; t130: was 256 GB / 32 MB - the game's 468 heap slots, 512 MB apart, end at 0x4C80000000) */
 #define G2S_GDS_BASE 0x4CF0000000ull   /* emulated GDS (64 KB), inside the page-table window, above the game's heap slots (t130: was 0x3F80000000) */
+#define G2S_MIPFB_BASE 0x4CF0100000ull   /* popin: mip statistics feedback table (g2s_mip_fb), 65536 slots of 16 bytes */
+#define G2S_MIPFB_SIZE 0x100000ull
+extern int g2s_mip_fb; extern int g2s_mip_test;
 #define G2S_TESS_BASE 0x4C80000000ull   /* tessellation scratch buffer (inside the page-table window; t130: was 0x3F00000000) */
 #define G2S_TESS_SIZE 0x4000000ull
 #define G2S_GS_BASE 0x4C90000000ull    /* geometry-shader scratch (E6, STATUS 48): header, emit records, ESGS and GSVS rings (t130: was 0x3F10000000) */
@@ -208,6 +223,10 @@ void g2s_spv_stats(u64 *released, u64 *released_bytes, u64 *flushes);
 /* t114: g2s_spv_compress = 1: a released translation keeps its words compressed; g2s_spv_get gives the words again
    (held or decompressed into a buffer valid until the next call; 0 if none) */
 extern int g2s_spv_compress;
+extern int g2s_memo_n;   /* w2: memo entries (--memo-entries) */
+extern int g2s_spv_compress_lazy;   /* w2: compress at g2s_spv_compress_step instead of inside g2s_spv_release */
+int g2s_spv_compress_step(int max_n);
+void g2s_spv_lazy_stats(u64 *queued, u64 *peak, u64 *done);
 const u32 *g2s_spv_get(u64 key, u32 *n);
 extern int g2s_spv_get_prefer_z;   /* test: decompress even while the words are held */
 void g2s_spv_zstats(u64 *n, u64 *bytes, u64 *raw, u64 *unpacked);
@@ -216,6 +235,42 @@ int g2s_translate_nomemo(const G2SIn *in, G2SOut *out);   /* t107: no memo looku
 int g2s_out_diff(const G2SOut *f, const G2SOut *m, char *what, int cap);
 #define G2S_FOLD_PC (1ull << 63)   /* t143: a fold slot (2 dwords) that holds this value (the shader's PC for S_GETPC_B64), not memory at it */   /* t138 diagnostic */
 extern int g2s_opt_old_posw;   /* t168 */
+extern int g2s_opt_smrd_lit_bytes;   /* w4_hill */
+extern void (*g2s_smrd_lit_hook)(int stage, u64 code_addr, u32 pc, u32 lit, int cnt, int sbuf, u64 base, int base_known, u32 vs1, u32 vs2);   /* w5_smrd */
+/* t181: shader-setup lookups made ahead of time on another thread. g2s_spec_lookup (any thread) finds the memo's result
+   for a setup without changing anything shared; everything it depended on is recorded here, and g2s_spec_accept (the
+   renderer, at the draw) takes the result only when all of it is still so - otherwise the renderer looks up itself. */
+enum { G2S_SPEC_NR = 128, G2S_SPEC_NGW = 64, G2S_SPEC_NB = 6 };
+typedef struct { u64 a; u32 n; u8 r; } G2SSpecGw;
+typedef struct G2SSpec {
+    G2SIn in;                          /* the setup (as the renderer builds it) */
+    int kind;                          /* 0 none found (the renderer translates), 1 exact reuse, 2 relocated (same key), 3 relocated (another entry) */
+    int slot; u32 gen; u64 ep;         /* the memo entry, its generation, the code epoch */
+    u32 nchk, ntries;                  /* entries compared, relocations tried (statistics) */
+    int nb; u32 bix[G2S_SPEC_NB]; u8 bk[G2S_SPEC_NB]; u32 bmod[G2S_SPEC_NB];   /* chains walked (bk 1 exact, 2 relocatable) and their change counters */
+    u32 nr; u64 ra[G2S_SPEC_NR]; u32 rn[G2S_SPEC_NR]; u8 rof[G2S_SPEC_NR]; u64 rh[G2S_SPEC_NR];   /* memory read (rof: only its readability decided; rh: hash of the bytes read) */
+    u64 rlo, rhi; int bad;             /* bounds of the reads; bad: a read could not be recorded / not made (no result) */
+    u32 ngw; G2SSpecGw gw[G2S_SPEC_NGW];   /* GPU-written answers assumed (as recorded in the memo) */
+    u64 wseq;                          /* the write log's position before the first read */
+    int norec, b2;                     /* (reads not recorded: code, checked by the epoch); kind 3: its chain */
+    int whynone;                       /* t181c: kind 0 - 1 exact-key entries failed, 2 relocation candidates failed, 3 none at all */
+    u32 pord, npred;                   /* w5_perf --gw-pred: the draw's number in its submit (set by the caller); candidates skipped by a predicted GPU-written answer */
+    int (*rd)(void *ctx, u64 a, u32 *out, u32 n); void *rctx;   /* the reader of the thread making it */
+    G2SOut out;
+} G2SSpec;
+typedef struct LkX G2SSpecScratch;
+G2SSpecScratch *g2s_spec_scratch_new(void);
+int g2s_spec_lookup(G2SSpec *S, const G2SIn *in, G2SSpecScratch *X);   /* S->rd / S->rctx set by the caller */
+int g2s_spec_accept(G2SSpec *S, const G2SIn *in, G2SOut *out, int *why);   /* renderer thread */
+u64 g2s_wlog_pos(void);
+int g2s_wlog_since(u64 since, u64 lo, u64 hi, const u64 *ra, const u32 *rn, const u8 *rof, u32 nr);   /* 1 = one of our writes since then over a read; -1 = the log no longer reaches back */
+extern u64 g2s_sa_gwdir[2]; extern u64 g2s_sa_cyc[4]; int g2s_out_same(const G2SOut *a, const G2SOut *b); u64 g2s_words_hash(const u32 *p, u32 n); int g2s_wlog_flags(u64 since, const G2SSpec *S, u8 *flag); extern int g2s_wlog_on; extern void (*g2s_yield)(void);
+enum { G2S_SA_OK, G2S_SA_NONE, G2S_SA_EPOCH, G2S_SA_INPUT, G2S_SA_MEMO, G2S_SA_GW, G2S_SA_N };
+/* t181a: --lookup-stats (diagnostic) */
+enum { G2S_LS_LOOKUPS, G2S_LS_EXACT, G2S_LS_RELOC, G2S_LS_FULL, G2S_LS_OTHER, G2S_LS_CYC, G2S_LS_CYC_EXACT, G2S_LS_CYC_RELOC, G2S_LS_CYC_FULL, G2S_LS_CYC_STATS,
+       G2S_LS_VS, G2S_LS_PS, G2S_LS_CS, G2S_LS_TESSGS, G2S_LS_RANGES, G2S_LS_DWORDS, G2S_LS_GWTRUE,
+       G2S_LS_D_NONE, G2S_LS_D1, G2S_LS_D3, G2S_LS_D15, G2S_LS_D63, G2S_LS_D255, G2S_LS_DMORE, G2S_LS_WRITES, G2S_LS_OVER, G2S_LS_N };
+extern int g2s_ls_on; extern u64 g2s_ls[G2S_LS_N]; void g2s_ls_get(u64 o[G2S_LS_N]); void g2s_ls_enable(void);
 extern u64 g2s_memo_skip_addr; extern int g2s_cache_bypass; extern u32 g2s_memo_flip; extern int g2s_memo_last_kind; extern u32 g2s_memo_last_born;   /* t138 */
 const u32 *g2s_spv_get(u64 key, u32 *n);
 void g2s_memo_flush(void);                                 /* t107: forget every memo entry */
@@ -233,6 +288,8 @@ enum { G2S_KP_N = 11 };
 extern int g2s_gs_fc, g2s_gs_hoist;   /* t154 experiments (see gcn2spv.c) */
 extern int g2s_gs_notes_all;
 extern int g2s_rd_code;   /* t160: 1 while the translator reads shader code (program, fetch shader) through G2SIn.read */   /* t158: every ES / GS ring store notes its V# (as before t158) */
+extern int g2s_ld_cache;   /* w6_gpu: 1 = an invocation's loads from the page of its last page-table hit skip the table (see gcn2spv.c) */
+extern int g2s_ld_group;   /* t196: 1 = the dwords of one load instruction share a page-table lookup (see gcn2spv.c) */
 extern int g2s_movrel_sel;   /* t156: 1 = V_MOVREL* as select chains over the registers (as before) */
 extern u64 g2s_kp[G2S_KP_N], g2s_kp_key; extern u32 g2s_kp_cnt[4]; extern int g2s_kp_fresh;
 void g2s_memo_path_stats(u64 o[8]);   /* t155: exact-input entries found / with other memory / relocated from them; relocation attempts from other inputs / reused */
@@ -243,7 +300,7 @@ void g2s_memo_epoch(void);                  /* a new game submit: recorded code 
 void g2s_memo_wrote(u64 lo, u64 hi);        /* our side wrote [lo, hi) of game memory (ends the epoch if it holds recorded code) */
 void g2s_memo_code_stats(u64 *skips, u64 *ep_writes, u64 *ep);
 void g2s_memo_verify_stats(u64 *verified, u64 *bad);
-extern int g2s_memo_verify;   /* != 0: every reused result is compared with a fresh translation */
+extern int g2s_rd_dups; extern int g2s_reloc_any; extern int g2s_gw_pred; void g2s_gwp_note(u64 a, u32 n, u32 ord, int r); extern int g2s_memo_verify;   /* != 0: every reused result is compared with a fresh translation */
 /* STATUS 78: the relocatable memo */
 extern int g2s_memo_reloc;
 extern void (*g2s_memo_bad_hook)(const char *what, u64 code_addr);

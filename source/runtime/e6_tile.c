@@ -191,14 +191,31 @@ static u64 tile_size(const TileInfo *t, u32 depth) {
 /* detile with a prepared TileInfo: src (tiled, srclen bytes) -> dst (linear, w x h x depth elements).
    Pipe and bank depend only on the 8x8 micro tile, so they are computed once per micro tile. */
 static u64 tile_addr(const TileInfo *t, u32 x, u32 y, u32 slice);
-static int detile_ref(const u8 *src, u64 srclen, u8 *dst, u32 w, u32 h, u32 depth, const TileInfo *t) {
+/* t196 (stutter): the reference path by row ranges. Every element's address is a function of its own (x, y, slice)
+   only, so any split by rows gives the same bytes; the renderer's helper threads can then share a level that has no
+   fast path (the 4096x3072 16-bit depth-tiled texture of a level's first frame: 276 ms on one thread, bench/results_dev
+   labels_01 flip 3991). Linear surfaces: a row whose bytes all lie inside the source is one copy (the same bytes: the
+   address is linear in x). g_detile_ref_rows = 0 (--no-detile-ref-rows): rows one element at a time, never split. */
+static int g_detile_ref_rows = 1;
+static void tile_rowcpy(u8 *d, const u8 *s, u64 n) {
+    while (n >= 8) { *(u64 *)d = *(const u64 *)s; d += 8; s += 8; n -= 8; }
+    while (n) { *d++ = *s++; n--; }
+}
+static int detile_ref_rows(const u8 *src, u64 srclen, u8 *dst, u32 w, u32 h, u32 depth, const TileInfo *t, u32 y0, u32 y1) {
     u32 bpe = t->bpp / 8;
-    for (u32 z = 0; z < depth; z++) for (u32 y = 0; y < h; y++) for (u32 x = 0; x < w; x++) {
-        u64 a = tile_addr(t, x, y, z); u8 *d = dst + (((u64)z * h + y) * w + x) * bpe;
-        if (a + bpe <= srclen) { for (u32 k = 0; k < bpe; k++) d[k] = src[a + k]; } else for (u32 k = 0; k < bpe; k++) d[k] = 0;
+    int lin = g_detile_ref_rows && (t->am == AM_LINEAR_GENERAL || t->am == AM_LINEAR_ALIGNED) && !(t->bpp & 7) && bpe;
+    if (y1 > h) y1 = h;
+    for (u32 z = 0; z < depth; z++) for (u32 y = y0; y < y1; y++) {
+        if (lin && w) { u64 a = tile_addr(t, 0, y, z), n = (u64)w * bpe;
+            if (a + n <= srclen) { tile_rowcpy(dst + ((u64)z * h + y) * w * bpe, src + a, n); continue; } }
+        for (u32 x = 0; x < w; x++) {
+            u64 a = tile_addr(t, x, y, z); u8 *d = dst + (((u64)z * h + y) * w + x) * bpe;
+            if (a + bpe <= srclen) { for (u32 k = 0; k < bpe; k++) d[k] = src[a + k]; } else for (u32 k = 0; k < bpe; k++) d[k] = 0;
+        }
     }
     return 1;
 }
+static int detile_ref(const u8 *src, u64 srclen, u8 *dst, u32 w, u32 h, u32 depth, const TileInfo *t) { return detile_ref_rows(src, srclen, dst, w, h, depth, t, 0, h); }
 static int detile_t_rows(const u8 *src, u64 srclen, u8 *dst, u32 w, u32 h, u32 depth, const TileInfo *t, u32 ty0, u32 ty1);
 static int detile_t(const u8 *src, u64 srclen, u8 *dst, u32 w, u32 h, u32 depth, const TileInfo *t) { return detile_t_rows(src, srclen, dst, w, h, depth, t, 0, h); }
 /* t128: the rows [ty0, ty1) of every slice (multiples of 8; a worker thread per range - the tiles' addresses do not depend on the other rows) */
@@ -217,7 +234,7 @@ static int detile_t_rows(const u8 *src, u64 srclen, u8 *dst, u32 w, u32 h, u32 d
     int macro = am_is_macro(t->am) && !(t->pitch < mtp || t->height < mth);
     u64 mt_bytes = 64ull * t->thickness * t->bpp / 8;
     if (!detile_fast_ok(t))
-        return ty0 == 0 && ty1 >= h ? detile_ref(src, srclen, dst, w, h, depth, t) : 0;   /* (the reference path is never split) */
+        return (ty0 == 0 && ty1 >= h) || g_detile_ref_rows ? detile_ref_rows(src, srclen, dst, w, h, depth, t, ty0, ty1) : 0;   /* (t196: the reference path by rows too) */
     u8 poff[64];
     for (u32 yy = 0; yy < 8; yy++) for (u32 xx = 0; xx < 8; xx++) poff[yy * 8 + xx] = (u8)pixel_in_micro(t, xx, yy, 0);
     u32 per_row = t->pitch / mtp;

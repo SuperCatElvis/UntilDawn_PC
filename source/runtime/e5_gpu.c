@@ -15,6 +15,7 @@ static int g_fibers_created; static u64 g_fiber_runs, g_audio_buffers_total, g_a
 static int g_opt_frames = 600;      /* stop after this many flips */
 static int g_opt_dump = -1;         /* raw dumps of the first N submits (default: 6 in play, 0 in replays; --dump N) */
 static int g_opt_window = 1;
+static void hp_start(void); static void hp_report(void);   /* t190 hitch profiler (below) */
 static int g_opt_profile;         /* --profile: sample where every game thread spends its time during the menu frames;
                                      --profile-play: the same over consecutive windows of 1800 flips, a report after each */
 static u64 g_prof_lo = 1800, g_prof_len = 1100;
@@ -36,7 +37,8 @@ static void *cap_open(const char *name) {
 static u64 g_op_n[256], g_op_dw[256];
 static u64 g_t0_packets, g_t2_packets, g_bad_streams;
 static u8 g_reg_ctx[0x400], g_reg_sh[0x400], g_reg_cfg[0x1000], g_reg_ucfg[0x4000];
-static u64 g_stall_at; static u32 g_stall_ms;
+static u64 g_stall_at; static u32 g_stall_ms; static u64 g_prep_ms_total;   /* w6_fast */
+static u64 g_hi_from, g_hi_to, g_hi_every = 1; static u32 g_hi_ms; static u64 g_hi_n;   /* w3_cloth test: --hitch-inject FROM:TO:MS:EVERY */
 static int g_rwd_secs = 120; static volatile u64 g_rwd_prog;   /* t156: replay watchdog (--replay-watchdog S, 0 = off) */
 static u64 g_submits, g_flips, g_dcb_bytes, g_ccb_bytes, g_ib_follow, g_ib_bad;
 static u64 g_draws, g_dispatches, g_label_writes, g_label_skipped, g_eop_irqs, g_dingdongs, g_compute_dw;
@@ -88,6 +90,56 @@ static u64 g_ns_addr[NS_N]; static u32 g_ns_rec[NS_N];
 static PMutex g_note_lock; static int g_note_lock_init;
 static void note_lock(void) { if (!g_note_lock_init) { g_note_lock_init = 1; pm_init(&g_note_lock); } pm_lock(&g_note_lock); }
 static void note_unlock(void) { pm_unlock(&g_note_lock); }
+/* t192: housekeeping off the game's and the renderer's threads. (1) Developer mode saves every new shader to a file;
+   that was CreateFile + WriteFile + CloseHandle on the game thread that set the shader, under the note lock - a level's
+   first frame meets ~1,000 new shaders: frames of 1-3.5 s (the longest hitches of every developer-mode session, STATUS
+   242). The bytes are now copied and queued; a helper thread writes the files. (2) The 10-second memory report's detail
+   pass (every sixth: it walks all game memory for zero pages, ~100 ms) ran on the renderer thread; now on the helper. */
+enum { HK_N = 8192 };
+typedef struct { char nm[96]; void *p; u32 n; } HkJob;
+static HkJob g_hk[HK_N]; static volatile u32 g_hk_w, g_hk_r; static volatile int g_hk_started, g_hk_mem, g_hk_busy; static u64 g_hk_dropped, g_hk_written, g_hk_bytes;
+static PMutex g_hk_lock;
+static void mem_report(const char *why);
+static void hk_write(const HkJob *j) { void *f = cap_open(j->nm); if (f) { plat_write_bin(f, j->p, j->n); plat_close(f); g_hk_written++; g_hk_bytes += j->n; } free(j->p); }
+static void hk_drain(void) {
+    for (;;) { HkJob j; int have = 0;
+        pm_lock(&g_hk_lock); if (g_hk_r != g_hk_w) { j = g_hk[g_hk_r % HK_N]; g_hk_r++; have = 1; } pm_unlock(&g_hk_lock);
+        if (!have) break; hk_write(&j); }
+}
+#ifdef _WIN32
+static u32 __stdcall hk_thread(void *arg) {
+    (void)arg;
+    for (;;) { plat_sleep_ms(15);
+        __atomic_store_n(&g_hk_busy, 1, __ATOMIC_RELEASE); hk_drain();
+        if (__atomic_exchange_n(&g_hk_mem, 0, __ATOMIC_ACQ_REL)) { say_cap_begin(); mem_report("every 10 s"); say_cap_end(); }
+        __atomic_store_n(&g_hk_busy, 0, __ATOMIC_RELEASE); }
+    return 0;
+}
+#endif
+static int hk_start(void) {
+    if (g_hk_started) return g_hk_started > 0;
+    pm_init(&g_hk_lock);
+#ifdef _WIN32
+    g_hk_started = CreateThread(0, 1u << 20, (void *)hk_thread, 0, 0, 0) ? 1 : -1;
+#else
+    g_hk_started = -1;
+#endif
+    return g_hk_started > 0;
+}
+/* called with the note lock held (one producer at a time) */
+static int hk_queue_file(const char *nm, const void *p, u32 n) {
+    if (!hk_start() || g_hk_w - g_hk_r >= HK_N) { g_hk_dropped += g_hk_started > 0; return 0; }
+    void *c = malloc(n); if (!c) return 0;
+    h_memcpy(c, p, n);
+    pm_lock(&g_hk_lock); HkJob *j = &g_hk[g_hk_w % HK_N]; int k = 0; for (; nm[k] && k < 95; k++) j->nm[k] = nm[k]; j->nm[k] = 0; j->p = c; j->n = n; g_hk_w++; pm_unlock(&g_hk_lock);
+    return 1;
+}
+static void hk_finish(void) {   /* at exit: what is still queued is written now */
+    if (g_hk_started <= 0) return;
+    for (int i = 0; i < 400 && __atomic_load_n(&g_hk_busy, __ATOMIC_ACQUIRE); i++) plat_sleep_ms(5);
+    hk_drain();
+    if (g_hk_written || g_hk_dropped) { say("  shader files written by the helper thread (t192): "); say_dec((i64)g_hk_written); say(" ("); say_dec((i64)(g_hk_bytes >> 10)); say(" KB), not queued (queue full) "); say_dec((i64)g_hk_dropped); say("\n"); }
+}
 static void note_shader(u64 addr, int stage) {
     if (!addr) return;
     u32 h = (u32)((addr >> 8) * 0x9E3779B97F4A7C15ull >> 49) & (NS_N - 1), slot = 0xFFFFFFFFu;
@@ -102,8 +154,8 @@ static void note_shader(u64 addr, int stage) {
     if (g_dev_mode && r->size && r->size < 0x100000) {
         char nm[96]; Sb s = {nm, 0, sizeof nm};
         sb_s(&s, "shaders/"); sb_s(&s, g_stage_names[stage]); sb_s(&s, "_"); sb_d(&s, g_nshaders - 1); sb_s(&s, ".bin");
-        void *f = cap_open(nm);
-        if (f) { plat_write_bin(f, (const void *)addr, r->size + 64); plat_close(f); r->dumped = 1; }
+        if (hk_queue_file(nm, (const void *)addr, (u32)r->size + 64)) r->dumped = 1;   /* t192: written by the helper thread */
+        else if (g_hk_started < 0) { void *f = cap_open(nm); if (f) { plat_write_bin(f, (const void *)addr, r->size + 64); plat_close(f); r->dumped = 1; } }
     }
 }
 static int stage_of_sh_reg(u32 r) {
@@ -229,6 +281,7 @@ static Pk *g_coll; static u32 g_ncoll, g_capcoll; static int g_coll_over;
 static Pk g_ce_list[1 << 19], g_de_list[1 << 21];
 static u8 g_ce_ram[65536];
 static u64 g_n_occl_dumps;
+static int g_opt_pm4_pf; static void pm4_prefetch(const void *p, u64 bytes);   /* w5_perf (below) */
 static void pm4_parse(const u32 *p, u64 ndw, int engine /*0 graphics DE, 1 constant engine, 2 compute*/, int depth) {
     u64 i = 0;
     while (i < ndw) {
@@ -278,7 +331,7 @@ static void pm4_parse(const u32 *p, u64 ndw, int engine /*0 graphics DE, 1 const
                 break;
             case 0x3F: case 0x33: {           /* INDIRECT_BUFFER / INDIRECT_BUFFER_CONST */
                 u64 a = (b[0] & ~3u) | ((u64)(b[1] & 0xFFFF) << 32); u64 n = b[2] & 0xFFFFF;
-                if (depth < 4 && mem_ok(a, n * 4)) { g_ib_follow++; pm4_parse((const u32 *)a, n, op == 0x33 ? 1 : engine, depth + 1); }
+                if (depth < 4 && mem_ok(a, n * 4)) { g_ib_follow++; if (g_opt_pm4_pf) pm4_prefetch((const void *)a, n * 4); pm4_parse((const u32 *)a, n, op == 0x33 ? 1 : engine, depth + 1); }
                 else g_ib_bad++;
                 break; }
             case 0x37: {                      /* WRITE_DATA */
@@ -302,7 +355,7 @@ static void pm4_parse(const u32 *p, u64 ndw, int engine /*0 graphics DE, 1 const
                 break;
             case 0x3C:                        /* WAIT_REG_MEM: the command processor stalls until a label holds a value - after an
                                                  EOS / EOP / RELEASE_MEM event that is "wait until earlier work has finished" */
-                if (engine != 1) vkr_sync_point(2);
+                if (engine != 1) { vkr_sync_point(2); spec_wait_reg_mem(); }   /* t181: the look-ahead thread waits for this point */
                 break;
             case 0x20:                        /* SET_PREDICATION */
                 if (engine == 0 && len >= 3) vkr_set_predication(b[0], b[1]);
@@ -391,6 +444,17 @@ static void dump_buffer(const char *kind, int k, const void *p, u64 bytes) {
 }
 
 /* ---------------- Gnm submission ---------------- */
+static int g_opt_ce_ahead, g_opt_pm4_runs;   /* t198 */
+/* w5_perf --pm4-prefetch: the command buffers were written a moment ago by the game's job threads on other cores, so
+   every 64 bytes the first pass over a buffer reads (the pass that collects the packets) is a cache line fetched from
+   another core, one after the other (the old profile: pm4_parse 18 % of the renderer's own code). The whole buffer is
+   asked for before that pass, so the fetches overlap. Reads only: nothing else changes. */
+static u64 g_n_pm4_pf;
+static void pm4_prefetch(const void *p, u64 bytes) {
+    if (bytes > (4u << 20)) bytes = 4u << 20;
+    const char *q = (const char *)p; for (u64 o = 0; o < bytes; o += 64) __builtin_prefetch(q + o, 0, 2);
+    g_n_pm4_pf += bytes;
+}
 static void submit_impl(u32 count, void **dcb, u32 *dcb_sz, void **ccb, u32 *ccb_sz) {
     const char *wo_ = wait_begin("renderer: translating a submit to Vulkan");
     u64 tsub0_ = plat_ticks();
@@ -398,6 +462,7 @@ static void submit_impl(u32 count, void **dcb, u32 *dcb_sz, void **ccb, u32 *ccb
     vkr_lw_check(1);   /* t107g: what the previous submit read, checked again now (late-write diagnostic) */
     rc_on_submit(count, dcb, dcb_sz, ccb, ccb_sz);   /* replay capture: memory changed since the last snapshot + this submit */
     vkr_begin_submit();
+    spec_submit_begin(count, dcb, dcb_sz);   /* t181: the look-ahead thread reads this submit's command buffers */
     int dump = (int)g_submits < g_opt_dump || g_frame_file != 0;   /* capture frames (P / O) also keep their raw command buffers */
     for (u32 k = 0; k < count; k++) {
         u32 nde = 0, nce = 0;
@@ -406,6 +471,7 @@ static void submit_impl(u32 count, void **dcb, u32 *dcb_sz, void **ccb, u32 *ccb
             g_ccb_bytes += ccb_sz[k];
             if (dump) dump_buffer("ccb", (int)k, ccb[k], ccb_sz[k]);
             g_coll = g_ce_list; g_capcoll = sizeof g_ce_list / sizeof g_ce_list[0]; g_ncoll = 0;
+            if (g_opt_pm4_pf) { pm4_prefetch(ccb[k], ccb_sz[k]); if (dcb && dcb[k] && dcb_sz && dcb_sz[k]) pm4_prefetch(dcb[k], dcb_sz[k]); }
             pm4_parse((const u32 *)ccb[k], ccb_sz[k] / 4, 1, 0);
             nce = g_ncoll;
         }
@@ -413,6 +479,7 @@ static void submit_impl(u32 count, void **dcb, u32 *dcb_sz, void **ccb, u32 *ccb
             g_dcb_bytes += dcb_sz[k]; g_cur.dwords += dcb_sz[k] / 4;
             if (dump) dump_buffer("dcb", (int)k, dcb[k], dcb_sz[k]);
             g_coll = g_de_list; g_capcoll = sizeof g_de_list / sizeof g_de_list[0]; g_ncoll = 0;
+            if (g_opt_pm4_pf && !(ccb && ccb[k] && ccb_sz && ccb_sz[k])) pm4_prefetch(dcb[k], dcb_sz[k]);
             pm4_parse((const u32 *)dcb[k], dcb_sz[k] / 4, 0, 0);
             nde = g_ncoll;
         }
@@ -420,27 +487,39 @@ static void submit_impl(u32 count, void **dcb, u32 *dcb_sz, void **ccb, u32 *ccb
         if (g_coll_over) { static int nlog; if (nlog++ < 4) tr("    command buffer too large for the CE/DE scheduler (packets dropped)\n"); }
         /* run CE ahead of DE as far as the counters allow (CE waits while ce - de >= diff; DE waits until ce > de) */
         u32 i = 0, j = 0; i64 ce = 0, de = 0;
+        spec_ce(k, 0);
         while (i < nde || j < nce) {
             int moved = 0;
             while (j < nce) {
                 const u32 *h = g_ce_list[j].p; u32 op = (h[0] >> 8) & 0xFF;
                 if (op == 0x88 && ce - de >= (i64)h[1] && i < nde) break;
-                if (op == 0x84) ce++;
+                if (g_opt_pm4_runs && op != 0x84 && op != 0x88) {   /* t198 --pm4-runs: the packets that follow in memory up to the next counter packet, in one call */
+                    const u32 *end = h + g_ce_list[j].len; u32 j2 = j + 1;
+                    while (j2 < nce && g_ce_list[j2].p == end) { u32 o2 = (end[0] >> 8) & 0xFF; if (o2 == 0x84 || o2 == 0x88) break; end += g_ce_list[j2].len; j2++; }
+                    pm4_parse(h, (u64)(end - h), 1, 0); j = j2; moved = 1; continue; }
                 pm4_parse(h, g_ce_list[j].len, 1, 0); j++; moved = 1;
+                if (op == 0x84) { ce++; spec_ce(k, (u32)ce); }   /* (t198: counted after the packet, and published for the look-ahead thread) */
             }
             while (i < nde) {
                 const u32 *h = g_de_list[i].p; u32 op = (h[0] >> 8) & 0xFF;
                 if (op == 0x86 && !(ce > de) && j < nce) break;
                 if (op == 0x85) de++;
+                if (g_opt_pm4_runs && op != 0x85 && op != 0x86) {
+                    const u32 *end = h + g_de_list[i].len; u32 i2 = i + 1;
+                    while (i2 < nde && g_de_list[i2].p == end) { u32 o2 = (end[0] >> 8) & 0xFF; if (o2 == 0x85 || o2 == 0x86) break; end += g_de_list[i2].len; i2++; }
+                    pm4_parse(h, (u64)(end - h), 0, 0); i = i2; moved = 1; continue; }
                 pm4_parse(h, g_de_list[i].len, 0, 0); i++; moved = 1;
+                if (op == 0x85 && g_opt_ce_ahead && j < nce) break;   /* t198 --ce-ahead: the constant engine takes its lead back after every draw-engine step */
             }
             if (!moved) {   /* counters disagree with our model: keep going in DE order */
                 g_ce_forced++;
                 if (i < nde) { const u32 *h = g_de_list[i].p; if (((h[0] >> 8) & 0xFF) == 0x85) de++; pm4_parse(h, g_de_list[i].len, 0, 0); i++; }
-                else { const u32 *h = g_ce_list[j].p; if (((h[0] >> 8) & 0xFF) == 0x84) ce++; pm4_parse(h, g_ce_list[j].len, 1, 0); j++; }
+                else { const u32 *h = g_ce_list[j].p; if (((h[0] >> 8) & 0xFF) == 0x84) ce++; pm4_parse(h, g_ce_list[j].len, 1, 0); j++; spec_ce(k, (u32)ce); }
             }
         }
+        spec_ce(k + 1, 0);
     }
+    spec_submit_end();   /* t181 */
     g_submits++; g_cur.submits++;
     gpu_apply_deferred();
     vkr_lw_check(0);   /* t107g: and when this submit has been translated */
@@ -453,6 +532,14 @@ static void submit_impl(u32 count, void **dcb, u32 *dcb_sz, void **ccb, u32 *ccb
 typedef struct { u32 fmt, tiling, aspect, w, h, pitch, option, r0; u64 r1; } VoAttr;
 static u64 g_vo_buffers[16]; static int g_vo_nbuf; static VoAttr g_vo_attr;
 static int g_vo_rate;                       /* 0 = 60 Hz, 1 = 30 Hz, 2 = 20 Hz */
+static u64 g_fps_after_flip; static int g_fps_after_val;
+/* w14_speed (unattended speed tests; all off by default): more --fps-after FLIP:N and --fps-after-ms MS:N (time since the first
+   flip); --uncapped-max N: with no frame-rate limit, at most N frames a second (default 240 = the physics step's floor; 0 = none);
+   --exit-ms MS: end the run MS after the first flip; --shots-ms A,B,..: screenshots at these times since the first flip
+   (the flip and its exact time are logged); --time-log: see e3_loader.c */
+static u64 g_fpsa_at[16]; static int g_fpsa_val[16]; static u8 g_fpsa_ms[16], g_fpsa_done[16]; static int g_nfpsa;
+static int g_opt_uncapped_max = 240;   /* w14_speed final: on by default (physics / cloth step floor is 1/240 s: above 240 fps they ran fps/240 x real time - 6.8x on the ~1630 fps splash screens); --uncapped-max 0 = none */ static u64 g_opt_exit_ms, g_shotms[64]; static int g_nshotms, g_shotms_next; static u64 g_flip1_tick;
+static void tl_flip(void);   /* --fps-after FLIP:N (t192, unattended runs): the frame-rate limit becomes N (0 = none) at that flip - menus at the usual rate, the scene under test at another */
 static int g_opt_fps;                       /* --fps N: frame-rate cap instead of the rate the game asks for (60); --fps 0 = no cap (-1) */
 static u64 g_vo_flip_count, g_vo_tsc_last, g_vo_t0; static i64 g_vo_flip_arg; static int g_vo_cur = -1;
 static u64 g_next_flip_tick, g_frame_tick;
@@ -478,6 +565,71 @@ static void fp_say_addr(u64 a) {
     if (a >= (u64)g_eboot.base && a < (u64)g_eboot.base + g_eboot.size) { say("eboot+"); say_hex(a - (u64)g_eboot.base); }
     else if (g_prx.base && a >= (u64)g_prx.base && a < (u64)g_prx.base + g_prx.size) { say("prx+"); say_hex(a - (u64)g_prx.base); }
     else say_hex(a);
+}
+/* t186 --vb-watch: hardware write watchpoints (DR0-DR3, every thread, re-armed every 120 flips for new threads) on
+   up to 4 addresses (16 traps per 600 flips at most, see vbw_hook) - by default the first vertex of two of the stranger's clothing pieces in the game's dynamic
+   vertex ring (Chapter 5; the same addresses in every session so far): 0x24cb46800 (the piece of capture step 55,
+   VS 0x24fe24d00), 0x24cb20200 (step 30), 0x24cb4a900 (step 56) and 0x24cb53d00 (step 33) - all NaN in the two
+   captures with the waist missing (15003, 13915), finite in the one with it whole (5825).
+   Every writing instruction is counted (up to 32 distinct ones, printed when first seen); a write that turns the
+   watched float from finite to NaN is recorded with all registers, xmm0-15 and the return addresses on the stack
+   (printed at the next flip, the first 6). Finds the game code that makes the waist disappear. */
+static int g_opt_vbw; static u64 g_vbw_a[4] = {0x24cb46800ull, 0x24cb20200ull, 0x24cb4a900ull, 0x24cb53d00ull}; static int g_vbw_n = 4, g_vbw_user;
+static u32 g_vbw_last[4]; static volatile u64 g_vbw_hits;
+static struct { volatile u64 rip; volatile u32 n, w; u32 first_flip, v; } g_vbw_rip[32]; static volatile int g_vbw_nrip; static int g_vbw_printed;
+typedef struct { u64 g[16], rip, ret[12], flip; u32 tid, w, before, after, x[16][4], nret; } VbwEv;
+static VbwEv g_vbw_ev[6]; static volatile int g_vbw_nev; static int g_vbw_evp;
+static int vbw_isnan(u32 v) { return (v & 0x7F800000u) == 0x7F800000u && (v & 0x7FFFFFu); }
+static volatile u32 g_vbw_cycle_hits;
+static void vbw_hook(u8 *ctx, u64 dr6) {
+    __atomic_add_fetch(&g_vbw_hits, 1, __ATOMIC_RELAXED);
+    /* few traps only: a trap is an exception, and Windows writes it on the thread's stack below rsp - over the System V
+       red zone of the writing function (STATUS 70: 1,577 traps crashed the game). After 16 hits per arming the
+       thread that traps clears its own debug registers; the next arming (every 600 flips) takes a new sample. */
+    if (__atomic_add_fetch(&g_vbw_cycle_hits, 1, __ATOMIC_RELAXED) > 16) *(u64 *)(ctx + 0x70) = 0;
+    u64 rip = *(u64 *)(ctx + 0xF8);
+    for (int w = 0; w < g_vbw_n; w++) if (dr6 >> w & 1) {
+        u32 v = *(volatile const u32 *)(g_vbw_a[w] & ~3ull), before = g_vbw_last[w]; g_vbw_last[w] = v;
+        int k, n = __atomic_load_n(&g_vbw_nrip, __ATOMIC_ACQUIRE);
+        for (k = 0; k < n; k++) if (g_vbw_rip[k].rip == rip && g_vbw_rip[k].w == (u32)w) { __atomic_add_fetch(&g_vbw_rip[k].n, 1, __ATOMIC_RELAXED); break; }
+        if (k == n && n < 32) { int i = __atomic_fetch_add(&g_vbw_nrip, 1, __ATOMIC_ACQ_REL); if (i < 32) { g_vbw_rip[i].w = (u32)w; g_vbw_rip[i].n = 1; g_vbw_rip[i].first_flip = (u32)g_plat_frame; g_vbw_rip[i].v = v; __atomic_store_n(&g_vbw_rip[i].rip, rip, __ATOMIC_RELEASE); } }
+        if (vbw_isnan(v) && !vbw_isnan(before)) {
+            int e = __atomic_fetch_add(&g_vbw_nev, 1, __ATOMIC_ACQ_REL);
+            if (e < 6) { VbwEv *E = &g_vbw_ev[e];
+                for (int r = 0; r < 16; r++) E->g[r] = *(u64 *)(ctx + 0x78 + 8 * r);
+                for (int r = 0; r < 16; r++) for (int q = 0; q < 4; q++) E->x[r][q] = *(u32 *)(ctx + 0x1A0 + 16 * r + 4 * q);
+                E->rip = rip; E->flip = g_plat_frame; E->tid = GetCurrentThreadId(); E->w = (u32)w; E->before = before; E->after = v; E->nret = 0;
+                u64 rsp = E->g[4], lo = (u64)g_eboot.base, hi = lo + g_eboot.size, plo = (u64)g_prx.base, phi = plo + g_prx.size;
+                for (u64 q = 0; q < 4096 && E->nret < 12; q++) { u64 a = rsp + 8 * q; if (!plat_readable(a, 8)) break; u64 c = *(const u64 *)a;
+                    if (!((c > lo + 6 && c < hi) || (g_prx.base && c > plo + 6 && c < phi))) continue;
+                    const u8 *b = (const u8 *)c; if (b[-5] == 0xE8 || (b[-6] == 0xFF && b[-5] == 0x15) || (b[-2] == 0xFF && (b[-1] & 0xF8) == 0xD0) || (b[-3] == 0xFF && (b[-2] & 0xF8) == 0x50)) E->ret[E->nret++] = c; } }
+        }
+    }
+}
+static void vbw_arm(void) { if (!g_opt_vbw) return; g_dr_hook = vbw_hook; for (int w = 0; w < g_vbw_n; w++) g_vbw_last[w] = *(volatile const u32 *)(g_vbw_a[w] & ~3ull); plat_dr_arm_all(g_vbw_a, g_vbw_n); }
+static void vbw_flip(void) {
+    if (!g_opt_vbw) return;
+    if (g_flips == 30 || g_flips % 600 == 0) {   /* (first arming once the game's threads exist; then a new sample every 600 flips) */
+        g_vbw_cycle_hits = 0;
+        if (g_flips == 30) { say("    (t186) vertex-buffer write watch on"); for (int w = 0; w < g_vbw_n; w++) { say(" "); say_hex(g_vbw_a[w]); } say("\n"); }
+        g_dr_hook = vbw_hook; plat_dr_arm_all(g_vbw_a, g_vbw_n); }
+    int n = __atomic_load_n(&g_vbw_nrip, __ATOMIC_ACQUIRE); if (n > 32) n = 32;
+    for (; g_vbw_printed < n; g_vbw_printed++) { if (!g_vbw_rip[g_vbw_printed].rip) break;
+        say("    (t186) watched address "); say_hex(g_vbw_a[g_vbw_rip[g_vbw_printed].w]); say(" written by "); fp_say_addr(g_vbw_rip[g_vbw_printed].rip); say(" (first at flip "); say_dec((i64)g_vbw_rip[g_vbw_printed].first_flip); say(", value "); say_hex(g_vbw_rip[g_vbw_printed].v); say(")\n"); }
+    int ne = __atomic_load_n(&g_vbw_nev, __ATOMIC_ACQUIRE); if (ne > 6) ne = 6;
+    static const char *const gn[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+    for (; g_vbw_evp < ne; g_vbw_evp++) { VbwEv *E = &g_vbw_ev[g_vbw_evp];
+        say("    (t186) NaN WRITTEN to watched address "); say_hex(g_vbw_a[E->w]); say(" by "); fp_say_addr(E->rip); say(" at flip "); say_dec((i64)E->flip); say(", thread id "); say_dec(E->tid);
+        say(", value before "); say_hex(E->before); say(" after "); say_hex(E->after); say("\n      ");
+        for (int r = 0; r < 16; r++) { say(" "); say(gn[r]); say("="); say_hex(E->g[r]); if (r == 7) say("\n      "); } say("\n");
+        for (int r = 0; r < 16; r++) { say("        xmm"); say_dec(r); say(":"); for (int q = 0; q < 4; q++) { say(" "); say_hex(E->x[r][q]); } say("\n"); }
+        say("      return addresses:"); for (u32 r = 0; r < E->nret; r++) { say(" "); fp_say_addr(E->ret[r]); } say("\n"); }
+}
+static void vbw_report(void) {
+    if (!g_opt_vbw) return;
+    say("\nvertex-buffer write watch (t186): "); say_dec((i64)g_vbw_hits); say(" writes trapped; NaN writes "); say_dec(__atomic_load_n(&g_vbw_nev, __ATOMIC_ACQUIRE)); say("; writers:\n");
+    int n = g_vbw_nrip < 32 ? g_vbw_nrip : 32;
+    for (int k = 0; k < n; k++) { say("    "); say_hex(g_vbw_a[g_vbw_rip[k].w]); say(" by "); fp_say_addr(g_vbw_rip[k].rip); say(" x"); say_dec(g_vbw_rip[k].n); say(", first at flip "); say_dec(g_vbw_rip[k].first_flip); say("\n"); }
 }
 static u8 g_fpd_printed[FP_MAXS][2];
 static void fp_print_detail(const FpDet *d);
@@ -714,6 +866,9 @@ static void probe_flip(void) {
         ps_print("the first call with a NaN input", &g_ps_firstnan_in, 9); }
     if (g_ik_have && !(g_ps_printed & 4)) { g_ps_printed |= 4; say("    (t151) IK probe: the two-bone IK math left a NaN in memory that was finite on entry (calls so far "); say_dec((i64)g_ik_calls); say(")\n");
         if (g_ik_made_good.frame) ik_print("the last call of that thread that stayed finite", &g_ik_made_good); ik_print("the first call that made a NaN", &g_ik_made); }
+#ifdef _WIN32
+    if (g_nanvb_onset && !g_fp_dump_at) g_fp_dump_at = g_nanvb_onset;   /* t185: the watched NaN onset (--nan-vb) */
+#endif
     if (g_fp_dump_at && !g_fp_dumped && g_plat_frame > g_fp_dump_at) { g_fp_dumped = 1; fp_ring_dump(g_fp_dump_at > 15 ? g_fp_dump_at - 15 : 0); }
     if (g_ps_have_made && !(g_ps_printed & 2)) { g_ps_printed |= 2; say("    (t150) prop probe: MatrixInterpolate made a NaN result from finite inputs\n"); ps_print("that call", &g_ps_madenan, 10); }
 }
@@ -782,13 +937,25 @@ static void mnan_report(int all) {
 }
 static void do_flip(int idx, i64 arg) {
     /* pace like a 60/30/20 Hz display */
-    u64 hz = g_opt_fps > 0 ? (u64)g_opt_fps : g_opt_fps < 0 ? 0 : (u64)(g_vo_rate == 1 ? 30 : g_vo_rate == 2 ? 20 : 60);
+    if (g_fps_after_flip && g_flips == g_fps_after_flip) { g_opt_fps = g_fps_after_val; say("  frame-rate limit from flip "); say_dec((i64)g_flips); say(": "); if (g_opt_fps > 0) say_dec(g_opt_fps); else say("none"); say(" (--fps-after)\n"); }
+    if (g_nfpsa || g_opt_exit_ms || g_nshotms) {   /* w14_speed */
+        u64 ms_ = g_flip1_tick ? (plat_ticks() - g_flip1_tick) * 1000 / plat_ticks_per_sec() : 0;
+        for (int i = 0; i < g_nfpsa; i++) if (!g_fpsa_done[i] && (g_fpsa_ms[i] ? (g_flip1_tick && ms_ >= g_fpsa_at[i]) : g_flips >= g_fpsa_at[i])) {
+            g_fpsa_done[i] = 1; g_opt_fps = g_fpsa_val[i]; say("  frame-rate limit from flip "); say_dec((i64)g_flips); say(" ("); say_dec((i64)ms_); say(" ms): ");
+            if (g_opt_fps > 0) say_dec(g_opt_fps); else say("none"); say(" (w14_speed --fps-after / --fps-after-ms)\n"); }
+        while (g_flip1_tick && g_shotms_next < g_nshotms && ms_ >= g_shotms[g_shotms_next]) {
+            if (g_nshot_more < 64) g_shot_more[g_nshot_more++] = g_flips + 1;   /* (the flip count is raised before the present) */
+            say("  timed screenshot (w14_speed): "); say_dec((i64)g_shotms[g_shotms_next]); say(" ms wanted, flip "); say_dec((i64)g_flips + 1); say(" at "); say_dec((i64)ms_); say(" ms\n"); g_shotms_next++; }
+        if (g_opt_exit_ms && g_flip1_tick && ms_ >= g_opt_exit_ms) g_opt_frames = (int)g_flips + 1;   /* ends at this flip (below) */
+    }
+    u64 hz = g_opt_fps > 0 ? (u64)g_opt_fps : g_opt_fps < 0 ? (u64)(g_opt_uncapped_max > 0 ? g_opt_uncapped_max : 0) : (u64)(g_vo_rate == 1 ? 30 : g_vo_rate == 2 ? 20 : 60);
     u64 f = plat_ticks_per_sec(), interval = hz ? f / hz : 0;
     u64 now = plat_ticks();
     if (g_stall_ms && g_flips == g_stall_at) {   /* --stall FLIP:MS - freeze the game's main thread here (diagnostic) */
         say("  diagnostic stall: main thread frozen for "); say_dec(g_stall_ms); say(" ms at flip "); say_dec((i64)g_flips); say("\n");
         plat_sleep_ms(g_stall_ms); now = plat_ticks(); g_next_flip_tick = now;
     }
+    if (g_hi_ms && g_flips >= g_hi_from && g_flips <= g_hi_to && (g_flips - g_hi_from) % g_hi_every == 0) { plat_sleep_ms(g_hi_ms); now = plat_ticks(); g_hi_n++; }   /* w3_cloth test: a long frame */
     if (interval && g_next_flip_tick > now) {   /* sleep to ~1 ms before the deadline, then yield until it (Sleep granularity is 1 ms at best) */
         u64 ms = (g_next_flip_tick - now) * 1000 / f, tp0_ = now;
         if (ms > 1) WAITING("flip: display-rate pacing", plat_sleep_ms((u32)(ms - 1)));
@@ -805,12 +972,14 @@ static void do_flip(int idx, i64 arg) {
     if (g_mnan_printed != g_nmnan) mnan_report(0);   /* t147 */
     if (g_opt_rsq_trap) rsq_flip();   /* t149 */
     if (g_opt_prop_probe || g_opt_ik_probe || g_fp_full) probe_flip();   /* t150 / t151 */
+    if (g_opt_vbw) vbw_flip();   /* t186 */
     g_vo_flip_count++; g_vo_cur = idx; g_vo_flip_arg = arg; g_vo_tsc_last = game_tsc();
     pm_unlock(&g_gpu_lock);
     gpu_lock(); rc_on_flip(idx, idx >= 0 && idx < g_vo_nbuf ? g_vo_buffers[idx] : 0, g_ce_ram); pm_unlock(&g_gpu_lock);   /* replay capture: end / start at the frame boundary */
     if (idx >= 0 && idx < g_vo_nbuf) { g_win.pixels = (const u8 *)g_vo_buffers[idx]; g_win.w = g_vo_attr.w; g_win.h = g_vo_attr.h; g_win.pitch = g_vo_attr.pitch ? g_vo_attr.pitch : g_vo_attr.w;
                                        WAITING("renderer: present", vkr_flip(g_vo_buffers[idx], g_vo_attr.w, g_vo_attr.h)); }
-    if (g_flips == 1) prof_start();
+    if (g_flips == 1) { prof_start(); hp_start(); g_flip1_tick = plat_ticks(); }
+    tl_flip();   /* w14_speed --time-log */
     if (g_flips == 1) { say("\n>>> FIRST FLIP: frame 1 submitted to the display (buffer "); say_dec(idx); say(") on thread \""); say(cur_thread_name()); say("\"\n"); }
     {   /* frame rate: wall-clock time of the last 60 flips, and the slowest single frame among them */
         static u64 t60; static u32 worst; u64 tf = plat_ticks_per_sec();
@@ -822,7 +991,8 @@ static void do_flip(int idx, i64 arg) {
             if (g_prep_rec_on && !g_rp_running) { char l[300]; Sb t = {l, 0, sizeof l}; sb_s(&t, "; "); prep_counts(&t); say(l); }   /* t163 */
             say("\n");
             if (t60 && !g_rp_running) vkr_perf_window(g_flips, now2 - t60, g_draws);
-            if (g_flips % 600 == 0 && !g_rp_running) mem_report("every 10 s");
+            if (!g_rp_running) vkr_ab_flip(g_flips);   /* t183 --ab-period */
+            if (g_flips % 600 == 0 && !g_rp_running) { if (hk_start()) __atomic_store_n(&g_hk_mem, 1, __ATOMIC_RELEASE); else mem_report("every 10 s"); }   /* t192: on the helper thread */
             t60 = now2; worst = 0;
         }
     }
@@ -835,7 +1005,7 @@ static SYSV int vo_open(int user, int bus, int index, void *param) {
     TRACE("sceVideoOutOpen", user, bus, index); (void)param;
     say("\n>>> sceVideoOutOpen: display opened (E4's end point)\n");
     g_vo_t0 = plat_ticks();
-    if (g_opt_window) { plat_window_open(); vkr_init(); plat_pad_start(); prep_run(); }   /* controllers: STATUS 49; t159: shader preparation, before the game's first screen */
+    if (g_opt_window) { plat_window_open(); vkr_init(); plat_pad_start(); { u64 tp0_ = plat_ticks(); g_timeout_hold = 1; prep_run(); g_timeout_hold = 0; g_prep_ms_total = (plat_ticks() - tp0_) * 1000 / plat_ticks_per_sec(); } }   /* w6_fast: --timeout-play, and the time-out line says how long it took */   /* controllers: STATUS 49; t159: shader preparation, before the game's first screen */
     update_window_text();
     return 1;
 }
@@ -982,11 +1152,22 @@ typedef struct { int kind, has_dsz, has_ccb, has_csz, idx; u32 count, vq, next, 
 static AqItem *g_aq; static volatile u64 g_aq_head, g_aq_tail; static int g_aq_flips, g_aq_started;   /* started: 0 no, 1 starting, 2 running, 3 failed */
 static PMutex g_aq_m; static PCond g_aq_cv;
 static u32 aq_get_mxcsr(void) { return __builtin_ia32_stmxcsr(); }
+static int aq_waiting(void) { return __atomic_load_n(&g_aq_tail, __ATOMIC_ACQUIRE) != __atomic_load_n(&g_aq_head, __ATOMIC_ACQUIRE); }   /* t182: something queued (the scan ahead stops) */
+static void prescan_hook(void) {
+#ifdef _WIN32
+    g_ps_stop = aq_waiting;
+#endif
+}
 static void aq_thread(void *arg) {
     if (arg) pt_set_current(arg);   /* (a registered thread: stall reports and the profiler see the renderer) */
     g_aq_tid = GetCurrentThreadId();
     for (;;) {
         pm_lock(&g_aq_m);
+        if (g_aq_head == g_aq_tail && !g_rnative) {   /* t182: nothing queued: the next submit's write-tracking scan ahead of it (once) */
+            pm_unlock(&g_aq_m);
+            if (!pm_trylock(&g_gpu_lock)) { prescan_hook(); vkr_prescan(); pm_unlock(&g_gpu_lock); }
+            pm_lock(&g_aq_m);
+        }
         if (g_aq_head == g_aq_tail) { u64 t0 = plat_ticks(); while (g_aq_head == g_aq_tail) pc_wait(&g_aq_cv, &g_aq_m, -1); g_t_aqidle += plat_ticks() - t0; }
         AqItem *it = &g_aq[g_aq_head % AQ_N];
         pm_unlock(&g_aq_m);
@@ -1502,14 +1683,158 @@ static void prof_report_one(ProfT *P, const char *name, int i) {
         }
     }
 }
+/* ---------------- t190: hitch profiler (--hitch-profile [MS]) ----------------
+   Only while a frame is late: once HP_START ms have passed since the last flip, every game thread (and the renderer
+   thread) is sampled every ~2 ms - game code by 16-byte block, our wait labels / OS calls with the game code that called
+   them, other modules (driver, Windows) by module, our own code by 16-byte block. When the frame ends after MS ms or more
+   (default 50) the frame's samples are printed per thread ("hitch" lines) and added to a session summary printed at exit.
+   Frames that are not late are never sampled (no cost); a late frame costs its samples (~10 us each). */
+enum { HP_KEYS = 96, HP_THR = 96, HP_SUM = 512 };
+typedef struct { u64 a, b, c[3]; u32 type, n; } HpKey;   /* t190b: c = the game call chain found on the stack */   /* type 1 game code (a = eboot offset), 2 wait (a = label, b = game caller),
+                                                      3 OS call (a = import index, b = game caller), 4 other module (a = base),
+                                                      5 our code (a = exe offset), 6 prx code (a = offset) */
+typedef struct { u32 n, nk; HpKey k[HP_KEYS]; } HpThr;
+static int g_opt_hitch; static u32 g_hp_report_ms = 50, g_hp_start_ms = 30; static int g_hp_e6_detail;   /* t196: --hitch-renderer */
+static HpThr *g_hp; static HpKey *g_hp_sum; static u32 g_hp_nsum; static u64 g_hp_count, g_hp_ms_total, g_hp_samples;
+static const char *g_hp_names[HP_THR];
+static void hp_add(HpKey *k, u32 *nk, u32 cap, u32 type, u64 a, u64 b, const u64 *c, u32 n) {
+    for (u32 i = 0; i < *nk; i++) if (k[i].type == type && k[i].a == a && k[i].b == b && k[i].c[0] == c[0] && k[i].c[1] == c[1] && k[i].c[2] == c[2]) { k[i].n += n; return; }
+    if (*nk < cap) { k[*nk].type = type; k[*nk].a = a; k[*nk].b = b; k[*nk].c[0] = c[0]; k[*nk].c[1] = c[1]; k[*nk].c[2] = c[2]; k[*nk].n = n; (*nk)++; }
+}
+/* t190b: the game's call chain of a sampled thread - stack scan from rsp for return addresses into the game's code
+   (each checked: a call instruction just before it); up to 3, skipping the one already known (b) */
+static int hp_is_ret_in(u64 v, u64 lo, u64 hi) {
+    if (v < lo + 8 || v >= hi) return 0;
+    const u8 *p = (const u8 *)v;
+    if (p[-5] == 0xE8) return 1;
+    for (int len = 2; len <= 7; len++) { const u8 *q = p - len; if (q[0] == 0xFF && ((q[1] >> 3) & 7) == 2) return 1; if (len >= 3 && (q[0] & 0xF0) == 0x40 && q[1] == 0xFF && ((q[2] >> 3) & 7) == 2) return 1; }
+    return 0;
+}
+static void hp_chain_in(u64 rsp, u64 skip, u64 *c, u64 lo, u64 hi) {
+    int n = 0; c[0] = c[1] = c[2] = 0;
+    u64 p = rsp & ~7ull, pgend = 0;
+    for (int i = 0; i < 4096 && n < 3; i++, p += 8) {
+        if (p >= pgend) { if (!plat_readable(p & ~0xfffull, 4096)) break; pgend = (p & ~0xfffull) + 4096; }
+        u64 v = *(const u64 *)p;
+        if (hp_is_ret_in(v, lo, hi) && v != skip && (!n || c[n - 1] != v - lo)) c[n++] = v - lo; }
+}
+static void hp_chain(u64 rsp, u64 skip, u64 *c) { hp_chain_in(rsp, skip, c, (u64)g_eboot.base, (u64)g_eboot.base + g_eboot.size); }
+static void hp_say_key(const HpKey *k) {
+    u64 eb = (u64)g_eboot.base;
+    switch (k->type) {
+    case 1: say("game eboot+"); say_hex(k->a); break;
+    case 6: say("game prx+"); say_hex(k->a); break;
+    case 2: say("waiting: "); say((const char *)k->a); if (k->b) { say(" (from eboot+"); say_hex(k->b - eb); say(")"); } break;
+    case 3: say("OS call "); say(k->a ? g_imports[k->a - 1].name : "(none yet)"); if (k->b) { say(" (from eboot+"); say_hex(k->b - eb); say(")"); } break;
+    case 4: say("in "); say(prof_mod_name(k->a)); if (k->b) { say(" (last OS call from eboot+"); say_hex(k->b - eb); say(")"); } break;
+    case 5: say("our code exe+"); say_hex(k->a); break;
+    case 8: say("renderer code exe+"); say_hex(k->a); if (k->c[0]) { say(" < exe+"); say_hex(k->c[0]); if (k->c[1]) { say(" < exe+"); say_hex(k->c[1]); } if (k->c[2]) { say(" < exe+"); say_hex(k->c[2]); } } return;
+    case 7: say("in "); say(prof_mod_name(k->a)); if (k->c[0]) { say(" < exe+"); say_hex(k->c[0]); if (k->c[1]) { say(" < exe+"); say_hex(k->c[1]); } if (k->c[2]) { say(" < exe+"); say_hex(k->c[2]); } } return;
+    default: say("?"); }
+    if (k->c[0]) { say(" <"); for (int i = 0; i < 3 && k->c[i]; i++) { say(i ? " < eboot+" : " eboot+"); say_hex(k->c[i]); } }
+}
+static void hp_one(HpThr *H, void *h, PThread *t, u8 *ctx) {
+    plat_stop_lock();
+    if (SuspendThread(h) == 0xFFFFFFFFu) { plat_stop_unlock(); return; }
+    for (u64 z = 0; z < 0x40; z++) ctx[z] = 0;
+    *(u32 *)(ctx + 0x30) = 0x100001;
+    int ok = GetThreadContext(h, ctx);
+    int ix = t->last_ix; const char *wt = t->wait; u64 lret = t->last_ret;
+    ResumeThread(h); plat_stop_unlock();
+    if (!ok) return;
+    u64 rip = *(u64 *)(ctx + 0xF8), rsp = *(u64 *)(ctx + 0x98), eb = (u64)g_eboot.base, ch[3];
+    H->n++; g_hp_samples++;
+    if (rip >= eb && rip < eb + g_eboot.size) { hp_chain(rsp, 0, ch); hp_add(H->k, &H->nk, HP_KEYS, 1, (rip - eb) & ~15ull, 0, ch, 1); }
+    else if (g_prx_loaded && rip >= (u64)g_prx.base && rip < (u64)g_prx.base + g_prx.size) { hp_chain(rsp, 0, ch); hp_add(H->k, &H->nk, HP_KEYS, 6, (rip - (u64)g_prx.base) & ~15ull, 0, ch, 1); }
+    else if (t->name[0] == 'E' && t->name[1] == '6') { ch[0] = ch[1] = ch[2] = 0;   /* the renderer: our own code */
+        /* t196 (--hitch-renderer): "translating a submit" is not a wait - it is the renderer at work, and in the three
+           sessions of bench/results_dev it is all the profile says about 97 of the 126 hitch frames that were not
+           diagnostics keys. With the option the sample is filed by where the renderer is: our code by 256-byte block
+           with our callers from the stack (type 8), another module (the driver, Windows) with our callers (type 7). */
+        if (wt && g_hp_e6_detail && str_eq(wt, "renderer: translating a submit to Vulkan")) wt = 0;
+        if (wt) hp_add(H->k, &H->nk, HP_KEYS, 2, (u64)wt, 0, ch, 1);
+        else if (g_hp_e6_detail && rip >= g_prof_exe_lo && rip < g_prof_exe_hi) { hp_chain_in(rsp, 0, ch, g_prof_exe_lo, g_prof_exe_hi); hp_add(H->k, &H->nk, HP_KEYS, 8, (rip - g_prof_exe_lo) & ~255ull, 0, ch, 1); }
+        else if (rip >= g_prof_exe_lo && rip < g_prof_exe_hi) hp_add(H->k, &H->nk, HP_KEYS, 5, (rip - g_prof_exe_lo) & ~15ull, 0, ch, 1);
+        else { hp_chain_in(rsp, 0, ch, g_prof_exe_lo, g_prof_exe_hi); hp_add(H->k, &H->nk, HP_KEYS, 7, prof_mod_of(rip), 0, ch, 1); } }   /* t190b: our callers (exe offsets, the linker map names them) */
+    else { hp_chain(rsp, lret, ch);
+        if (wt) hp_add(H->k, &H->nk, HP_KEYS, 2, (u64)wt, lret, ch, 1);
+        else if (rip >= g_prof_exe_lo && rip < g_prof_exe_hi) hp_add(H->k, &H->nk, HP_KEYS, 3, ix >= 0 && ix <= N_IMPORTS ? (u64)ix : 0, lret, ch, 1);
+        else hp_add(H->k, &H->nk, HP_KEYS, 4, prof_mod_of(rip), lret, ch, 1); }
+}
+static void hp_print_top(HpKey *k, u32 nk, u32 n, int max) {
+    u8 used[HP_SUM] = {0};
+    for (int r = 0; r < max; r++) { int b = -1; for (u32 i = 0; i < nk; i++) if (!used[i] && (b < 0 || k[i].n > k[b].n)) b = (int)i;
+        if (b < 0 || k[b].n * 50 < n) break;   /* under 2 % */
+        used[b] = 1; say(r ? "; " : " "); hp_say_key(&k[b]); say(" "); say_dec((i64)(k[b].n * 100 / (n ? n : 1))); say("%"); }
+}
+static void hp_finish(u64 flip, u64 ms) {
+    g_hp_count++; g_hp_ms_total += ms;
+    say("    hitch (t190): frame "); say_dec((i64)flip); say(" took "); say_dec((i64)ms); say(" ms; where the threads were in its late part (samples ~2 ms apart):\n");
+    for (int i = 0; i < HP_THR; i++) { HpThr *H = &g_hp[i]; if (!H->n) continue;
+        { u32 top = 0; for (u32 q = 0; q < H->nk; q++) if (H->k[q].n > top) top = H->k[q].n;
+          const char *nm = g_hp_names[i] ? g_hp_names[i] : "?"; int key = i == 0 || (nm[0] == 'E' && nm[1] == '6') || (nm[0] == 'L' && nm[1] == 'u');
+          if (key || top * 20 < H->n * 19) { say("      ["); say(nm); say("] "); say_dec((i64)H->n); say(":"); hp_print_top(H->k, H->nk, H->n, g_hp_e6_detail && nm[0] == 'E' && nm[1] == '6' ? 10 : 5); say("\n"); } }
+        for (u32 q = 0; q < H->nk; q++) { HpKey *K = &H->k[q]; u32 tmp = g_hp_nsum;
+            /* session summary per thread name: key b holds the caller for waits / OS calls; thread name folded into the type's high bits by index */
+            hp_add(g_hp_sum, &tmp, HP_SUM, K->type | (u32)i << 8, K->a, K->b, K->c, K->n); g_hp_nsum = tmp; }
+        H->n = 0; H->nk = 0; }
+}
+static void hp_report(void) {
+    if (!g_opt_hitch || !g_hp_sum) return;
+    say("\n=== hitch profile (t190): "); say_dec((i64)g_hp_count); say(" frames of "); say_dec(g_hp_report_ms); say(" ms or more, "); say_dec((i64)(g_hp_ms_total / 1000)); say(" s in all, ");
+    say_dec((i64)g_hp_samples); say(" samples ===\n");
+    for (int i = 0; i < HP_THR; i++) { HpKey tmp[HP_SUM]; u32 nk = 0, n = 0;
+        for (u32 q = 0; q < g_hp_nsum; q++) if ((g_hp_sum[q].type >> 8) == (u32)i) { tmp[nk] = g_hp_sum[q]; tmp[nk].type &= 0xff; n += tmp[nk].n; nk++; }
+        if (!n) continue;
+        say("  ["); say(g_hp_names[i] ? g_hp_names[i] : "?"); say("] "); say_dec((i64)n); say(" samples:"); hp_print_top(tmp, nk, n, 10); say("\n"); }
+}
+static void hp_thread(void *arg) {
+    (void)arg; static __attribute__((aligned(16))) u8 ctx[1232];
+    u64 f = plat_ticks_per_sec(), cur = ~0ull, fstart = 0; int active = 0;
+    for (;;) {
+        plat_sleep_ms(2);
+        u64 fl = __atomic_load_n(&g_flips, __ATOMIC_ACQUIRE);
+        if (fl != cur) {   /* a flip happened: the frame we sampled (if any) has ended */
+            if (active) { u64 end = g_frame_tick, ms = end > fstart ? (end - fstart) * 1000 / f : 0; if (ms >= g_hp_report_ms) hp_finish(cur + 1, ms); else for (int i = 0; i < HP_THR; i++) { g_hp[i].n = 0; g_hp[i].nk = 0; } }
+            cur = fl; active = 0; fstart = g_frame_tick; }
+        u64 now = plat_ticks();
+        if (now <= fstart || (now - fstart) * 1000 / f < g_hp_start_ms) continue;
+        /* w5_fast: a frame that never ends was never reported (hp_finish runs at the next flip) - after 8 s without a flip,
+           and every 30 s from then on, where the threads have been since (label policy 4 stalls: Chapter 1 flip 4832) */
+        { static u64 st_flip = ~0ull, st_next; if (st_flip != cur) { st_flip = cur; st_next = fstart + 8 * f; }
+          if (active && cur > 300 && now >= st_next && !g_finishing) { st_next = now + 30 * f;   /* (w6_fast: not while the program is ending - every run printed one after its last flip) */
+              say("*** no flip for "); say_dec((i64)((now - fstart) / f)); say(" s after flip "); say_dec((i64)cur); say(" (w5_fast); where the threads were (samples ~2 ms apart, since the last such report):\n");
+              for (int i = 0; i < HP_THR; i++) { HpThr *H = &g_hp[i]; if (!H->n) continue; const char *nm = g_hp_names[i] ? g_hp_names[i] : "?";
+                  u32 top = 0; for (u32 q = 0; q < H->nk; q++) if (H->k[q].n > top) top = H->k[q].n;
+                  int key = i == 0 || (nm[0] == 'E' && nm[1] == '6') || nm[0] == '(' || top * 20 < H->n * 19;
+                  if (key) { say("      ["); say(nm); say("] "); say_dec((i64)H->n); say(":"); hp_print_top(H->k, H->nk, H->n, 10); say("\n"); }
+                  H->n = 0; H->nk = 0; }
+              if (g_hp_stall_fn) g_hp_stall_fn(); } }
+        active = 1;
+        int nt = g_nthreads; if (nt > HP_THR) nt = HP_THR;
+        for (int i = 0; i < nt; i++) { PThread *t = g_threads[i]; if (!t || !t->host || t->done) continue; g_hp_names[i] = t->name; hp_one(&g_hp[i], t->host, t, ctx); }
+    }
+}
+static u64 lbl_dn(void) { return g_draws + g_dispatches; }   /* w5_fast (--label-trailing) */
+static void hp_start(void) {
+    if (!g_opt_hitch || g_hp) return;
+    g_hp = (HpThr *)calloc(HP_THR, sizeof(HpThr)); g_hp_sum = (HpKey *)calloc(HP_SUM, sizeof(HpKey)); if (!g_hp || !g_hp_sum) return;
+    if (!g_prof_exe_lo) { char en[260]; u64 eb = plat_module_of((u64)(void *)hp_start, en, sizeof en);
+      if (eb) { u32 lf = *(const u32 *)(eb + 0x3C); g_prof_exe_lo = eb; g_prof_exe_hi = eb + *(const u32 *)(eb + lf + 0x50); } }
+    say("  hitch profiler on (t190, --hitch-profile): frames of "); say_dec(g_hp_report_ms); say(" ms or more are reported with where every thread was after "); say_dec(g_hp_start_ms); say(" ms\n");
+    pt_create(hp_thread, 0, 0x40000);
+}
 #else
+static void hp_start(void) {}
+static void hp_report(void) {}
 static void prof_start(void) {}
 static void prof_report(void) {}
 static void prof_replay_begin(void) {}
 static void prof_replay_end(void) {}
 #endif
 static void e5_print_gpu_summary(void) {
-    prof_report();
+    hk_finish();
+    prof_report(); hp_report();
     e5_print_top_calls();
     say("\n=== GPU capture ===\nflips "); say_dec((i64)g_flips); say(", submits "); say_dec((i64)g_submits);
     say(", draws "); say_dec((i64)g_draws); say(", dispatches "); say_dec((i64)g_dispatches);

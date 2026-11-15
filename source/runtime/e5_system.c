@@ -75,6 +75,7 @@ static void pad_orientation_step(const float w[3], float dt) {   /* q += 0.5 * q
 }
 /* --press FLIP:BUTTON - a scripted press, held for 8 flips, for unattended runs (x o up down left right options) */
 static u64 g_press_at[64]; static u32 g_press_btn[64]; static int g_npress;
+static u64 g_pressms_at[64]; static u32 g_pressms_btn[64]; static int g_npressms; static u64 g_pressms_t0;   /* --press-ms MS:BUTTON (t193): by time since the first flip, held 150 ms */
 /* --press-until-recap START:EVERY:BUTTON:LAST (t165w) - BUTTON every EVERY flips from START until the game opens its
    "previously on" movie (it is resuming the chapter) or flip LAST: menus whose timing varies from run to run are passed
    without fixed flips; after that no more presses, the game runs on by itself */
@@ -82,6 +83,9 @@ static u64 g_prr_start, g_prr_every, g_prr_last; static u32 g_prr_btn; static vo
 static u32 press_due(void) {
     u32 b = 0;
     for (int i = 0; i < g_npress; i++) if (g_flips >= g_press_at[i] && g_flips < g_press_at[i] + 8) b |= g_press_btn[i];
+    if (g_npressms) { if (!g_pressms_t0 && g_flips) g_pressms_t0 = plat_ticks();
+        u64 ms = g_pressms_t0 ? (plat_ticks() - g_pressms_t0) * 1000 / plat_ticks_per_sec() : 0;
+        for (int i = 0; i < g_npressms; i++) if (ms >= g_pressms_at[i] && ms < g_pressms_at[i] + 150) b |= g_pressms_btn[i]; }
     if (g_prr_state == 1 && g_flips >= g_prr_start) {
         u64 rf = __atomic_load_n(&g_recap_flip, __ATOMIC_ACQUIRE);
         if (rf >= g_prr_start || g_flips > g_prr_last) {
@@ -92,19 +96,72 @@ static u32 press_due(void) {
     }
     return b;
 }
+/* --stick FLIP:LEN:LX:LY[:RX:RY] (t193, unattended runs): the sticks held at these values (0..255, 128 = centre) for LEN flips;
+   --stick-ms MS:LEN_MS:LX:LY[:RX:RY]: the same by time since the first flip (independent of the frame rate) */
+typedef struct { u64 at, len; u8 v[4]; u8 ms; } StickScr;
+static StickScr g_stick[64]; static int g_nstick; static u64 g_stick_t0;
+static int stick_due(int *lx, int *ly, int *rx, int *ry) {
+    if (!g_nstick) return 0;
+    if (!g_stick_t0 && g_flips) g_stick_t0 = plat_ticks();
+    u64 ms = g_stick_t0 ? (plat_ticks() - g_stick_t0) * 1000 / plat_ticks_per_sec() : 0; int hit = 0;
+    for (int i = 0; i < g_nstick; i++) { const StickScr *k = &g_stick[i]; u64 now = k->ms ? ms : g_flips;
+        if (now >= k->at && now < k->at + k->len) { *lx = k->v[0]; *ly = k->v[1]; *rx = k->v[2]; *ry = k->v[3]; hit = 1; } }
+    return hit;
+}
 static u32 g_pad_last;
+/* t199d --record-input FILE / --replay-input FILE: the controller state the game is given (buttons, sticks, triggers) is
+   written with its time, and given again in another run, so that a stretch a person played once (a walk the scripted
+   stick options cannot steer) can be repeated unattended. Time 0 is the first movie the game opens from flip 250 on
+   (resuming a chapter: its "previously on" movie - the same event --press-until-recap stops at), so the menu before it
+   may take any time in either run. Samples: u32 ms, u32 buttons, u8 lx ly rx ry l2 r2, u16 0 (16 bytes), after a
+   16-byte header "UDIN1". */
+typedef struct { u32 ms, b; u8 v[6]; u16 z; } InRec;
+static const char *g_inrec_path, *g_inrep_path; static void *g_inrec_h; static InRec g_inrec_buf[64]; static int g_inrec_nb; static u64 g_inrec_n;
+static InRec *g_inrep; static u64 g_inrep_n, g_inrep_i, g_inrep_used; static u64 g_in_t0; static int g_inrep_done;
+static i64 in_anchor_ms(void) {
+    if (!g_in_t0) { u64 rf = __atomic_load_n(&g_recap_flip, __ATOMIC_ACQUIRE); if (rf < 250) return -1; g_in_t0 = plat_ticks(); say("  input record / replay: time 0 at flip "); say_dec((i64)g_flips); say("\n"); }
+    return (i64)((plat_ticks() - g_in_t0) * 1000 / plat_ticks_per_sec());
+}
+static void inrec_flush(void) { if (g_inrec_h && g_inrec_nb) { plat_write_bin(g_inrec_h, g_inrec_buf, (u64)g_inrec_nb * sizeof(InRec)); g_inrec_nb = 0; } }
+static void inrec_note(u32 b, int lx, int ly, int rx, int ry, int l2, int r2) {
+    i64 ms = in_anchor_ms(); if (ms < 0) return;
+    if (!g_inrec_h) { g_inrec_h = plat_open_write(g_inrec_path); if (!g_inrec_h) { say("  --record-input: cannot write the file\n"); g_inrec_path = 0; return; }
+        char hd[16] = "UDIN1"; plat_write_bin(g_inrec_h, hd, 16); }
+    InRec r; r.ms = (u32)ms; r.b = b; r.v[0] = (u8)lx; r.v[1] = (u8)ly; r.v[2] = (u8)rx; r.v[3] = (u8)ry; r.v[4] = (u8)l2; r.v[5] = (u8)r2; r.z = 0;
+    static InRec last; static int have;
+    if (have && last.b == r.b && !h_memcmp(last.v, r.v, 6) && r.ms - last.ms < 250) return;   /* unchanged: one sample every 250 ms */
+    last = r; have = 1; g_inrec_buf[g_inrec_nb++] = r; g_inrec_n++;
+    if (g_inrec_nb == 64 || (r.ms & ~1023u) != (g_inrec_buf[0].ms & ~1023u)) inrec_flush();   /* on disk within about a second */
+}
+static int inrep_get(u32 *b, int *lx, int *ly, int *rx, int *ry, int *l2, int *r2) {
+    if (!g_inrep) { u64 sz = 0; u8 *f = plat_read_file(g_inrep_path, &sz);
+        if (!f || sz < 32 || h_memcmp(f, "UDIN1", 5)) { say("  --replay-input: cannot read the file\n"); g_inrep_path = 0; return 0; }
+        g_inrep = (InRec *)(f + 16); g_inrep_n = (sz - 16) / sizeof(InRec);
+        say("  --replay-input: "); say_dec((i64)g_inrep_n); say(" samples, "); say_dec((i64)(g_inrep[g_inrep_n - 1].ms / 1000)); say(" s\n"); }
+    i64 ms = in_anchor_ms(); if (ms < 0) return 0;
+    if ((u64)ms > (u64)g_inrep[g_inrep_n - 1].ms + 500) { if (!g_inrep_done) { g_inrep_done = 1; say("  --replay-input: the recording ended at flip "); say_dec((i64)g_flips); say("\n"); } return 0; }
+    while (g_inrep_i + 1 < g_inrep_n && g_inrep[g_inrep_i + 1].ms <= (u32)ms) g_inrep_i++;
+    const InRec *r = &g_inrep[g_inrep_i]; if (r->ms > (u32)ms) return 0;
+    *b = r->b; *lx = r->v[0]; *ly = r->v[1]; *rx = r->v[2]; *ry = r->v[3]; *l2 = r->v[4]; *r2 = r->v[5]; g_inrep_used++; return 1;
+}
 static SYSV int pad_open(int user, int type, int index, void *param) { TRACE("scePadOpen", user, type, index); (void)param; return 1; }
 /* t159: the shader preparation screen's skip (e6_prep.c): Esc or Backspace with the window in front, or Circle on a controller */
+static int g_opt_scripted_input;
 static int prep_skip_pressed(void) {
-    if (g_win.focused && (plat_key(0x1B) || plat_key(0x08))) return 1;
+    /* w13_prep: only with the window in front, and never in an unattended run (--scripted-input). Before, Circle on a
+       controller skipped the preparation of a test run while the user played another game (w9_prep 2hB, 2hC, 2hD, 2hG0,
+       2hG1, 2hGN, 2full_f1: "skipped by the player"). */
+    if (g_opt_scripted_input || !g_win.focused) return 0;
+    if (plat_key(0x1B) || plat_key(0x08)) return 1;
     PlatPad P; return plat_pad_poll(&P) && (P.buttons & PAD_CIRCLE) != 0;
 }
+#define PAD_FOCUS (g_win.focused && !g_opt_scripted_input)
 static SYSV int pad_read_state(int h, u8 *d) {
     if (h != 1 || !d) return (int)0x80920003;
     g_pad_reads++;
     h_memset(d, 0, 120);
     u32 b = 0; int lx = 128, ly = 128, rx = 128, ry = 128, l2 = 0, r2 = 0;
-    if (g_win.focused) {
+    if (PAD_FOCUS) {
         /* keyboard mapping (Windows virtual-key codes) */
         if (plat_key(0x0D) || plat_key(0x20)) b |= PAD_CROSS;          /* Enter / Space  -> Cross */
         if (plat_key(0x08) || plat_key(0x1B)) b |= PAD_CIRCLE;         /* Backspace / Esc -> Circle */
@@ -132,12 +189,12 @@ static SYSV int pad_read_state(int h, u8 *d) {
     /* mouse aiming (M toggles): the pointer is captured, its movement drives the right stick, left button = R2 (shoot),
        right button = L2 (aim) */
     {
-        static int mwas; int m = g_win.focused && plat_key('M');
+        static int mwas; int m = PAD_FOCUS && plat_key('M');
         if (m && !mwas) { g_mouse_aim = !g_mouse_aim; g_aim_vx = g_aim_vy = 0; say(g_mouse_aim ? "  mouse aiming on (M to turn off)\n" : "  mouse aiming off\n"); }
         mwas = m;
-        if (!g_win.focused) plat_mouse_capture(0);
+        if (!PAD_FOCUS) plat_mouse_capture(0);
         else plat_mouse_capture(g_mouse_aim);
-        if (g_mouse_aim && g_win.focused) {
+        if (g_mouse_aim && PAD_FOCUS) {
             i32 dx, dy; plat_mouse_delta(&dx, &dy);
             g_aim_vx = g_aim_vx * 0.5f + (float)dx * g_mouse_sens; g_aim_vy = g_aim_vy * 0.5f + (float)dy * g_mouse_sens;
             float vx = g_aim_vx < -127 ? -127 : g_aim_vx > 127 ? 127 : g_aim_vx, vy = g_aim_vy < -127 ? -127 : g_aim_vy > 127 ? 127 : g_aim_vy;
@@ -148,7 +205,10 @@ static SYSV int pad_read_state(int h, u8 *d) {
         }
     }
     /* a game controller (DualShock 4 / DualSense over HID, or XInput) adds to the keyboard */
-    PlatPad cp; int ctrl = g_win.focused && plat_pad_poll(&cp);
+    /* t199f: in unattended runs (--scripted-input) a game controller is still read while the window is in front, so that a
+       person can help a character along; the keyboard and mouse stay ignored there (typing meant for another program used
+       to reach the game) unless --scripted-input-strict */
+    PlatPad cp; int ctrl = g_win.focused && g_opt_scripted_input < 2 && plat_pad_poll(&cp);
     if (ctrl) {
         static const char *last_kind; if (cp.kind != last_kind) { say("  controller: "); say(cp.kind ? cp.kind : "?"); say(cp.has_motion ? " (with motion sensors)\n" : "\n"); last_kind = cp.kind; }
         g_pad_ctrl_reads++;
@@ -161,6 +221,10 @@ static SYSV int pad_read_state(int h, u8 *d) {
     }
     { u32 sb = press_due(); static u32 last_sb; if (sb & ~last_sb) { say("  scripted press at flip "); say_dec((i64)g_flips); say("\n"); } last_sb = sb; b |= sb; }
     if (b & ~g_pad_last) g_pad_presses++;
+    g_pad_last = b;
+    stick_due(&lx, &ly, &rx, &ry);   /* t193 */
+    if (g_inrep_path) { u32 qb; int q[6]; if (inrep_get(&qb, &q[0], &q[1], &q[2], &q[3], &q[4], &q[5])) { b |= qb; lx = q[0]; ly = q[1]; rx = q[2]; ry = q[3]; if (q[4] > l2) l2 = q[4]; if (q[5] > r2) r2 = q[5]; } }   /* t199d */
+    if (g_inrec_path) inrec_note(b, lx, ly, rx, ry, l2, r2);
     g_pad_last = b;
     *(u32 *)d = b;
     d[4] = (u8)lx; d[5] = (u8)ly; d[6] = (u8)rx; d[7] = (u8)ry; d[8] = (u8)l2; d[9] = (u8)r2;
@@ -181,7 +245,7 @@ static SYSV int pad_read_state(int h, u8 *d) {
     /* touch pad (ScePadTouchData at +52: count, then 2 x {u16 x, u16 y, u8 id} at +60 / +68; pad 1920 x 943):
        left mouse button held inside the window = one finger at the pointer (drag = swipe; click with T = press);
        F / G / R / V = a quick swipe left / right / up / down across the middle of the pad */
-    if (g_win.focused) {
+    if (PAD_FOCUS) {
         static int sw_dir = -1; static u64 sw_t0; static u8 tid; static int was_down;
         u64 now = plat_ticks(), dur = plat_ticks_per_sec() / 4;   /* a swipe takes 250 ms */
         int sw_on = sw_dir >= 0 && now - sw_t0 < dur;
@@ -353,6 +417,18 @@ static SYSV int ac_param_get_int(int id, int *v) {
 /* libSceGnmDriver */
 static SYSV int gnm_user_pa(void) { return 0; }     /* user PA debug interface: disabled, as on a retail console */
 static SYSV int gnm_ok(void) { return 0; }
+/* popin: sceGnmSetupMipStatsReport(buffer, size, ...) - see g_opt_mipstats in e3_hle.c. With --mip-stats the ring starts
+   as valid reports of "nothing sampled" (header = the first report); without it the buffer is not touched, as before. */
+static SYSV int gnm_mipstats_setup(void *buf, u32 size, u32 a2, u32 a3, u32 a4) {
+    g_ms_buf = (u64)buf; g_ms_size = size;
+    say("  mip statistics (popin): the game set up a report buffer at "); say_hex((u64)buf); say(", "); say_dec(size); say(" bytes ("); say_dec(a2); say(", "); say_dec(a3); say(", "); say_dec(a4);
+    say(g_opt_mipstats ? "); reports are written (--mip-stats)\n" : "); nothing writes it (the game reads zeros in front of it: every texture counts as sampled at level 0)\n");
+    if (g_opt_mipstats && buf && size >= 0x840 && size <= (64u << 20) && mem_ok((u64)buf, size)) {
+        *(volatile u32 *)buf = 0x40;
+        for (u64 o = 0x40; o + 8 <= size; o += 8) *(volatile u64 *)((u64)buf + o) = 0x0F00000000000000ull;
+    }
+    return 0;
+}
 /* The tessellation-factor ring's GPU address. The game maps its own direct memory there (seen in the log:
    a fixed mapping at exactly the returned address), so this only returns the address and maps nothing.
    0xFF0000000 is at the top of the 8-64 GB range, away from the game's other mappings. */
@@ -486,7 +562,7 @@ static const HleEntry g_hle_sys[] = {
     {"sceRtcGetCurrentTick", (void *)rtc_current_tick}, {"sceRtcSetTick", (void *)rtc_set_tick}, {"sceRtcGetDayOfWeek", (void *)rtc_day_of_week},
     {"sceRtcGetWin32FileTime", (void *)rtc_win32_filetime}, {"sceRtcFormatRFC2822LocalTime", (void *)rtc_format_rfc2822_local},
     {"sceAppContentInitialize", (void *)ac_initialize}, {"sceAppContentAppParamGetInt", (void *)ac_param_get_int},
-    {"sceGnmIsUserPaEnabled", (void *)gnm_user_pa}, {"sceGnmSetupMipStatsReport", (void *)gnm_ok},
+    {"sceGnmIsUserPaEnabled", (void *)gnm_user_pa}, {"sceGnmSetupMipStatsReport", (void *)gnm_mipstats_setup},
     {"sceGnmGetTheTessellationFactorRingBufferBaseAddress", (void *)gnm_tf_ring},
     {"sceMsgDialogInitialize", (void *)md_init}, {"sceMsgDialogOpen", (void *)md_open}, {"sceMsgDialogUpdateStatus", (void *)md_status},
     {"sceMsgDialogGetResult", (void *)md_result}, {"sceMsgDialogClose", (void *)md_close}, {"sceMsgDialogTerminate", (void *)md_term},

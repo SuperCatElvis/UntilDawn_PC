@@ -35,8 +35,12 @@ static SYSV int sd_dir_search(const SdSearchCond *cond, SdSearchResult *r) {
 typedef struct { int user; int pad; const char *title_id; const char *dir_name; const void *fingerprint; u64 blocks; u32 mode; } SdMount;
 typedef struct { char mount_point[16]; u64 required_blocks; u32 unused, mount_status; } SdMountResult;
 static int g_save_mounts_total;
+static int g_opt_sd_delay_ms, g_opt_sd_delay_nth = 1;
+static volatile u32 g_sd_mount_calls; static volatile u64 g_sd_mount_tick;   /* w3: save-data mounts asked so far, and when the last one returned (the splash-skip gate, e3_loader.c) */   /* w3 test option --savedata-delay-ms N: the first save-data mount takes N ms longer (a slow disk at start-up) */
 static SYSV int sd_mount(const SdMount *m, SdMountResult *r) {
     TRACE("sceSaveDataMount", m ? m->dir_name : 0, m ? m->mode : 0, m ? m->blocks : 0);
+    if (g_save_mounts_total < 24) { say("  save data mount asked: \""); say(m && m->dir_name ? m->dir_name : "?"); say("\" (flip "); say_dec((i64)g_plat_frame); say(")\n"); }   /* w3 */
+    { static int nth; nth++; if (g_opt_sd_delay_ms && nth == g_opt_sd_delay_nth) { say("  (test) this save data mount is delayed\n"); plat_sleep_ms((u32)g_opt_sd_delay_ms); } }
     if (!m || !r || !m->dir_name) return (int)0x809F0001;
     char host[1100]; save_host_dir(host, m->dir_name);
     pm_lock(&g_save_lock);
@@ -56,7 +60,7 @@ static SYSV int sd_mount(const SdMount *m, SdMountResult *r) {
     pm_unlock(&g_save_lock);
     if (slot < 0) return (int)0x809F000B;   /* MOUNT_FULL */
     r->required_blocks = 0; r->mount_status = (u32)status;
-    g_save_mounts_total++;
+    g_save_mounts_total++; __atomic_store_n(&g_sd_mount_tick, plat_ticks(), __ATOMIC_RELEASE); __atomic_add_fetch(&g_sd_mount_calls, 1, __ATOMIC_RELEASE);
     tr("    save data \""); tr(m->dir_name); tr(status ? "\" created and mounted at " : "\" mounted at "); tr(r->mount_point); tr("\n");
     return 0;
 }

@@ -16,6 +16,7 @@ GetCursorPos
 ScreenToClient
 MessageBoxA
 GetSystemMetrics
+SetProcessDPIAware
 AdjustWindowRect
 LoadIconA
 SetCursorPos
@@ -23,3 +24,9 @@ ClientToScreen
 ClipCursor
 ShowCursor
 SetCursor
+GetWindowRect
+EnumDisplayMonitors
+GetMonitorInfoA
+MonitorFromWindow
+SetWindowPos
+SetWindowLongPtrA

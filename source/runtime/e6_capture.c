@@ -55,6 +55,7 @@ static void rc_out(const void *p, u64 n) {
 }
 static void rc_writer(void *arg) {
     (void)arg; u64 written = 0;
+    int low_ = g_bg_io_low && SetThreadPriority(GetCurrentThread(), 0x00010000 /* THREAD_MODE_BACKGROUND_BEGIN */) != 0;   /* w11_load: the GBs of a capture do not compete with the game's file reads */
     for (;;) {
         pm_lock(&g_rcq_m);
         while (!g_rcq_head && !g_rcq_closing) pc_wait(&g_rcq_c, &g_rcq_m, 100000);
@@ -65,8 +66,9 @@ static void rc_writer(void *arg) {
         plat_write_bin(g_rc_file, b->d, b->n); written += b->n; plat_free_pages(b);
     }
     plat_close(g_rc_file); g_rc_file = 0;
+    if (low_) SetThreadPriority(GetCurrentThread(), 0x00020000 /* THREAD_MODE_BACKGROUND_END */);
     say("    replay capture file complete: "); say_dec((i64)(written >> 20)); say(" MB written in ");
-    say_dec((i64)((plat_ticks() - g_rc_t0) * 1000 / plat_ticks_per_sec())); say(" ms (background)\n");
+    say_dec((i64)((plat_ticks() - g_rc_t0) * 1000 / plat_ticks_per_sec())); say(low_ ? " ms (background, low I/O priority)\n" : " ms (background)\n");
     __atomic_store_n(&g_rc_writer_busy, 0, __ATOMIC_RELEASE);
 }
 static void rc_chunk(u32 tag, const void *p, u64 n) { u64 h[2] = {tag, n}; rc_out(h, 16); if (n) rc_out(p, n); }
@@ -130,6 +132,7 @@ static u32 rc_depth_bytes(u32 fmt) { return (fmt == VK_FORMAT_D16_UNORM || fmt =
 /* which images are captured, and how many bytes each takes (depth as 32-bit floats, then stencil bytes) */
 static int rc_img_bytes(const VImg *m, u64 *main, u64 *sten) {
     if (!m->img || m->is_copy || (!m->gpu_written && !m->depth)) return 0;
+    if (m->rs) return 0;   /* t196: scaled images are not captured (a capture is made without --render-scale) */
     if (m->fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && m->fmt <= VK_FORMAT_BC7_SRGB_BLOCK) return 0;
     u64 layers = (!m->is3d && m->d > 1) ? m->d : 1, depth3 = m->is3d ? m->d : 1, px = (u64)m->w * m->h * depth3 * layers;
     /* depth as Vulkan copies it: 2 bytes per texel for D16, 4 for the 32-bit formats (captures made before 19 Oct
@@ -314,6 +317,13 @@ static void rc_trace_step(void) {
         vk_submit_wait();
         Sb t = {b, 0, sizeof b}; sb_s(&t, "  img "); sb_x(&t, m->addr); sb_s(&t, " "); sb_d(&t, m->w); sb_s(&t, "x"); sb_d(&t, m->h); sb_s(&t, " f"); sb_d(&t, m->fmt);
         sb_s(&t, " "); sb_x(&t, rct_hash(V.stage_map, a + st));
+        {   /* t193: the hash of the surface's viewed part (t191: the same in a padded and in a view-sized image) */
+            VwEnt *e = vw_ent(m->addr, m->lw ? m->lw : m->w, m->lh ? m->lh : m->h, m->fmt, 0);
+            u32 cw = e && e->state && e->vw < m->w ? e->vw : m->w, ch = e && e->state && e->vh < m->h ? e->vh : m->h;
+            u64 bpt = !m->is3d && m->d <= 1 && m->w && m->h ? a / ((u64)m->w * m->h) : 0;
+            if (bpt && bpt * m->w * m->h == a) { u64 hv = 0x9E3779B97F4A7C15ull;
+                for (u32 y = 0; y < ch; y++) { hv = (hv ^ rct_hash(V.stage_map + (u64)y * m->w * bpt, (u64)cw * bpt)) * 0xff51afd7ed558ccdull; hv ^= hv >> 31; }
+                sb_s(&t, " view "); sb_d(&t, cw); sb_s(&t, "x"); sb_d(&t, ch); sb_s(&t, " "); sb_x(&t, hv); } }
         { u32 x0, y0, x1, y1; u64 nf = m->depth ? 0 : rct_nonfinite(V.stage_map, m, &x0, &y0, &x1, &y1);
           if (nf) { sb_s(&t, " nonfinite "); sb_d(&t, (i64)nf); sb_s(&t, " in "); sb_d(&t, x0); sb_s(&t, ","); sb_d(&t, y0); sb_s(&t, "-"); sb_d(&t, x1); sb_s(&t, ","); sb_d(&t, y1); } }
         if (!m->depth) { i64 mn = rct_mean(V.stage_map, m); if (mn >= 0) { sb_s(&t, " mean_r "); sb_d(&t, mn); } }
@@ -334,6 +344,19 @@ static void rc_trace_step(void) {
         rct_stage_begin(); VkBufferCopy bc = {lo - sh->lo, 0, hi - lo}; vkCmdCopyBuffer(V.cb, sh->buf, V.stage, 1, &bc); vk_submit_wait();
         Sb t = {b, 0, sizeof b}; sb_s(&t, "  vram "); sb_x(&t, lo); sb_s(&t, "-"); sb_x(&t, hi); sb_s(&t, " "); sb_x(&t, rct_hash(V.stage_map, hi - lo)); sb_s(&t, "\n"); plat_write(g_rct_file, b); }
     g_rct_nsw = 0;
+    if (g_opt_sh_verify) {   /* w3 diagnostic --sh-verify: written-back VRAM copies against RAM, whenever the number of differing dwords changes */
+        static u64 last[512];
+        for (int i = 0; i < g_nsh; i++) { VShadow *sh = &g_sh[i]; if (!sh->live || !sh->wb || sh->hi - sh->lo > V.stage_size || !mem_ok(sh->lo, sh->hi - sh->lo)) continue;
+            rct_stage_begin(); VkBufferCopy bc = {0, 0, sh->hi - sh->lo}; vkCmdCopyBuffer(V.cb, sh->buf, V.stage, 1, &bc); vk_submit_wait();
+            const u32 *v = (const u32 *)V.stage_map, *r = (const u32 *)sh->lo; u64 n = (sh->hi - sh->lo) / 4, nd = 0, first = 0, lastd = 0, runs = 0; int inrun = 0;
+            for (u64 q = 0; q < n; q++) { if (v[q] != r[q]) { if (!nd) first = q; nd++; lastd = q; if (!inrun) { runs++; inrun = 1; } } else inrun = 0; }
+            if (nd == last[i]) continue; last[i] = nd;
+            Sb t = {b, 0, sizeof b}; sb_s(&t, "  shverify "); sb_x(&t, sh->lo); sb_s(&t, "-"); sb_x(&t, sh->hi); sb_s(&t, " dwords differing "); sb_d(&t, (i64)nd); sb_s(&t, " in runs "); sb_d(&t, (i64)runs);
+            if (nd) { sb_s(&t, " first "); sb_x(&t, sh->lo + 4 * first); sb_s(&t, " vram "); sb_x(&t, v[first]); sb_s(&t, " ram "); sb_x(&t, r[first]); sb_s(&t, " last "); sb_x(&t, sh->lo + 4 * lastd); }
+            sb_s(&t, "\n"); plat_write(g_rct_file, b);
+            if (nd) { inrun = 0; int pr = 0; for (u64 q = 0; q < n && pr < 12; q++) { if (v[q] != r[q]) { if (!inrun) { u64 e = q; while (e < n && v[e] != r[e]) e++; Sb u = {b, 0, sizeof b}; sb_s(&u, "    run "); sb_x(&u, sh->lo + 4 * q); sb_s(&u, "-"); sb_x(&u, sh->lo + 4 * e); sb_s(&u, " vram "); sb_x(&u, v[q]); sb_s(&u, " ram "); sb_x(&u, r[q]); sb_s(&u, "\n"); plat_write(g_rct_file, b); pr++; inrun = 1; } } else inrun = 0; } }
+        }
+    }
     if (V.gds) { rct_stage_begin(); VkBufferCopy bc = {0, 0, 65536}; vkCmdCopyBuffer(V.cb, V.gds, V.stage, 1, &bc); vk_submit_wait();
         Sb t = {b, 0, sizeof b}; sb_s(&t, "  gds "); sb_x(&t, rct_hash(V.stage_map, 65536)); sb_s(&t, "\n"); plat_write(g_rct_file, b); }
 }
@@ -355,8 +378,8 @@ static u64 g_rc_sum; static const char *g_rc_sum_path; static const char *g_rc_r
 static int g_rc_memo_flush;   /* t107: --replay-memo-flush */
 static int g_rc_trc_from, g_rc_trc_to;   /* t154: --g2s-trace-repeats A-B: translation trace (e6_g2strace.c) of replay repeats A..B */
 static int g_rc_repeat, g_rc_vram_at;   /* --replay-vram K: before repeat K, game memory copied to VRAM (vk_mirror_all) */
-typedef struct { u64 t, busy, sub, tr, tex, pipe, wait, draw, draws, bar, batches, bsub, qsub, disp, wbk, mh, mm, mc, w_new, w_gw, w_mem, w_ev, fw, csk, cew, cep, sf; u32 slow[24]; int has_slow; u64 tc[11], tx[4], gws; u64 nk[6], full, rel; } RcRep;
-static void rc_rep_take(RcRep *r) { r->t = plat_ticks(); r->busy = g_gpu_busy_ns; r->sub = g_t_submit; r->tr = g_t_tr; r->tex = g_t_tex; r->pipe = g_t_pipe;
+typedef struct { u64 t, busy, sub, tr, tex, pipe, wait, draw, draws, bar, batches, bsub, qsub, disp, wbk, mh, mm, mc, w_new, w_gw, w_mem, w_ev, fw, csk, cew, cep, sf; u32 slow[24]; int has_slow; u64 tc[11], tx[4], gws; u64 nk[6], full, rel; u64 tsc, ls[G2S_LS_N]; u64 sp[SPS_N]; } RcRep;
+static void rc_rep_take(RcRep *r) { r->tsc = __builtin_ia32_rdtsc(); g2s_ls_get(r->ls); spec_get(r->sp); r->t = plat_ticks(); r->busy = g_gpu_busy_ns; r->sub = g_t_submit; r->tr = g_t_tr; r->tex = g_t_tex; r->pipe = g_t_pipe;
     r->wait = g_t_wait; r->draw = g_t_draw; r->draws = g_draws; r->bar = g_n_vkbar; r->batches = g_gpu_batches;
     r->bsub = g_t_bsub; r->qsub = g_t_qsub; r->disp = g_t_disp; r->wbk = g_t_wbk; g2s_memo_stats(&r->mh, &r->mm, &r->mc); g2s_memo_why(&r->w_new, &r->w_gw, &r->w_mem, &r->w_ev); r->fw = g_n_full_waits; r->sf = g_n_slot_full; r->has_slow = vk_slow_read(r->slow); g2s_memo_code_stats(&r->csk, &r->cew, &r->cep);
     for (int k = 0; k < 11; k++) r->tc[k] = g_tc[k]; for (int k = 0; k < 4; k++) r->tx[k] = g_t_tx[k]; r->gws = g_gw_seq; g2s_memo_nokeep(r->nk);
@@ -365,7 +388,7 @@ static void rc_rep_say(int k, const RcRep *a, void *res) {
     RcRep b; rc_rep_take(&b);
     u64 f = plat_ticks_per_sec() / 10000;   /* 0.1 ms */
 #define D01(x) sb_d(&s, (i64)((x) / 10)); sb_s(&s, "."); sb_d(&s, (i64)((x) % 10))
-    char t[2048]; Sb s = {t, 0, sizeof t};
+    char t[4096]; Sb s = {t, 0, sizeof t};
     sb_s(&s, "  repeat "); sb_d(&s, k); sb_s(&s, ": "); D01((b.t - a->t) / f); sb_s(&s, " ms wall; game submit calls "); D01((b.sub - a->sub) / f);
     sb_s(&s, " ms (draw recording "); D01((b.draw - a->draw) / f); sb_s(&s, ": translation "); D01((b.tr - a->tr) / f); sb_s(&s, ", textures "); D01((b.tex - a->tex) / f);
     sb_s(&s, ", pipelines "); D01((b.pipe - a->pipe) / f); sb_s(&s, ", GPU waits "); D01((b.wait - a->wait) / f); sb_s(&s, "); GPU busy "); D01((b.busy - a->busy) / 100000);
@@ -384,6 +407,25 @@ static void rc_rep_say(int k, const RcRep *a, void *res) {
     sb_s(&s, ", CPU writes "); sb_d(&s, (i64)(b.tc[6] - a->tc[6])); sb_s(&s, ", GPU writes "); sb_d(&s, (i64)(b.tc[7] - a->tc[7])); sb_s(&s, "; same bytes "); sb_d(&s, (i64)(b.tc[8] - a->tc[8]));
     sb_s(&s, ", uploaded "); sb_d(&s, (i64)(b.tc[9] - a->tc[9])); sb_s(&s, ", waits for GPU writers "); sb_d(&s, (i64)(b.tc[10] - a->tc[10])); sb_s(&s, "; GPU writes logged "); sb_d(&s, (i64)(b.gws - a->gws));
     sb_s(&s, "; ms: checks "); D01((b.tx[0] - a->tx[0]) / f); sb_s(&s, ", tracking restarts "); D01((b.tx[1] - a->tx[1]) / f); sb_s(&s, ", hashing "); D01((b.tx[2] - a->tx[2]) / f); sb_s(&s, ", uploads "); D01((b.tx[3] - a->tx[3]) / f); sb_s(&s, "\n");
+    if (g_sp_on) {   /* t181 */
+        u64 dt = b.t - a->t; u64 cpus = dt ? (b.tsc - a->tsc) * (plat_ticks_per_sec() / 1000000) / dt : 3000; if (!cpus) cpus = 3000;
+        sb_s(&s, "      "); spec_line(&s, a->sp, b.sp, cpus); }
+    if (g2s_ls_on) {   /* t181a: --lookup-stats */
+        const u64 *x = a->ls, *y = b.ls; u64 d[G2S_LS_N]; for (int q = 0; q < G2S_LS_N; q++) d[q] = y[q] - x[q];
+        u64 dt = b.t - a->t; u64 cpus = dt ? (b.tsc - a->tsc) * (plat_ticks_per_sec() / 1000000) / dt : 1; if (!cpus) cpus = 1;   /* TSC cycles per us */
+#define LUS(c) D01((c) * 10 / cpus / 1000)
+        sb_s(&s, "      lookups (t181a): "); sb_d(&s, (i64)d[G2S_LS_LOOKUPS]); sb_s(&s, " (VS "); sb_d(&s, (i64)d[G2S_LS_VS]); sb_s(&s, ", PS "); sb_d(&s, (i64)d[G2S_LS_PS]); sb_s(&s, ", CS "); sb_d(&s, (i64)d[G2S_LS_CS]);
+        sb_s(&s, "; tessellation / geometry "); sb_d(&s, (i64)d[G2S_LS_TESSGS]); sb_s(&s, "): exact "); sb_d(&s, (i64)d[G2S_LS_EXACT]); sb_s(&s, ", relocated "); sb_d(&s, (i64)d[G2S_LS_RELOC]);
+        sb_s(&s, ", full "); sb_d(&s, (i64)d[G2S_LS_FULL]); sb_s(&s, ", other "); sb_d(&s, (i64)d[G2S_LS_OTHER]); sb_s(&s, "; ms: all "); LUS(d[G2S_LS_CYC]); sb_s(&s, " (exact "); LUS(d[G2S_LS_CYC_EXACT]);
+        sb_s(&s, ", relocated "); LUS(d[G2S_LS_CYC_RELOC]); sb_s(&s, ", full "); LUS(d[G2S_LS_CYC_FULL]); sb_s(&s, "), these statistics "); LUS(d[G2S_LS_CYC_STATS]);
+        u64 nh = d[G2S_LS_EXACT] + d[G2S_LS_RELOC]; if (!nh) nh = 1;
+        sb_s(&s, "\n      reused lookups (t181a): data ranges read "); sb_d(&s, (i64)d[G2S_LS_RANGES]); sb_s(&s, " ("); sb_d(&s, (i64)(d[G2S_LS_RANGES] / nh)); sb_s(&s, " per lookup, ");
+        sb_d(&s, (i64)(d[G2S_LS_DWORDS] / nh)); sb_s(&s, " dwords); with a GPU-written answer "); sb_d(&s, (i64)d[G2S_LS_GWTRUE]);
+        sb_s(&s, "; newest write in this submit over what they read, in lookups before: none "); sb_d(&s, (i64)d[G2S_LS_D_NONE]); sb_s(&s, ", 1 "); sb_d(&s, (i64)d[G2S_LS_D1]);
+        sb_s(&s, ", 2-3 "); sb_d(&s, (i64)d[G2S_LS_D3]); sb_s(&s, ", 4-15 "); sb_d(&s, (i64)d[G2S_LS_D15]); sb_s(&s, ", 16-63 "); sb_d(&s, (i64)d[G2S_LS_D63]); sb_s(&s, ", 64-255 "); sb_d(&s, (i64)d[G2S_LS_D255]);
+        sb_s(&s, ", 256+ "); sb_d(&s, (i64)d[G2S_LS_DMORE]); sb_s(&s, "; writes noted "); sb_d(&s, (i64)d[G2S_LS_WRITES]); sb_s(&s, " (table full "); sb_d(&s, (i64)d[G2S_LS_OVER]); sb_s(&s, ")\n");
+#undef LUS
+    }
     if (a->has_slow && b.has_slow) {   /* --mem-slow */
         sb_s(&s, "      shader memory accesses missing the page table: loads "); sb_d(&s, (i64)(b.slow[0] - a->slow[0])); sb_s(&s, " (not in any region "); sb_d(&s, (i64)(b.slow[1] - a->slow[1]));
         sb_s(&s, "), stores "); sb_d(&s, (i64)(b.slow[2] - a->slow[2])); sb_s(&s, "; first addresses (whole run): load "); sb_x(&s, ((u64)b.slow[17] << 32) | b.slow[16]);
@@ -416,10 +458,27 @@ static VImg *rc_find_img(const RcImg *ri) {
         if (!best || m->wseq > best->wseq) best = m; }
     return best;
 }
+/* t193: a captured padded surface whose image is view-sized now (t191): compared over the viewed part */
+static VImg *rc_find_img_view(const RcImg *ri) {
+    VImg *best = 0;
+    FOR_ADDR(i, ri->addr) { VImg *m = &V.img[i];
+        if (!m->img || m->is_copy || m->addr != ri->addr || m->lw != ri->w || m->lh != ri->h || (m->w == ri->w && m->h == ri->h) || m->w > ri->w || m->h > ri->h) continue;
+        if ((u32)m->fmt != ri->fmt || (u32)m->depth != ri->depth || m->is3d || m->arrayed || ri->d > 1) continue;
+        if (!best || m->wseq > best->wseq) best = m; }
+    return best;
+}
 /* exit code: 0 every image identical, 1 differences, 2 capture unusable, 3 replay failed */
 static void prof_replay_begin(void); static void prof_replay_end(void);   /* t115: --profile-replay (e5_gpu.c) */
 static void rwd_start(void);   /* t156: replay watchdog (e5_gpu.c) */
+static int g_opt_rp_anycore;   /* t171: --replay-any-core */
+/* w2: --replay-mem-sync. The capture's memory pages (what the game's threads wrote between two submits) were
+   written into game memory as soon as the replay reached them - while batches of the earlier submits could still be
+   waiting on the back-end thread or the GPU, which read game memory when they RUN (imported host memory, mirror
+   copies). The live game made those writes after the labels of the earlier work had come back. With this option the
+   replay waits for the GPU before it applies captured memory after a submit. */
+static int g_rc_memsync; static u64 g_rc_memsync_n;
 static int rc_replay(const char *path) {
+    int rc_gpu_busy = 0;
     void *f = hf_open_rb(path);
     if (!f) { say("replay: cannot open "); say(path); say("\n"); return 2; }
     char mg[8]; if (!rc_rd(f, mg, 8) || !rc_magic_ok(mg)) { say("replay: not a capture file\n"); return 2; }
@@ -450,6 +509,12 @@ static int rc_replay(const char *path) {
             plat_window_open(); vkr_init();
             if (!g_vk_on) { say("replay: Vulkan renderer did not start\n"); return 3; }
             vk_up = 1; rwd_start();   /* t156 */
+            if (!g_opt_rp_anycore) {   /* t171: the replay thread as the play renderer thread (t107h/i): high priority, performance cores only.
+                   Left to Windows, a replay's frame times jumped between ~31 and ~50 ms (6125) as the thread moved between
+                   performance and efficiency cores. --replay-any-core: the old way. */
+                void *me = plat_this_thread(); pt_set_priority_high(me);
+                int np = plat_thread_on_pcores(me);
+                say("replay: replay thread at high priority"); if (np) { say(", kept on the "); say_dec(np); say(" performance-core processors"); } say(" (t171)\n"); }
             if (g_prep_replay) { prep_run(); if (g_prep_exit) { vk_save_pcache(); say("replay: --prep-exit: ended after the shader preparation\n"); return 0; } }   /* t159 */
             /* result file: the first free replay_<flip>_run<k>.txt */
             for (run = 1; run < 1000; run++) { Sb s = {rp, 0, sizeof rp}; sb_s(&s, g_cap_dir); sb_s(&s, "/replay_"); sb_d(&s, (i64)flip_no); sb_s(&s, "_run"); sb_d(&s, run); sb_s(&s, ".txt"); if (plat_file_size(rp) < 0) break; }
@@ -462,6 +527,7 @@ static int rc_replay(const char *path) {
         if (tag == RC_MISC) { u64 misc[4]; if (n != sizeof misc || !rc_rd(f, misc, n)) return 2; g_index_base = misc[0]; g_index_type = (u32)misc[1]; g_index_size = (u32)misc[2]; g_num_instances = (u32)misc[3]; continue; }
         if (tag == RC_CERM) { if (n != 65536 || !g_rc_ce_ram || !rc_rd(f, g_rc_ce_ram, n)) return 2; continue; }
         if (tag == RC_MEMP) {
+            if (g_rc_memsync && vk_up && rc_gpu_busy) { vk_submit_wait(); rc_gpu_busy = 0; g_rc_memsync_n++; }   /* w2: see g_rc_memsync */
             u64 sc[2]; if (!rc_rd(f, sc, 16)) return 2;
             for (u64 k = 0; k < sc[1]; k++) {
                 u64 a; if (!rc_rd(f, &a, 8)) return 2;
@@ -469,7 +535,8 @@ static int rc_replay(const char *path) {
                 if (!rc_rd(f, (void *)a, 4096)) return 2;
             }
             continue; }
-        if (tag == RC_SHDW) {   /* the VRAM copy's contents go into memory; E6 copies them to VRAM when it creates the copy again */
+        if (tag == RC_SHDW) {
+            if (g_rc_memsync && vk_up && rc_gpu_busy) { vk_submit_wait(); rc_gpu_busy = 0; g_rc_memsync_n++; }   /* the VRAM copy's contents go into memory; E6 copies them to VRAM when it creates the copy again */
             u64 lh[2]; if (!rc_rd(f, lh, 16) || !mem_ok(lh[0], lh[1] - lh[0]) || n != 16 + lh[1] - lh[0]) return 2;
             if (!rc_rd(f, (void *)lh[0], lh[1] - lh[0])) return 2;
             continue; }
@@ -516,12 +583,21 @@ static int rc_replay(const char *path) {
                 VImg *m = rc_find_img(&ri);
                 if (res) { char t[160]; Sb s = {t, 0, sizeof t}; sb_s(&s, "  "); sb_x(&s, ri.addr); sb_s(&s, " "); sb_d(&s, ri.w); sb_s(&s, "x"); sb_d(&s, ri.h); sb_s(&s, "x"); sb_d(&s, ri.d);
                     sb_s(&s, " fmt "); sb_d(&s, ri.fmt); sb_s(&s, ri.depth ? " depth" : ""); sb_s(&s, ": "); plat_write(res, t); }
+                int crop = 0; if (!m) { m = rc_find_img_view(&ri); crop = m != 0; }
                 if (!m) { n_missing++; if (res) plat_write(res, "MISSING in replay\n"); continue; }
+                VImg *m_rs = m->rs ? m : 0;   /* t196: a scaled image is compared (and shown) at the game's size: its 1x resample */
+                if (m_rs) { m = rs_1x(m_rs); if (!m) { n_missing++; if (res) plat_write(res, "scaled image: no 1x copy possible\n"); continue; } if (res) plat_write(res, "(scaled, resampled to 1x) "); }
+                if (crop && res) { char t[64]; Sb s = {t, 0, sizeof t}; sb_s(&s, "(view "); sb_d(&s, m->w); sb_s(&s, "x"); sb_d(&s, m->h); sb_s(&s, ") "); plat_write(res, t); }
                 vk_begin_cb(); vk_end_rendering(); stage_dev(); V.stage_used = 0;
+                if (crop) mem_copy(V.stage_map, buf, ri.bytes);   /* outside the viewed part: as captured */
                 VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
                 vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+                if (crop) { VkBufferImageCopy bic = {0, ri.w, ri.h, {ri.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {m->w, m->h, 1}};
+                    vkCmdCopyImageToBuffer(V.cb, m->img, VK_IMAGE_LAYOUT_GENERAL, V.stage, 1, &bic);
+                    if (has_st && m->stencil) { bic.bufferOffset = main; bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT; vkCmdCopyImageToBuffer(V.cb, m->img, VK_IMAGE_LAYOUT_GENERAL, V.stage, 1, &bic); } }
+                else {
                 rc_copy_image_to_stage(m, ri.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0);
-                if (has_st && m->stencil) rc_copy_image_to_stage(m, VK_IMAGE_ASPECT_STENCIL_BIT, main);
+                if (has_st && m->stencil) rc_copy_image_to_stage(m, VK_IMAGE_ASPECT_STENCIL_BIT, main); }
                 vk_submit_wait();
                 const u8 *got = V.stage_map; u64 ndiff = 0, maxd = 0;
                 for (int q = 0; q < g_rc_ndcap; q++) if (g_rc_dcap[q] == ri.addr) { char nm[128]; Sb s3 = {nm, 0, sizeof nm}; sb_s(&s3, "replay_replayed_"); sb_x(&s3, ri.addr); sb_s(&s3, "_"); sb_d(&s3, ri.w); sb_s(&s3, "x"); sb_d(&s3, ri.h); sb_s(&s3, "_f"); sb_d(&s3, ri.fmt); sb_s(&s3, ri.depth ? "_depth" : ""); sb_s(&s3, ".bin");
@@ -541,6 +617,15 @@ static int rc_replay(const char *path) {
                         for (u64 i = 0; i + 3 < ri.bytes; i += 4) { u8 a = V.stage_map[i]; V.stage_map[i] = V.stage_map[i + 2]; V.stage_map[i + 2] = a; a = buf[i]; buf[i] = buf[i + 2]; buf[i + 2] = a; }
                     char nm[96]; Sb s = {nm, 0, sizeof nm}; sb_s(&s, "replay_"); sb_d(&s, (i64)flip_no); sb_s(&s, "_run"); sb_d(&s, run); sb_s(&s, "_display.bmp"); bmp_write(nm, got, ri.w, ri.h);
                     Sb s2 = {nm, 0, sizeof nm}; sb_s(&s2, "replay_"); sb_d(&s2, (i64)flip_no); sb_s(&s2, "_captured_display.bmp"); bmp_write(nm, buf, ri.w, ri.h);
+                    u32 pw_ = m_rs ? rs_up(ri.w < m_rs->w ? ri.w : m_rs->w) : 0, ph_ = m_rs ? rs_up(ri.h < m_rs->h ? ri.h : m_rs->h) : 0;
+                    if (m_rs && (u64)pw_ * ph_ * 4 <= V.stage_size) {   /* t196: and the picture in its own (scaled) pixels */
+                        vk_begin_cb(); vk_end_rendering(); V.stage_used = 0;
+                        VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+                        vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb2, 0, 0, 0, 0);
+                        VkBufferImageCopy bic2 = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {pw_, ph_, 1}};
+                        vkCmdCopyImageToBuffer(V.cb, m_rs->img, VK_IMAGE_LAYOUT_GENERAL, V.stage, 1, &bic2); vk_submit_wait();
+                        if (ri.fmt == VK_FORMAT_B8G8R8A8_UNORM || ri.fmt == VK_FORMAT_B8G8R8A8_SRGB) for (u64 i = 0; i + 3 < (u64)pw_ * ph_ * 4; i += 4) { u8 a = V.stage_map[i]; V.stage_map[i] = V.stage_map[i + 2]; V.stage_map[i + 2] = a; }
+                        Sb s3 = {nm, 0, sizeof nm}; sb_s(&s3, "replay_"); sb_d(&s3, (i64)flip_no); sb_s(&s3, "_run"); sb_d(&s3, run); sb_s(&s3, "_display_scaled.bmp"); bmp_write(nm, V.stage_map, pw_, ph_); }
                 }
             }
             if (!expect && g_rc_wseq_top > V.wseq) V.wseq = g_rc_wseq_top;   /* t135: the frame's own writes come after the captured ones */
@@ -575,19 +660,34 @@ static int rc_replay(const char *path) {
                 if (g_rct_file) { plat_write(g_rct_file, "replay trace of "); plat_write(g_rct_file, path); plat_write(g_rct_file, "\n"); }
             }
             if (!g_rp_running) { g_rp_running = 1; g_rp_step = 0; }
-            g_rc_submit_fn((u32)cnt, dcb, dsz, ccb, csz); nsub++; ncb += cnt;
+            g_rc_submit_fn((u32)cnt, dcb, dsz, ccb, csz); nsub++; ncb += cnt; rc_gpu_busy = 1;
             free(rec); free(dcb); free(dsz);
             continue; }
         if (tag == RC_DING) {
             u64 rec[5]; if (n != sizeof rec || !rc_rd(f, rec, n) || !g_rc_doorbell_fn) return 2;
             if (!g_rp_running) { g_rp_running = 1; g_rp_step = 0; }
-            g_rc_doorbell_fn((u32)rec[0], (u32 *)rec[1], (u32)rec[2], (u32)rec[3], (u32)rec[4]); nding++;
+            g_rc_doorbell_fn((u32)rec[0], (u32 *)rec[1], (u32)rec[2], (u32)rec[3], (u32)rec[4]); nding++; rc_gpu_busy = 1;
             continue; }
         if (tag == RC_FLIP) {
             u64 fl[3]; if (n != sizeof fl || !rc_rd(f, fl, n)) return 2;
             dispbuf = fl[2]; if (!rep_k) flips++;
             vk_submit_wait();
             nan_at_flip(0);   /* t135 --nan-scan / --nan-hunt in replays: every frame */
+            if (g_opt_gw_probe && g_fpr_n) {   /* w3 diagnostic: folded values that are not what memory holds once the frame's GPU work has finished */
+                u32 bad = 0, shown = 0;
+                for (u32 q = 0; q < g_fpr_n; q++) { u64 a = g_fpr[q].a; u32 nn = g_fpr[q].n, d1 = 0; if (!mem_ok(a, 4ull * nn)) continue;
+                    for (u32 k = 0; k < nn; k++) if (g_fpr[q].v[k] != ((const u32 *)a)[k]) d1++;
+                    if (!d1) continue; bad++;
+                    if (shown++ < 80) { VShadow *sh = shadow_of(a, 4ull * nn); vl("  fold-probe: draw "); vl_d(g_fpr[q].draw); vl(" folded "); vl_x(a); vl(" x"); vl_d(nn); vl(sh ? (sh->wb ? " (VRAM copy, written back)" : " (VRAM copy)") : " (RAM)"); vl(g_fpr[q].infl ? " [in flight then]" : ""); vl(": "); vl_d(d1); vl(" dwords differ from memory at the end of the frame; then / now:");
+                        for (u32 k = 0; k < 3 && k < nn; k++) { vl(" "); vl_x(g_fpr[q].v[k]); vl("/"); vl_x(((const u32 *)a)[k]); } vl("\n"); } }
+                vl("  fold-probe: "); vl_d(g_fpr_n); vl(" folded loads from GPU-written pages, "); vl_d(bad); vl(" with values that changed by the end of the frame\n"); g_fpr_n = 0; }
+            if (g_opt_gw_probe && g_gwpr_n) {   /* w3 diagnostic */
+                for (int q = 0; q < g_gwpr_n; q++) { u64 a = g_gwpr[q].a; u32 nn = g_gwpr[q].n; VkBuffer bf; u64 off; static u32 vv[16]; int loc = vk_locate(a, 4ull * nn, &bf, &off); VShadow *sh = shadow_of(a, 4ull * nn);
+                    if (loc) { rct_stage_begin(); VkBufferCopy bc = {off, 0, 4ull * nn}; vkCmdCopyBuffer(V.cb, bf, V.stage, 1, &bc); vk_submit_wait(); for (u32 k = 0; k < nn; k++) vv[k] = ((const u32 *)V.stage_map)[k]; }
+                    int d1 = 0, d2 = 0; for (u32 k = 0; k < nn; k++) { if (g_gwpr[q].v[k] != ((const u32 *)a)[k]) d1++; if (loc && vv[k] != ((const u32 *)a)[k]) d2++; }
+                    vl("  gw-probe: draw "); vl_d(g_gwpr[q].draw); vl(" load "); vl_x(a); vl(" x"); vl_d(nn); vl(sh ? (sh->wb ? " (VRAM copy, written back)" : " (VRAM copy)") : " (RAM)"); vl(": RAM at the decision vs RAM now differ in "); vl_d(d1); vl(" dwords, GPU-side bytes vs RAM now in "); vl_d(loc ? d2 : -1);
+                    vl("; then / now / gpu:"); for (u32 k = 0; k < 4 && k < nn; k++) { vl(" "); vl_x(g_gwpr[q].v[k]); vl("/"); vl_x(((const u32 *)a)[k]); vl("/"); vl_x(loc ? vv[k] : 0); } vl("\n"); }
+                g_gwpr_n = 0; }
             if (rep_k) V.frame++;   /* repeats: a new frame for the renderer (per-frame texture checks run again, as in play) */
             continue; }
         if (tag == RC_END_) {
@@ -595,6 +695,7 @@ static int rc_replay(const char *path) {
             if (rep_k && rep_k == g_rc_repeat) prof_replay_end();   /* t115: the profile of the repeats after the first */
             if (rep_k && rep_k == g_rc_repeat && dispbuf) {   /* the displayed picture after the last repeat (to compare runs) */
                 VImg *d = 0; for (int i = 0; i < V.nimg; i++) { VImg *m = &V.img[i]; if (m->addr == dispbuf && m->gpu_written && !m->depth && m->bpe == 32 && !m->is_copy && (!d || m->wseq > d->wseq)) d = m; }
+                if (d && d->rs) d = rs_1x(d);   /* t196: at the game's size, as the other pictures */
                 if (d && (u64)d->w * d->h * 4 <= V.stage_size) {
                     vk_submit_wait(); vk_begin_cb(); vk_end_rendering(); stage_dev(); V.stage_used = 0;
                     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
@@ -613,7 +714,7 @@ static int rc_replay(const char *path) {
                 rep_k++; if (rep_k == g_rc_vram_at) { vk_mirror_all(); vk_submit_wait(); }
                 if (g_rc_memo_flush) g2s_memo_flush();   /* t107: as if every user-data pointer had moved (play) */
                 if (!g_opt_nexp && rep_k == (g_rc_repeat >= 4 ? g_rc_repeat - 2 : g_rc_repeat)) {   /* (--exp: all repeats, one variant each) */   /* the GPU-time-by-shader table: the last repeats only (steady state) */
-                    pm_lock(&g_slock); g_nprof = 0; pm_unlock(&g_slock); g_prof_reps = g_rc_repeat - rep_k + 1; }
+                    pm_lock(&g_slock); g_nprof = 0; tl_reset(); pm_unlock(&g_slock); g_prof_reps = g_rc_repeat - rep_k + 1; }
                 if (rep_k == 3) prof_replay_begin();   /* (repeats 1-2 still create images and warm up) */
                 if (g_rc_trc_from && rep_k == g_rc_trc_from) trc_start();   /* t154: --g2s-trace-repeats A-B (translation trace of repeats A..B) */
                 if (g_rc_trc_from && rep_k == g_rc_trc_to + 1) trc_stop();

@@ -13,7 +13,7 @@ set -e
 cd "$(dirname "$0")"
 B=${UD_BUILD_DIR:-../../build}; mkdir -p "$B/obj"; B=$(cd "$B" && pwd); O=$B/obj
 TS=${UD_LINK_TIMESTAMP:+/timestamp:$UD_LINK_TIMESTAMP}
-clang --target=x86_64-pc-windows-msvc -O1 -ffreestanding -fno-builtin -mno-stack-arg-probe -fno-stack-protector \
+clang --target=x86_64-pc-windows-msvc ${UD_OPT:--O1} -ffreestanding -fno-builtin -mno-stack-arg-probe -fno-stack-protector \
       -Wall -Wno-unused-function -Ivk -c e3_loader.c -o $O/e6_loader.obj
 clang --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin -mno-stack-arg-probe -fno-stack-protector \
       -Wno-unused-function -c gcn2spv.c -o $O/gcn2spv.obj

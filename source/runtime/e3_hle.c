@@ -487,6 +487,8 @@ static void note_level_open(const char *p) {
         if (!k) __atomic_store_n(&g_recap_flip, (u64)g_plat_frame ? (u64)g_plat_frame : 1, __ATOMIC_RELEASE); }
     __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
 }
+#include "e6_ahead.c"   /* w11_load: --read-ahead */
+static int g_ra_fd_pid[MAX_FD];
 static volatile u64 g_hh_opens;   /* t167: game files with "halloween" in their name opened (the pumpkins' assets) */
 static SYSV int h_kopen(const char *p, int flags, int mode) {
     TRACE("sceKernelOpen", p, flags, mode);
@@ -511,8 +513,9 @@ static SYSV int h_kopen(const char *p, int flags, int mode) {
         f = hf_open_rb(hp);
     }
     if (!f) return (int)0x80020002;
+    int rapid_ = kind == 1 ? ra_open(p) : -1;   /* w11_load */
     pm_lock(&g_fd_alloc);
-    for (int i = 3; i < MAX_FD; i++) if (!g_fd[i]) { g_fd[i] = f; fd_set_path(i, p); pm_unlock(&g_fd_alloc); return i; }
+    for (int i = 3; i < MAX_FD; i++) if (!g_fd[i]) { g_fd[i] = f; g_ra_fd_pid[i] = rapid_; fd_set_path(i, p); pm_unlock(&g_fd_alloc); return i; }
     pm_unlock(&g_fd_alloc);
     hf_close(f); return (int)0x80020018;
 }
@@ -531,9 +534,11 @@ static void rb_copy(u8 *d, const u8 *s, u64 n) {   /* 8 bytes at a time (whole s
     while (n--) *d++ = *s++;
 }
 static u64 game_read_(void *f, void *b, u64 n);
+static volatile u64 g_io_last;   /* w11_load: tick of the game's last file read (--pc-save-quiet waits for a pause) */
 static volatile u64 g_io_n, g_io_bytes, g_io_ticks, g_io_max;   /* t144: the game's file reads (count, bytes, ticks, the longest) - for the long-frame lines */
 static u64 game_read(void *f, void *b, u64 n) {
-    u64 t0 = plat_ticks(); u64 r = game_read_(f, b, n); u64 dt = plat_ticks() - t0;
+    u64 t0 = plat_ticks();
+    u64 r = game_read_(f, b, n); u64 dt = plat_ticks() - t0; g_io_last = t0 + dt;
     __atomic_add_fetch(&g_io_n, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_io_bytes, r, __ATOMIC_RELAXED); __atomic_add_fetch(&g_io_ticks, dt, __ATOMIC_RELAXED);
     u64 m = g_io_max; while (dt > m && !__atomic_compare_exchange_n(&g_io_max, &m, dt, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
     return r;
@@ -552,9 +557,12 @@ static u64 game_read_(void *f, void *b, u64 n) {
     __atomic_add_fetch(&g_n_bounced_reads, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_n_bounced_bytes, tot, __ATOMIC_RELAXED);
     return tot;
 }
+/* w11_load test (--read-delay-ms N): a slow / busy disk - every game file read that was not read ahead takes N ms longer */
+static void ra_delay(int hit) { if (!g_opt_read_delay_ms || hit) return; u64 t0 = plat_ticks(); plat_sleep_ms((u32)g_opt_read_delay_ms); __atomic_add_fetch(&g_io_ticks, plat_ticks() - t0, __ATOMIC_RELAXED); }
 static SYSV i64 h_kread(int fd, void *b, u64 n) {
     if (fd < 3 || fd >= MAX_FD || !g_fd[fd]) return (i64)0x80020009;
-    fd_lock(fd); i64 r = g_fd[fd] ? (i64)game_read(g_fd[fd], b, n) : (i64)0x80020009; fd_unlock(fd); fd_read_note(fd, r, n, -1, "read"); if (r > 0) hw_note((u64)b, (u64)r, 2); return r;
+    fd_lock(fd); ra_delay(g_ra_ready && g_fd[fd] && g_ra_fd_pid[fd] >= 0 ? ra_read(g_ra_fd_pid[fd], hf_seek(g_fd[fd], 0, 1), n) : 0);
+    i64 r = g_fd[fd] ? (i64)game_read(g_fd[fd], b, n) : (i64)0x80020009; fd_unlock(fd); fd_read_note(fd, r, n, -1, "read"); if (r > 0) hw_note((u64)b, (u64)r, 2); return r;
 }
 static SYSV i64 h_klseek(int fd, i64 o, int w) {
     if (fd < 3 || fd >= MAX_FD || !g_fd[fd]) return (i64)0x80020009;
@@ -567,6 +575,7 @@ static SYSV i64 h_kpread(int fd, void *b, u64 n, i64 off) {
     fd_lock(fd);
     if (!g_fd[fd]) { fd_unlock(fd); return (i64)0x80020009; }
     i64 cur = hf_seek(g_fd[fd], 0, 1);
+    ra_delay(g_ra_ready && g_ra_fd_pid[fd] >= 0 ? ra_read(g_ra_fd_pid[fd], off, n) : 0);   /* w11_load */
     hf_seek(g_fd[fd], off, 0); i64 r = (i64)game_read(g_fd[fd], b, n);
     if (cur >= 0) hf_seek(g_fd[fd], cur, 0);
     fd_unlock(fd); fd_read_note(fd, r, n, off, "pread"); if (r > 0) hw_note((u64)b, (u64)r, 2); return r;
@@ -1078,6 +1087,8 @@ static void *map_at_hint(void *hint, u64 len, int fixed, int zero) {
 /* Direct memory is "physical": the PS4 can map one physical range at two addresses and both show the same bytes.
    E6 gives every mapping its own memory, so record the physical ranges and report any second mapping of one. */
 typedef struct { i64 phys; u64 len, va; int prot; u64 flip, caller; } DMap;
+static int g_fixed_stop = 1; static volatile int g_fixed_fatal;   /* w16_rel rc3 */
+static int g_relaunched, g_test_occupied, g_relaunch_failed; static u64 g_relaunch_prev;   /* w16_rel rc3 (e3_main) */
 static DMap g_dmap[65536]; static int g_ndmap, g_dalias, g_dfixed_moved, g_dmaps_total; static u64 g_dreleases, g_vq_calls, g_vq_hits;
 static PMutex g_dmap_lock;
 static int dmap_live_over(u64 va, u64 len) {   /* t134: is any direct-memory mapping still recorded over [va, va+len)? */
@@ -1153,6 +1164,10 @@ static SYSV int h_map_direct(void **addr, u64 len, int prot, int flags, i64 phys
     pm_unlock(&g_dmap_lock);
     if (want && p != want && (flags & 0x10)) {   /* MAP_FIXED, but E6 could not give that address */
         if (g_dfixed_moved++ < 20) { say("  FIXED mapping moved: wanted "); say_hex((u64)want); say(", got "); say_hex((u64)p); say("\n"); }
+        if (g_fixed_stop && !__atomic_exchange_n(&g_fixed_fatal, 1, __ATOMIC_ACQ_REL)) {   /* w16_rel rc3: the game will use the address it asked for - a sure crash later; stop now, clearly */
+            say("\n*** The game's memory at "); say_hex((u64)want); say(" could not be placed where the game needs it (host memory is there: address guard line at the start) - the game stops here instead of crashing later. Start it again; saves are kept. (--no-fixed-stop: go on as before)\n");
+            if (g_on_fatal) g_on_fatal();
+            plat_exit(24); }
     }
     *addr = p; return 0;
 }
@@ -1217,7 +1232,49 @@ static SYSV int h_virtual_query(void *addr, int flags, void *info, u64 sz) {
     __atomic_add_fetch(&g_vq_hits, 1, __ATOMIC_RELAXED);
     return 0;
 }
-static SYSV u64 h_direct_size(void) { return 0x13C000000ull; }   /* 5,056 MB as on retail PS4 */
+/* popin: the game sizes its "RenderData Pool (Garlic)" (fixed address 0x1015a00000; streamed textures, and the lump heaps
+   are carved out of it) from this answer: size = answer - 0x10000 - 110 MB - the 580 MB application heap - 1213 MB of
+   other pools (eboot+0xace9c9). --direct-memory-mb N reports N MB instead of the PS4's 5,056: every MB more is one MB
+   more of that pool. The pool must end below the heap slots at 0x1200000000 (N <= 9728). */
+static u32 g_opt_dmem_mb;   /* --direct-memory-mb N (0 = the PS4's 5,056 MB) */
+static u64 g_dmem_extra;   /* w5: direct memory added for the enlarged Scaleform pool (--render-scale with --rs-ui-mem 1, e3_loader.c patch_gfx_mem) */
+static SYSV u64 h_direct_size(void) { return (g_opt_dmem_mb ? (u64)g_opt_dmem_mb << 20 : 0x13C000000ull) + g_dmem_extra; }   /* 5,056 MB as on retail PS4 */
+/* popin: mip statistics (sceGnmSetupMipStatsReport). On the PS4 the GPU counts, for up to 256 textures the game tags
+   each frame (T# word 6: bits 12-19 counter bank, bit 20 enable), the finest mip level sampled and the pixels covered,
+   and the driver writes reports into the game's ring buffer (header dword = offset of the newest report, 0x800 bytes =
+   256 qwords each: bits 0-23 and 32-55 pixel counts, bits 56-59 the finest level, 15 = not sampled). The game's texture
+   streaming takes the level it must keep resident from them (eboot+0xa162f0, +0xce67d0). Nothing wrote that buffer
+   here: the header stayed 0, the game then reads the zero bytes in front of the buffer and takes every texture as
+   "sampled at level 0 on no pixels" - it keeps level 1 of every texture resident, seen or not, and the top level only
+   where its distance heuristic or baked data ask for it.
+   --mip-stats empty : valid reports, nothing sampled (diagnostic: only the game's distance / baked signals remain)
+   --mip-stats drawn : a texture bound by a draw in the last frames reports level 0 on 4 % of the screen (the game then
+                       wants its top level); every other texture reports "not sampled"
+   --mip-stats drawn1: the same, on no pixels (the game then wants level 1 of drawn textures only)
+   Which level a draw really samples is not measured (that needs counters in the translated pixel shaders). */
+static int g_opt_mipstats;      /* 0 off (the buffer is left alone, as before), 1 empty, 2 drawn, 3 drawn1, 4 gpu, 5 gpuz (see e3_loader.c ms_report) */
+static u32 g_opt_stream_log;    /* --stream-log N: the streaming manager's numbers every N updates */
+static u64 g_ms_buf; static u32 g_ms_size;
+static volatile u32 *g_mipfb_map;   /* --mip-stats gpu: four host copies of the feedback table the pixel shaders write, and its template (e6_vk.c), 0 = none */
+static volatile u32 g_mipfb_seq;    /* frames copied so far: frame n is in copy n & 3 */
+static int g_mipfb_turn, g_mipfb_init;
+enum { MS_HASH = 16384 };
+static volatile u32 g_ms_key[MS_HASH], g_ms_stamp[MS_HASH]; static volatile u32 g_ms_epoch = 1, g_ms_used;
+static void ms_seen(u32 t0) {   /* renderer: a draw samples the texture whose T# word 0 is t0 */
+    if (!t0) return;
+    u32 i = (t0 * 0x9E3779B1u) >> 18;
+    for (int n = 0; n < 64; n++, i = (i + 1) & (MS_HASH - 1)) {
+        u32 k = g_ms_key[i];
+        if (!k) { u32 z = 0; if (__atomic_compare_exchange_n(&g_ms_key[i], &z, t0, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { __atomic_fetch_add(&g_ms_used, 1, __ATOMIC_RELAXED); k = t0; } else k = z; }
+        if (k == t0) { g_ms_stamp[i] = g_ms_epoch; return; }
+    }
+}
+static u32 ms_lookup(u32 t0) {   /* the report epoch in which t0 was last sampled, 0 = never */
+    if (!t0) return 0;
+    u32 i = (t0 * 0x9E3779B1u) >> 18;
+    for (int n = 0; n < 64; n++, i = (i + 1) & (MS_HASH - 1)) { u32 k = g_ms_key[i]; if (k == t0) return g_ms_stamp[i]; if (!k) return 0; }
+    return 0;
+}
 
 /* ---------------- kernel: time ---------------- */
 static u64 g_tsc_freq = 1594000000ull;   /* the measured host TSC rate */
@@ -1385,8 +1442,18 @@ static const char *mem_alloc_name(u64 ab) {
     }
     return 0;
 }
+static void (*g_mem_pressure_fn)(u64 sys_avail, u64 commit_avail);
+/* t196 (stutter): the detail pass of the periodic report (every sixth, i.e. every 3600 flips) stalls the renderer for
+   35-39 ms although it runs on the helper thread since t192: in all three sessions of bench/results_dev there is a
+   hitch frame at flip 3600k + 602 (19 frames), and the Vulkan log has "slow texture binding: 36 ms, frame 7802 / 11402 /
+   15002 / 18602 / 22202 / 25802" with no image created, evicted or uploaded in it. The calls of the detail pass that
+   hold process-wide locks are the address-space walk (VirtualQuery over every region and QueryWorkingSetEx over the
+   pages outside game memory) and HeapSummary of every heap (the C runtime heap the renderer allocates from among
+   them). --light-mem-report leaves those two out of the periodic reports (they still run at exit and in crash
+   reports); the counters of our own tables and the driver's budget figures stay. Default: as before. */
+static int g_opt_memrep_light = 1;   /* w2: the default (cave / Chapter 1 / the three sessions: a 50-77 ms frame at flip 3600k + 602 every time without it); --full-mem-report: off */
 static void mem_report(const char *why) {
-    static u32 ncall; int detail = !str_eq(why, "every 10 s") || ncall++ % 6 == 0;
+    static u32 ncall; int periodic = str_eq(why, "every 10 s"); int detail = !periodic || ncall++ % 6 == 0;
     PlatProcMem pm; int ok = plat_proc_mem(&pm);
     int nm = (int)__atomic_load_n(&g_nmem, __ATOMIC_ACQUIRE);
     u64 game = 0; for (int i = 0; i < nm; i++) game += g_mem[i].hi - g_mem[i].lo;
@@ -1395,6 +1462,7 @@ static void mem_report(const char *why) {
     say("game memory mapped "); say_dec((i64)(game >> 20)); say(" MB in "); say_dec(nm); say(" ranges (pools "); say_dec((i64)(g_pool_bytes >> 20)); say(" MB, "); say_dec((i64)(g_pool_used >> 20)); say(" MB used)");
     if (pm.sys_total) { say("; system: RAM free "); say_dec((i64)(pm.sys_avail >> 20)); say(" of "); say_dec((i64)(pm.sys_total >> 20)); say(" MB, commit free "); say_dec((i64)(pm.commit_avail >> 20)); say(" of "); say_dec((i64)(pm.commit_total >> 20)); say(" MB"); }
     say("\n");
+    if (ok && g_mem_pressure_fn) g_mem_pressure_fn(pm.sys_avail, pm.commit_avail);   /* t194 */
     if (pm.sys_total && pm.sys_avail < (1ull << 30)) { static int nlow; if (nlow++ < 20) say("    LOW MEMORY: less than 1 GB of RAM free on this PC (Windows may be paging; other programs closed would help)\n"); }
     if (!detail) return;
     /* game memory by kind: arenas (reserved / committed / mapped by the game), pools, the rest (the game's large mappings) */
@@ -1428,7 +1496,8 @@ static void mem_report(const char *why) {
     g_memrep_crash = str_eq(why, "at the crash");
     if (g_mem_report_gpu) g_mem_report_gpu();
     if (str_eq(why, "at exit") && !g_hwk_ok) g_hwk_ok = plat_heap_walk(&g_hwk);   /* t113 (exit only: the walk holds each heap's lock) */
-    PlatMemWalk w; if (plat_mem_walk(&w, mem_in_game)) {
+    int light = periodic && g_opt_memrep_light;
+    PlatMemWalk w; if (!light && plat_mem_walk(&w, mem_in_game)) {
         say("      address space: committed private "); say_dec((i64)(w.priv >> 20)); say(" MB (game memory "); say_dec((i64)(w.priv_game >> 20)); say(", other "); say_dec((i64)((w.priv - w.priv_game) >> 20));
         say(" of which in RAM about "); say_dec((i64)(w.other_res >> 20)); say("), mapped "); say_dec((i64)(w.mapped >> 20)); say(" MB, program files "); say_dec((i64)(w.image >> 20));
         say(" MB (in RAM about "); say_dec((i64)(w.image_res >> 20)); say("); ");
@@ -1440,7 +1509,7 @@ static void mem_report(const char *why) {
             const char *nm = mem_alloc_name(w.top[i].abase); if (nm) { say(" ("); say(nm); say(")"); } if (i < 7 && w.top[i + 1].bytes) say(","); }
         say("\n");
     }
-    PlatHeaps hp; if (!g_memrep_crash && plat_heaps(&hp)) {
+    PlatHeaps hp; if (!light && !g_memrep_crash && plat_heaps(&hp)) {
         say("      heaps: "); say_dec((i64)hp.n); say(", committed "); say_dec((i64)(hp.committed >> 20)); say(" MB (C runtime heap "); say_dec((i64)(hp.crt >> 20)); say(" MB; largest");
         for (int i = 0; i < 4 && hp.top[i]; i++) { say(" "); say_dec((i64)(hp.top[i] >> 20)); }
         say(" MB)\n");

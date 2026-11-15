@@ -35,7 +35,20 @@ static void *g_trace;           /* trace file handle */
 static void tr(const char *s) { if (g_trace) plat_write(g_trace, s); }
 static void tr_hex(u64 v) { char b[20]; fmt_hex(b, v); tr(b); }
 static void tr_dec(i64 v) { char b[24]; fmt_dec(b, v); tr(b); }
-static void say(const char *s) { if (!s) s = "(null)"; plat_write(0, s); tr(s); }
+/* t192: one thread's text can be collected and written as one piece (the helper thread's memory report must not be cut by other threads' lines) */
+static volatile u32 g_say_cap_tid; static char g_say_cap[32768]; static u32 g_say_cap_n;
+#ifdef _WIN32
+#define SAY_TID() GetCurrentThreadId()
+#else
+#define SAY_TID() 0u
+#endif
+static void say(const char *s) {
+    if (!s) s = "(null)";
+    if (g_say_cap_tid && SAY_TID() == g_say_cap_tid) { while (*s && g_say_cap_n < sizeof g_say_cap - 1) g_say_cap[g_say_cap_n++] = *s++; return; }
+    plat_write(0, s); tr(s);
+}
+static void say_cap_begin(void) { g_say_cap_n = 0; __atomic_store_n(&g_say_cap_tid, SAY_TID(), __ATOMIC_RELEASE); }
+static void say_cap_end(void) { __atomic_store_n(&g_say_cap_tid, 0, __ATOMIC_RELEASE); g_say_cap[g_say_cap_n] = 0; if (g_say_cap_n) { plat_write(0, g_say_cap); tr(g_say_cap); } g_say_cap_n = 0; }
 static float str_to_f(const char *s) {   /* "1", "0.25", "2.5": decimal without exponent */
     float v = 0, f = 0.1f; int neg = 0, frac = 0;
     if (*s == '-') { neg = 1; s++; }
@@ -1271,6 +1284,7 @@ static u64 g_mskip_player, g_mskip_orig_vt;     /* the player wearing the copy, 
 static u8 *g_mskip_ret0, *g_mskip_pause1, *g_mskip_bigtime; static u64 g_mskip_pause_target; static int g_mskip_phase;
 static u64 g_mskip_flip; static u32 g_mskip_prev; static int g_mskip_req, g_mskip_n, g_mskip_auto_grp; static u64 g_mskip_auto_until;
 static u64 g_mskip_seen[32]; static int g_mskip_nseen;
+static int g_opt_splash_wait = 0; static u64 g_n_splash_waits;   /* w3 */
 static int g_mskip_diag; static char g_mskip_diag_name[160];   /* t107j: the prompt report, once per movie */
 static int mskip_name(u64 w, char *out, int cap) {   /* the movie's file name: [w+0x18] is a refcounted string; find its text */
     out[0] = 0; u64 sp = 0; if (!atm_rd(w + 0x18, &sp, 8) || !vis_ptr_ok(sp)) return 0;
@@ -1381,6 +1395,22 @@ static void movie_skip_probe(u64 *P, u32 id) {
     /* t107j: once per movie, which game movie showed the prompt (or which were being updated, when none could) */
     if (g_mskip_diag == 1 && g_plat_frame >= g_skp_req_flip + 12) { g_mskip_diag = 2; if (!str_eq(name, g_mskip_diag_name)) { int k = 0; while (name[k] && k < 159) { g_mskip_diag_name[k] = name[k]; k++; } g_mskip_diag_name[k] = 0; sf_prompt_report(name); } }
     if (!g_mskip_req) return;
+    /* w3 (--no-splash-skip-wait: as t198): the start-up logos cannot be skipped on the PS4, and the game relies on that:
+       while they play it reads the save (GameSave.dat, FinalGlobalState.dat - two mounts) and then starts loading the
+       saved chapter's level description and its streams (the level's lighting set, "masteribls", first). Skipped
+       before that had happened (a slow start: the logos began at flip 213 instead of ~60 in session 60_03), the game
+       reached the menu and the chapter without that load: the chapter opened lit by its spot lights only (no sky /
+       ambient light) for ~190 frames. A skip asked earlier is now carried out once the save has been read during the
+       logos (half a second after its second mount), or 12 s after they began, or at once when there is no save. */
+    if (g_opt_splash_wait && grp == 1 && str_has(name, "splash")) {
+        static u64 w0, t0; static u32 m0; static int told;
+        if (w0 != w) { w0 = w; t0 = plat_ticks(); m0 = __atomic_load_n(&g_sd_mount_calls, __ATOMIC_ACQUIRE); told = 0; }
+        u64 now = plat_ticks(), hz = plat_ticks_per_sec(); u32 mc = __atomic_load_n(&g_sd_mount_calls, __ATOMIC_ACQUIRE);
+        char sdir[1100]; save_host_dir(sdir, "GAMESAVE");
+        int ready = !plat_is_dir(sdir) || (mc - m0 >= 2 && now - __atomic_load_n(&g_sd_mount_tick, __ATOMIC_ACQUIRE) > hz / 2) || now - t0 > hz * 12;
+        if (!ready) { if (!told) { told = 1; g_n_splash_waits++; say("  movie skip (w3): the start-up logos end once the game has read the save (flip "); say_dec((i64)g_plat_frame); say(")\n"); } return; }
+        if (told) { say("  movie skip (w3): carried out now (flip "); say_dec((i64)g_plat_frame); say(", save-data mounts during the logos "); say_dec((i64)(mc - m0)); say(")\n"); }
+    }
     g_mskip_req = 0;
     if (!vis_ptr_ok(vt) || !(dump_readable(vt, sizeof g_mskip_vt) || plat_readable(vt, sizeof g_mskip_vt))) return;
     mskip_restore();
@@ -1809,57 +1839,1175 @@ static void patch_skin_check(Module *m) {
     say("  skin-table check on (eboot+0xe12fc0, STATUS 68): a skinning call whose records do not add up is repaired when one count lost its low byte, otherwise limited; logged\n");
 }
 
-/* ------------------------------------------------------------------ v0.3.2: Havok Cloth particle w lanes (STATUS 238)
-   Havok Cloth keeps its particles as 4-lane vectors. The constraint solvers apply their corrections to all four lanes
-   but measure lengths with 3-lane dot products, so the unused w lane has no restoring force: the fixed particles get
-   w = 1 (MoveParticles, through the instance's 4x4 transform), rounding seeds tiny differences, and every link that
-   stays compressed multiplies them until w overflows to inf. Where inf meets a 0 coefficient (the volume constraint's
-   frame) it becomes NaN in the cloth's output transforms: the stranger's waist and coat strips vanished. x / y / z never
-   depend on w (offline replays bit-identical with and without this reset), so w of the position and previous-position
-   arrays is set back to 1 at the start of every cloth instance update (entry of eboot+0x73f190, rdi = hclClothInstance);
-   a non-finite w in the third particle array (0 when healthy) is cleared. --no-cloth-fix turns it off. */
-static int g_opt_no_cloth_fix; static volatile int g_cloth_state; static u64 g_cloth_vt, g_cloth_name, g_cloth_lo, g_cloth_hi, g_cloth_calls, g_cloth_drift, g_cloth_nonfinite;
-static void cloth_probe(u64 *P, u32 id) {
-    (void)id; u64 ci = P[32 + 8];   /* rdi */
-    if (g_cloth_state <= 0) {   /* first call (relocations are applied by now): the vtable's typeinfo must name hclSimClothInstance */
-        if (g_cloth_state < 0) return;
-        u64 ti = *(const u64 *)(g_cloth_vt - 8); int ok = ti >= g_cloth_lo && ti + 16 <= g_cloth_hi && *(const u64 *)(ti + 8) == g_cloth_name;   /* typeinfo inside the eboot */
-        __atomic_store_n(&g_cloth_state, ok ? 1 : -1, __ATOMIC_RELEASE);
-        if (!ok) { say("  cloth fix: the cloth type's vtable does not match - off\n"); return; } }
-    if (!mem_ok(ci, 0x30)) return;
-    u64 arr = *(const u64 *)(ci + 0x20); u32 ns = *(const u32 *)(ci + 0x28);   /* the simulation instances */
-    if (!ns || ns > 64 || !arr || (arr & 7) || !mem_ok(arr, 8ull * ns)) return;
-    u64 drift = 0, nonfin = 0;
-    for (u32 i = 0; i < ns; i++) {
-        u64 sim = ((const u64 *)arr)[i];
-        if (!sim || (sim & 7) || !mem_ok(sim, 0x48) || *(const u64 *)sim != g_cloth_vt) continue;   /* hclSimClothInstance only */
-        for (int k = 0; k < 3; k++) {   /* three hkArray<hkVector4> {data, size, capacity} at +0x18 / +0x28 / +0x38 */
-            u64 a = *(const u64 *)(sim + 0x18 + 16 * k); u32 n = *(const u32 *)(sim + 0x20 + 16 * k);
+/* ------------------------------------------------------------------ t187: cloth onset recorder (--cloth-onset, diagnostic)
+   STATUS 236: the stranger's waist (and two strips) vanish because Havok Cloth particles (hclSimClothInstance) turn NaN.
+   The F6 captures are all taken after that. This entry probe on the per-instance cloth update (eboot+0x73f190,
+   rdi = hclClothInstance, rsi = the update context) keeps, for each cloth instance, the last CO_SLOTS pre-update
+   snapshots of the memory pages its update uses (the instance, its simulation instances and particle arrays, and the
+   game-heap pages reachable from the instance and the world within three pointer steps). When a simulation instance
+   that was finite at its previous update holds NaN, the snapshots and the current state go to
+   cloth_onset_<flip>.bin (capture folder) for an offline replay of the failing update on top of an F6 capture of the
+   same session (bench\t187\harness). No traps, no watchpoints: memory copies on the cloth thread only. */
+static int g_opt_cloth_onset;
+enum { CO_INST = 6, CO_SIMS = 8, CO_SLOTS = 8, CO_MAXP = 320, CO_DUMPS = 6 };
+typedef struct { u64 flip; u32 mx, np; u64 ctx[8]; u32 nan[CO_SIMS]; u64 pg[CO_MAXP]; u8 *data; } COSlot;
+typedef struct { u64 ci, world; u32 nsim, used, next; u64 sim[CO_SIMS]; int fin[CO_SIMS], dumped[CO_SIMS]; u64 pages_flip; u32 np; u64 pg[CO_MAXP]; COSlot slot[CO_SLOTS]; } COInst;
+static COInst *g_co; static volatile int g_co_lock; static u64 g_co_base; static u32 g_co_ndumps, g_co_mx_seen[8], g_co_nmx; static u64 g_co_calls, g_co_onsets;
+static int co_is_sim(u64 s) { return s > 0x10000 && !(s & 7) && mem_ok(s, 0x48) && *(const u64 *)s == g_co_base + 0x1fd25d0; }
+static u32 co_nan_rows(u64 s) {   /* particle rows holding a NaN in the three arrays (+0x18 / +0x28 / +0x38, count +0x20) */
+    u32 c = 0;   /* t190b: each array's own size; inf counts too (non-finite) */
+    for (int k = 0; k < 3; k++) { u64 a = *(const u64 *)(s + 0x18 + 16 * k); u32 n = *(const u32 *)(s + 0x20 + 16 * k); if (!a || !n || n > 65536 || !mem_ok(a, 16ull * n)) continue;
+        const u32 *u = (const u32 *)a; for (u32 i = 0; i < 4 * n; i += 4) { int bad = 0; for (int j = 0; j < 4; j++) bad |= ((u[i + j] >> 23) & 0xff) == 0xff; c += bad; } }
+    return c; }
+static int co_addpg(COInst *I, u64 p) { p &= ~0xfffull; for (u32 i = 0; i < I->np; i++) if (I->pg[i] == p) return 0; if (I->np >= CO_MAXP || !mem_ok(p, 4096)) return 0; I->pg[I->np++] = p; return 1; }
+static void co_pages(COInst *I) {   /* the page set: explicit objects first, then a 3-step pointer closure in the game heap */
+    I->np = 0; co_addpg(I, I->ci); co_addpg(I, I->ci + 0x10f); if (I->world) { co_addpg(I, I->world); co_addpg(I, I->world + 0x8f); }
+    for (u32 s = 0; s < I->nsim; s++) { u64 o = I->sim[s]; co_addpg(I, o); co_addpg(I, o + 0x1bf); u32 n = *(const u32 *)(o + 0x20);
+        for (int k = 0; k < 3 && n < 20000; k++) { u64 a = *(const u64 *)(o + 0x18 + 16 * k); for (u64 b = a; a && b < a + 16ull * n + 4096; b += 4096) co_addpg(I, b < a + 16ull * n ? b : a + 16ull * n - 1); } }
+    u32 lo = 0;
+    for (int depth = 0; depth < 3; depth++) { u32 hi = I->np;
+        for (u32 i = lo; i < hi && I->np < CO_MAXP; i++) { const u64 *q = (const u64 *)I->pg[i];
+            for (int k = 0; k < 512 && I->np < CO_MAXP; k++) { u64 v = q[k]; if (v >= 0x200000000ull && v < 0x1000000000ull && !(v & 7)) co_addpg(I, v); } }
+        lo = hi; } }
+static void co_dump(COInst *I, u32 sidx, u32 nanrows) {
+    char path[600]; Sb s = {path, 0, sizeof path}; sb_s(&s, g_cap_dir); sb_s(&s, "/cloth_onset_"); sb_d(&s, (i64)g_plat_frame); sb_s(&s, ".bin");
+    void *h = plat_open_write(path); if (!h) return;
+    u64 hdr[8] = {0x313030305343445full /* "_DCS0001" */, g_co_base, I->ci, I->world, I->nsim, CO_SLOTS, g_plat_frame, sidx};
+    plat_write_bin(h, hdr, sizeof hdr); plat_write_bin(h, I->sim, sizeof I->sim);
+    for (u32 k = 0; k < CO_SLOTS; k++) { COSlot *S = &I->slot[(I->next + k) % CO_SLOTS]; if (!S->data || !S->np) continue;
+        u64 sh[4] = {S->flip, S->mx, S->np, 0}; plat_write_bin(h, sh, sizeof sh); plat_write_bin(h, S->ctx, sizeof S->ctx); plat_write_bin(h, S->nan, sizeof S->nan);
+        plat_write_bin(h, S->pg, 8ull * S->np); plat_write_bin(h, S->data, 4096ull * S->np); }
+    { u64 sh[4] = {g_plat_frame, 0, I->np, 1}; plat_write_bin(h, sh, sizeof sh); u64 z[8] = {0}; u32 zn[CO_SIMS] = {0}; plat_write_bin(h, z, sizeof z); plat_write_bin(h, zn, sizeof zn);
+      plat_write_bin(h, I->pg, 8ull * I->np); for (u32 i = 0; i < I->np; i++) plat_write_bin(h, (const void *)I->pg[i], 4096); }   /* the NaN state itself, last */
+    plat_close(h);
+    say("    cloth onset (t187): flip "); say_dec((i64)g_plat_frame); say(" cloth instance "); say_hex(I->ci); say(" simulation "); say_dec(sidx); say(" ("); say_hex(I->sim[sidx]);
+    say(") now has "); say_dec(nanrows); say(" NaN particle rows - "); say_dec(CO_SLOTS); say(" snapshots of "); say_dec(I->np); say(" pages -> "); say(path); say("\n");
+}
+/* t188: cloth w-lane fix (on by default, --no-cloth-fix turns it off). STATUS 238: Havok Cloth keeps particles as
+   4-lane vectors and its constraint solvers (links, bend, volume) apply their corrections to all four lanes, but measure
+   lengths with 3-lane dot products, so the unused w lane has no restoring force. MoveParticles writes w = 1 for the
+   fixed particles; rounding seeds tiny differences and every link that stays compressed multiplies them (2-4x per
+   update in the stranger's strips) until w overflows to inf; the volume constraint's frame then turns inf * 0 into NaN
+   and the cloth's output transforms - the waist / strips of the stranger, and other cloths - go NaN for good. The x/y/z
+   lanes never depend on w (replayed bit-identical with and without this reset), so setting w back to 1 in the position
+   and previous-position arrays at the start of each cloth instance update changes nothing but the overflow. */
+static int g_opt_no_cl_checks;   /* w3_cloth */
+static int g_opt_no_cloth_fix, g_opt_cloth_log;   /* --cloth-log (w2_cloth): one line per new cloth instance */
+static u64 g_cw_calls, g_cw_drift, g_cw_nonfinite, g_cw_xyz;
+static u64 g_cw_seen[48]; static u32 g_cw_nseen; static volatile int g_cw_lock;   /* t190b: instances already reported */
+static const char *cloth_name(u64 ci) {   /* hclClothInstance +0x10 -> hclClothData, +0x10 its name (e.g. "Jacket") */
+    u64 cd = *(const u64 *)(ci + 0x10); if (!mem_ok(cd, 0x18)) return "?";
+    u64 nm = *(const u64 *)(cd + 0x10) & ~1ull; if (!mem_ok(nm, 1)) return "?";
+    const char *p = (const char *)nm; for (int i = 0; i < 48; i++) { if (!p[i]) return p; if (p[i] < 32 || p[i] > 126) return "?"; } return "?";
+}
+/* w2_cloth: onset diagnostics. The physics steps of the last frames (phys_probe) and, per cloth instance, its last
+   updates (flip, step, the simulation's own last sub-step, largest coordinate exponent) are kept; the first non-finite
+   report of an instance prints them, so a recurrence shows whether the cloth exploded over several updates or turned
+   non-finite in one, how old the instance was, and which steps it was given. */
+enum { PH_RING = 16, CH_INST = 48, CH_RING = 12 };
+typedef struct { u64 flip; u32 raw_us, bits; } PhStep;
+static PhStep g_ph_ring[PH_RING]; static volatile u32 g_ph_ring_n;
+typedef struct { u32 flip, dt, last, maxexp; } ChUpd;
+typedef struct { u64 ci, first_flip, updates; ChUpd r[CH_RING]; u32 n; u64 last_op, scratch; u32 opn, bad, begin_flip, begin_dt;
+    float *g_ts[4]; u32 g_tsn[4]; float *g_bm; u32 g_bmn, g_have; u32 *sn[8][3]; u32 snn[8][3]; u64 sn_upd; float sn_root[16]; u32 sn_have, in_bad_run; } ChInst;   /* w3_cloth: the update in progress */
+static ChInst g_ch[CH_INST];
+static void say_us(u32 bits) { float f; mem_copy(&f, &bits, 4); say_dec((i64)(f * 1e6f + 0.5f)); }   /* a float step as microseconds */
+/* w3_cloth: input guard and state restore (STATUS: the "Jacket" that turns non-finite as a whole in one update).
+   Origin (reproduced offline with the game's own code, bench\agents\w3_cloth\harness): the cloth's INPUT - the world-space
+   bone matrices of its hclTransformSet ([instance+0x40] -> [+0x10], 64 bytes per bone) - is non-finite (or garbage) for
+   one update; the skin / move-particles / collision operators carry it into every particle of the three simulations, and
+   Verlet state never recovers. Two layers, both acting only when something is already wrong:
+   (1) input guard: at the begin of an update the transform sets and the buffers' world matrices ([buffer+0x80], 2 x 4x4)
+       are checked; while they are sane a copy is kept; when a value is non-finite or absurd (|x| >= 2^24) the whole set
+       is replaced by the last sane copy for this update (the cloth simulates against the previous pose for one frame).
+   (2) state restore: while the particles are finite at the begin of an update a copy of the three particle arrays of each
+       simulation is kept; when they are found non-finite (checked after every operator, at the end and at the next
+       begin) the copy is written back (moved with the character's root if it is older than one update): the garment
+       carries on from its last good shape instead of staying broken for the session.
+   --no-cloth-input-guard / --no-cloth-restore turn them off; --cloth-test-nan FLIP:BONE:HEXBITS[:COUNT] (test) writes
+   HEXBITS into bone BONE of every cloth's first transform set at the begin of COUNT updates from flip FLIP. */
+static int g_opt_no_cl_inguard, g_opt_no_cl_restore; static u64 g_tn_flip; static u32 g_tn_bone, g_tn_bits, g_tn_count, g_tn_done;
+static u64 g_cl_in_bad, g_cl_in_held, g_cl_in_unheld, g_cl_restores, g_cl_restore_fail; static u32 g_cl_in_said, g_cl_rs_said, g_cl_in_dumps;
+static void cl_dump_inputs(u64 ci, u64 ctx, u64 op, u64 prev);
+static void ch_release(ChInst *H) { for (int t = 0; t < 4; t++) if (H->g_ts[t]) free(H->g_ts[t]); if (H->g_bm) free(H->g_bm); for (int i = 0; i < 8; i++) for (int k = 0; k < 3; k++) if (H->sn[i][k]) free(H->sn[i][k]); }
+static int cl_badf(u32 v) { return ((v >> 23) & 0xff) >= 151; }   /* non-finite or |x| >= 2^24 */
+static void cloth_input_guard(ChInst *H, u64 ci, u64 ctx) {
+    u64 tsa = *(const u64 *)(ci + 0x40); u32 nts = *(const u32 *)(ci + 0x48); u64 ba = *(const u64 *)(ci + 0x30); u32 nb = *(const u32 *)(ci + 0x38);
+    if (nts > 4 || (nts && !mem_ok(tsa, 8ull * nts)) || nb > 64 || (nb && !mem_ok(ba, 8ull * nb))) return;
+    u32 bad = 0, badb[12], nbadb = 0, firstv = 0; int firstt = -1, same = H->g_have && H->g_bmn == nb;
+    for (u32 t = 0; t < nts; t++) { u64 ts = ((const u64 *)tsa)[t]; if (!mem_ok(ts, 0x30)) return;
+        u64 p = *(const u64 *)(ts + 0x10), q = *(const u64 *)(ts + 0x20); u32 n = *(const u32 *)(ts + 0x18), n2 = *(const u32 *)(ts + 0x28);
+        if (!n || n > 1024 || n2 != n || !mem_ok(p, 64ull * n) || !mem_ok(q, 64ull * n)) return;
+        if (H->g_tsn[t] != n) same = 0;
+        if (g_tn_count && t == 0 && g_plat_frame >= g_tn_flip && g_tn_done < g_tn_count && g_tn_bone < n) { u32 *w = (u32 *)(p + 64ull * g_tn_bone); for (int j = 0; j < 16; j++) w[j] = g_tn_bits;
+            if (!g_tn_done || g_tn_done + 1 == g_tn_count) { say("    TEST (--cloth-test-nan): flip "); say_dec((i64)g_plat_frame); say(" cloth \""); say(cloth_name(ci)); say("\": bone "); say_dec(g_tn_bone); say(" of its transform set overwritten with "); say_hex(g_tn_bits); say("\n"); }
+            g_tn_done++; }
+        const u32 *u = (const u32 *)p, *u2 = (const u32 *)q;
+        for (u32 b = 0; b < n; b++) { int bb = 0; for (int j = 0; j < 16; j++) { if (cl_badf(u[16 * b + j])) { if (!bb && firstt < 0) { firstt = (int)t; firstv = u[16 * b + j]; } bb = 1; } if (((u2[16 * b + j] >> 23) & 0xff) == 0xff) bb = 1; }
+            if (bb) { bad++; if (nbadb < 12) badb[nbadb++] = b; } } }
+    u32 badm = 0; for (u32 b = 0; b < nb; b++) { u64 o = ((const u64 *)ba)[b]; if (!mem_ok(o, 0x100)) return; const u32 *u = (const u32 *)(o + 0x80); for (int j = 0; j < 32; j++) if (cl_badf(u[j])) { badm++; break; } }
+    if (!bad && !badm) {   /* sane: keep a copy */
+        for (u32 t = 0; t < nts; t++) { u64 ts = ((const u64 *)tsa)[t]; u32 n = *(const u32 *)(ts + 0x18);
+            if (H->g_tsn[t] != n || !H->g_ts[t]) { if (H->g_ts[t]) free(H->g_ts[t]); H->g_ts[t] = (float *)malloc(128ull * n); H->g_tsn[t] = n; }
+            if (!H->g_ts[t]) { H->g_have = 0; return; }
+            mem_copy(H->g_ts[t], (const void *)*(const u64 *)(ts + 0x10), 64ull * n); mem_copy((u8 *)H->g_ts[t] + 64ull * n, (const void *)*(const u64 *)(ts + 0x20), 64ull * n); }
+        if (H->g_bmn != nb || !H->g_bm) { if (H->g_bm) free(H->g_bm); H->g_bm = (float *)malloc(128ull * (nb ? nb : 1)); H->g_bmn = nb; }
+        if (!H->g_bm) { H->g_have = 0; return; }
+        for (u32 b = 0; b < nb; b++) mem_copy((u8 *)H->g_bm + 128ull * b, (const void *)(((const u64 *)ba)[b] + 0x80), 128);
+        if (H->in_bad_run && g_cl_in_said < 16) { g_cl_in_said++; say("    cloth input guard (w3_cloth): flip "); say_dec((i64)g_plat_frame); say(" cloth \""); say(cloth_name(ci)); say("\": inputs sane again after "); say_dec(H->in_bad_run); say(" update(s)\n"); }
+        H->g_have = 1; H->in_bad_run = 0; return; }
+    __atomic_add_fetch(&g_cl_in_bad, 1, __ATOMIC_RELAXED);
+    int hold = !g_opt_no_cl_inguard && same;
+    if (!H->in_bad_run && g_cl_in_said < 16) { g_cl_in_said++;
+        say("    cloth input guard (w3_cloth): flip "); say_dec((i64)g_plat_frame); say(" cloth \""); say(cloth_name(ci)); say("\" instance "); say_hex(ci); say(" on "); say(cur_thread_name());
+        say(": BAD INPUT at the begin of update "); say_dec((i64)H->updates); say(": "); say_dec(bad); say(" bone matrix(es) of its transform set(s) non-finite or absurd");
+        if (nbadb) { say(" (bones"); for (u32 k = 0; k < nbadb; k++) { say(" "); say_dec(badb[k]); } if (bad > nbadb) say(" ..."); say("; first bad value bits "); say_hex(firstv); say(")"); }
+        say(", "); say_dec(badm); say(" buffer world matrix(es) bad; ");
+        say(hold ? "replaced by the last sane inputs for this update\n" : g_opt_no_cl_inguard ? "left as they are (--no-cloth-input-guard)\n" : "no sane copy yet - left as they are\n");
+        if (g_cl_in_dumps < 4) { g_cl_in_dumps++; cl_dump_inputs(ci, ctx, 0, 0); } }
+    H->in_bad_run++;
+    if (!hold) { __atomic_add_fetch(&g_cl_in_unheld, 1, __ATOMIC_RELAXED); return; }
+    for (u32 t = 0; t < nts; t++) { u64 ts = ((const u64 *)tsa)[t]; u32 n = H->g_tsn[t];
+        mem_copy((void *)*(const u64 *)(ts + 0x10), H->g_ts[t], 64ull * n); mem_copy((void *)*(const u64 *)(ts + 0x20), (const u8 *)H->g_ts[t] + 64ull * n, 64ull * n); }
+    for (u32 b = 0; b < nb; b++) mem_copy((void *)(((const u64 *)ba)[b] + 0x80), (const u8 *)H->g_bm + 128ull * b, 128);
+    __atomic_add_fetch(&g_cl_in_held, 1, __ATOMIC_RELAXED);
+}
+static int cl_root(u64 ci, float *m) {   /* the first buffer's world matrix (the character's root), 0 if not sane */
+    u64 ba = *(const u64 *)(ci + 0x30); u32 nb = *(const u32 *)(ci + 0x38); if (!nb || nb > 64 || !mem_ok(ba, 8)) return 0;
+    u64 o = *(const u64 *)ba; if (!mem_ok(o, 0x100)) return 0; mem_copy(m, (const void *)(o + 0x80), 64); const u32 *u = (const u32 *)m; for (int j = 0; j < 16; j++) if (cl_badf(u[j])) return 0; return 1; }
+/* ------------------------------------------------------------------ w5_cloth: checks at the SOURCE of the cloth inputs
+   The cloth's bone matrices are written by the game's SkinnedMeshComponent::HavokClothUpdateJob (eboot+0x13be580 ->
+   0x13c2b60 -> 0x13e6900): transform set[i] = world x pose[i], world from the entity transform [comp+0x518]+0xc0 (read
+   without its lock), pose = the component's current pose ([comp+0x2f0 + 0x70*[comp+0x3d0]]: +0x20 skeleton, +0x28 state
+   (bit 0: model-space matrices valid), +0x30 local transforms (48 bytes a bone), +0x40 model-space matrices (64 bytes),
+   both buffers allocated lazily and NOT cleared). The pose is produced by the component's pose update job
+   (eboot+0x13bddd0, called from 0x14365dd): it flips [comp+0x3d0], evaluates the animation, copies bones from a master
+   component ([comp+0x610], read without the master's lock), runs the pose modifiers ([comp+0x110]) and writes the pose.
+   Two always-on probes (no change of game state, a few hundred bytes read per component and frame):
+   (1) exit of the pose update job (eboot+0x13be555, r15 = component): the current pose's local transforms and, when
+       marked valid, model-space matrices; the first producers of a non-finite / absurd value are named.
+   (2) entry of eboot+0x13c2b60 (rdi wrapper, rsi world matrix, rdx pose, xmm0 step, r13 component): world, pose, step,
+       pose state, buffer re-allocation, and the wrapper's reset state machine ([wrapper+0x88]) with the transition
+       constraints' type / timer; a ring of the last calls per wrapper is printed at the first non-finite report of the
+       cloth, so a recurrence names its origin: world, pose (and which producer), step, or none of them (= inside the
+       cloth: reset / transition). --no-cloth-source-checks turns them off. */
+static int g_opt_no_cl_src;
+enum { CJ_W = 24, CJ_RING = 20 };
+typedef struct { u32 flip, dt, tctime; u8 st, pst, flags, tctype; } CjRec;   /* flags: 1 model buffer changed, 2 pose not marked valid, 4 world moved > 1, 8 bad pose, 16 bad world, 32 bad step */
+typedef struct { u64 w, comp, pp[2], mb[2], ci[3]; u32 n, nci, last_flip; u8 last_st; float wpos[3]; u64 resets, calls; CjRec r[CJ_RING]; } CjW;
+static CjW g_cj[CJ_W]; static volatile int g_cj_lock; static u64 g_cj_calls, g_cj_bad, g_cj_resets, g_cj_notvalid, g_cj_realloc, g_ps_calls, g_ps_bad, g_ps_bad_local; static u32 g_cj_said, g_ps_said, g_cj_reset_said;
+static int cj_rd(u64 a, u64 n) { return a > 0x10000 && (mem_ok(a, n) || plat_readable(a, n)); }
+static void say_frames(void) { say("frame times of the last frames (flip: measured us -> physics step us):"); u32 pn = g_ph_ring_n, pc = pn < PH_RING ? pn : PH_RING; for (u32 q = 0; q < pc; q++) { PhStep *R = &g_ph_ring[(pn - pc + q) % PH_RING]; say(" "); say_dec((i64)R->flip); say(": "); say_dec(R->raw_us); say(" -> "); say_us(R->bits); say(";"); } }
+/* bad values of a pose: locals (lanes 0-2, 4-7, 8-10 of each 48-byte transform) and model matrices; returns counts */
+static void pose_scan(u64 pose, u32 *nl, u32 *nm, u32 *fb, u32 *fv, u32 *nbones, int models) {
+    *nl = *nm = *fb = *fv = *nbones = 0; if (!mem_ok(pose, 0x70)) return;
+    u64 sk = *(const u64 *)(pose + 0x20), lb = *(const u64 *)(pose + 0x30), le = *(const u64 *)(pose + 0x38), mb = *(const u64 *)(pose + 0x40), me = *(const u64 *)(pose + 0x48);
+    u32 n = sk && mem_ok(sk, 0x38) ? *(const u32 *)(sk + 0x30) : 0; if (!n || n > 2048) return; *nbones = n;
+    if (lb && le - lb == 48ull * n && mem_ok(lb, 48ull * n)) { const u32 *u = (const u32 *)lb;
+        for (u32 b = 0; b < n; b++, u += 12) { u32 bad = 0; for (int j = 0; j < 11; j++) if (j != 3 && cl_badf(u[j])) { bad = u[j]; break; } if (bad) { if (!*nl && !*nm) { *fb = b; *fv = bad; } (*nl)++; } } }
+    if (models && mb && me - mb == 64ull * n && mem_ok(mb, 64ull * n)) { const u32 *u = (const u32 *)mb;
+        for (u32 b = 0; b < n; b++, u += 16) { u32 bad = 0; for (int j = 0; j < 16; j++) if (cl_badf(u[j])) { bad = u[j]; break; } if (bad) { if (!*nm) { *fb = b; *fv = bad; } (*nm)++; } } }
+}
+static const char *comp_cloth_name(u64 comp) {   /* the name of the component's first cloth, "" if it has none */
+    u64 w = *(const u64 *)(comp + 0x620); if (!w || !mem_ok(w, 0x90)) return "";
+    u64 a = *(const u64 *)(w + 0x18); u32 n = *(const u32 *)(w + 0x10); if (!n || n > 16 || !mem_ok(a, 16)) return "";
+    u64 ci = *(const u64 *)a; return mem_ok(ci, 0x30) ? cloth_name(ci) : ""; }
+static void say_comp(u64 comp) {
+    say("component "); say_hex(comp); say(" (cloth \""); say(comp_cloth_name(comp)); say("\", master "); say_hex(*(const u64 *)(comp + 0x610)); say(", "); say_dec(*(const i32 *)(comp + 0x108)); say(" pose modifiers, flags "); say_hex(*(const u32 *)(comp + 0x240));
+    say(", entity "); say_hex(*(const u64 *)(comp + 0x518)); say(", pose index "); say_dec(*(const i32 *)(comp + 0x3d0)); say(")"); }
+static void pose_probe(u64 *P, u32 id) {   /* exit of the pose update job */
+    (void)id; u64 comp = P[32]; if (!mem_ok(comp, 0x690)) return;
+    u32 idx = *(const u32 *)(comp + 0x3d0); if (idx > 1) return;
+    u64 pose = comp + 0x2f0 + 0x70ull * idx; u32 st = *(const u32 *)(pose + 0x28), nl, nm, fb, fv, nb;
+    __atomic_add_fetch(&g_ps_calls, 1, __ATOMIC_RELAXED);
+    pose_scan(pose, &nl, &nm, &fb, &fv, &nb, st & 1); if (!nl && !nm) return;
+    __atomic_add_fetch(&g_ps_bad, 1, __ATOMIC_RELAXED); if (nl) __atomic_add_fetch(&g_ps_bad_local, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&g_ps_said, 1, __ATOMIC_RELAXED) > 12) return;
+    u32 pl, pm, pb, pv, pn; pose_scan(comp + 0x2f0 + 0x70ull * (idx ^ 1), &pl, &pm, &pb, &pv, &pn, 1);
+    while (__atomic_exchange_n(&g_cj_lock, 1, __ATOMIC_ACQUIRE)) { }
+    say("    pose check (w5_cloth): flip "); say_dec((i64)g_plat_frame); say(" ["); say(cur_thread_name()); say("] the pose update job (eboot+0x13bddd0) left BAD VALUES in the pose of "); say_comp(comp);
+    say(": "); say_dec(nl); say(" local transform(s), "); say_dec(nm); say(" model-space matrix(es) of "); say_dec(nb); say(" bones non-finite or absurd; first: bone "); say_dec(fb); say(" bits "); say_hex(fv);
+    say(nl ? " (in the LOCAL transforms: animation evaluation / master copy / pose modifiers)" : " (locals sane: the model-space computation or its buffer)");
+    say("; pose state "); say_dec(st); say("; the previous pose (other buffer): "); say_dec(pl); say(" bad local(s), "); say_dec(pm); say(" bad matrix(es); ");
+    u64 ms = *(const u64 *)(comp + 0x610); if (ms && mem_ok(ms, 0x690)) { u32 ml, mm, mb2, mv, mn; u32 mi = *(const u32 *)(ms + 0x3d0) & 1; pose_scan(ms + 0x2f0 + 0x70ull * mi, &ml, &mm, &mb2, &mv, &mn, 1);
+        say("its master's current pose: "); say_dec(ml); say(" bad local(s), "); say_dec(mm); say(" bad matrix(es), state "); say_dec(*(const u32 *)(ms + 0x2f0 + 0x70ull * mi + 0x28)); say("; "); }
+    say_frames(); say("\n");
+    __atomic_store_n(&g_cj_lock, 0, __ATOMIC_RELEASE);
+}
+static CjW *cj_find(u64 w, int make) {
+    for (int i = 0; i < CJ_W; i++) if (g_cj[i].w == w) return &g_cj[i];
+    if (!make) return 0;
+    CjW *X = 0; while (__atomic_exchange_n(&g_cj_lock, 1, __ATOMIC_ACQUIRE)) { }
+    for (int i = 0; i < CJ_W && !X; i++) if (!g_cj[i].w) X = &g_cj[i];
+    if (!X) { u32 old = ~0u; for (int i = 0; i < CJ_W; i++) if (g_cj[i].last_flip < old) { old = g_cj[i].last_flip; X = &g_cj[i]; } { u8 *z = (u8 *)X; for (u64 q = 0; q < sizeof *X; q++) z[q] = 0; } }   /* the wrapper not seen for the longest time */
+    X->w = w; __atomic_store_n(&g_cj_lock, 0, __ATOMIC_RELEASE); return X; }
+static void cj_say_ring(const CjW *X) {
+    say("      (w5_cloth) the game's cloth job for this cloth ("); say_dec((i64)X->calls); say(" calls, "); say_dec((i64)X->resets); say(" resets): its last calls, oldest first (flip: reset state / step us / pose state / transition type:timer us / flags");
+    say(" R = model-matrix buffer changed, V = pose not marked valid, M = world moved > 1 unit, P = bad pose, W = bad world, S = bad step):");
+    u32 cnt = X->n < CJ_RING ? X->n : CJ_RING; for (u32 q = 0; q < cnt; q++) { const CjRec *R = &X->r[(X->n - cnt + q) % CJ_RING];
+        say(" "); say_dec(R->flip); say(": "); say_dec(R->st); say(" / "); say_us(R->dt); say(" / "); say_dec(R->pst); say(" / "); say_dec(R->tctype); say(":"); say_us(R->tctime); say(" / ");
+        if (!R->flags) say("-"); if (R->flags & 1) say("R"); if (R->flags & 2) say("V"); if (R->flags & 4) say("M"); if (R->flags & 8) say("P"); if (R->flags & 16) say("W"); if (R->flags & 32) say("S"); say(";"); }
+    say("\n"); }
+static void wn_report_for(u64 ci);
+static void cj_report_for(u64 ci) {   /* at a cloth's first non-finite report */
+    if (g_opt_no_cl_src) return;
+    wn_report_for(ci);
+    for (int i = 0; i < CJ_W; i++) for (u32 k = 0; k < g_cj[i].nci; k++) if (g_cj[i].w && g_cj[i].ci[k] == ci) { cj_say_ring(&g_cj[i]); return; }
+    say("      (w5_cloth) no cloth job record for this instance\n"); }
+static void cjob_probe(u64 *P, u32 id) {   /* entry of eboot+0x13c2b60 */
+    (void)id; const u64 *g = P + 32; u64 w = g[8], world = g[9], pose = g[12], comp = g[2]; u32 dtb = (u32)P[0];
+    if (!mem_ok(w, 0x90) || !mem_ok(pose, 0x70) || !cj_rd(world, 64)) return;
+    int have_comp = mem_ok(comp, 0x690) && *(const u64 *)(comp + 0x620) == w;
+    __atomic_add_fetch(&g_cj_calls, 1, __ATOMIC_RELAXED);
+    CjW *X = cj_find(w, 1); X->calls++; X->last_flip = (u32)g_plat_frame; if (have_comp) X->comp = comp;
+    { u64 a = *(const u64 *)(w + 0x18); u32 n = *(const u32 *)(w + 0x10); X->nci = 0; if (n && n <= 16 && mem_ok(a, 16ull * n)) for (u32 k = 0; k < n && k < 3; k++) X->ci[X->nci++] = *(const u64 *)(a + 16ull * k); }
+    u8 fl = 0; const u32 *wu = (const u32 *)world; const float *wf = (const float *)world;
+    for (int j = 0; j < 16; j++) if (cl_badf(wu[j])) fl |= 16;
+    if (!(fl & 16)) { if (X->calls > 1) { float dx = wf[12] - X->wpos[0], dy = wf[13] - X->wpos[1], dz = wf[14] - X->wpos[2]; if (dx * dx + dy * dy + dz * dz > 1.0f) fl |= 4; } X->wpos[0] = wf[12]; X->wpos[1] = wf[13]; X->wpos[2] = wf[14]; }
+    u32 pst = *(const u32 *)(pose + 0x28), nl, nm, fb, fv, nb; pose_scan(pose, &nl, &nm, &fb, &fv, &nb, 1); if (nm) fl |= 8;
+    if (!(pst & 1)) { fl |= 2; __atomic_add_fetch(&g_cj_notvalid, 1, __ATOMIC_RELAXED); }
+    u64 mb = *(const u64 *)(pose + 0x40), lb = *(const u64 *)(pose + 0x30);
+    { int sl = X->pp[0] == pose ? 0 : X->pp[1] == pose ? 1 : !X->pp[0] ? 0 : !X->pp[1] ? 1 : (int)(X->calls & 1);
+      if (X->pp[sl] == pose && X->mb[sl] && X->mb[sl] != mb) { fl |= 1; __atomic_add_fetch(&g_cj_realloc, 1, __ATOMIC_RELAXED); } X->pp[sl] = pose; X->mb[sl] = mb; (void)lb; }
+    { u32 e = (dtb >> 23) & 0xff; if (e == 0xff || (dtb >> 31) || (e >= 127 && dtb != 0x3f800000)) fl |= 32; }   /* non-finite, negative or above 1 s */
+    u8 st = (u8)*(const u32 *)(w + 0x88); u32 tctype = 0, tctime = 0;
+    { u64 ta = *(const u64 *)(w + 0x48); i32 tn = *(const i32 *)(w + 0x40); if (tn > 0 && mem_ok(ta, 8)) { u64 tc = *(const u64 *)ta; if (mem_ok(tc, 0x30)) { tctype = *(const u32 *)(tc + 0x20); tctime = *(const u32 *)(tc + 0x24); } } }
+    int reset = st == 1 && X->last_st != 1; X->last_st = st; if (reset) { X->resets++; __atomic_add_fetch(&g_cj_resets, 1, __ATOMIC_RELAXED); }
+    CjRec *R = &X->r[X->n % CJ_RING]; R->flip = (u32)g_plat_frame; R->dt = dtb; R->st = st; R->pst = (u8)pst; R->flags = fl; R->tctype = (u8)tctype; R->tctime = tctime; X->n++;
+    if (reset && g_opt_cloth_log && g_cj_reset_said < 60) { g_cj_reset_said++; say("    cloth job (w5_cloth, --cloth-log): flip "); say_dec((i64)g_plat_frame); say(" cloth \""); say(X->nci && mem_ok(X->ci[0], 0x30) ? cloth_name(X->ci[0]) : "?"); say("\" RESET requested (wrapper state 1: teleport detector, enable or the game), cloth enabled "); say_dec(*(const u8 *)(w + 0xc)); say(fl & 4 ? ", world moved > 1 unit this frame" : ""); say("\n"); }
+    if (!(fl & (8 | 16 | 32))) return;
+    __atomic_add_fetch(&g_cj_bad, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&g_cj_said, 1, __ATOMIC_RELAXED) > 10) return;
+    while (__atomic_exchange_n(&g_cj_lock, 1, __ATOMIC_ACQUIRE)) { }
+    say("    cloth job check (w5_cloth): flip "); say_dec((i64)g_plat_frame); say(" ["); say(cur_thread_name()); say("] the game's cloth job (eboot+0x13c2b60) is about to write BAD INPUTS for cloth \""); say(X->nci && mem_ok(X->ci[0], 0x30) ? cloth_name(X->ci[0]) : "?"); say("\": ");
+    if (fl & 16) { say("WORLD matrix (entity transform) bad:"); for (int j = 0; j < 16; j++) { say(" "); say_hex(wu[j]); } say("; "); }
+    if (fl & 8) { say("POSE: "); say_dec(nm); say(" model-space matrix(es) of "); say_dec(nb); say(" bad (first bone "); say_dec(fb); say(" bits "); say_hex(fv); say("), "); say_dec(nl); say(" local transform(s) bad; "); }
+    if (fl & 32) { say("STEP bits "); say_hex(dtb); say("; "); }
+    say("pose "); say_hex(pose); say(" state "); say_dec(pst); say(", model buffer "); say_hex(mb); say(fl & 1 ? " (CHANGED since the last call)" : ""); say("; ");
+    if (have_comp) { say_comp(comp); say("; "); }
+    say_frames(); say("\n"); cj_say_ring(X);
+    __atomic_store_n(&g_cj_lock, 0, __ATOMIC_RELEASE);
+}
+/* ------------------------------------------------------------------ w5_cloth: the cloth's WIND input (GPU compute)
+   Each cloth simulation with a wind coefficient ([simData+0x68] != 0; the Jacket's three) has a game action (vtable
+   eboot+0x2050ef0, apply eboot+0x1357d70, called by Havok inside hclSimulateOperator on the cloth thread):
+       force[i] += (wind[i] - (x[i] - xprev[i]) / dt) * k
+   wind[i] (12 bytes a particle, [action+0x28]) is the OUTPUT OF A COMPUTE SHADER: the wind manager ([eboot+0xd849720],
+   update eboot+0xbdb570 once a frame with the render clock's raw frame time [eboot+0xd82f818], 0 .. 1 s) dispatches a
+   sampler over the query positions the action wrote the frame before and the action waits for its label
+   (eboot+0xbdb530) before reading. The game zeroes NaN components only: an infinite or huge sample (|v| > 1.8e19, its
+   square overflows) or a zero step turns every particle of the simulation non-finite in that update - the user's
+   signature without any bad bone. Probe at eboot+0x1357dc0 (after the wait): the samples and the step are checked,
+   the largest sample and the last calls are kept per simulation and printed at the cloth's first non-finite report;
+   a non-finite or absurd (>= 2^24) sample is zeroed like the game's own NaN case (--no-cloth-wind-guard: only reported).
+   --cloth-test-wind FLIP:HEXBITS[:COUNT] (test) overwrites the first sample of every action with HEXBITS. */
+/* w6_cloth: ROOT CAUSE of the stranger's non-finite coat (60_05 flip 2116, 120_02 flip 2845, and the earlier sessions): the wind action
+   normalises each sample w with len2 = dot(w, w) (eboot+0x1357ec4), mask = len2 <= 0 (0x1357eca), r = rsqrtps(len2) (0x1357ecf) and one
+   Newton step. The PS4 runs game threads with MXCSR 0x9FC0 (flush-to-zero + denormals-are-zero): a sample shorter than ~2^-63 gives
+   len2 = 0 there and is masked. With MXCSR 0x1F80 (ours) len2 is a denormal > 0: not masked, rsqrtps(denormal) = +inf, the Newton
+   step gives -inf, the force is inf / NaN, and the whole simulation turns non-finite in that update. A wind that fades out passes
+   through that range (|w| 2^-75 .. 2^-63) for a frame or two. Fix: a sample whose three squared components are all below FLT_MIN
+   (what flush-to-zero turns into 0) is zeroed before the action reads it = the PS4's result (direction 0, no wind force).
+   --no-cloth-wind-tiny-fix turns it off. */
+static int g_opt_no_wind_tiny; static u64 g_wn_tiny, g_wn_tiny_calls; static u32 g_wn_tiny_said;
+static int wn_sq_tiny(u32 b) { float x; __builtin_memcpy(&x, &b, 4); double d = (double)x * (double)x * 18446744073709551616.0; return (float)d < 0x1p-62f; }   /* x * x rounded to 24 bits with an unbounded exponent < 2^-126 */
+static int g_opt_no_wind_guard; static u64 g_tw_flip; static u32 g_tw_bits, g_tw_count, g_tw_done;
+enum { WN_S = 32, WN_RING = 12 };
+typedef struct { u32 flip, dt, mdt; u8 maxexp, bad, minexp, tiny; } WnRec;
+typedef struct { u64 sim, act; u32 n, calls; u8 topexp; u32 topflip; WnRec r[WN_RING]; } WnS;
+static WnS g_wn[WN_S]; static u64 g_wn_calls, g_wn_bad, g_wn_zeroed, g_wn_baddt; static u32 g_wn_said, g_wn_first_said, g_wn_dtmin = ~0u, g_wn_dtmax, g_wn_mdtmin = ~0u, g_wn_mdtmax, g_wn_topexp, g_wn_topflip;
+static u64 g_wn_base;
+static u32 g_wn_topmdt, g_wn_topsrc, g_wn_lastpq; static u64 g_wn_pqchg;
+static u32 g_wn_dumps;
+static u32 g_wn_cs_done;
+static WnS *wn_find(u64 sim, int make) {
+    for (int i = 0; i < WN_S; i++) if (g_wn[i].sim == sim) return &g_wn[i];
+    if (!make) return 0;
+    WnS *X = 0; while (__atomic_exchange_n(&g_cj_lock, 1, __ATOMIC_ACQUIRE)) { }
+    for (int i = 0; i < WN_S && !X; i++) if (!g_wn[i].sim) X = &g_wn[i];
+    if (!X) { u32 old = ~0u; for (int i = 0; i < WN_S; i++) { u32 lf = g_wn[i].n ? g_wn[i].r[(g_wn[i].n - 1) % WN_RING].flip : 0; if (lf < old) { old = lf; X = &g_wn[i]; } } { u8 *z = (u8 *)X; for (u64 q = 0; q < sizeof *X; q++) z[q] = 0; } }
+    X->sim = sim; __atomic_store_n(&g_cj_lock, 0, __ATOMIC_RELEASE); return X; }
+static void wn_say_ring(const WnS *X, u32 k) {
+    say("      (w5_cloth) wind of simulation "); say_dec(k); say(" ("); say_dec((i64)X->calls); say(" calls; largest sample ever 2^"); say_dec((i64)X->topexp - 127); say(" at flip "); say_dec(X->topflip); say("); last calls, oldest first (flip: cloth sub-step us / wind manager step us / largest sample 2^n / bad samples / smallest non-zero sample 2^n / samples too short to normalise):");
+    u32 cnt = X->n < WN_RING ? X->n : WN_RING; for (u32 q = 0; q < cnt; q++) { const WnRec *R = &X->r[(X->n - cnt + q) % WN_RING]; say(" "); say_dec(R->flip); say(": "); say_us(R->dt); say(" / "); say_us(R->mdt); say(" / "); if (R->maxexp) say_dec((i64)R->maxexp - 127); else say("0"); say(" / "); say_dec(R->bad); say(" / "); if (R->minexp) say_dec((i64)R->minexp - 127); else say("0"); say(" / "); say_dec(R->tiny); say(";"); }
+    say("\n"); }
+static void wn_report_for(u64 ci) {
+    if (!g_wn_base) return;
+    u64 arr = *(const u64 *)(ci + 0x20); u32 ns = *(const u32 *)(ci + 0x28); if (ns > 8 || !arr || !mem_ok(arr, 8ull * ns)) return;
+    for (u32 k = 0; k < ns; k++) { WnS *X = wn_find(((const u64 *)arr)[k], 0); if (X) wn_say_ring(X, k); else { say("      (w5_cloth) simulation "); say_dec(k); say(": no wind action seen\n"); } } }
+static void wind_probe(u64 *P, u32 id) {   /* eboot+0x1357dc0: r14 action, r15 simulation, r12d particles, [rbp-0x24] the step */
+    (void)id; const u64 *g = P + 32; u64 act = g[1], sim = g[0], rbp = g[10]; u32 n = (u32)g[3];
+    if (!mem_ok(act, 0x30) || !cj_rd(rbp - 0x28, 8) || !n || n > 65536) return;
+    u64 out = *(const u64 *)(act + 0x28); if (!mem_ok(out, 12ull * n)) return;
+    u32 dtb = *(const u32 *)(rbp - 0x24), mdt = 0; u64 mgr = *(const u64 *)(g_wn_base + 0xd849720); if (mgr && mem_ok(mgr, 0x340)) mdt = *(const u32 *)(mgr + 0x2c4);
+    __atomic_add_fetch(&g_wn_calls, 1, __ATOMIC_RELAXED);
+    if (g_tw_count && g_plat_frame >= g_tw_flip && g_tw_done < g_tw_count) { u32 *w = (u32 *)out; w[0] = w[1] = w[2] = g_tw_bits; if (!(g_tw_done % 16)) { say("    TEST (--cloth-test-wind): flip "); say_dec((i64)g_plat_frame); say(": first wind sample of simulation "); say_hex(sim); say(" overwritten with "); say_hex(g_tw_bits); say("\n"); } g_tw_done++; }
+    u32 *u = (u32 *)out, maxe = 0, bad = 0, fi = 0, fv[3] = {0, 0, 0};
+    for (u32 i = 0; i < 3 * n; i++) { u32 e = (u[i] >> 23) & 0xff; if (e > maxe && e != 0xff) maxe = e; if (e >= 151) { if (!bad) { fi = i / 3; fv[0] = u[3 * fi]; fv[1] = u[3 * fi + 1]; fv[2] = u[3 * fi + 2]; } bad++; } }
+    int baddt = (dtb >> 31) || ((dtb >> 23) & 0xff) < 127 - 17 || ((dtb >> 23) & 0xff) >= 127;   /* negative, under 2^-17 s (8 us), 1 s or more, non-finite */
+    if (dtb < g_wn_dtmin) g_wn_dtmin = dtb; if (dtb > g_wn_dtmax && !(dtb >> 31)) g_wn_dtmax = dtb; if (mdt < g_wn_mdtmin) g_wn_mdtmin = mdt; if (mdt > g_wn_mdtmax && !(mdt >> 31)) g_wn_mdtmax = mdt;
+    if (maxe > g_wn_topexp) { g_wn_topexp = maxe; g_wn_topflip = (u32)g_plat_frame; g_wn_topmdt = mdt; g_wn_topsrc = mgr && mem_ok(mgr, 0x340) ? *(const u32 *)(mgr + 0x2f0) : 0; }
+    if (mgr && mem_ok(mgr, 0x340)) { u32 pq = *(const u32 *)(mgr + 0x2fc); if (g_wn_lastpq && pq != g_wn_lastpq) { g_wn_pqchg++; if (g_opt_cloth_log && g_wn_pqchg <= 24) { say("    cloth wind (w5_cloth, --cloth-log): flip "); say_dec((i64)g_plat_frame); say(": persistent wind queries "); say_dec(g_wn_lastpq); say(" -> "); say_dec(pq); say(" (a wind handle was created or released; the manager moves the others' samples)\n"); } } g_wn_lastpq = pq; }
+    u32 mine = 0, tiny = 0;   /* w6_cloth */
+    for (u32 i = 0; i < n; i++) { const u32 *w = u + 3 * i; int nz = 0, fin = 1, big = 0; for (int j = 0; j < 3; j++) { u32 e = (w[j] >> 23) & 0xff; if (w[j] << 1) { nz = 1; if (e != 0xff && (!mine || e < mine)) mine = e ? e : 1; } if (e == 0xff) fin = 0; if (!wn_sq_tiny(w[j])) big = 1; }
+        if (nz && fin && !big) { tiny++; if (!g_opt_no_wind_tiny) u[3 * i] = u[3 * i + 1] = u[3 * i + 2] = 0; } }
+    if (tiny) { __atomic_add_fetch(&g_wn_tiny, tiny, __ATOMIC_RELAXED); __atomic_add_fetch(&g_wn_tiny_calls, 1, __ATOMIC_RELAXED);
+        if (__atomic_add_fetch(&g_wn_tiny_said, 1, __ATOMIC_RELAXED) <= 24) { u32 mx; __asm__ volatile("stmxcsr %0" : "=m"(mx)); while (__atomic_exchange_n(&g_cj_lock, 1, __ATOMIC_ACQUIRE)) { }
+            say("    cloth wind fix (w6_cloth): flip "); say_dec((i64)g_plat_frame); say(" ["); say(cur_thread_name()); say("] wind action of simulation "); say_hex(sim); say(": "); say_dec(tiny); say(" of "); say_dec(n);
+            say(" wind sample(s) too short to normalise (squared length below FLT_MIN; smallest non-zero component 2^"); say_dec((i64)mine - 127); say(", largest 2^"); say_dec(maxe ? (i64)maxe - 127 : 0);
+            say(g_opt_no_wind_tiny ? ") LEFT as they are (--no-cloth-wind-tiny-fix): the cloth turns non-finite in this update unless the thread flushes denormals" : ") zeroed, as the PS4's flush-to-zero arithmetic does - without this the cloth turns non-finite in this update"); say("; thread MXCSR "); say_hex(mx & 0xffc0); say("\n");
+            __atomic_store_n(&g_cj_lock, 0, __ATOMIC_RELEASE); } }
+    WnS *X = wn_find(sim, 1); X->act = act; X->calls++; if (maxe > X->topexp) { X->topexp = (u8)maxe; X->topflip = (u32)g_plat_frame; }
+    { WnRec *R = &X->r[X->n % WN_RING]; R->flip = (u32)g_plat_frame; R->dt = dtb; R->mdt = mdt; R->maxexp = (u8)maxe; R->bad = (u8)(bad > 255 ? 255 : bad); R->minexp = (u8)mine; R->tiny = (u8)(tiny > 255 ? 255 : tiny); X->n++; }
+    if (g_opt_cloth_log && X->calls == 1 && g_wn_first_said < 24) { g_wn_first_said++; say("    cloth wind (w5_cloth, --cloth-log): flip "); say_dec((i64)g_plat_frame); say(" first wind action call for simulation "); say_hex(sim); say(", "); say_dec(n); say(" particles, samples at "); say_hex(out); say(", wind manager "); say_hex(mgr); say(" outputs "); say_hex(mgr ? *(const u64 *)(mgr + 0x2e0) : 0); say(", persistent queries "); say_dec(mgr ? *(const i32 *)(mgr + 0x2fc) : 0); say("\n"); }
+    if (g_opt_cloth_log && !g_wn_cs_done) { g_wn_cs_done = 1; u64 set = *(const u64 *)(g_wn_base + 0x235ad58), o = set && mem_ok(set, 0x38) ? *(const u64 *)(set + 0x30) : 0;   /* the sampler's compute shader ([[eboot+0x235ad58]+0x30]: size, -, address >> 8) */
+        if (o && mem_ok(o, 0x10)) { u64 ca = ((u64)*(const u32 *)(o + 8) << 8) | ((u64)*(const u32 *)(o + 0xc) << 40); u32 sz = *(const u32 *)o & 0x7fffff;
+            say("    cloth wind (w5_cloth, --cloth-log): the wind sampler's compute shader is at "); say_hex(ca); say(", "); say_dec(sz); say(" bytes");
+            if (sz && sz < (1u << 20) && mem_ok(ca, sz)) { char path[600]; Sb sb = {path, 0, sizeof path}; sb_s(&sb, g_cap_dir); sb_s(&sb, "/cloth_wind_cs.bin"); void *h = plat_open_write(path); if (h) { plat_write_bin(h, (const void *)ca, sz); plat_close(h); say(" -> "); say(path); } }
+            say("\n"); } }
+    if (baddt) __atomic_add_fetch(&g_wn_baddt, 1, __ATOMIC_RELAXED);
+    if (!bad && !baddt) return;
+    if (bad) __atomic_add_fetch(&g_wn_bad, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&g_wn_said, 1, __ATOMIC_RELAXED) <= 10) {
+        while (__atomic_exchange_n(&g_cj_lock, 1, __ATOMIC_ACQUIRE)) { }
+        say("    cloth wind check (w5_cloth): flip "); say_dec((i64)g_plat_frame); say(" ["); say(cur_thread_name()); say("] the wind action (eboot+0x1357d70) of simulation "); say_hex(sim); say(" ("); say_dec(n); say(" particles) got ");
+        if (bad) { say("BAD WIND SAMPLES from the GPU sampler: "); say_dec(bad); say(" component(s) non-finite or >= 2^24, first at particle "); say_dec(fi); say(": "); say_hex(fv[0]); say(" "); say_hex(fv[1]); say(" "); say_hex(fv[2]); say(g_opt_no_wind_guard ? " (left: --no-cloth-wind-guard); " : " (zeroed); "); }
+        if (baddt) { say("a BAD STEP (the action divides by it): bits "); say_hex(dtb); say("; "); }
+        say("samples at "); say_hex(out); say(", cloth sub-step us "); say_us(dtb); say(", wind manager step us "); say_us(mdt);
+        if (mgr && mem_ok(mgr, 0x340)) { say(", manager time bits "); say_hex(*(const u32 *)(mgr + 0x2c0)); say(", generation "); say_dec(*(const u32 *)(mgr + 0x2cc)); say(", dispatched flag "); say_dec(*(const u8 *)(mgr + 0x2d0)); say(", label "); say_dec(*(const u32 *)(mgr + 0x2d4)); say(", queries this frame "); say_dec(*(const i32 *)(mgr + 0x2f8)); say(" + persistent "); say_dec(*(const i32 *)(mgr + 0x2fc)); }
+        say("; "); say_frames(); say("\n"); wn_say_ring(X, 0);
+        if (bad) { u64 in = *(const u64 *)(act + 0x20); u32 nbp = 0, nz = 0; for (u32 i = 0; i < n; i++) { int b = 0, z = 1; for (int j = 0; j < 3; j++) { if (((u[3 * i + j] >> 23) & 0xff) >= 151) b = 1; if (u[3 * i + j] << 1) z = 0; } nbp += (u32)b; nz += (u32)z; }
+            say("      (w5_cloth) "); say_dec(nbp); say(" of "); say_dec(n); say(" samples bad, "); say_dec(nz); say(" zero; renderer state of the sample / query memory:");
+            for (int w = 0; w < 2; w++) { u64 a0 = w ? in : out, len = w ? 0x2cull * n : 12ull * n; if (!a0) continue; say(w ? "; queries " : " samples "); say_hex(a0); say(" +"); say_dec((i64)len);
+                for (u64 pa = a0 & ~0xFFFFull; pa < a0 + len; pa += 0x10000) { VShadow *S = shadow_of(pa > a0 ? pa : a0, 4); say(" [64 KB page "); say_hex(pa); say(": VRAM copy "); if (S) { say_hex(S->lo); say("-"); say_hex(S->hi); say(S->wb ? " write-back" : ""); say(S->ro ? " read-only" : ""); } else say("none");
+                    say(", GPU-held "); say_dec(coh_held4k((pa > a0 ? pa : a0) & ~0xFFFull)); say(", mirror state "); say_dec(g_rm_st && pa >= G2S_PT_BASE && pa < G2S_PT_BASE + G2S_PT_SIZE ? g_rm_st[(pa - G2S_PT_BASE) >> 16] : 255); say("]"); } }
+            if (in && mem_ok(in, 0x2cull * n)) { const u32 *q = (const u32 *)(in + 0x2cull * fi); say("; query of the first bad sample:"); for (int j = 0; j < 4; j++) { say(" "); say_hex(q[j]); } }
+            say("\n");
+            if (g_wn_dumps < 3) { g_wn_dumps++; char path[600]; Sb sb = {path, 0, sizeof path}; sb_s(&sb, g_cap_dir); sb_s(&sb, "/cloth_wind_"); sb_d(&sb, (i64)g_plat_frame); sb_s(&sb, ".bin"); void *h = plat_open_write(path);
+                if (h) { u64 hdr[8] = {0x3130304e57434c5full, sim, act, out, in, n, g_plat_frame, ((u64)mdt << 32) | dtb}; plat_write_bin(h, hdr, sizeof hdr); plat_write_bin(h, (const void *)out, 12ull * n); if (in && mem_ok(in, 0x2cull * n)) plat_write_bin(h, (const void *)in, 0x2cull * n); plat_close(h); say("      (w5_cloth) samples and queries -> "); say(path); say("\n"); } } }
+        __atomic_store_n(&g_cj_lock, 0, __ATOMIC_RELEASE); }
+    if (bad && !g_opt_no_wind_guard) { for (u32 i = 0; i < n; i++) { int b = 0; for (int j = 0; j < 3; j++) if (((u[3 * i + j] >> 23) & 0xff) >= 151) b = 1; if (b) { u[3 * i] = u[3 * i + 1] = u[3 * i + 2] = 0; __atomic_add_fetch(&g_wn_zeroed, 1, __ATOMIC_RELAXED); } } }
+}
+static void patch_cloth_wind(Module *m) {
+    static const u8 a[5] = {0xc5, 0xf2, 0x5e, 0x45, 0xd8};   /* eboot+0x1357dc0: vdivss xmm0,xmm1,[rbp-0x28] */
+    const u32 va = 0x1357dc0;
+    if (!g_stub_w || m->size < 0x2000000) return;
+    for (int i = 0; i < 5; i++) if (m->base[va + i] != a[i]) { say("  cloth wind check (w5_cloth): the code does not match this eboot - not applied\n"); return; }
+    g_wn_base = (u64)m->base; u8 *s = m->base + va, *st = g_stub_w;
+    g_stub_w = probe_emit_stub(g_stub_w, 1, a, 5, s + 5, (void *)&wind_probe);
+    s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5));
+    say("  cloth wind check on (w5_cloth): the GPU wind samples and the step of every cloth wind action are checked (eboot+0x1357dc0); non-finite or absurd samples are "); say(g_opt_no_wind_guard ? "reported only (--no-cloth-wind-guard)\n" : "zeroed like the game's own NaN case; --no-cloth-wind-guard: reported only\n");
+    say(g_opt_no_wind_tiny ? "  cloth wind fix OFF (--no-cloth-wind-tiny-fix): wind samples too short to normalise are only counted\n" : "  cloth wind fix on (w6_cloth): a wind sample whose squared length underflows (below FLT_MIN) is zeroed before the wind action normalises it (eboot+0x1357ec4..0x1357ecf: the PS4's flush-to-zero mode gives length 0 there, ours gave rsqrt(denormal) = inf -> non-finite cloth); --no-cloth-wind-tiny-fix turns it off\n");
+    if (g_tw_count) { say("  TEST: --cloth-test-wind: from flip "); say_dec((i64)g_tw_flip); say(" the first wind sample of "); say_dec(g_tw_count); say(" action call(s) is overwritten with "); say_hex(g_tw_bits); say("\n"); }
+}
+static void cloth_wind_report(void) {
+    if (!g_wn_calls) return;
+    say("  cloth wind check (w5_cloth): wind action calls "); say_dec((i64)g_wn_calls); say(", with bad samples "); say_dec((i64)g_wn_bad); say(" (samples zeroed "); say_dec((i64)g_wn_zeroed); say("), with a bad step "); say_dec((i64)g_wn_baddt);
+    say("; largest sample 2^"); say_dec((i64)g_wn_topexp - 127); say(" at flip "); say_dec(g_wn_topflip); say(" (wind manager step us "); say_us(g_wn_topmdt); say(", "); say_dec(g_wn_topsrc); say(" wind sources); persistent query count changes "); say_dec((i64)g_wn_pqchg); say("; cloth sub-step us "); say_us(g_wn_dtmin); say(" .. "); say_us(g_wn_dtmax); say(", wind manager step us "); say_us(g_wn_mdtmin); say(" .. "); say_us(g_wn_mdtmax); say("\n");
+    say("  cloth wind fix (w6_cloth): wind samples too short to normalise (each would have turned its cloth non-finite with MXCSR 0x1F80): "); say_dec((i64)g_wn_tiny); say(" in "); say_dec((i64)g_wn_tiny_calls); say(g_opt_no_wind_tiny ? " wind action calls, LEFT (--no-cloth-wind-tiny-fix)\n" : " wind action calls, zeroed like the PS4's flush-to-zero result\n");
+}
+static void patch_cloth_src(Module *m) {
+    static const u8 a[8] = {0x49, 0x8b, 0x45, 0x00, 0x48, 0x3b, 0x45, 0xd0};   /* eboot+0x13be555: mov rax,[r13+0]; cmp rax,[rbp-0x30] */
+    static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    static const struct { u32 va; const u8 *b; int n; void *h; } site[2] = {{0x13be555, a, 8, (void *)&pose_probe}, {0x13c2b60, e, 6, (void *)&cjob_probe}};
+    if (!g_stub_w || m->size < 0x2000000) return;
+    for (int k = 0; k < 2; k++) for (int i = 0; i < site[k].n; i++) if (m->base[site[k].va + i] != site[k].b[i]) { say("  cloth source checks (w5_cloth): the code does not match this eboot - not applied\n"); return; }
+    for (int k = 0; k < 2; k++) { u8 *s = m->base + site[k].va, *st = g_stub_w;
+        g_stub_w = probe_emit_stub(g_stub_w, (u32)(k + 1), site[k].b, site[k].n, s + site[k].n, site[k].h);
+        s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); for (int i = 5; i < site[k].n; i++) s[i] = 0x90; }
+    say("  cloth source checks on (w5_cloth): the pose of every skinned mesh is checked where its update job ends (eboot+0x13be555) and the world matrix, pose and step where the game's cloth job starts (eboot+0x13c2b60); --no-cloth-source-checks turns them off\n");
+}
+static void cloth_src_report(void) {
+    if (!g_ps_calls && !g_cj_calls) return;
+    say("  cloth source checks (w5_cloth): pose update jobs checked "); say_dec((i64)g_ps_calls); say(", left bad values "); say_dec((i64)g_ps_bad); say(" (of those in the local transforms "); say_dec((i64)g_ps_bad_local);
+    say("); cloth jobs checked "); say_dec((i64)g_cj_calls); say(", with a bad world matrix / pose / step "); say_dec((i64)g_cj_bad); say(", reading a pose not marked valid "); say_dec((i64)g_cj_notvalid); say(", with a changed model-matrix buffer "); say_dec((i64)g_cj_realloc); say("; cloth resets requested "); say_dec((i64)g_cj_resets); say("\n");
+    for (int i = 0; i < CJ_W; i++) if (g_cj[i].w && g_cj[i].calls) { say("    cloth \""); say(g_cj[i].nci && mem_ok(g_cj[i].ci[0], 0x30) ? cloth_name(g_cj[i].ci[0]) : "?"); say("\" wrapper "); say_hex(g_cj[i].w); say(": "); say_dec((i64)g_cj[i].calls); say(" job calls, "); say_dec((i64)g_cj[i].resets); say(" resets, last at flip "); say_dec(g_cj[i].last_flip); say("\n"); }
+}
+static void cloth_snapshot(ChInst *H, u64 ci) {
+    u64 arr = *(const u64 *)(ci + 0x20); u32 ns = *(const u32 *)(ci + 0x28); if (ns > 8 || !arr || !mem_ok(arr, 8ull * ns)) return;
+    for (u32 i = 0; i < ns; i++) { u64 sm = ((const u64 *)arr)[i]; if (!co_is_sim(sm)) continue;
+        for (int k = 0; k < 3; k++) { u64 a = *(const u64 *)(sm + 0x18 + 16 * k); u32 n = *(const u32 *)(sm + 0x20 + 16 * k); if (!a || !n || n > 65536 || !mem_ok(a, 16ull * n)) { H->snn[i][k] = 0; continue; }
+            if (H->snn[i][k] != n || !H->sn[i][k]) { if (H->sn[i][k]) free(H->sn[i][k]); H->sn[i][k] = (u32 *)malloc(16ull * n); H->snn[i][k] = H->sn[i][k] ? n : 0; }
+            if (H->sn[i][k]) mem_copy(H->sn[i][k], (const void *)a, 16ull * n); } }
+    H->sn_have = cl_root(ci, H->sn_root) ? 2 : 1; H->sn_upd = H->updates;
+}
+static int cloth_restore(ChInst *H, u64 ci, const char *when) {
+    if (g_opt_no_cl_restore || !H->sn_have) { __atomic_add_fetch(&g_cl_restore_fail, 1, __ATOMIC_RELAXED); return 0; }
+    u64 arr = *(const u64 *)(ci + 0x20); u32 ns = *(const u32 *)(ci + 0x28); if (ns > 8 || !arr || !mem_ok(arr, 8ull * ns)) return 0;
+    float now[16]; int move = H->sn_have == 2 && H->updates > H->sn_upd + 1 && cl_root(ci, now); const float *o = H->sn_root;
+    for (u32 i = 0; i < ns; i++) { u64 sm = ((const u64 *)arr)[i]; if (!co_is_sim(sm)) continue;
+        for (int k = 0; k < 3; k++) { u64 a = *(const u64 *)(sm + 0x18 + 16 * k); u32 n = *(const u32 *)(sm + 0x20 + 16 * k); if (!a || !n || n != H->snn[i][k] || !H->sn[i][k] || !mem_ok(a, 16ull * n)) continue;
+            mem_copy((void *)a, H->sn[i][k], 16ull * n);
+            if (move) { float *p = (float *)a;   /* p' = Rn Ro^T (p - to) + tn (columns 0..2 = rotation, column 3 = translation); the third array holds directions */
+                for (u32 j = 0; j < n; j++, p += 4) { float d[3], l[3]; for (int c = 0; c < 3; c++) d[c] = k < 2 ? p[c] - o[12 + c] : p[c];
+                    for (int c = 0; c < 3; c++) l[c] = o[4 * c] * d[0] + o[4 * c + 1] * d[1] + o[4 * c + 2] * d[2];
+                    for (int c = 0; c < 3; c++) p[c] = now[c] * l[0] + now[4 + c] * l[1] + now[8 + c] * l[2] + (k < 2 ? now[12 + c] : 0.0f); } } } }
+    if (move) { mem_copy(H->sn_root, now, 64); H->sn_upd = H->updates; for (u32 i = 0; i < ns; i++) { u64 sm = ((const u64 *)arr)[i]; if (!co_is_sim(sm)) continue; for (int k = 0; k < 3; k++) { u64 a = *(const u64 *)(sm + 0x18 + 16 * k); if (a && H->sn[i][k] && H->snn[i][k] == *(const u32 *)(sm + 0x20 + 16 * k)) mem_copy(H->sn[i][k], (const void *)a, 16ull * H->snn[i][k]); } } }
+    __atomic_add_fetch(&g_cl_restores, 1, __ATOMIC_RELAXED);
+    if (g_cl_rs_said < 16) { g_cl_rs_said++; say("    cloth restore (w3_cloth): flip "); say_dec((i64)g_plat_frame); say(" cloth \""); say(cloth_name(ci)); say("\" instance "); say_hex(ci); say(": non-finite particles "); say(when);
+        say(" -> the particle state of update "); say_dec((i64)H->sn_upd); say(" written back (now update "); say_dec((i64)H->updates); say(move ? ", moved with the root)\n" : ")\n"); }
+    return 1;
+}
+static void cloth_wfix(u64 ci, u64 ctx) {
+    u64 arr = *(const u64 *)(ci + 0x20); u32 ns = *(const u32 *)(ci + 0x28);
+    if (ns > 64 || !arr || !mem_ok(arr, 8ull * ns)) return;
+    u64 drift = 0, nonfin = 0, xyz = 0; u32 rep[8][3][2], mxe = 0; mem_fill(rep, 0, sizeof rep);
+    for (u32 i = 0; i < ns; i++) { u64 s = ((const u64 *)arr)[i]; if (!co_is_sim(s)) continue;
+        for (int k = 0; k < 3; k++) { u64 a = *(const u64 *)(s + 0x18 + 16 * k); u32 n = *(const u32 *)(s + 0x20 + 16 * k);   /* hkArray {data, size, capacity}: each array's own size (v0.3.2 review) */
             if (!a || (a & 15) || !n || n > 65536 || !mem_ok(a, 16ull * n)) continue;
             u32 *u = (u32 *)a;
-            for (u32 j = 3; j < 4 * n; j += 4) { u32 v = u[j];
-                if (k < 2) { if (v == 0x3f800000u) continue;
-                    if (((v >> 23) & 0xff) == 0xff) nonfin++; else if (v > 0x3f8147aeu || v < 0x3f7d70a4u) drift++;   /* outside 0.99 .. 1.01 (bit compare) */
-                    u[j] = 0x3f800000u; }
-                else if (((v >> 23) & 0xff) == 0xff) { u[j] = 0; nonfin++; } } } }
-    __atomic_add_fetch(&g_cloth_calls, 1, __ATOMIC_RELAXED);
-    if (drift) __atomic_add_fetch(&g_cloth_drift, drift, __ATOMIC_RELAXED);
-    if (nonfin) __atomic_add_fetch(&g_cloth_nonfinite, nonfin, __ATOMIC_RELAXED);
+            for (u32 j = 0; j < 4 * n; j += 4) {   /* t190b: x / y / z counted too (never changed) */
+                if (((u[j] >> 23) & 0xff) == 0xff || ((u[j + 1] >> 23) & 0xff) == 0xff || ((u[j + 2] >> 23) & 0xff) == 0xff) { xyz++; if (i < 8) rep[i][k][0]++; }
+                else if (k == 0) for (int c = 0; c < 3; c++) { u32 e = (u[j + c] >> 23) & 0xff; if (e > mxe) mxe = e; }
+                u32 v = u[j + 3];
+                if (k < 2) { if (v == 0x3f800000u) continue;   /* positions / previous positions: w = 1 */
+                    if (((v >> 23) & 0xff) == 0xff) { nonfin++; if (i < 8) rep[i][k][1]++; } else if (v > 0x3f8147aeu || v < 0x3f7d70a4u) drift++;   /* outside 0.99 .. 1.01 (bit order; no FP registers used here) */
+                    u[j + 3] = 0x3f800000u; }
+                else if (((v >> 23) & 0xff) == 0xff) { u[j + 3] = 0; nonfin++; if (i < 8) rep[i][k][1]++; } } } }   /* third array: w is 0 when healthy; only a non-finite w is cleared */
+    __atomic_add_fetch(&g_cw_calls, 1, __ATOMIC_RELAXED);
+    ChInst *H = 0;
+    { while (__atomic_exchange_n(&g_cw_lock, 1, __ATOMIC_ACQUIRE)) { }
+      int fr = -1; for (int q = 0; q < CH_INST; q++) { if (g_ch[q].ci == ci) { H = &g_ch[q]; break; } if (fr < 0 && (!g_ch[q].ci || g_ch[q].first_flip + 36000 < g_plat_frame)) fr = q; }
+      if (!H && fr >= 0) { H = &g_ch[fr]; ch_release(H); mem_fill(H, 0, sizeof *H); H->ci = ci; H->first_flip = g_plat_frame;
+          if (g_opt_cloth_log) { say("    cloth (w2_cloth, --cloth-log): flip "); say_dec((i64)g_plat_frame); say(" first update of cloth \""); say(cloth_name(ci)); say("\" instance "); say_hex(ci); say(", "); say_dec(ns); say(" simulations, step us "); say_us(ctx && (mem_ok(ctx, 8) || plat_readable(ctx, 8)) ? *(const u32 *)ctx : 0); say(nonfin || xyz ? ", already non-finite\n" : "\n"); } }
+      if (H) { ChUpd *U = &H->r[H->n++ % CH_RING]; H->updates++; U->flip = (u32)g_plat_frame; U->dt = ctx && (mem_ok(ctx, 8) || plat_readable(ctx, 8)) ? *(const u32 *)ctx : 0; U->maxexp = mxe;
+          u64 s0 = ns ? ((const u64 *)arr)[0] : 0; U->last = co_is_sim(s0) ? *(const u32 *)(s0 + 0xe8) : 0; }
+      if (H) { H->last_op = 0; H->opn = 0; H->begin_flip = (u32)g_plat_frame; H->begin_dt = H->r[(H->n - 1) % CH_RING].dt; H->scratch = ctx && (mem_ok(ctx, 0x20) || plat_readable(ctx, 0x20)) ? *(const u64 *)(ctx + 0x18) : 0; if (nonfin || xyz) H->bad = 1; }
+      __atomic_store_n(&g_cw_lock, 0, __ATOMIC_RELEASE); }
+    if (H) { cloth_input_guard(H, ci, ctx);   /* w3_cloth: an instance begins on one thread at a time */
+        if (xyz) { if (cloth_restore(H, ci, "at the begin of an update")) H->bad = 0; } else if (!nonfin) cloth_snapshot(H, ci); }
+    if (drift) __atomic_add_fetch(&g_cw_drift, drift, __ATOMIC_RELAXED);
+    if (nonfin) __atomic_add_fetch(&g_cw_nonfinite, nonfin, __ATOMIC_RELAXED);
+    if (xyz) __atomic_add_fetch(&g_cw_xyz, xyz, __ATOMIC_RELAXED);
+    if (nonfin || xyz) {   /* t190b: first time per instance - which cloth, which simulation and array, x/y/z or w */
+        while (__atomic_exchange_n(&g_cw_lock, 1, __ATOMIC_ACQUIRE)) { }
+        int seen = 0; for (u32 q = 0; q < g_cw_nseen; q++) if (g_cw_seen[q] == ci) seen = 1;
+        if (!seen && g_cw_nseen < 48) { g_cw_seen[g_cw_nseen++] = ci;
+            say("    cloth fix (t190b): flip "); say_dec((i64)g_plat_frame); say(" cloth \""); say(cloth_name(ci)); say("\" instance "); say_hex(ci); say(" on "); say(cur_thread_name()); say(", first non-finite values:");
+            for (u32 i = 0; i < ns && i < 8; i++) for (int k = 0; k < 3; k++) if (rep[i][k][0] || rep[i][k][1]) {
+                u64 s = ((const u64 *)arr)[i]; say(" sim "); say_dec(i); say(" ("); say_dec(*(const u32 *)(s + 0x20)); say(" particles) array "); say_dec(k); say(": x/y/z "); say_dec(rep[i][k][0]); say(", w "); say_dec(rep[i][k][1]); say(";"); }
+            say("\n");
+            if (H) { say("      (w2_cloth) the instance was first updated at flip "); say_dec((i64)H->first_flip); say(", "); say_dec((i64)H->updates); say(" updates ago; its last updates, oldest first (flip: step us / the simulation's previous sub-step us / largest |x,y,z| as 2^n):");
+                u32 cnt = H->n < CH_RING ? H->n : CH_RING; for (u32 q = 0; q < cnt; q++) { ChUpd *U = &H->r[(H->n - cnt + q) % CH_RING]; say(" "); say_dec(U->flip); say(": "); say_us(U->dt); say(" / "); say_us(U->last); say(" / "); if (U->maxexp) say_dec((i64)U->maxexp - 127); else say("none finite"); say(";"); }
+                say("\n      (w2_cloth) physics steps of the last frames (flip: measured us -> step us):");
+                u32 pn = g_ph_ring_n, pc = pn < PH_RING ? pn : PH_RING; for (u32 q = 0; q < pc; q++) { PhStep *R = &g_ph_ring[(pn - pc + q) % PH_RING]; say(" "); say_dec((i64)R->flip); say(": "); say_dec(R->raw_us); say(" -> "); say_us(R->bits); say(";"); }
+                say("\n"); }
+            cj_report_for(ci); }
+        __atomic_store_n(&g_cw_lock, 0, __ATOMIC_RELEASE); }
 }
-static void patch_cloth_fix(Module *m) {
+static void cloth_bend_note(u64 ci);
+/* w3_cloth: the update of a cloth instance is a chain of job steps (job function eboot+0x7e7f00): begin (eboot+0x73f190),
+   one step per operator (eboot+0x7ab8f0), end (eboot+0x73f6b0), on any Havok worker thread or the main thread. The game
+   starts the jobs at eboot+0xcb6250 (a scratch block for all instances is allocated there) and, right after
+   (eboot+0xcc0890, an inlined copy of 0xcb6340), waits for the thread pool, runs the post-step and frees the scratch block. Checks: (1) updates
+   in flight when that wait returns / when the next start begins (must be 0); (2) the particles after every operator: the
+   first operator that leaves them non-finite is named, and the instance's inputs are written to cloth_nan_<flip>.bin;
+   (3) test options that widen races: --cloth-delay MS:EVERY:MASK[:FROM:TO] sleeps on the cloth thread (mask 1 begin,
+   2 operator, 4 end), --hitch-inject FROM:TO:MS:EVERY sleeps on the main thread at the flip. */
+static volatile i32 g_cl_inflight; static u64 g_cl_begins, g_cl_ends, g_cl_ops, g_cl_ov_end, g_cl_ov_start, g_cl_mid, g_cl_delay_n, g_cl_waits; static u32 g_cl_said;
+static int g_opt_cl_delay_ms, g_opt_cl_delay_every = 1, g_opt_cl_delay_mask = 1; static u64 g_opt_cl_delay_from, g_opt_cl_delay_to = ~0ull;
+static void cl_delay(int bit) {
+    if (!g_opt_cl_delay_ms || !(g_opt_cl_delay_mask & bit) || g_plat_frame < g_opt_cl_delay_from || g_plat_frame > g_opt_cl_delay_to) return;
+    u64 n = __atomic_add_fetch(&g_cl_delay_n, 1, __ATOMIC_RELAXED); if (n % (u64)g_opt_cl_delay_every == 0) plat_sleep_ms((u32)g_opt_cl_delay_ms); }
+static void cloth_probe(u64 *P, u32 id) {
+    (void)id; const u64 *g = P + 32;   /* r15 r14 r13 r12 r11 r10 r9 r8 rdi rsi rbp rbx rdx rcx rax rflags */
+    u64 ci = g[8], ctx = g[9];
+    __atomic_add_fetch(&g_cl_inflight, 1, __ATOMIC_ACQ_REL); __atomic_add_fetch(&g_cl_begins, 1, __ATOMIC_RELAXED); cl_delay(1);   /* w3_cloth */
+    if (mem_ok(ci, 0x30)) cloth_bend_note(ci);
+    int dofix = !g_opt_no_cloth_fix && mem_ok(ci, 0x30);   /* t188 fix; t190b: with the recorder on, applied after its NaN check and before its snapshot */
+    __atomic_add_fetch(&g_co_calls, 1, __ATOMIC_RELAXED);
+    if (!g_co || !mem_ok(ci, 0x110) || !(mem_ok(ctx, 0x40) || plat_readable(ctx, 0x40))) { if (dofix) cloth_wfix(ci, ctx); return; }   /* the context may be on the thread's stack (not game memory) */
+    u32 mx; __asm__ volatile("stmxcsr %0" : "=m"(mx));
+    while (__atomic_exchange_n(&g_co_lock, 1, __ATOMIC_ACQUIRE)) { }
+    { int seen = 0; for (u32 i = 0; i < g_co_nmx; i++) if (g_co_mx_seen[i] == (mx & 0xffc0)) seen = 1;
+      if (!seen && g_co_nmx < 8) { g_co_mx_seen[g_co_nmx++] = mx & 0xffc0; say("    cloth onset (t187): cloth update runs with MXCSR "); say_hex(mx & 0xffc0); say(" on thread "); say(cur_thread_name()); say("\n"); } }
+    COInst *I = 0; for (int i = 0; i < CO_INST; i++) if (g_co[i].used && g_co[i].ci == ci) { I = &g_co[i]; break; }
+    if (!I) for (int i = 0; i < CO_INST; i++) if (!g_co[i].used) { I = &g_co[i]; mem_fill(I, 0, sizeof *I); I->used = 1; I->ci = ci; break; }
+    if (!I) { __atomic_store_n(&g_co_lock, 0, __ATOMIC_RELEASE); if (dofix) cloth_wfix(ci, ctx); return; }
+    /* simulation instances: hclClothInstance +0x20 array, +0x28 count */
+    u64 arr = *(const u64 *)(ci + 0x20); u32 ns = *(const u32 *)(ci + 0x28), nsim = 0; u64 sims[CO_SIMS];
+    if (ns <= 64 && arr && mem_ok(arr, 8ull * ns)) for (u32 i = 0; i < ns && nsim < CO_SIMS; i++) { u64 s = ((const u64 *)arr)[i]; if (co_is_sim(s)) sims[nsim++] = s; }
+    int changed = nsim != I->nsim; for (u32 i = 0; i < nsim && !changed; i++) changed = sims[i] != I->sim[i];
+    if (changed) { I->nsim = nsim; for (u32 i = 0; i < nsim; i++) { I->sim[i] = sims[i]; I->fin[i] = -1; I->dumped[i] = 0; } I->pages_flip = 0; }
+    u64 world = *(const u64 *)(ctx + 8); if (!mem_ok(world, 0x90)) world = 0;
+    if (!I->np || world != I->world || g_plat_frame >= I->pages_flip + 300) { I->world = world; co_pages(I); I->pages_flip = g_plat_frame; }
+    u32 nan[CO_SIMS] = {0};
+    for (u32 i = 0; i < I->nsim; i++) { nan[i] = co_nan_rows(I->sim[i]);
+        if (nan[i] && I->fin[i] == 1 && !I->dumped[i] && g_co_ndumps < CO_DUMPS) { I->dumped[i] = 1; g_co_ndumps++; g_co_onsets++; co_dump(I, i, nan[i]); }
+        if (I->fin[i] == -1) { say("    cloth onset (t187): flip "); say_dec((i64)g_plat_frame); say(" instance "); say_hex(ci); say(" simulation "); say_dec(i); say(" "); say_hex(I->sim[i]);
+            say(" particles "); say_dec(*(const u32 *)(I->sim[i] + 0x20)); say(nan[i] ? " - already NaN when first seen (" : " - finite when first seen ("); say_dec(nan[i]); say(" NaN rows)\n"); }
+        I->fin[i] = nan[i] ? 0 : 1; }
+    if (dofix) cloth_wfix(ci, ctx);   /* t190b: the snapshot below is the state the update starts from */
+    COSlot *S = &I->slot[I->next];
+    if (!S->data) S->data = (u8 *)calloc(CO_MAXP, 4096);
+    if (S->data) { S->flip = g_plat_frame; S->mx = mx; S->np = I->np; mem_copy(S->ctx, (const void *)ctx, sizeof S->ctx); mem_copy(S->nan, nan, sizeof S->nan);
+        for (u32 i = 0; i < I->np; i++) { S->pg[i] = I->pg[i]; mem_copy(S->data + 4096ull * i, (const void *)I->pg[i], 4096); }
+        I->next = (I->next + 1) % CO_SLOTS; }
+    if (g_plat_frame % 1800 == 0) { say("    cloth onset (t187): flip "); say_dec((i64)g_plat_frame); say(" instance "); say_hex(ci); say(" NaN rows per simulation:");
+        for (u32 i = 0; i < I->nsim; i++) { say(" "); say_dec(nan[i]); say("/"); say_dec(*(const u32 *)(I->sim[i] + 0x20)); } say("\n"); }
+    __atomic_store_n(&g_co_lock, 0, __ATOMIC_RELEASE);
+}
+static void patch_cloth_onset(Module *m) {
     static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};   /* push rbp; mov rbp,rsp; push r15 */
-    const u32 va = 0x73f190, vt = 0x1fd25d0;
-    if (!g_stub_w || m->size < vt + 8) return;
-    for (int i = 0; i < 6; i++) if (m->base[va + i] != e[i]) { say("  cloth fix: the code does not match this eboot (01.03 expected) - not applied\n"); return; }
-    { static const char want[] = "19hclSimClothInstance"; const u32 nm = 0x1839df0;   /* the type's RTTI name (typeinfo +8) */
-      int ok = m->size >= nm + sizeof want; for (int i = 0; ok && i < (int)sizeof want; i++) ok = m->base[nm + i] == (u8)want[i];
-      if (!ok) { say("  cloth fix: the cloth type does not match this eboot (01.03 expected) - not applied\n"); return; }
-      g_cloth_name = (u64)m->base + nm; }
-    g_cloth_vt = (u64)m->base + vt; g_cloth_lo = (u64)m->base; g_cloth_hi = (u64)m->base + m->size;
+    const u32 va = 0x73f190;
+    if (!g_stub_w || m->size < 0x2000000) return;
+    for (int i = 0; i < 6; i++) if (m->base[va + i] != e[i]) { say("  cloth onset recorder: the code does not match this eboot (01.03 expected) - not applied\n"); return; }
+    if (g_opt_cloth_onset) { g_co = (COInst *)calloc(CO_INST, sizeof *g_co); if (!g_co) return; }
+    g_co_base = (u64)m->base;
     u8 *s = m->base + va, *st = g_stub_w;
     g_stub_w = probe_emit_stub(g_stub_w, 1, e, 6, s + 6, (void *)&cloth_probe);
     s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90;
-    say("  cloth fix on (STATUS 238): Havok Cloth particle w lanes reset to 1 at each cloth update (eboot+0x73f190); --no-cloth-fix turns it off\n");
+    if (!g_opt_no_cloth_fix) say("  cloth fix on (t188, STATUS 238): Havok Cloth particle w lanes reset to 1 at each cloth instance update (entry of eboot+0x73f190); --no-cloth-fix turns it off\n");
+    if (g_opt_cloth_onset) say("  cloth onset recorder on (t187, --cloth-onset): entry of eboot+0x73f190; the first NaN of a Havok cloth simulation writes cloth_onset_<flip>.bin\n");
+}
+/* ------------------------------------------------------------------ w3 (--render-scale with --rs-ui 3): Scaleform viewport
+   The game gives every full-screen Scaleform movie the viewport (W, H, 0, 0, W, H) with W, H read from its display
+   settings ([[eboot+0xd636c18] + 0x47e8 / + 0x47ec] = 1920, 1080): Movie::SetViewport (vtable + 0x68) at eboot+0x14e1da1,
+   +0x14e2451 and +0x14e6001. Scaleform rasterises glyphs into its cache, tessellates shapes and sizes its filter / cache
+   render targets for that viewport, so the interface has the game's resolution whatever the renderer does afterwards.
+   Here the three sites load the physical size instead (constants); the layout is unchanged (the movies scale their stage
+   to the viewport), and the renderer takes the draws that come with this viewport as physical (e6_vk.c g_rs_phys).
+   Movies rendered into a texture (the subtitle strip: viewport from the component, eboot+0x14e5f2f) are not changed. */
+static int g_gfx_vp_patched;
+static void patch_gfx_viewport(Module *m, u32 pw, u32 ph) {
+    static const struct { u32 va; u8 len; u8 old[8]; u8 opc; } S[6] = {
+        {0x14e1d4c, 6, {0x8b, 0x88, 0xe8, 0x47, 0x00, 0x00}, 0xb9}, {0x14e1d52, 6, {0x8b, 0x80, 0xec, 0x47, 0x00, 0x00}, 0xb8},   /* mov ecx,[rax+0x47e8]; mov eax,[rax+0x47ec] */
+        {0x14e23fc, 6, {0x8b, 0x88, 0xe8, 0x47, 0x00, 0x00}, 0xb9}, {0x14e2402, 6, {0x8b, 0x80, 0xec, 0x47, 0x00, 0x00}, 0xb8},
+        {0x14e5fab, 8, {0x41, 0x8b, 0x84, 0x24, 0x80, 0x01, 0x00, 0x00}, 0xb8}, {0x14e5fb3, 8, {0x41, 0x8b, 0x8c, 0x24, 0x84, 0x01, 0x00, 0x00}, 0xb9}};   /* mov eax,[r12+0x180]; mov ecx,[r12+0x184] */
+    if (m->size < 0x2000000) return;
+    for (int i = 0; i < 6; i++) for (int k = 0; k < S[i].len; k++) if (m->base[S[i].va + k] != S[i].old[k]) {
+        say("    render scale, interface (--rs-ui 3): the code does not match this eboot (01.03 expected) - viewport not changed, the interface is filtered instead (as --rs-ui 1)\n"); g_opt_rs_ui = 1; return; }
+    for (int i = 0; i < 6; i++) { u8 *q = m->base + S[i].va; int w_ = (i & 1) == 0;   /* (each pair: width, then height) */
+        q[0] = S[i].opc; *(u32 *)(q + 1) = w_ ? pw : ph; for (int k = 5; k < S[i].len; k++) q[k] = 0x90; }
+    g_gfx_vp_patched = 1;
+    if (g_opt_rs_ui == 4) {   /* movies rendered to a texture (eboot+0x14e5f28: mov rax,[rdi]; lea rsi,[rbp-0x68]; call [rax+0x68]): the six
+                                 sizes of the viewport at [rbp-0x68] times num / den (rounded up, as the renderer scales the texture) */
+        static const u8 o[10] = {0x48, 0x8b, 0x07, 0x48, 0x8d, 0x75, 0x98, 0xff, 0x50, 0x68};
+        u8 *q = m->base + 0x14e5f28, *st = g_stub_w; int ok = st != 0; u32 n_ = pw * 3 == 1920 * 4 ? 4 : pw * 100 / 1920, d_ = pw * 3 == 1920 * 4 ? 3 : 100;
+        for (int k = 0; k < 10 && ok; k++) if (q[k] != o[k]) ok = 0;
+        if (!ok) { say("    render scale, interface (--rs-ui 4): the texture movies' call site does not match - they stay as with --rs-ui 3\n"); g_opt_rs_ui = 3; }
+        else {
+            u8 *w = st;
+            *w++ = 0x57; *w++ = 0xb9; *(u32 *)w = 6; w += 4; *w++ = 0x48; *w++ = 0x8d; *w++ = 0x75; *w++ = 0x98;                    /* push rdi; mov ecx,6; lea rsi,[rbp-0x68] */
+            *w++ = 0x8b; *w++ = 0x06; *w++ = 0x69; *w++ = 0xc0; *(u32 *)w = n_; w += 4; *w++ = 0x05; *(u32 *)w = d_ - 1; w += 4;      /* L: mov eax,[rsi]; imul eax,eax,n; add eax,d-1 */
+            *w++ = 0x99; *w++ = 0xbf; *(u32 *)w = d_; w += 4; *w++ = 0xf7; *w++ = 0xff; *w++ = 0x89; *w++ = 0x06;                     /* cdq; mov edi,d; idiv edi; mov [rsi],eax */
+            *w++ = 0x48; *w++ = 0x83; *w++ = 0xc6; *w++ = 0x04; *w++ = 0xff; *w++ = 0xc9; *w++ = 0x75; *w++ = 0xe1;                   /* add rsi,4; dec ecx; jnz L */
+            *w++ = 0x5f; *w++ = 0x48; *w++ = 0x8b; *w++ = 0x07; *w++ = 0x48; *w++ = 0x8d; *w++ = 0x75; *w++ = 0x98; *w++ = 0xff; *w++ = 0x60; *w++ = 0x68;   /* pop rdi; mov rax,[rdi]; lea rsi,[rbp-0x68]; jmp [rax+0x68] */
+            g_stub_w = w;
+            q[0] = 0xe8; *(i32 *)(q + 1) = (i32)(st - (q + 5)); for (int k = 5; k < 10; k++) q[k] = 0x90;
+            say("    render scale, interface (--rs-ui 4): movies rendered to a texture get their viewport at the physical size as well\n"); } }
+    say("    render scale, interface (--rs-ui 3): Scaleform's full-screen viewport is "); say_dec(pw); say("x"); say_dec(ph); say(" (3 call sites): glyphs and shapes are rasterised for the output resolution\n");
+}
+/* ------------------------------------------------------------------ w4 (--rs-ui 3): Scaleform's memory for the larger viewport
+   With the physical viewport Scaleform sizes its filter / cache render targets in physical pixels (scale^2 the bytes),
+   but it takes them from a fixed pool: the game's memory layout (eboot+0xace8xx) gives "Scaleform Internal (Garlic)"
+   256 MB at 0x1000000000 (mov qword [rbx+0x140],0x10000000 at +0xace9a8; the next two regions follow it: AVPlayer at
+   +0x10000000 (lea at +0xaceb32), RW Textures at +0x15a00000 (add at +0xaceb40)); the component's allocator
+   (eboot+0x14e0690) serves GPU memory (type 0x6001) from it and returns -1 when it is full. A screen such as Status &
+   Collectibles at 200 percent then gets render targets without memory: missing filters / masks (the extra logo line
+   back on the main menu) and the crash at eboot+0x412295 (HAL mask code on a render target without data).
+   Also the render buffer manager keeps at most 8 MB of unused targets for reuse (RenderBufferManagerGeneric(1, 0x800000, 0)
+   at eboot+0x14e15d4), tuned for 1080p targets.
+   Here: the pool and that limit grow with the area (the two regions behind the pool move up by the same amount; the
+   whole stays below the heap slots at 0x1200000000). --rs-ui-mem 0 leaves the game's sizes.
+   --trace-gfx-mem (diagnostic): the pool's use, its largest requests and every failed request, in the game log. */
+static int g_opt_rs_ui_mem = 1, g_opt_rs_ui_rt, g_opt_trace_gfx_mem, g_opt_rs_ui_dmem_off;   /* (--rs-ui-dmem 0: A/B, the w4 behaviour) */ static u64 g_gfx_pool_size = 0x10000000;
+static volatile i64 g_gm_used, g_gm_peak, g_gm_fail, g_gm_n; static u64 g_gm_last_size, g_gm_said_peak, g_gm_big_lines, g_gm_fail_lines;
+static void gm_probe(u64 *P, u32 id) {
+    const u64 *g = P + 32;
+    if (id == 1) { if ((u32)g[13] == 0x6001) g_gm_last_size = g[9]; else g_gm_last_size = 0; return; }
+    if (id == 2) {   /* after the pool's allocation: rax = the block or 0 */
+        u64 p = g[14], sz = g_gm_last_size;
+        if (!p) { g_gm_fail++; if (g_gm_fail_lines++ < 40) { say("    gfx-mem: FAILED request of "); say_dec((i64)sz); say(" bytes at flip "); say_dec((i64)g_plat_frame); say(" (pool in use "); say_dec(g_gm_used >> 20); say(" MB of "); say_dec((i64)(g_gfx_pool_size >> 20)); say(")\n"); } return; }
+        if (p >= 0x1000000000ull && p < 0x1000000000ull + g_gfx_pool_size) { u64 c = *(u64 *)(p - 8) & ~7ull; if (c < sz || c > sz + (1u << 20)) c = sz; g_gm_used += (i64)c; g_gm_n++;
+            if (g_gm_used > g_gm_peak) g_gm_peak = g_gm_used;
+            if (sz >= (4u << 20) && g_gm_big_lines++ < 200) { say("    gfx-mem: request of "); say_dec((i64)sz); say(" bytes at flip "); say_dec((i64)g_plat_frame); say(" -> "); say_hex(p); say(", pool in use "); say_dec(g_gm_used >> 20); say(" MB\n"); }
+            if ((u64)g_gm_peak >= g_gm_said_peak + (32u << 20)) { g_gm_said_peak = (u64)g_gm_peak; say("    gfx-mem: pool in use "); say_dec(g_gm_peak >> 20); say(" MB at flip "); say_dec((i64)g_plat_frame); say("\n"); } }
+        return; }
+    if (id == 3) { u64 p = g[9]; if (p >= 0x1000000000ull && p < 0x1000000000ull + g_gfx_pool_size) { u64 c = *(u64 *)(p - 8) & ~7ull; if (c <= g_gfx_pool_size) { g_gm_used -= (i64)c; g_gm_n--; } } }
+}
+static void gfx_mem_report(void) {
+    if (!g_opt_trace_gfx_mem) return;
+    say("    gfx-mem (w4): Scaleform pool "); say_dec((i64)(g_gfx_pool_size >> 20)); say(" MB, in use now "); say_dec(g_gm_used >> 20); say(" MB in "); say_dec(g_gm_n); say(" blocks, peak "); say_dec(g_gm_peak >> 20); say(" MB, failed requests "); say_dec(g_gm_fail); say("\n");
+}
+static void patch_gfx_mem(Module *m, u64 num, u64 den, u32 pw, u32 ph) {
+    if (m->size < 0x2000000) return;
+    if (g_opt_rs_ui_mem && num > den) {
+        static const u8 o1[11] = {0x48, 0xc7, 0x83, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10};   /* mov qword [rbx+0x140],0x10000000 */
+        static const u8 o2[7] = {0x48, 0x8d, 0x88, 0x00, 0x00, 0x00, 0x10};                           /* lea rcx,[rax+0x10000000] */
+        static const u8 o3[6] = {0x48, 0x05, 0x00, 0x00, 0xa0, 0x15};                                 /* add rax,0x15a00000 */
+        static const u8 o4[5] = {0xba, 0x00, 0x00, 0x80, 0x00};                                       /* mov edx,0x800000 */
+        /* w5 (the crash of the cave at 200 percent, eboot+0x9d3a87 = the game's assertion after a failed buffer allocation in
+           WaterComponent's set-up): the game sizes its last region ("RW Textures", the device's buffer heap, which the lump
+           loader shrinks 100 MB at a time when it needs direct memory) as the direct memory left over (eboot+0xace9c9 ..
+           +0xace9e5: size - ... - 0x4bd20000). w4 enlarged the pool without taking the difference from anywhere, so the game
+           had 768 MB (200 percent; 208 MB at 133) less direct memory than it counted on, the loader released that much more
+           of the buffer heap, and a level with large dynamic buffers ran out. Now the direct memory the system reports grows
+           by the pool's growth (h_direct_size) and the same amount goes into that subtraction: every other region and the
+           free direct memory are exactly the game's own. */
+        static const u8 o5[6] = {0x48, 0x05, 0x00, 0x00, 0x2e, 0xb4};                                 /* add rax,-0x4bd20000 */
+        u8 *q5 = m->base + 0xace9df; int ok5 = 1; for (int k = 0; k < 6; k++) if (q5[k] != o5[k]) ok5 = 0;
+        u8 *q1 = m->base + 0xace9a8, *q2 = m->base + 0xaceb32, *q3 = m->base + 0xaceb40, *q4 = m->base + 0x14e15d4; int ok = 1;
+        for (int k = 0; k < 11; k++) if (q1[k] != o1[k]) ok = 0;
+        for (int k = 0; k < 7; k++) if (q2[k] != o2[k]) ok = 0;
+        for (int k = 0; k < 6; k++) if (q3[k] != o3[k]) ok = 0;
+        for (int k = 0; k < 5; k++) if (q4[k] != o4[k]) ok = 0;
+        if (!ok) say("    render scale, interface (--rs-ui-mem): the code does not match this eboot - Scaleform's memory pool keeps the game's size\n");
+        else {
+            u64 sz = (0x10000000ull * num * num / (den * den) + 0xFFFFFF) & ~0xFFFFFFull, ru = (0x800000ull * num * num / (den * den) + 0xFFFFF) & ~0xFFFFFull;
+            if (sz > 0x44000000ull) sz = 0x44000000ull; if (ru > 0x20000000ull) ru = 0x20000000ull;   /* (w5: 1088 MB at most - the subtraction below is a signed 32-bit immediate) */
+            if (ok5 && !g_opt_rs_ui_dmem_off) { u64 ex = sz - 0x10000000ull; *(i32 *)(q5 + 2) = -(i32)(0x4bd20000u + (u32)ex); g_dmem_extra = ex;
+                say("    render scale, interface (w5): direct memory "); say_dec((i64)(ex >> 20)); say(" MB larger for that pool (the game's other regions and its free direct memory unchanged)\n"); }
+            else say("    render scale, interface (w5): the pool's growth is NOT added to the direct memory (as w4: the game's buffer heap can run short)\n");
+            *(u32 *)(q1 + 7) = (u32)sz; *(u32 *)(q2 + 3) = (u32)sz; *(u32 *)(q3 + 2) = (u32)(sz + 0x5a00000); *(u32 *)(q4 + 1) = (u32)ru; g_gfx_pool_size = sz;
+            say("    render scale, interface (--rs-ui-mem 1, w4): Scaleform's memory pool is "); say_dec((i64)(sz >> 20)); say(" MB instead of 256 (render targets at the physical size), its reuse limit "); say_dec((i64)(ru >> 20)); say(" MB instead of 8\n"); } }
+    if (g_opt_rs_ui_rt) {   /* the default render target object's size (eboot+0x14e14ba: mov edx,[rcx+0x47e8]; mov ecx,[rcx+0x47ec]) */
+        static const u8 o[12] = {0x8b, 0x91, 0xe8, 0x47, 0x00, 0x00, 0x8b, 0x89, 0xec, 0x47, 0x00, 0x00};
+        u8 *q = m->base + 0x14e14ba; int ok = 1; for (int k = 0; k < 12; k++) if (q[k] != o[k]) ok = 0;
+        if (ok) { q[0] = 0xba; *(u32 *)(q + 1) = pw; q[5] = 0x90; q[6] = 0xb9; *(u32 *)(q + 7) = ph; q[11] = 0x90; say("    render scale, interface (--rs-ui-rt 1): Scaleform's default render target object has the physical size too\n"); } }
+    if (g_opt_trace_gfx_mem && g_stub_w) {
+        static const u8 e1[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57}, e2[6] = {0x49, 0x89, 0xc6, 0x4d, 0x85, 0xf6}, e3[6] = {0x31, 0xc0, 0x48, 0x83, 0xfe, 0xff};
+        static const u32 va[3] = {0x14e0690, 0x14e06d2, 0x14e0730}; const u8 *e[3] = {e1, e2, e3}; int ok = 1;
+        for (int k = 0; k < 3; k++) for (int i = 0; i < 6; i++) if (m->base[va[k] + i] != e[k][i]) ok = 0;
+        if (!ok) say("  gfx-mem trace: the code does not match this eboot - not applied\n");
+        else { for (int k = 0; k < 3; k++) { u8 *s = m->base + va[k], *st = g_stub_w; g_stub_w = probe_emit_stub(g_stub_w, (u32)(k + 1), e[k], 6, s + 6, (void *)&gm_probe); s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90; }
+            g_gfx_mem_report_fn = gfx_mem_report; say("  gfx-mem trace on (w4): Scaleform's GPU memory pool\n"); } }
+}
+/* ------------------------------------------------------------------ w2_cloth: bend-stiffness division by zero
+   Cause of the cloth that turns non-finite in ONE update (the stranger's waist / strips after t188, "jacket_collar"):
+   Havok Cloth's bend-stiffness solver (eboot+0x7a7670, and its twin at eboot+0x768e..) divides by the squared length of
+   the hinge edge with rcpps and no test: |e|^2 = dpps(e, e); r = rcpps(|e|^2); r' = r (2 - |e|^2 r). When the two
+   particles of the edge hold the same position (a strip folded flat under fast motion; coordinates near 290 have a
+   float spacing of 3e-5), |e|^2 is 0, r is inf and r' is NaN. The neighbouring reciprocal square roots of the same
+   function ARE masked (the hinge normals become 0), but 0 * NaN is NaN: all four particles of the hinge are stored as
+   NaN, the links spread it to the whole simulation in the same update, and Verlet state never recovers (the cloth's
+   output transforms, the CPU skinning and the picture lose the piece for good). Reproduced offline with the game's own
+   code on capture 13432 (bench\agents\w2_cloth\harness\sim_dt.c): with the fixed 1/30 s step as well as with varying
+   steps, first NaN store eboot+0x7a7831 with xmm6 = inf - the same single-update signature as the sessions' reports.
+   Fix: the reciprocal of a zero (or denormal) squared length is taken as 0, as the function's own masks do for the
+   normals: the rest-curvature term of that hinge is skipped for that iteration, everything else is unchanged
+   (particle x/y/z bit-identical over 2600 updates when no edge is degenerate). --no-cloth-bend-fix turns it off. */
+static int g_opt_no_bend_fix; static volatile u64 *g_bend_cnt; static u64 g_bend_seen; static u32 g_bend_said;
+static void patch_cloth_bend(Module *m) {
+    static const u8 want[16] = {0xc5, 0xf8, 0x53, 0xf2, 0xc5, 0xe8, 0x59, 0xd6, 0xc5, 0xf8, 0x28, 0x1d};   /* vrcpps xmm6,xmm2; vmulps xmm2,xmm2,xmm6; vmovaps xmm3,[rip+..] (xmm3 is free here) */
+    static const u32 site[2] = {0x7a7719, 0x768fda};
+    if (!g_stub_w || m->size < 0x1000000) return;
+    for (int k = 0; k < 2; k++) for (int i = 0; i < 12; i++) if (m->base[site[k] + i] != want[i]) { say("  cloth bend fix: the code does not match this eboot (01.03 expected) - not applied\n"); return; }
+    u8 *w = (u8 *)(((u64)g_stub_w + 15) & ~15ull);
+    u32 *inf4 = (u32 *)w; for (int i = 0; i < 4; i++) inf4[i] = 0x7f800000u; w += 16;
+    g_bend_cnt = (volatile u64 *)w; *g_bend_cnt = 0; w += 16;
+    for (int k = 0; k < 2; k++) {
+        u8 *p = m->base + site[k], *st = w;
+        *w++ = 0xc5; *w++ = 0xf8; *w++ = 0x53; *w++ = 0xf2;                                   /* vrcpps xmm6,xmm2 */
+        *w++ = 0xc5; *w++ = 0xc8; *w++ = 0xc2; *w++ = 0x1d; *(i32 *)w = (i32)((u8 *)inf4 - (w + 5)); w += 4; *w++ = 0x01;   /* vcmpltps xmm3,xmm6,[inf]: finite reciprocals */
+        *w++ = 0xc5; *w++ = 0xc8; *w++ = 0x54; *w++ = 0xf3;                                   /* vandps xmm6,xmm6,xmm3 */
+        *w++ = 0x48; *w++ = 0x8d; *w++ = 0x64; *w++ = 0x24; *w++ = 0x80; *w++ = 0x51;         /* lea rsp,[rsp-0x80]; push rcx (red zone kept, no flags touched) */
+        *w++ = 0xc5; *w++ = 0xf8; *w++ = 0x50; *w++ = 0xcb;                                   /* vmovmskps ecx,xmm3 */
+        *w++ = 0x8d; *w++ = 0x49; *w++ = 0xf1;                                               /* lea ecx,[rcx-15] */
+        *w++ = 0xe3; *w++ = 18;                                                              /* jrcxz +18: every lane finite */
+        *w++ = 0x48; *w++ = 0x8b; *w++ = 0x0d; *(i32 *)w = (i32)((u8 *)g_bend_cnt - (w + 4)); w += 4;   /* mov rcx,[count] */
+        *w++ = 0x48; *w++ = 0x8d; *w++ = 0x49; *w++ = 0x01;                                   /* lea rcx,[rcx+1] */
+        *w++ = 0x48; *w++ = 0x89; *w++ = 0x0d; *(i32 *)w = (i32)((u8 *)g_bend_cnt - (w + 4)); w += 4;   /* mov [count],rcx */
+        *w++ = 0x59; *w++ = 0x48; *w++ = 0x8d; *w++ = 0xa4; *w++ = 0x24; *(u32 *)w = 0x80; w += 4;      /* pop rcx; lea rsp,[rsp+0x80] */
+        *w++ = 0xc5; *w++ = 0xe8; *w++ = 0x59; *w++ = 0xd6;                                   /* vmulps xmm2,xmm2,xmm6 */
+        *w++ = 0xe9; *(i32 *)w = (i32)((p + 8) - (w + 4)); w += 4;                            /* back to the vmovaps */
+        p[0] = 0xe9; *(i32 *)(p + 1) = (i32)(st - (p + 5)); p[5] = p[6] = p[7] = 0x90;
+        w = (u8 *)(((u64)w + 15) & ~15ull);
+    }
+    g_stub_w = w;
+    say("  cloth bend fix on (w2_cloth): Havok Cloth's bend-stiffness solver no longer divides by a hinge edge of zero length (eboot+0x7a7719, +0x768fda); --no-cloth-bend-fix turns it off\n");
+}
+static void cloth_bend_note(u64 ci) {   /* called at each cloth instance update: says when the guard has acted since the last look */
+    if (!g_bend_cnt) return;
+    u64 c = *g_bend_cnt; if (c == g_bend_seen) return;
+    u64 d = c - g_bend_seen; g_bend_seen = c;
+    if (g_bend_said < 24) { g_bend_said++; say("    cloth bend fix (w2_cloth): flip "); say_dec((i64)g_plat_frame); say(": "); say_dec((i64)d); say(" hinge edge(s) of zero length handled since the last cloth update (total "); say_dec((i64)c); say("); now updating cloth \""); say(cloth_name(ci)); say("\"\n"); }
+}
+static ChInst *ch_find(u64 ci) { for (int q = 0; q < CH_INST; q++) if (g_ch[q].ci == ci) return &g_ch[q]; return 0; }
+static int cl_rd(u64 a, u64 n) { return a > 0x10000 && (mem_ok(a, n) || plat_readable(a, n)); }
+static const char *cl_rtti(u64 obj) {   /* the object's class name (Itanium ABI: vtable[-1] -> type_info, +8 its name) */
+    if (!cl_rd(obj, 8)) return "?"; u64 vt = *(const u64 *)obj; if (!cl_rd(vt - 8, 8)) return "?"; u64 ti = *(const u64 *)(vt - 8); if (!cl_rd(ti + 8, 8)) return "?";
+    u64 nm = *(const u64 *)(ti + 8); if (!cl_rd(nm, 48)) return "?"; const char *p = (const char *)nm; for (int i = 0; i < 48; i++) { if (!p[i]) return i ? p : "?"; if (p[i] < 32 || p[i] > 126) return "?"; } return "?"; }
+static void cl_wr(void *h, u64 a, u64 n, u32 tag) { if (!cl_rd(a, n)) return; u64 hd[3] = {a, n, tag}; plat_write_bin(h, hd, sizeof hd); plat_write_bin(h, (const void *)a, n); }
+static void cl_wr_obj(void *h, u64 o, u64 n, u32 tag) {   /* the object and every array it points to (pointer + count pairs) */
+    if (!cl_rd(o, n)) return; cl_wr(h, o, n, tag);
+    for (u64 k = 0; k + 16 <= n; k += 8) { u64 p = *(const u64 *)(o + k); u32 c = *(const u32 *)(o + k + 8);
+        if (p < 0x10000 || (p & 3) || !c || c > 65536) continue;
+        u64 L = (u64)c * 64; if (L > 262144) L = 262144; if (!cl_rd(p, L)) { L = (u64)c * 16; if (!cl_rd(p, L)) L = 16; }
+        cl_wr(h, p, L, tag | 0x100 | (u32)(k << 16)); } }
+static void cl_dump_inputs(u64 ci, u64 ctx, u64 op, u64 prev) {
+    char path[600]; Sb s = {path, 0, sizeof path}; sb_s(&s, g_cap_dir); sb_s(&s, "/cloth_nan_"); sb_d(&s, (i64)g_plat_frame); sb_s(&s, ".bin");
+    void *h = plat_open_write(path); if (!h) return;
+    u64 hdr[8] = {0x3130304e4c43445full /* "_DCLN001" */, g_co_base, ci, ctx, op, prev, g_plat_frame, 0}; plat_write_bin(h, hdr, sizeof hdr);
+    cl_wr(h, ctx, 0x40, 1); cl_wr_obj(h, ci, 0x110, 2);
+    if (cl_rd(ctx, 0x20)) { cl_wr_obj(h, *(const u64 *)(ctx + 8), 0x90, 3); u64 sc = *(const u64 *)(ctx + 0x18); if (sc) cl_wr(h, sc, 0x4000, 9); }
+    if (op) cl_wr_obj(h, op, 0x100, 4); if (prev) cl_wr_obj(h, prev, 0x100, 5);
+    static const u32 arr[3][3] = {{0x20, 0x28, 6}, {0x30, 0x38, 7}, {0x40, 0x48, 8}};   /* simulations, buffers, transform sets */
+    for (int a = 0; a < 3; a++) { u64 p = *(const u64 *)(ci + arr[a][0]); u32 n = *(const u32 *)(ci + arr[a][1]); if (n > 64 || !cl_rd(p, 8ull * n)) continue;
+        for (u32 i = 0; i < n; i++) cl_wr_obj(h, ((const u64 *)p)[i], a == 0 ? 0x1c0 : 0x110, arr[a][2] | (i << 24)); }
+    { ChInst *H = ch_find(ci); u64 p = *(const u64 *)(ci + 0x20); u32 n = *(const u32 *)(ci + 0x28);   /* w6_cloth: the particle state BEFORE this update (tag 10: header address = the live array) and each simulation's wind action, samples, queries (11, 12, 13) */
+        if (n <= 8 && cl_rd(p, 8ull * n)) for (u32 i = 0; i < n; i++) { u64 sm = ((const u64 *)p)[i]; if (!co_is_sim(sm)) continue;
+            if (H && H->sn_have) for (int k = 0; k < 3; k++) if (H->sn[i][k] && H->snn[i][k]) { u64 hd[3] = {*(const u64 *)(sm + 0x18 + 16 * k), 16ull * H->snn[i][k], 10u | (i << 24) | ((u32)k << 16)}; plat_write_bin(h, hd, sizeof hd); plat_write_bin(h, H->sn[i][k], 16ull * H->snn[i][k]); }
+            WnS *X = wn_find(sm, 0); if (X && X->act && cl_rd(X->act, 0x40)) { u32 np = *(const u32 *)(sm + 0x20); cl_wr(h, X->act, 0x40, 11u | (i << 24)); if (np && np <= 65536) { cl_wr(h, *(const u64 *)(X->act + 0x28), 12ull * np, 12u | (i << 24)); cl_wr(h, *(const u64 *)(X->act + 0x20), 0x2cull * np, 13u | (i << 24)); } } } }
+    plat_close(h);
+    say("      (w3_cloth) the instance's inputs (context, instance, world, scratch, operators, simulations, buffers, transform sets and their arrays, the particle state before the update, wind samples) -> "); say(path); say("\n");
+}
+static void cloth_mid_check(u64 ci, u64 ctx, u64 op, int at_end) {
+    ChInst *H = ch_find(ci); if (!H || H->bad) return;
+    u64 arr = *(const u64 *)(ci + 0x20); u32 ns = *(const u32 *)(ci + 0x28); if (ns > 8 || !arr || !mem_ok(arr, 8ull * ns)) return;
+    u32 rows[8], tot = 0; for (u32 i = 0; i < ns; i++) { u64 sm = ((const u64 *)arr)[i]; rows[i] = co_is_sim(sm) ? co_nan_rows(sm) : 0; tot += rows[i]; }
+    if (!tot) { H->last_op = op; H->opn++; return; }
+    while (__atomic_exchange_n(&g_cw_lock, 1, __ATOMIC_ACQUIRE)) { }
+    if (H->bad) { __atomic_store_n(&g_cw_lock, 0, __ATOMIC_RELEASE); return; }
+    H->bad = 1; g_cl_mid++; int quiet = g_cl_mid > 6;
+    if (!quiet) {
+    say("    cloth (w3_cloth): flip "); say_dec((i64)g_plat_frame); say(" cloth \""); say(cloth_name(ci)); say("\" instance "); say_hex(ci); say(" on "); say(cur_thread_name());
+    say(": particles turned non-finite DURING the update begun at flip "); say_dec(H->begin_flip); say(" (step us "); say_us(H->begin_dt); say(", update "); say_dec((i64)H->updates); say(" of the instance)");
+    if (H->last_op) { say(", after operator "); say_dec((i64)H->opn - 1); say(" ("); say(cl_rtti(H->last_op)); say(", type "); say_dec(cl_rd(H->last_op, 0x20) ? *(const u32 *)(H->last_op + 0x18) : 0); say(", object "); say_hex(H->last_op); say(")"); }
+    else say(", before its first operator (between begin and the first operator)");
+    if (at_end) say(" and before the end of the update"); else { say(" and before operator "); say_dec(H->opn); say(" ("); say(cl_rtti(op)); say(", type "); say_dec(cl_rd(op, 0x20) ? *(const u32 *)(op + 0x18) : 0); say(")"); }
+    say("; non-finite rows per simulation:"); for (u32 i = 0; i < ns; i++) { say(" "); say_dec(rows[i]); }
+    say("; scratch at begin "); say_hex(H->scratch); say(", now "); say_hex(cl_rd(ctx, 0x20) ? *(const u64 *)(ctx + 0x18) : 0); say("; updates in flight "); say_dec(g_cl_inflight); say("\n");
+    cj_report_for(ci);
+    if (g_cl_mid <= 3) cl_dump_inputs(ci, ctx, at_end ? 0 : op, H->last_op); }
+    __atomic_store_n(&g_cw_lock, 0, __ATOMIC_RELEASE);
+    if (g_co) { while (__atomic_exchange_n(&g_co_lock, 1, __ATOMIC_ACQUIRE)) { }
+        for (int i = 0; i < CO_INST; i++) if (g_co[i].used && g_co[i].ci == ci) { COInst *I = &g_co[i];
+            for (u32 k = 0; k < I->nsim && k < ns; k++) if (rows[k] && !I->dumped[k] && g_co_ndumps < CO_DUMPS) { I->dumped[k] = 1; g_co_ndumps++; g_co_onsets++; co_dump(I, k, rows[k]); break; } }
+        __atomic_store_n(&g_co_lock, 0, __ATOMIC_RELEASE); }
+    if (cloth_restore(H, ci, at_end ? "at the end of an update" : "after an operator")) { H->bad = 0; H->last_op = op; H->opn++; }
+}
+static void cloth_op_probe(u64 *P, u32 id) {
+    const u64 *g = P + 32; u64 op = g[8], ctx = g[9];
+    if (id == 3) {   /* eboot+0xcc08b1 (the inlined copy of 0xcb6354 that the game calls): the wait for the thread pool has returned */
+        g_cl_waits++; i32 n = __atomic_load_n(&g_cl_inflight, __ATOMIC_ACQUIRE);
+        if (n) { g_cl_ov_end++; if (g_cl_said < 12) { g_cl_said++; say("    cloth (w3_cloth): flip "); say_dec((i64)g_plat_frame); say(": "); say_dec(n); say(" cloth update(s) STILL RUNNING when the game's wait for the cloth jobs returned (the scratch block is freed next)\n"); } }
+        return; }
+    if (id == 4) {   /* eboot+0xcb6250: the next start */
+        i32 n = __atomic_load_n(&g_cl_inflight, __ATOMIC_ACQUIRE);
+        if (n) { g_cl_ov_start++; if (g_cl_said < 12) { g_cl_said++; say("    cloth (w3_cloth): flip "); say_dec((i64)g_plat_frame); say(": "); say_dec(n); say(" cloth update(s) still running when the next cloth step starts\n"); } }
+        return; }
+    if (!cl_rd(ctx, 0x28)) return;
+    u64 ci = id == 2 ? op : *(const u64 *)(ctx + 0x10);
+    if (id == 1) { __atomic_add_fetch(&g_cl_ops, 1, __ATOMIC_RELAXED); cl_delay(2); if (mem_ok(ci, 0x50)) cloth_mid_check(ci, ctx, op, 0); }
+    else { cl_delay(4); if (mem_ok(ci, 0x50)) cloth_mid_check(ci, ctx, 0, 1); __atomic_add_fetch(&g_cl_ends, 1, __ATOMIC_RELAXED); __atomic_sub_fetch(&g_cl_inflight, 1, __ATOMIC_ACQ_REL); }
+}
+static void patch_cloth_ops(Module *m) {
+    static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};   /* push rbp; mov rbp,rsp; push r15 */
+    static const u8 w[9] = {0x48, 0x8b, 0x7b, 0x18, 0xc5, 0xfa, 0x10, 0x43, 0x30};   /* mov rdi,[rbx+0x18]; vmovss xmm0,[rbx+0x30] */
+    static const struct { u32 va; const u8 *b; int n; } site[4] = {{0x7ab8f0, e, 6}, {0x73f6b0, e, 6}, {0xcc08b1, w, 9}, {0xcb6250, e, 6}};
+    if (!g_stub_w || !g_co_base || m->size < 0x2000000) return;
+    for (int k = 0; k < 4; k++) for (int i = 0; i < site[k].n; i++) if (m->base[site[k].va + i] != site[k].b[i]) { say("  cloth update checks (w3_cloth): the code does not match this eboot - not applied\n"); return; }
+    for (int k = 0; k < 4; k++) { u8 *s = m->base + site[k].va, *st = g_stub_w;
+        g_stub_w = probe_emit_stub(g_stub_w, (u32)(k + 1), site[k].b, site[k].n, s + site[k].n, (void *)&cloth_op_probe);
+        s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); for (int i = 5; i < site[k].n; i++) s[i] = 0x90; }
+    if (!g_opt_no_cloth_fix) { say("  cloth input guard "); say(g_opt_no_cl_inguard ? "off" : "on"); say(", cloth state restore "); say(g_opt_no_cl_restore ? "off" : "on"); say(" (w3_cloth): an update that begins with non-finite bone matrices runs on the last sane ones; particles found non-finite are written back from the last finite state; --no-cloth-input-guard / --no-cloth-restore\n"); }
+    say("  cloth update checks on (w3_cloth): particles checked after every cloth operator, updates in flight checked when the game's wait returns; --no-cloth-checks turns them off\n");
+    if (g_opt_cl_delay_ms) { say("  TEST: --cloth-delay: the cloth threads sleep "); say_dec(g_opt_cl_delay_ms); say(" ms every "); say_dec(g_opt_cl_delay_every); say(" call(s), mask "); say_dec(g_opt_cl_delay_mask); say("\n"); }
+}
+/* ------------------------------------------------------------------ t192: physics follows the frame time (STATUS 242)
+   The game steps Havok physics (rigid bodies: the lantern, doors, debris) and Havok Cloth by a fixed 1/30 s once per
+   rendered frame: SystemPhysicsComponent::UpdateMain (eboot+0x13b6400) passes the float at eboot+0xd828234 (set once to
+   0x3d088888) to the physics manager's update (eboot+0xcb5e70), whose fixed step [mgr+0x118] is latched from the same
+   float at creation; the cloth step is min([mgr+0x30] = that step, 0.1). On the PS4 a frame IS 1/30 s. At 60 fps
+   physics ran at twice real time (the lantern swinging wildly; the PS5 version shows the same at 60 fps).
+   At the entry of UpdateMain, once per frame, both values are set to the frame time: the smoothed time between calls,
+   exactly 1/30 at 30 fps or below (bit-identical to the original there - slower frames keep the PS4's behaviour),
+   exactly 1/limit when the frame-rate limit is being held, never under 1/240; the accumulator remainder [mgr+0x11c] is
+   cleared, so every frame makes exactly one step of that length. --fixed-physics-step: the game's 1/30 per frame. */
+static int g_opt_phys_catchup; static u64 g_ph_nclamp; static u32 g_ph_minbits, g_ph_maxbits;
+static int g_opt_fixed_phys; static u64 g_ph_last, g_ph_calls, g_ph_n30, g_ph_nlim, g_ph_nvar; static double g_ph_ema, g_ph_sum; static u64 g_ph_base, g_ph_size;
+static void phys_probe(u64 *P, u32 id) {
+    (void)P; (void)id;
+    u64 now = plat_ticks(), f = plat_ticks_per_sec(); double raw = g_ph_last && now > g_ph_last ? (double)(now - g_ph_last) / (double)f : 1.0 / 30;
+    g_ph_last = now;
+    /* w2_cloth: a frame longer than 1/30 s counts as 1/30 s, as in the game itself (it steps 1/30 s per frame however long
+       the frame took): a hitch no longer raises the following steps (the smoothed value used to jump by up to 60 % in one
+       frame and physics then ran ahead for a quarter of a second); the step now changes by at most 12.5 % of 1/60 s per
+       frame at 60 fps. --phys-step-catchup: as t192 - t197 (frames up to 0.1 s enter the average). */
+    double cap = g_opt_phys_catchup ? 0.1 : 1.0 / 30;
+    if (raw > cap) { raw = cap; g_ph_nclamp++; } if (raw < 0.002) raw = 0.002;
+    g_ph_ema = g_ph_ema > 0 ? g_ph_ema * 0.875 + raw * 0.125 : raw;
+    double dt = g_ph_ema; u32 bits;
+    if (dt >= (1.0 / 30) * 0.97) { bits = 0x3d088888u; g_ph_n30++; }
+    else { double lim = g_opt_fps > 0 ? 1.0 / g_opt_fps : g_opt_fps < 0 && g_opt_uncapped_max > 0 ? 1.0 / g_opt_uncapped_max : 0;   /* (w14_speed: --uncapped-max is a limit too) */
+        if (lim > 0 && dt > lim * 0.96 && dt < lim * 1.04) { dt = lim; g_ph_nlim++; } else g_ph_nvar++;
+        if (dt < 1.0 / 240) dt = 1.0 / 240;
+        float fd = (float)dt; mem_copy(&bits, &fd, 4); }
+    { float fd; mem_copy(&fd, &bits, 4); g_ph_sum += fd; }
+    g_ph_calls++; if (!g_ph_minbits || bits < g_ph_minbits) g_ph_minbits = bits; if (bits > g_ph_maxbits) g_ph_maxbits = bits;   /* (positive floats order like their bits) */
+    { PhStep *R = &g_ph_ring[g_ph_ring_n % PH_RING]; R->flip = g_plat_frame; R->raw_us = (u32)(raw * 1e6); R->bits = bits; g_ph_ring_n++; }
+    *(volatile u32 *)(g_ph_base + 0xd828234) = bits;
+    u64 mgr = *(const u64 *)(g_ph_base + 0xd740e10);
+    if (mgr && !(mgr & 7) && mem_ok(mgr, 0x120)) {
+        u32 cur = *(const u32 *)(mgr + 0x118);
+        if (cur == bits || (cur >= 0x3b000000u && cur <= 0x3dcccccdu)) {   /* a plausible step (1/500 .. 0.1 s): the manager as analysed */
+            *(volatile u32 *)(mgr + 0x118) = bits; *(volatile u32 *)(mgr + 0x11c) = 0; } }
+}
+static void patch_phys_step(Module *m) {
+    static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};   /* push rbp; mov rbp,rsp; push r15 */
+    static const u8 use[11] = {0x48, 0x8d, 0x05, 0x99, 0x1d, 0x47, 0x0c, 0xc5, 0xfa, 0x10, 0x00};   /* 13b6494: lea rax,[0xd828234]; vmovss xmm0,[rax] */
+    const u32 va = 0x13b6400;
+    if (!g_stub_w || m->size < 0xd828238) return;
+    int ok = 1; for (int i = 0; i < 6; i++) ok &= m->base[va + i] == e[i];
+    for (int i = 0; i < 11; i++) ok &= m->base[0x13b6494 + i] == use[i];
+    ok &= *(const u32 *)(m->base + 0xf416e8) == 0x3d088888u;   /* the static initialiser's immediate */
+    if (!ok) { say("  physics step: the code does not match this eboot (01.03 expected) - not applied (physics keeps 1/30 s per frame)\n"); return; }
+    g_ph_base = (u64)m->base; g_ph_size = m->size;
+    u8 *s = m->base + va, *st = g_stub_w;
+    g_stub_w = probe_emit_stub(g_stub_w, 2, e, 6, s + 6, (void *)&phys_probe);
+    s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90;
+    say("  physics step follows the frame time (t192, STATUS 242): 1/30 s at 30 fps or below as on the PS4, the frame time above that; --fixed-physics-step turns it off\n");
+}
+/* ------------------------------------------------------------------ w14_speed: --time-log [MS] (diagnostic, off by default)
+   Which time values the game's systems advance by (eboot 01.03, w14_speed NOTES):
+   - SMGTime (Supermassive, RTTI type eboot+0xd84d4b0, instance [eboot+0xd84d4a0], update eboot+0x1291950 once a frame):
+     four clocks of 0x38 bytes at +0x10 / +0x48 / +0x80 / +0xb8, each advanced by RDTSC ticks since the last update
+     (eboot+0xe67de0: +0x8 total ticks, +0x10 ticks this frame x the clock's scale +0x18, +0x30 dt = ticks x 3.1368e-10);
+     clocks 1 and 2 clamp a frame to 0x9804040 ticks (0.1 s at 1.594 GHz); scale +0xf0, paused +0xf4 / +0xf5.
+     dt of the clocks: +0x40 (real), +0x78 (game: scaled / paused), +0xb0, +0xe8.
+   - Morpheme animation: MorphemeComponent::JobUpdateAnim (eboot+0x1427840) takes the component's clock dt from
+     eboot+0x1377210 (one of the four above by the entity's time class), max(dt, 1e-4), into eboot+0x13c65b0.
+   - Scaleform components (eboot+0x14de4a0): the same per-component clock dt.
+   - Decima entity logic: fixed logic ticks of 1/15 s (0x6558028 ticks, eboot+0xe9b178), time at [[eboot+0xd828108]+8].
+   - Havok physics / cloth: the fixed 1/30 s float eboot+0xd828234 per frame (t192 makes it the frame time).
+   With --time-log, every MS of wall time (default 1000) one line: flips and fps, game clock ticks per wall second
+   (1.000 = real time) for the four SMGTime clocks and the logic clock, physics seconds simulated per wall second, and
+   the Morpheme updates of the window (probe at eboot+0x13c65b0): updates per flip, dt per update (avg / min / max),
+   animation seconds per wall second (avg dt x flips / wall), and updates of one component twice in one flip. */
+static int g_opt_tlog; static u32 g_tlog_ms = 1000; static int g_an_installed;
+static volatile u64 g_an_calls, g_an_dtns, g_an_rep; static volatile u32 g_an_minb = 0x7f7fffffu, g_an_maxb;
+enum { AN_H = 2048 };
+static u64 g_an_comp[AN_H], g_an_cflip[AN_H];
+static void anim_probe(u64 *P, u32 id) {
+    (void)id; u32 b = (u32)P[0]; float dt; mem_copy(&dt, &b, 4); u64 comp = P[40];
+    __atomic_add_fetch(&g_an_calls, 1, __ATOMIC_RELAXED);
+    if (dt > 0 && dt < 10) __atomic_add_fetch(&g_an_dtns, (u64)((double)dt * 1e9), __ATOMIC_RELAXED);
+    if (!(b & 0x80000000u)) {
+        u32 o = __atomic_load_n(&g_an_minb, __ATOMIC_RELAXED); while (b < o && !__atomic_compare_exchange_n(&g_an_minb, &o, b, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        o = __atomic_load_n(&g_an_maxb, __ATOMIC_RELAXED); while (b > o && !__atomic_compare_exchange_n(&g_an_maxb, &o, b, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {} }
+    u32 h = (u32)((comp >> 4) * 0x9E3779B1u) % AN_H; u64 fl = g_plat_frame;   /* (racy by design: a diagnostic count) */
+    if (g_an_comp[h] == comp && g_an_cflip[h] == fl) __atomic_add_fetch(&g_an_rep, 1, __ATOMIC_RELAXED);
+    g_an_comp[h] = comp; g_an_cflip[h] = fl;
+}
+static void patch_anim_probe(Module *m) {
+    static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    static const u8 call[5] = {0xe8, 0x12, 0xed, 0xf9, 0xff};   /* 1427899: call 0x13c65b0 */
+    const u32 va = 0x13c65b0; if (!g_stub_w || m->size < 0x1427900) return;
+    int ok = 1; for (int i = 0; i < 6; i++) ok &= m->base[va + i] == e[i];
+    for (int i = 0; i < 5; i++) ok &= m->base[0x1427899 + i] == call[i];
+    if (!ok) { say("  time log (w14_speed): the animation update does not match this eboot - no animation counts\n"); return; }
+    u8 *s = m->base + va, *st = g_stub_w;
+    g_stub_w = probe_emit_stub(g_stub_w, 1, e, 6, s + 6, (void *)&anim_probe);
+    s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90; g_an_installed = 1;
+}
+/* w14_speed build 2: the look / camera smoothing the game's scripts use (counts for --time-log; --smooth-dt changes it).
+   - gAddCameraWiggle (eboot+0x157d1d0; script export "AddCameraWiggle"): the right-stick camera wiggle. Per call:
+     offset += (target - offset) x DampFactor x xmm0 (CameraWiggleLimitsResource +0x30..+0x3c, near/far, X/Y); its R2
+     timer counts down by the same xmm0 - the argument is a time step. Counted: calls, sum of the argument.
+   - SmoothingParametersResource (getters eboot+0x15d18c0 SlowdownFactor +0x38, eboot+0x15d1d10 BufferSize +0x3c;
+     FindSmoothingParameters eboot+0x156d5b0): "BufferSize" (samples) and "SlowdownFactor" used by the looking /
+     pointing scripts. When the counts are on, the two getters are replaced by ours (same result unless --smooth-dt).
+   (w14_speed batch 2: in the main menu and with the stick held the getters are never called and the wiggle is not
+   used; FindSmoothingParameters runs twice a frame. The build-2 option --smooth-dt changed nothing and was removed.) */
+static volatile u64 g_wg_calls, g_wg_argns, g_sm_slow_calls, g_sm_buf_calls, g_sm_find_calls; static volatile u32 g_wg_damp_bits, g_sm_slow_bits, g_sm_slow_out_bits; static volatile i32 g_sm_buf_last;
+static void wiggle_probe(u64 *P, u32 id) {
+    (void)id; float a; u32 b = (u32)P[0]; mem_copy(&a, &b, 4); __atomic_add_fetch(&g_wg_calls, 1, __ATOMIC_RELAXED);
+    if (a > 0 && a < 10) __atomic_add_fetch(&g_wg_argns, (u64)((double)a * 1e9), __ATOMIC_RELAXED);
+    u64 lim = P[39]; (void)lim; u64 r = P[40]; if (r && !(r & 3) && mem_ok(r, 0x40)) g_wg_damp_bits = *(const u32 *)(r + 0x30);
+}
+static void smfind_probe(u64 *P, u32 id) { (void)P; (void)id; __atomic_add_fetch(&g_sm_find_calls, 1, __ATOMIC_RELAXED); }
+static SYSV float sm_slow_get(u64 res) {
+    float f = *(const float *)(res + 0x38); __atomic_add_fetch(&g_sm_slow_calls, 1, __ATOMIC_RELAXED); u32 b; mem_copy(&b, &f, 4); g_sm_slow_bits = b;
+    mem_copy(&b, &f, 4); g_sm_slow_out_bits = b; return f;
+}
+static SYSV int sm_buf_get(u64 res) { int n = *(const i32 *)(res + 0x3c); __atomic_add_fetch(&g_sm_buf_calls, 1, __ATOMIC_RELAXED); g_sm_buf_last = n; return n; }
+static int g_wg_installed, g_sm_installed;
+static void patch_look_probes(Module *m) {
+    static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    static const u8 gs[6] = {0xc5, 0xfa, 0x10, 0x47, 0x38, 0xc3}, gb[4] = {0x8b, 0x47, 0x3c, 0xc3};
+    if (!g_stub_w || m->size < 0x15d1d20) return;
+    int okw = 1, okf = 1, oks = 1; for (int i = 0; i < 6; i++) { okw &= m->base[0x157d1d0 + i] == e[i]; okf &= m->base[0x156d5b0 + i] == e[i]; oks &= m->base[0x15d18c0 + i] == gs[i]; }
+    for (int i = 0; i < 4; i++) oks &= m->base[0x15d1d10 + i] == gb[i];
+    for (int i = 6; i < 16; i++) oks &= m->base[0x15d18c0 + i] == 0x90;
+    for (int i = 4; i < 16; i++) oks &= m->base[0x15d1d10 + i] == 0x90;
+    if (okw && g_opt_tlog) { u8 *s = m->base + 0x157d1d0, *st = g_stub_w; g_stub_w = probe_emit_stub(g_stub_w, 1, e, 6, s + 6, (void *)&wiggle_probe); s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90; g_wg_installed = 1; }
+    if (okf && g_opt_tlog) { u8 *s = m->base + 0x156d5b0, *st = g_stub_w; g_stub_w = probe_emit_stub(g_stub_w, 2, e, 6, s + 6, (void *)&smfind_probe); s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90; }
+    if (oks) { u8 *a = m->base + 0x15d18c0, *b = m->base + 0x15d1d10;   /* movabs rax, fn; jmp rax (12 of the 16 bytes) */
+        a[0] = 0x48; a[1] = 0xb8; *(u64 *)(a + 2) = (u64)(void *)&sm_slow_get; a[10] = 0xff; a[11] = 0xe0;
+        b[0] = 0x48; b[1] = 0xb8; *(u64 *)(b + 2) = (u64)(void *)&sm_buf_get; b[10] = 0xff; b[11] = 0xe0; g_sm_installed = 1; }
+    say("  look smoothing (w14_speed): wiggle counts "); say(g_wg_installed ? "on" : "off"); say(", smoothing getters "); say(g_sm_installed ? "ours" : "NOT MATCHED (left alone)");
+    say("\n");
+}
+static void say_f3(double v) { if (v < 0) { say("-"); v = -v; } u64 k = (u64)(v * 1000 + 0.5); say_dec((i64)(k / 1000)); say("."); char b[4] = {(char)('0' + k / 100 % 10), (char)('0' + k / 10 % 10), (char)('0' + k % 10), 0}; say(b); }
+static void tl_flip(void) {
+    static u64 t0, f0, tk[5], ph_c0; static double ph_s0; static int have;
+    if (!g_opt_tlog) return;
+    u64 now = plat_ticks(), f = plat_ticks_per_sec(); u64 base = (u64)g_eboot.base;
+    u64 smg = base ? *(const u64 *)(base + 0xd84d4a0) : 0, lg = base ? *(const u64 *)(base + 0xd828108) : 0;
+    int sok = smg && !(smg & 7) && mem_ok(smg, 0xf8), lok = lg && !(lg & 7) && mem_ok(lg, 0x10);
+    u64 cur[5]; for (int k = 0; k < 4; k++) cur[k] = sok ? *(const u64 *)(smg + 0x10 + 0x38 * k + 0x8) : 0; cur[4] = lok ? *(const u64 *)(lg + 8) : 0;
+    if (!have) { t0 = now; f0 = g_flips; for (int k = 0; k < 5; k++) tk[k] = cur[k]; ph_c0 = g_ph_calls; ph_s0 = g_ph_sum; have = 1; return; }
+    if ((now - t0) * 1000 < (u64)g_tlog_ms * f) return;
+    double w = (double)(now - t0) / (double)f; u64 nf = g_flips - f0;
+    say("  time-log (w14): flip "); say_dec((i64)g_flips); say(", wall "); say_dec((i64)(w * 1000)); say(" ms, flips "); say_dec((i64)nf);
+    say(" (fps "); say_f3(nf / w); say("); clocks per wall s: real ");
+    for (int k = 0; k < 5; k++) { if (k == 1) say(" game "); else if (k == 2) say(" c2 "); else if (k == 3) say(" c3 "); else if (k == 4) say(" logic ");
+        say_f3(cur[k] >= tk[k] ? (double)(cur[k] - tk[k]) / 1594000000.0 / w : -1); }
+    if (sok) { float d[4], sc; for (int k = 0; k < 4; k++) mem_copy(&d[k], (const void *)(smg + 0x40 + 0x38 * k), 4); mem_copy(&sc, (const void *)(smg + 0xf0), 4);
+        say(" (dt now ms"); for (int k = 0; k < 4; k++) { say(" "); say_f3(d[k] * 1000.0); } say(", scale "); say_f3(sc); say(", paused "); say_dec(*(const u8 *)(smg + 0xf4)); say("/"); say_dec(*(const u8 *)(smg + 0xf5)); say(")"); }
+    say("; physics s per wall s "); say_f3((g_ph_sum - ph_s0) / w); say(" ("); say_dec((i64)(g_ph_calls - ph_c0)); say(" steps)");
+    if (g_an_installed) {
+        u64 c = __atomic_exchange_n(&g_an_calls, 0, __ATOMIC_RELAXED), ns = __atomic_exchange_n(&g_an_dtns, 0, __ATOMIC_RELAXED), rp = __atomic_exchange_n(&g_an_rep, 0, __ATOMIC_RELAXED);
+        u32 mn = __atomic_exchange_n(&g_an_minb, 0x7f7fffffu, __ATOMIC_RELAXED), mx = __atomic_exchange_n(&g_an_maxb, 0, __ATOMIC_RELAXED); float fmn, fmx; mem_copy(&fmn, &mn, 4); mem_copy(&fmx, &mx, 4);
+        double avg = c ? (double)ns / 1e9 / (double)c : 0;
+        say("; anim updates "); say_dec((i64)c); say(" ("); say_f3(nf ? (double)c / nf : 0); say(" a flip), dt ms avg "); say_f3(avg * 1000); say(" min "); say_f3(c ? fmn * 1000.0 : 0); say(" max "); say_f3(c ? fmx * 1000.0 : 0);
+        say(", anim s per wall s "); say_f3(avg * nf / w); say(", twice in one flip "); say_dec((i64)rp); }
+    if (g_wg_installed || g_sm_installed) {
+        u64 wc = __atomic_exchange_n(&g_wg_calls, 0, __ATOMIC_RELAXED), wa = __atomic_exchange_n(&g_wg_argns, 0, __ATOMIC_RELAXED);
+        u64 sc = __atomic_exchange_n(&g_sm_slow_calls, 0, __ATOMIC_RELAXED), bc = __atomic_exchange_n(&g_sm_buf_calls, 0, __ATOMIC_RELAXED), fc = __atomic_exchange_n(&g_sm_find_calls, 0, __ATOMIC_RELAXED);
+        float wd, sl, so; u32 x = g_wg_damp_bits; mem_copy(&wd, &x, 4); x = g_sm_slow_bits; mem_copy(&sl, &x, 4); x = g_sm_slow_out_bits; mem_copy(&so, &x, 4);
+        say("; wiggle calls "); say_dec((i64)wc); say(" (arg avg ms "); say_f3(wc ? (double)wa / 1e6 / wc : 0); say(", far damp X "); say_f3(wd); say(")");
+        say("; smoothing find "); say_dec((i64)fc); say(", slowdown gets "); say_dec((i64)sc); say(" ("); say_f3(sl); say(" -> "); say_f3(so); say("), buffer gets "); say_dec((i64)bc); say(" ("); say_dec(g_sm_buf_last); say(")"); }
+    say("\n");
+    t0 = now; f0 = g_flips; for (int k = 0; k < 5; k++) tk[k] = cur[k]; ph_c0 = g_ph_calls; ph_s0 = g_ph_sum;
+}
+/* ------------------------------------------------------------------ popin: texture streaming (mip statistics, log)
+   Two probes at function entries of the game's texture streaming (eboot 01.03):
+   1. eboot+0xa162f0 (rdi = the streamed-texture table S = R + 0x83ac0, R = [eboot+0xd636c18]): once per update it reads
+      the mip statistics of the 256 textures tagged in the previous update (bank b -> texture index u16 [S+0x6922c+2b],
+      texture object [S+0x20068+8*index], its T# at +0xa0) from the accumulators at [R+0x4800]+0x40, which eboot+0xa2c9d0
+      fills from the report ring at [R+0x47f8]. With --mip-stats the accumulators and the ring's first report are written
+      here, just before they are read (see g_opt_mipstats in e3_hle.c).
+   2. eboot+0xce78d0 (rdi = the streaming manager, called at the end of its update eboot+0xce6580): --stream-log N prints
+      the manager's own byte counts every N updates. Fields as read in the code: +0x8858 memory the textures may use
+      (pool free + resident texture bytes), +0x8860 resident texture bytes, +0x8868 pending; bytes of mip levels wanted
+      by the mip statistics +0x8818, by the baked per-location data +0x8828, by distance priority +0x8830 / +0x8838
+      (high-priority group), by any of them +0x8840; +0x8848 bytes granted within the budget (eboot+0xce6dd0: pass 1 the
+      statistics' level with the whole budget, pass 2 the finer of distance / baked with 90 %), +0x8850 bytes to load;
+      list counts +0xe5d0 all, +0xe5e8 to load, +0xe600 to drop; requests made +0x808 loads (at most 64 an update, 17 MB
+      a texture), +0x8810 drops (only when memory is short). */
+static u64 g_pi_base; static u32 g_ms_last[4096]; static u64 g_ms_reports, g_ms_seen_sum, g_ms_bank_sum, g_sl_calls;
+/* w2_popin: --mip-stats gpu / gpuz. The pixel shaders measure what the PS4's counters measure (gcn2spv.c mipfb_note):
+   per texture the smallest level wanted, the samples, the samples that wanted a finer level than the T# offers. The
+   report of a tagged texture is made from its slot (found by T# word 0, so the answer does not depend on which frame's
+   bank numbers the renderer has reached), covering the frames since the slot was last read (the game tags 256
+   textures an update in turn, so about every 6th update for 1,400 textures); counts are scaled to pixels a frame.
+   Report entry as the game reads it (eboot+0xa2c9d0, +0xa162f0, +0xce67d0): bits 56-59 the smallest level (15 = not
+   sampled), bits 0-23 pixels that wanted finer than resident ("A": below the fraction [R+0xa3b18] of the screen the
+   game takes one level coarser than the smallest), bits 32-55 the other pixels ("B"; A + B = coverage = priority).
+   A texture some draw binds but no instrumented sample reads (compute / vertex stages, gathers, explicit gradients)
+   reports level 0 on no pixels: the game treats it exactly as it did with the report left zero (level 1).
+   --mip-measure: the table is filled and read for the pop-in numbers of --stream-log whatever --mip-stats says. */
+static int g_opt_mip_measure;
+#define MIP_SC ((g2s_mip_test & 2) ? 256u : 64u)   /* w3_perf: pixels per sample (--mip-sample 256 = --mip-test 2) */
+static int g_opt_mip_fast;    /* --mip-fast (or --mip-stats gpufast): see ms_report */
+static int g_opt_mip_sharp;   /* --mip-sharp: the pixels that want a finer level than is resident are reported as at least the game's
+                                 threshold (3 % of the screen), so the game takes the smallest level sampled itself, not one coarser
+                                 (more detail than a PS4 keeps for textures that are small on screen) */
+static u32 g_fb_acc[4 * 65536], g_fb_done; static u64 g_fb_frames;   /* per slot: smallest level x16, samples, samples wanting finer, T# word 0 - summed over the frames since it was read */
+static u32 g_fb_ep[65536];                    /* update in which the slot was last read */
+static u8 g_tr_lvl[4096], g_tr_few[4096]; static u32 g_tr_ep[4096], g_tr_cov[4096];   /* measured: smallest level, update, pixels a frame */
+static u8 g_pq_cur[4096]; static u32 g_pq_need[4096], g_pq_first[4096];
+static u64 g_pq_pops, g_pq_pop_lv, g_pq_blur, g_pq_blur_lv, g_pq_blur_px, g_pq_vis, g_pq_lat_sum, g_pq_lat_n, g_pq_lat_max, g_pq_arr, g_pq_over, g_pq_over_lv, g_pq_short, g_pq_short_lv;
+static u64 g_fb_samples, g_fb_none, g_fb_coll, g_fb_hist[8];
+static u8 g_fa_min[4096], g_fa_n[4096]; static u32 g_fa_tot[4096], g_fa_cl[4096]; static u64 g_fa_snaps;   /* --mip-stats gpufast */
+static void ms_report(u64 S) {
+    u64 R = *(const u64 *)(g_pi_base + 0xd636c18);
+    if (!R || S != R + 0x83ac0 || !mem_ok(R + 0x47e8, 0x28) || !mem_ok(S + 0x20050, 0x49400)) return;
+    u64 acc = *(const u64 *)(R + 0x4800), buf = *(const u64 *)(R + 0x47f8);
+    if (!acc || !buf || buf != g_ms_buf || g_ms_size < 0x840 || !mem_ok(acc, 0x840) || !mem_ok(buf, 0x840)) return;
+    if (g_ms_used > MS_HASH / 2) { for (int i = 0; i < MS_HASH; i++) g_ms_key[i] = 0; g_ms_used = 0; }   /* (addresses no longer used pile up: start again; textures stay "seen" for 40 updates) */
+    u32 ep = __atomic_add_fetch(&g_ms_epoch, 1, __ATOMIC_RELAXED);
+    u64 px = (u64)*(const u32 *)(R + 0x47e8) * *(const u32 *)(R + 0x47ec), cnt = g_opt_mipstats == 2 ? px / 25 + 1 : 0;
+    if (cnt > 0xFFFFFF) cnt = 0xFFFFFF;
+    u32 nseen = 0, nb = 0;
+    volatile u32 *fb = 0;
+    if (g_mipfb_map) {   /* the frames copied since the last update, except the two newest (their copies may not be finished), into the slots' sums */
+        u32 seq = __atomic_load_n(&g_mipfb_seq, __ATOMIC_ACQUIRE), hi = seq >= 2 ? seq - 2 : 0;
+        if (hi > g_fb_done + 2) g_fb_done = hi - 2;   /* (older copies are overwritten) */
+        for (; g_fb_done < hi; g_fb_done++) {
+            const volatile u32 *src = g_mipfb_map + (u64)(g_fb_done & 3) * (G2S_MIPFB_SIZE / 4);
+            for (u32 k = 0; k < 65536; k++) { u32 tot = src[4 * k + 1]; if (!tot) continue;
+                u32 *q = g_fb_acc + 4 * k, mn = src[4 * k], tag = src[4 * k + 3];
+                if (q[1] && q[3] != tag) { if (tot < q[1]) continue; q[0] = 0xFFFFFFFFu; q[1] = 0; q[2] = 0; }   /* two textures in one slot: the one with more samples */
+                if (!q[1]) q[0] = 0xFFFFFFFFu;
+                if (mn < q[0]) q[0] = mn; q[1] += tot; q[2] += src[4 * k + 2]; q[3] = tag; }
+            g_fb_frames++;
+        }
+        fb = g_fb_acc;
+    }
+    if (g_opt_mipstats) *(volatile u32 *)buf = 0x40;
+    int fast = g_opt_mipstats >= 4 && g_opt_mip_fast && fb && mem_ok(R + 0xabb00, 0x40040) && mem_ok(R + 0xecae4, 4);
+    if (fast) {   /* --mip-stats gpufast: every streamed texture's slot is read every update; a finer level wanted than the
+                     game's smoothed statistic says is written into the texture's entry at once (the game would see it when
+                     the texture's turn among the 256 tagged comes, and then through its smoothing: 6 to 20 updates) */
+        i32 n = *(const i32 *)(R + 0xecae4); if (n > 4095) n = 4095;
+        for (i32 i = 1; i <= n; i++) {
+            u8 *E = (u8 *)(R + 0xabb00 + 64ull * (u32)i); u32 fi = *(const u16 *)(E + 0x48);
+            if (!fi) { g_fa_n[i] = 0; continue; }
+            if (g_fa_n[i] < 255) g_fa_n[i]++;
+            u64 to = *(const u64 *)(S + 0x20068 + 8ull * (u32)i); if (!to || (to & 7) || !mem_ok(to + 0xa0, 0x20)) continue;
+            u32 t0 = *(const u32 *)(to + 0xa0); if (!t0) continue;
+            u32 sl = (t0 * 0x9E3779B1u) >> 16; volatile u32 *q = fb + 4 * sl;
+            u32 mn = q[0], tot = q[1], cl = q[2], tag = q[3];
+            if (!tot || mn == 0xFFFFFFFFu) continue;
+            if (tag != t0) { g_fb_coll++; continue; }
+            q[0] = 0xFFFFFFFFu; q[1] = 0; q[2] = 0;
+            if (cl > tot) cl = tot;
+            u32 lv = mn >> 4; if (lv > 14) lv = 14;
+            if (!g_fa_tot[i] || lv < g_fa_min[i]) g_fa_min[i] = (u8)lv;
+            g_fa_tot[i] += tot; g_fa_cl[i] += cl;
+            u32 f = *(const u32 *)(E + 0x34), f20 = (f >> 20) & 15; float sm = *(const float *)(E + 0x40);
+            if ((float)lv < sm && lv < f20) {
+                u64 A = (u64)cl * MIP_SC, B = (u64)(tot - cl) * MIP_SC; if (A > 0xFFFFFF) A = 0xFFFFFF; if (B > 0xFFFFFF) B = 0xFFFFFF;
+                if (g_opt_mip_sharp) { u64 thr = (u64)((float)px * *(const float *)(R + 0xa3b18)) + 1; if (thr > 0xFFFFFF) thr = 0xFFFFFF; if (A < thr) { B = B > thr - A ? B - (thr - A) : 0; A = thr; } }
+                u64 old = *(const u64 *)(E + 0x38), mnb = old >> 56; if (lv < mnb) mnb = lv;
+                *(volatile float *)(E + 0x40) = (float)lv;
+                *(volatile u64 *)(E + 0x38) = (mnb << 56) | ((u64)lv << 48) | (B << 24) | A;
+                if (fi < 0x1000 && mem_ok(S + 0x68020 + fi, 1)) *(volatile u8 *)(S + 0x68020 + fi) = 1;
+                g_fa_snaps++;
+            }
+        }
+    }
+    for (u32 b = 0; b < 256; b++) {
+        u32 idx = *(const u16 *)(S + 0x6922c + 2 * b); u64 e = 0x0F00000000000000ull;   /* not sampled */
+        if (idx && idx < 4096) {
+            nb++;
+            u64 to = *(const u64 *)(S + 0x20068 + 8ull * idx); u32 t0 = 0;
+            if (to && !(to & 7) && mem_ok(to + 0xa0, 0x20)) { t0 = *(const u32 *)(to + 0xa0); u32 st = ms_lookup(t0); if (st && ep - st <= 8) { if (!g_ms_last[idx] || ep - g_ms_last[idx] > 40) g_pq_first[idx] = ep; g_ms_last[idx] = ep; } }
+            int drawn = g_ms_last[idx] && ep - g_ms_last[idx] <= 40;
+            u64 eg = e;
+            if (fb && t0) {   /* the measured numbers */
+                u32 sl = (t0 * 0x9E3779B1u) >> 16; volatile u32 *q = fb + 4 * sl;
+                u32 mn = q[0], tot = q[1], cl = q[2], tag = q[3], fr = ep - g_fb_ep[sl];
+                if (fast) { tot = g_fa_tot[idx]; cl = g_fa_cl[idx]; mn = (u32)g_fa_min[idx] << 4; fr = g_fa_n[idx]; tag = t0; g_fa_tot[idx] = 0; g_fa_cl[idx] = 0; g_fa_n[idx] = 0; }
+                else if (tot && tag != t0) { g_fb_coll++; tot = 0; }   /* another texture's numbers (the slot is shared): left for it */
+                else { q[0] = 0xFFFFFFFFu; q[1] = 0; q[2] = 0; g_fb_ep[sl] = ep; }
+                if (!fr || fr > 64) fr = 1;
+                if (tot && mn != 0xFFFFFFFFu) {
+                    if (cl > tot) cl = tot;
+                    u32 lv = mn >> 4; if (lv > 14) lv = 14;
+                    u64 A = (u64)cl * MIP_SC / fr, B = (u64)(tot - cl) * MIP_SC / fr; if (A > 0xFFFFFF) A = 0xFFFFFF; if (B > 0xFFFFFF) B = 0xFFFFFF;
+                    if (g_opt_mip_sharp && g_opt_mipstats >= 4) { u64 thr = (u64)((float)px * *(const float *)(R + 0xa3b18)) + 1; if (thr > 0xFFFFFF) thr = 0xFFFFFF; if (A < thr) { B = B > thr - A ? B - (thr - A) : 0; A = thr; } }
+                    eg = ((u64)lv << 56) | (B << 32) | A;
+                    g_tr_lvl[idx] = (u8)lv; g_tr_ep[idx] = ep; g_tr_cov[idx] = (u32)(A + B); g_tr_few[idx] = (float)A >= (float)px * *(const float *)(R + 0xa3b18); g_fb_samples++; g_fb_hist[lv > 7 ? 7 : lv]++;
+                } else if (drawn) { eg = 0; g_fb_none++; }
+            }
+            if (g_opt_mipstats >= 4) { e = eg; if (drawn || eg != 0x0F00000000000000ull) nseen++; }
+            else if (g_opt_mipstats >= 2 && drawn) { e = cnt; nseen++; }   /* level 0 */
+        }
+        if (g_opt_mipstats) {
+            volatile u64 *pa = (volatile u64 *)(acc + 0x40 + 8ull * b); *pa = (*pa & 0xf0000000ff000000ull) | e;
+            *(volatile u64 *)(buf + 0x40 + 8ull * b) = e;
+        }
+    }
+    if (g_opt_mipstats && !g_ms_reports++) { say("  mip statistics (popin): first report written at flip "); say_dec((i64)g_plat_frame); say(g_opt_mipstats == 1 ? " (empty)\n" : g_opt_mipstats == 2 ? " (drawn textures: level 0 on 4 % of the screen)\n" : g_opt_mipstats == 3 ? " (drawn textures: level 0 on no pixels)\n" : " (levels and pixels measured by the pixel shaders)\n"); }
+    g_ms_seen_sum += nseen; g_ms_bank_sum += nb;
+}
+/* pop-in numbers (every update, printed by --stream-log). Per streamed texture (table entry at R+0xabb00+64*index: +0x34
+   bits 24-27 the finest resident level, bits 20-23 the coarsest it may fall to; +0x38 the smoothed statistics):
+   arrivals = finer levels that became resident; pops = arrivals on a texture that draws had been using for more than
+   3 updates (the picture sharpens while it is looked at); with the measured levels (--mip-stats gpu / --mip-measure):
+   blurred = texture-updates in which a texture on screen wanted a finer level than was resident (and the levels and
+   pixels missing); "by the game's 3 % rule" = the same counted as the game decides (one level coarser unless 3 % of
+   the screen want finer than resident; g_tr_few is 1 when they do); latency = updates from the first such update to the arrival, over = texture-updates in which more
+   was resident than wanted (levels). */
+static void pop_metric(u64 m) {
+    u64 R = *(const u64 *)(g_pi_base + 0xd636c18); (void)m;
+    if (!R || !mem_ok(R + 0xabb00, 0x40040) || !mem_ok(R + 0xecae4, 4)) return;
+    i32 n = *(const i32 *)(R + 0xecae4); if (n > 4095) n = 4095;
+    u32 ep = g_ms_epoch, up = (u32)g_sl_calls;
+    for (i32 i = 1; i <= n; i++) {
+        const u8 *E = (const u8 *)(R + 0xabb00 + 64ull * (u32)i);
+        if (!*(const u16 *)(E + 0x48)) { g_pq_cur[i] = 0xFF; g_pq_need[i] = 0; continue; }
+        u32 f = *(const u32 *)(E + 0x34), cur = (f >> 24) & 15, prev = g_pq_cur[i];
+        int drawn = g_ms_last[i] && ep - g_ms_last[i] <= 40;
+        if (prev != 0xFF && cur < prev) {
+            g_pq_arr++;
+            if (drawn && ep - g_pq_first[i] > 3) { g_pq_pops++; g_pq_pop_lv += prev - cur; }
+            if (g_pq_need[i]) { u64 d = up - g_pq_need[i]; g_pq_lat_sum += d; g_pq_lat_n++; if (d > g_pq_lat_max) g_pq_lat_max = d; }
+        }
+        g_pq_cur[i] = (u8)cur;
+        if (g_tr_ep[i] && ep - g_tr_ep[i] <= 16) {
+            u32 want = g_tr_lvl[i]; g_pq_vis++;
+            if (want < cur) { g_pq_blur++; g_pq_blur_lv += cur - want; g_pq_blur_px += g_tr_cov[i]; }
+            else if (want > cur) { g_pq_over++; g_pq_over_lv += want - cur; }
+            if (want < cur && !g_tr_few[i]) want++;   /* the game's rule: under 3 % of the screen wanting finer than resident -> one level coarser */
+            if (want < cur) { g_pq_short++; g_pq_short_lv += cur - want; if (!g_pq_need[i]) g_pq_need[i] = up; } else g_pq_need[i] = 0;
+        } else g_pq_need[i] = 0;
+    }
+}
+static void stream_log(u64 m) {
+    if (!mem_ok(m, 0xe630)) return;
+    pop_metric(m);
+    if (!g_opt_stream_log || (g_sl_calls++ % g_opt_stream_log)) { if (!g_opt_stream_log) g_sl_calls++; return; }
+#define SLQ(o) ((i64)(*(const u64 *)(m + (o)) >> 20))
+#define SLD(o) ((i64)*(const i32 *)(m + (o)))
+    say("    streaming (popin): flip "); say_dec((i64)g_plat_frame); say(" update "); say_dec((i64)g_sl_calls);
+    say(": usable "); say_dec(SLQ(0x8858)); say(" MB, resident "); say_dec(SLQ(0x8860)); say(" MB, pending "); say_dec(SLQ(0x8868));
+    say(" MB; wanted by statistics "); say_dec(SLQ(0x8818)); say(" MB, baked "); say_dec(SLQ(0x8828)); say(" MB, distance "); say_dec(SLQ(0x8830)); say(" + "); say_dec(SLQ(0x8838));
+    say(" MB, any "); say_dec(SLQ(0x8840)); say(" MB; granted "); say_dec(SLQ(0x8848)); say(" MB, to load "); say_dec(SLQ(0x8850));
+    say(" MB; textures "); say_dec(SLD(0xe5d0)); say(", to load "); say_dec(SLD(0xe5e8)); say(", to drop "); say_dec(SLD(0xe600));
+    say("; requests: loads "); say_dec(SLD(0x808)); say(", drops "); say_dec(SLD(0x8810));
+    { u64 R = *(const u64 *)(g_pi_base + 0xd636c18);
+      if (R && mem_ok(R + 0x4810, 0x150)) { say("; pool "); say_dec((i64)(*(const u64 *)(R + 0x4810 + 0x120) >> 20)); say(" MB, used "); say_dec((i64)(*(const u64 *)(R + 0x4810 + 0x128) >> 20)); say(" MB"); }
+      if (R && g_ms_buf && mem_ok(g_ms_buf, 4)) { say("; report header "); say_hex(*(const u32 *)g_ms_buf); }
+      if (R && mem_ok(R + 0xa3b18, 4) && mem_ok(R + 0x83ac0 + 0x20054, 4) && g_sl_calls < 4000) { say("; pixel threshold x1e6 "); say_dec((i64)(*(const float *)(R + 0xa3b18) * 1e6f)); say(", smoothing x1000 "); say_dec((i64)(*(const float *)(R + 0x83ac0 + 0x20054) * 1000.0f)); say(", baked data "); say_hex(*(const u64 *)(m + 0xa580)); say(" / "); say_dec(*(const i32 *)(m + 0xa5a4)); } }
+    if (g_ms_reports) { say("; mip reports "); say_dec((i64)g_ms_reports); say(", seen "); say_dec((i64)g_ms_seen_sum); say(" of "); say_dec((i64)g_ms_bank_sum); say(" tagged"); }
+    say("\n    pop-in (w2_popin): update "); say_dec((i64)g_sl_calls); say(": arrivals "); say_dec((i64)g_pq_arr); say(", pops "); say_dec((i64)g_pq_pops); say(" (levels "); say_dec((i64)g_pq_pop_lv);
+    say(")"); if (g_mipfb_map) { say("; measured: visible "); say_dec((i64)g_pq_vis); say(", blurred "); say_dec((i64)g_pq_blur); say(" (levels "); say_dec((i64)g_pq_blur_lv); say(", Mpixels "); say_dec((i64)(g_pq_blur_px >> 20));
+        say("), by the game's 3 % rule "); say_dec((i64)g_pq_short); say(" (levels "); say_dec((i64)g_pq_short_lv); say("), over "); say_dec((i64)g_pq_over); say(" (levels "); say_dec((i64)g_pq_over_lv); say("), latency updates mean x10 "); say_dec(g_pq_lat_n ? (i64)(g_pq_lat_sum * 10 / g_pq_lat_n) : 0); say(" max "); say_dec((i64)g_pq_lat_max); say(" n "); say_dec((i64)g_pq_lat_n);
+        say("; frames "); say_dec((i64)g_fb_frames); say(", slots read "); say_dec((i64)g_fb_samples); say(", drawn without samples "); say_dec((i64)g_fb_none); say(", shared "); say_dec((i64)g_fb_coll); if (g_opt_mip_fast) { say(", written at once "); say_dec((i64)g_fa_snaps); } say(", levels 0..7+:"); for (int k = 0; k < 8; k++) { say(" "); say_dec((i64)g_fb_hist[k]); } }
+    say("\n");
+#undef SLQ
+#undef SLD
+}
+static void popin_probe(u64 *P, u32 id) { if (id == 1) ms_report(P[40]); else stream_log(P[40]); }   /* P[40] = rdi */
+static void patch_popin(Module *m) {
+    static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};   /* push rbp; mov rbp,rsp; push r15 */
+    static const u8 c1[8] = {0x41, 0x80, 0xbe, 0x50, 0x00, 0x02, 0x00, 0x00};         /* a16343: cmp byte [r14+0x20050],0 */
+    static const u8 c2[9] = {0x45, 0x0f, 0xb7, 0x8c, 0x06, 0x2c, 0x92, 0x06, 0x00};   /* a163a0: movzx r9d, word [r14+rax+0x6922c] */
+    static const u8 c3[8] = {0x4d, 0x8b, 0x94, 0x24, 0x58, 0x88, 0x00, 0x00};         /* ce6de8: mov r10,[r12+0x8858] */
+    static const u8 c4[7] = {0x44, 0x8b, 0x1a, 0x41, 0x83, 0xc3, 0xc0};               /* a2c9d0: mov r11d,[rdx]; add r11d,-0x40 */
+    const u32 va1 = 0xa162f0, va2 = 0xce78d0;
+    if (!g_stub_w || m->size < 0xd636c20) return;
+    int ok = 1;
+    for (int i = 0; i < 6; i++) ok &= m->base[va1 + i] == e[i] && m->base[va2 + i] == e[i];
+    for (int i = 0; i < 8; i++) ok &= m->base[0xa16343 + i] == c1[i] && m->base[0xce6de8 + i] == c3[i];
+    for (int i = 0; i < 9; i++) ok &= m->base[0xa163a0 + i] == c2[i];
+    for (int i = 0; i < 7; i++) ok &= m->base[0xa2c9d0 + i] == c4[i];
+    if (!ok) { say("  texture streaming probes (popin): the code does not match this eboot (01.03 expected) - not applied; --mip-stats / --stream-log do nothing\n"); g_opt_mipstats = 0; g_opt_stream_log = 0; return; }
+    g_pi_base = (u64)m->base;
+    if (g_opt_mipstats || g_opt_mip_measure) { u8 *s = m->base + va1, *st = g_stub_w; g_stub_w = probe_emit_stub(g_stub_w, 1, e, 6, s + 6, (void *)&popin_probe); s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90; }
+    if (g_opt_stream_log) { u8 *s = m->base + va2, *st = g_stub_w; g_stub_w = probe_emit_stub(g_stub_w, 2, e, 6, s + 6, (void *)&popin_probe); s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90; }
+    if (g_opt_mipstats) say(g_opt_mipstats == 1 ? "  mip statistics (popin, --mip-stats empty): reports say that no texture is sampled (entry of eboot+0xa162f0)\n"
+                          : g_opt_mipstats == 2 ? "  mip statistics (popin, --mip-stats drawn): textures bound by recent draws report level 0 on 4 % of the screen, the others nothing (entry of eboot+0xa162f0)\n"
+                          : g_opt_mipstats == 3 ? "  mip statistics (popin, --mip-stats drawn1): textures bound by recent draws report level 0 on no pixels, the others nothing (entry of eboot+0xa162f0)\n"
+                          : "  mip statistics (w2_popin, --mip-stats gpu): the levels and pixel counts the pixel shaders measure, as the PS4's counters (entry of eboot+0xa162f0)\n");
+    if (g_opt_mipstats >= 4 && g_opt_mip_fast) say("    --mip-fast: a finer level wanted reaches the game in the same update (not PS4 timing)\n");
+    if (g_opt_mipstats >= 4 && g_opt_mip_sharp) say("    --mip-sharp: the smallest level sampled is asked for however few pixels want it (more than a PS4 keeps)\n");
+    if (g2s_mip_fb == 3) say("    --mip-early-only: pixel shaders that stay depth-tested after they run are not instrumented (their textures report as drawn: level 1)\n");
+    if (g2s_mip_fb >= 2) say("    --mip-early-z: pixel shaders that neither discard nor write depth are depth-tested before they run\n");
+    if (g_opt_mip_measure && g_opt_mipstats < 4) say("  mip statistics (w2_popin, --mip-measure): the pixel shaders measure the levels wanted, for the pop-in numbers only\n");
+    if (g_opt_stream_log) { say("  streaming log (popin, --stream-log): the texture streaming manager's byte counts every "); say_dec(g_opt_stream_log); say(" updates (entry of eboot+0xce78d0)\n"); }
+}
+static void phys_report(void) {
+    if (!g_ph_calls) return;
+    say("  physics step (t192): "); say_dec((i64)g_ph_calls); say(" updates, "); say_dec((i64)(g_ph_sum * 1000)); say(" ms simulated; steps of 1/30 s "); say_dec((i64)g_ph_n30); say(", of 1/frame-limit "); say_dec((i64)g_ph_nlim); say(", of the measured frame time "); say_dec((i64)g_ph_nvar);
+    say("; shortest step us "); say_us(g_ph_minbits); say(", longest "); say_us(g_ph_maxbits); say("; frames longer than "); say(g_opt_phys_catchup ? "0.1 s" : "1/30 s"); say(" (counted as that) "); say_dec((i64)g_ph_nclamp); say("\n");
+}
+static void cloth_onset_report(void) {
+    cloth_src_report();
+    cloth_wind_report();
+    if (g_cl_begins || g_cl_in_bad) { say("  cloth input guard / restore (w3_cloth): updates that began with bad inputs (non-finite or absurd bone / buffer matrices): "); say_dec((i64)g_cl_in_bad); say(", of those run on the last sane inputs: "); say_dec((i64)g_cl_in_held); say(", left as they were: "); say_dec((i64)g_cl_in_unheld); say("; particle states written back: "); say_dec((i64)g_cl_restores); say(", non-finite states that could not be restored: "); say_dec((i64)g_cl_restore_fail); say("\n"); }
+    if (g_cl_begins) { say("  cloth update checks (w3_cloth): "); say_dec((i64)g_cl_begins); say(" updates begun, "); say_dec((i64)g_cl_ends); say(" ended, "); say_dec((i64)g_cl_ops); say(" operator steps; still running when the wait returned: "); say_dec((i64)g_cl_ov_end); say(" of "); say_dec((i64)g_cl_waits); say(" waits, at the next start: "); say_dec((i64)g_cl_ov_start); say("; instances that turned non-finite during an update: "); say_dec((i64)g_cl_mid); say("\n"); }
+    if (g_co_base && !g_opt_no_cloth_fix) { say("  cloth fix (t188): "); say_dec((i64)g_cw_calls); say(" cloth updates, "); say_dec((i64)g_cw_drift); say(" particle w values had drifted (>1%), "); say_dec((i64)g_cw_nonfinite); say(" were non-finite; particles with non-finite x/y/z seen "); say_dec((i64)g_cw_xyz); say(" times\n"); }
+    if (g_bend_cnt) { say("  cloth bend fix (w2_cloth): "); say_dec((i64)*g_bend_cnt); say(" hinge edges of zero length handled (each would have turned its cloth non-finite)\n"); }
+    if (!g_co) return;
+    say("  cloth onset recorder (t187): "); say_dec((i64)g_co_calls); say(" cloth updates, "); say_dec((i64)g_co_onsets); say(" onsets written\n");
+    for (int i = 0; i < CO_INST; i++) { COInst *I = &g_co[i]; if (!I->used) continue; say("    instance "); say_hex(I->ci); say(" pages "); say_dec(I->np); say(" simulations:");
+        for (u32 k = 0; k < I->nsim; k++) { say(" "); say_dec(co_nan_rows(I->sim[k])); say("/"); say_dec(*(const u32 *)(I->sim[k] + 0x20)); say(" NaN"); } say("\n"); }
 }
 
 
@@ -1990,12 +3138,56 @@ static void arena_lock_summary(void) {
         sb_s(&u, " bytes from eboot+"); sb_x(&u, e->ret_me - (u64)g_eboot.base); sb_s(&u, " while thread id "); sb_d(&u, e->tid_other); sb_s(&u, " was allocating "); sb_d(&u, (i64)e->size_other); sb_s(&u, " bytes from eboot+"); sb_x(&u, e->ret_other - (u64)g_eboot.base); sb_s(&u, "\n"); say(b); }
 }
 
+/* w16_rel rc2: start-up lines (after the options): Optimised Rendering requested + source, early GPU hand-over, frame-rate limit */
+static void fr_log_start(void) {
+    say("Optimised Rendering: ");
+    if (g_fr_req >= 0) { say(g_fr_req ? "enabled (" : "disabled ("); say(fr_src_name(g_fr_src)); if (g_fr_src == 2) say(g_fr_req ? ": --fast-rendering" : ": --no-fast-rendering"); say(")\n"); }
+    else say(g_opt_early_labels == 4 ? "enabled (command line: developer label options)\n" : g_opt_early_labels ? "partial (command line: developer label options)\n" : "disabled (not requested)\n");
+    say("Early GPU handover: ");
+    say(g_opt_wbg && g_opt_early_labels == 4 ? "requested - not active yet (it is reported as active when the first frame has been handed over early)\n" : "not active (Optimised Rendering disabled)\n");
+    say("Frame-rate limit: ");
+    if (g_opt_fps > 0) { say_dec(g_opt_fps); say(" FPS"); }
+    else if (g_opt_fps < 0) { if (g_opt_uncapped_max > 0) { say("uncapped (at most "); say_dec(g_opt_uncapped_max); say(" FPS)"); } else say("uncapped (no ceiling: --uncapped-max 0)"); }
+    else say("60 FPS (the game's own rate)");
+    if (g_fps_src >= 0) { say(" ("); say(fr_src_name(g_fps_src)); if (g_fps_src == 2) say(": --fps"); say(")"); }
+    say("\n");
+}
+/* w16_rel rc2: crash / device-loss / fatal-stop report of the GPU and the Optimised Rendering state. Once per run. Crash-path
+   safe: no allocation, no lock (the guard's counters and table are read as they are - a racy snapshot), stack buffer only. */
+static volatile int g_fr_crash_once;
+static void fr_crash_report(void *f) {
+    if (__atomic_exchange_n(&g_fr_crash_once, 1, __ATOMIC_ACQ_REL)) return;
+    char b[900]; Sb t = {b, 0, sizeof b};
+    sb_s(&t, "\n--- GPU and Optimised Rendering state (v" UD_VERSION ") ---\nGPU: "); sb_s(&t, g_dev.name[0] ? g_dev.name : "(not yet known)"); sb_s(&t, " (vendor "); sb_s(&t, dev_vendor_name(g_dev.vendor_id)); sb_s(&t, ")");
+    sb_s(&t, ", driver "); sb_s(&t, g_dev.driver_info[0] ? g_dev.driver_info : "?"); sb_s(&t, " ("); sb_s(&t, g_dev.driver_name); sb_s(&t, "), PCI "); sb_x(&t, g_dev.vendor_id); sb_s(&t, ":"); sb_x(&t, g_dev.device_id);
+    sb_s(&t, "\nOptimised Rendering: requested "); sb_s(&t, g_fr_req == 1 ? "on" : g_fr_req == 0 ? "off" : g_opt_early_labels == 4 ? "on (developer options)" : "off"); sb_s(&t, " ("); sb_s(&t, fr_src_name(g_fr_src)); sb_s(&t, "), early GPU handover ");
+    if (g_fr_state == 1) { sb_s(&t, "ACTIVE since flip "); sb_d(&t, (i64)g_fr_active_flip); } else sb_s(&t, g_opt_wbg ? "requested, not active" : "not active");
+    sb_s(&t, "; label policy "); sb_d(&t, g_opt_early_labels); sb_s(&t, ", trailing "); sb_d(&t, g_opt_lbl_trail); sb_s(&t, ", read guard "); sb_d(&t, g_opt_rdg); sb_s(&t, ", big guard "); sb_d(&t, g_opt_wbg_big);
+    sb_s(&t, "\nFrame-rate limit: "); if (g_opt_fps > 0) { sb_d(&t, g_opt_fps); sb_s(&t, " FPS"); } else if (g_opt_fps < 0) { sb_s(&t, "uncapped, at most "); sb_d(&t, g_opt_uncapped_max); sb_s(&t, " FPS"); } else sb_s(&t, "game rate");
+    sb_s(&t, " ("); sb_s(&t, g_fps_src >= 0 ? fr_src_name(g_fps_src) : "game"); sb_s(&t, "); flip "); sb_d(&t, (i64)g_flips); sb_s(&t, "\n");
+    plat_write(f, b);
+    if (g_opt_wbg) {
+        int n = g_wbg_n; if (n < 0) n = 0; if (n > WBG_N) n = WBG_N; int c1 = 0, c2 = 0;
+        for (int i = 0; i < n; i++) { u8 pr = g_wbg[i].prot; if (pr == 1) c1++; else if (pr == 2) c2++; }
+        t.n = 0; b[0] = 0;
+        sb_s(&t, "Guard: "); sb_s(&t, g_wbg_init ? "set up" : "not set up"); sb_s(&t, ", table "); sb_d(&t, n); sb_s(&t, " of "); sb_d(&t, WBG_N); sb_s(&t, " pages (most "); sb_d(&t, (i64)g_wbg_maxn); sb_s(&t, "), closed now: no access "); sb_d(&t, c1); sb_s(&t, ", read-only "); sb_d(&t, c2);
+        sb_s(&t, "; batches handed over "); sb_d(&t, (i64)g_sub_seq); sb_s(&t, ", finished "); sb_d(&t, (i64)g_done_seq); sb_s(&t, "; early releases "); sb_d(&t, (i64)g_wbg_arms); sb_s(&t, ", early labels "); sb_d(&t, (i64)g_n_early_labels);
+        sb_s(&t, "\n  game-thread waits "); sb_d(&t, (i64)g_wbg_gfaults); sb_s(&t, ", own threads let through "); sb_d(&t, (i64)g_wbg_ofaults); sb_s(&t, "; table full (labels waited) "); sb_d(&t, (i64)g_wbg_full_holds); sb_s(&t, ", guard timeouts "); sb_d(&t, (i64)g_wbg_timeouts);
+        sb_s(&t, ", unguardable pages "); sb_d(&t, (i64)g_wbg_badprot); sb_s(&t, ", unclaimed faults "); sb_d(&t, (i64)g_wbg_last_bad); sb_s(&t, ", re-guard races "); sb_d(&t, (i64)(g_wbg_race[0] + g_wbg_race[1] + g_wbg_race[2] + g_wbg_race[3])); sb_s(&t, " (twice "); sb_d(&t, (i64)g_wbg_twice); sb_s(&t, ")");
+        sb_s(&t, "\n  last guard events (newest first: page, event, level, batch, finished):"); plat_write(f, b);
+        u32 ne = g_wbg_nev, m = ne < 8 ? ne : 8;
+        for (u32 i = 0; i < m; i++) { u32 k = (ne - 1 - i) % WBG_EV; t.n = 0; b[0] = 0; sb_s(&t, "\n    "); sb_x(&t, g_wbg_ev[k].pg); { char c[3] = {' ', (char)g_wbg_ev[k].ty, 0}; sb_s(&t, c); } sb_s(&t, " "); sb_d(&t, g_wbg_ev[k].lvl); sb_s(&t, " "); sb_d(&t, (i64)g_wbg_ev[k].seq); sb_s(&t, " "); sb_d(&t, (i64)g_wbg_ev[k].done); plat_write(f, b); }
+        plat_write(f, "\n");
+    }
+    plat_write(f, "--- end of GPU and Optimised Rendering state ---\n");
+}
 static void crash_dump(const u64 *g, u64 rip, u64 fault) {
     static const char *nm[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
     void *lg = g_ud_release ? plat_log_handle() : 0;   /* the player build keeps everything in Logs\UntilDawn.log */
     void *f = lg ? lg : plat_open_write("e6_crash_dump.txt");
     if (!f) return;
     if (lg) plat_write(f, "\n--- crash dump ---\n");
+    fr_crash_report(f);   /* w16_rel rc2 */
     char b[200];
     { Sb t = {b, 0, sizeof b}; sb_s(&t, "crash at "); sb_x(&t, rip);
       if (rip >= (u64)g_eboot.base && rip < (u64)g_eboot.base + g_eboot.size) { sb_s(&t, " (eboot+"); sb_x(&t, rip - (u64)g_eboot.base); sb_s(&t, ")"); }
@@ -2159,7 +3351,7 @@ static void print_summary(void) {
     say("\ndebug breaks (int3) skipped: "); say_dec(g_breakpoints);
     say("\ngame threads' x87 control word: "); say(g_opt_host_fpu ? "Windows default (0x27F, 53-bit)" : "PS4 default (0x37F, 64-bit extended)");
     { u64 tf = plat_ticks_per_sec() / 1000; if (!tf) tf = 1; say("\nlog writes (t145b): "); say_dec((i64)g_pw_n); say(", over 20 ms "); say_dec((i64)g_pw_slow_n); say(" ("); say_dec((i64)(g_pw_slow_ticks / tf)); say(" ms in all, longest "); say_dec((i64)(g_pw_slow_max / tf)); say(" ms); t146: queued "); say_dec((i64)g_lw_queued); say(", dropped (ring full) "); say_dec((i64)g_lw_dropped); say(" bytes\n"); }
-    say("\n"); mnan_report(1); rsq_summary();
+    say("\n"); mnan_report(1); rsq_summary(); vbw_report(); cloth_onset_report(); phys_report();
     if (g_fp_trap) { say("\nFP exceptions recorded (invalid / divide-by-zero): "); say_dec((i64)g_fp_total); say(" at "); say_dec(g_nfps); say(" places (t145: noisy-site pauses "); say_dec((i64)g_fp_disarms); say(", re-arms at flips "); say_dec((i64)g_fp_rearms); say("; t148: compare sites made quiet "); say_dec((i64)g_fp_quieted); say("):\n"); fp_report(1); }
     say("\nall_programs.prx loaded: "); say(g_prx_loaded ? "yes" : "no");
     say("\ngame threads started: "); say_dec(g_threads_started);
@@ -2170,11 +3362,12 @@ static void print_summary(void) {
     say("\nwall-clock reads (time, gettimeofday, CLOCK_REALTIME): "); say_dec(g_wall_reads);
     if (g_opt_trace_vis) { say("\nvisibility trace: Entity::SetVisible "); say_dec((i64)g_vis_calls[1]); say(", SkinnedMeshComponent::SetVisible "); say_dec((i64)g_vis_calls[2]); say(", StaticMeshComponent::SetVisible "); say_dec((i64)g_vis_calls[3]); say(", prop attach "); say_dec((i64)g_vis_calls[4]); say(", detach "); say_dec((i64)g_vis_calls[5]); say(", drawIndexOffset calls "); say_dec((i64)g_vis_draw_calls); if (g_opt_big_bounds) { say(", culling boxes made huge "); say_dec((i64)g_vis_big_n); } say(" (lines in captures\\visible_trace.txt: "); say_dec((i64)g_vis_lines); say(")"); }
     if (!g_opt_no_skin_check) { say("\nskin-table check: skinning calls "); say_dec((i64)g_skin_calls); say(", whose records did not add up: "); say_dec((i64)g_skin_bad); say(", repaired (a count-0 record restored): "); say_dec((i64)g_skin_repaired); say(" (details in skin_check.txt)"); }
-    if (!g_opt_no_cloth_fix && g_cloth_vt) { say(g_cloth_state < 0 ? "\ncloth fix (STATUS 238): off (the cloth type's vtable did not match); cloth updates " : "\ncloth fix (STATUS 238): cloth updates "); say_dec((i64)g_cloth_calls); say(", particle w values reset after drifting more than 1%: "); say_dec((i64)g_cloth_drift); say(", non-finite: "); say_dec((i64)g_cloth_nonfinite); }
     say("\n"); mem_report("at exit");
     say("direct-memory mappings: "); say_dec(g_dmaps_total); say(" (live "); say_dec(g_ndmap); say(", releases "); say_dec((i64)g_dreleases); say(", virtual queries "); say_dec((i64)g_vq_calls); say(" answered "); say_dec((i64)g_vq_hits);
     say("), mapping pools "); say_dec((i64)(g_pool_bytes >> 20)); say(" MB, in use "); say_dec((i64)(g_pool_used >> 20)); say(" MB, memory regions "); say_dec(g_nmem); say(", second mappings of the same physical memory: "); say_dec(g_dalias);
     say(", fixed mappings moved: "); say_dec(g_dfixed_moved); say(", fixed re-mappings kept in place: "); say_dec((i64)g_fixed_inplace); say(" (of them over released memory, zeroed, t134: "); say_dec((i64)g_fixed_reused_zeroed); say(")");
+    ra_save();   /* w11_load */
+    { u64 f_ = plat_ticks_per_sec() / 1000; if (!f_) f_ = 1; say("game file reads in all (w11_load): "); say_dec((i64)g_io_n); say(", "); say_dec((i64)(g_io_bytes >> 20)); say(" MB, "); say_dec((i64)(g_io_ticks / f_)); say(" ms on the game's threads, longest "); say_dec((i64)(g_io_max / f_)); say(" ms\n"); }
     say("\nfile reads at an offset (sceKernelPread): "); say_dec(g_fd_preads); say(", calls that found another thread already using the same file: "); say_dec(g_fd_contended);
     say(g_opt_direct_reads ? "; reads straight into game memory (--direct-reads)" : "; reads through our buffers (t107): "); if (!g_opt_direct_reads) { say_dec((i64)g_n_bounced_reads); say(", "); say_dec((i64)(g_n_bounced_bytes >> 20)); say(" MB"); }
     say("\nmutexes created: error-checking "); say_dec(g_mx_types[1]); say(", recursive "); say_dec(g_mx_types[2]); say(", normal "); say_dec(g_mx_types[3]);
@@ -2196,7 +3389,10 @@ static void e3_fatal_summary(void) {
     vkr_on_fatal(); print_summary(); plat_close(g_trace);
     if (g_ud_release) pt_suspend_others();   /* after the report (a suspended thread may hold a lock the report needs) */
     /* t165w: not in a frame-limited (unattended) run - the box would keep the process open until someone closes it */
-    if (g_ud_release && !g_normal_exit && !(g_opt_frames > 0 && g_opt_frames < 2000000000)) plat_message_box("Until Dawn - stopped", g_coh_fatal_hit ?
+    if (g_ud_release && !g_normal_exit && !(g_opt_frames > 0 && g_opt_frames < 2000000000)) plat_message_box("Until Dawn - stopped", g_fixed_fatal ?
+        "Until Dawn stopped because Windows had placed other memory where the game needs its own (a fixed memory address), so the game could not go on safely.\n\n"
+        "This depends on the memory layout of each start: please start the game again. Your saves are kept.\n\n"
+        "The details were written to Logs\\UntilDawn.log (next to UntilDawn.exe). If it happens again, please keep that file for a bug report." : g_coh_fatal_hit ?
         "Until Dawn stopped because the GPU coherence step could not complete safely (it was stopped rather than go on with memory that may be wrong).\n\n"
         "For troubleshooting it can be turned off: in Config\\settings.ini set the line  gpu_coherence = 0  (change the existing line, or add it).\n\n"
         "The details were written to Logs\\UntilDawn.log (next to UntilDawn.exe). Please keep that file for the bug report." : g_dev_lost_hit ?
@@ -2211,7 +3407,7 @@ static void e3_fatal_summary(void) {
    Returns 0 to go on with the arguments it put in *pargc / *pargv, otherwise the exit code. */
 static int ud_player_start(int *pargc, char ***pargv) {
     static char base[1024], cfg[1100], logs[1100], logf[1200], prev[1200], game[1100], cap[1200], fpsbuf[16];
-    static char *av[64];
+    static char *av[128];
     plat_exe_dir(base, sizeof base);
     plat_chdir(base);
     path_join(cfg, base, "Config"); path_join(logs, base, "Logs");
@@ -2243,6 +3439,27 @@ static int ud_player_start(int *pargc, char ***pargv) {
         return 10 + bad;
     }
     say("ok (CUSA02636 01.03, "); say_dec((i64)(sizeof g_ud_manifest / sizeof g_ud_manifest[0])); say(" files)\n");
+    if (g_uds.disp_auto) g_dopt_on = 1;   /* w6_disp: OFF unless the settings ask for it (or --display-auto) */
+    if (g_dopt_save && g_uds.disp_auto && !g_uds.seen_rr) {   /* w6_disp: a settings file of an earlier version. Its display lines were that version's defaults unless changed: untouched
+                                              defaults (windowed 1280x720) become the new default, borderless; anything else is the player's choice and stays. */
+        int old_def = !g_uds.borderless && g_uds.window_w == 1280 && g_uds.window_h == 720;
+        if (old_def) { g_uds.borderless = 1; ud_ini_set("display_mode", "borderless", 0); }
+        g_uds.seen_mode = 1;
+        ud_ini_set("monitor", "auto", "; (added by this version) Monitor: auto (the primary monitor) or its number in the monitor list of Logs\\UntilDawn.log.\r\n");
+        ud_ini_set("render_resolution", "auto", "; (added by this version) Rendering resolution: auto = the resolution of the monitor or window (1920x1080, 2560x1440,\r\n; 3840x2160 ...; never below 1920x1080), or 1080p, 1440p, 2160p or WIDTHxHEIGHT. display_mode is borderless or windowed\r\n; (Alt+Enter switches while the game runs). Restart after changing.\r\n");
+        g_uds.rr_mode = 1; g_uds.seen_rr = 1;
+        say(old_def ? "settings: Config\\settings.ini is from an earlier version with the old display defaults: display_mode is now borderless, render_resolution = auto added\n" : "settings: Config\\settings.ini is from an earlier version: its display mode is kept, render_resolution = auto added\n");
+    }
+    if (g_dopt_save && !g_uds.seen_fast) {   /* w16_rel: a file of an earlier version gets the new settings with their defaults; its own values stay */
+        ud_ini_set("optimised_rendering", "1", "; (added by version 0.4.0) Optimised Rendering (Fast Mode): 1 = on (default), 0 = off. The game goes on with its\r\n"
+                   "; next frame while the graphics card finishes the previous one, with safety checks that keep the game's memory\r\n"
+                   "; consistent. Faster, the same picture; it does not change frame_rate_limit (30, 60, 120, 240 or uncapped =\r\n"
+                   "; 0; uncapped still stops at 240 frames a second).\r\n");
+        say("settings: optimised_rendering = 1 added to Config\\settings.ini (Optimised Rendering (Fast Mode), new in 0.4.0)\n"); }
+    if (g_dopt_save && !g_uds.seen_gpuopt) {
+        ud_ini_set("gpu_optimisations", "1", "; (added by version 0.4.0) 1 = the graphics optimisations of version 0.4.0 (same picture). 0 = off, only for\r\n"
+                   "; troubleshooting (some shaders may be prepared again after a change).\r\n");
+        say("settings: gpu_optimisations = 1 added to Config\\settings.ini (new in 0.4.0)\n"); }
     /* settings -> the existing switches */
     g_opt_fps = g_uds.fps_limit > 0 ? g_uds.fps_limit : -1;
     g_win_borderless = g_uds.borderless; g_win_cw = g_uds.window_w; g_win_ch = g_uds.window_h;
@@ -2251,7 +3468,11 @@ static int ud_player_start(int *pargc, char ***pargv) {
     { static char cdir[1100], cp[1200], ct[1200]; path_join(cdir, base, "Cache"); plat_mkdir(cdir);
       path_join(cp, cdir, "vulkan_pipelines.bin"); path_join(ct, cdir, "vulkan_pipelines.tmp"); g_pcache_path = cp; g_pcache_tmp = ct;
       static char mp[1200]; path_join(mp, base, "pipelines.udm"); g_prep_manifest_path = mp; }   /* t160: the shipped pipeline manifest */
-    say("settings: frame-rate limit "); if (g_uds.fps_limit) say_dec(g_uds.fps_limit); else say("none");
+    say("settings: frame-rate limit "); if (g_uds.fps_limit) say_dec(g_uds.fps_limit); else { say("uncapped (at most "); say_dec(UD_FPS_CEILING); say(" frames a second)"); }
+    if (g_uds.fps_asked > UD_FPS_CEILING) { say(" (frame_rate_limit = "); say_dec(g_uds.fps_asked); say(" is above the highest limit)"); }
+    say(", Optimised Rendering (Fast Mode) "); say(g_uds.fast_render ? "on" : "off (optimised_rendering = 0)");
+    say(", GPU optimisations "); say(g_uds.gpu_opt ? "on" : "off (gpu_optimisations = 0)");
+    say(", display system "); say(g_uds.disp_auto ? "on" : "off (display_system = off)");
     say(", display "); say(g_uds.borderless ? "borderless" : "windowed"); say(", developer mode "); say(g_uds.developer ? "on" : "off");
     say(", renderer thread "); say(g_uds.renderer_thread ? "on" : "off (renderer_thread = 0)");
     say(", gpu coherence "); say(g_uds.gpu_coherence ? "on" : "off (gpu_coherence = 0)"); say(", halloween hunt "); say(g_uds.halloween_hunt ? "on" : "off");
@@ -2268,13 +3489,19 @@ static int ud_player_start(int *pargc, char ***pargv) {
     if (!g_uds.heap_slot_reuse) av[n++] = "--heap-slots-roundrobin";   /* t131 */
     if (!g_uds.shader_prep) av[n++] = "--no-prep";   /* t159 */
     if (g_uds.shader_prep == 2) av[n++] = "--prep-background";   /* t164 */
+    if (g_uds.disp_auto) av[n++] = "--rs-generic";   /* w16_rel: the display system's scaled shaders (as every v0.4.0 test: play_dev D) */
+    g_fr_req = g_uds.fast_render; g_fr_src = g_uds.seen_fast && !g_uds.fresh ? 1 : 0;   /* (rc3: a file written at this start holds the defaults) */   /* w16_rel rc2: Optimised Rendering (Fast Mode) requested (applied after the options: --no-fast-rendering / --fast-rendering win); never by GPU vendor */
+    g_fps_src = g_uds.seen_fps && !g_uds.fresh ? 1 : 0;
+    if (g_uds.gpu_opt) { static char *const k_gpu_opt[] = {"--ce-ahead", "--par-ce-gate", "--gw-pred", "--memo-reloc-any", "--memo-rd-dups", "--tex-dirty-ahead", "--par-fastcheck",
+                                                          "--par-pcores", "--sync-pitch", "--dsync-cs", "--dsync-draw", "--fb-cover", "1", "--pc-save-early"};   /* w16_rel: play_dev P without the diagnostics (--gpu-pass-log) */
+        for (unsigned k = 0; k < sizeof k_gpu_opt / sizeof k_gpu_opt[0]; k++) av[n++] = k_gpu_opt[k]; }
     if (g_uds.heap_slot_mb != 512) { static char hs[16]; char *q = hs + sizeof hs - 1; *q = 0; int v = g_uds.heap_slot_mb; do { *--q = (char)('0' + v % 10); v /= 10; } while (v); av[n++] = "--heap-slot-mb"; av[n++] = q; }   /* t130 */
     if (g_uds.developer) {   /* t107: developer mode only - extra options from Config\dev_options.txt (one line, separated by spaces) */
         static char dop[1100], dbuf[2048]; path_join(dop, cfg, "dev_options.txt");
         u64 dn = 0; char *dt = (char *)plat_read_file(dop, &dn);
         if (dt && dn) { if (dn > sizeof dbuf - 1) dn = sizeof dbuf - 1; mem_copy(dbuf, dt, dn); dbuf[dn] = 0;
             say("developer options (Config\\dev_options.txt):");
-            for (char *q = dbuf; *q && n < 60; ) { while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') *q++ = 0; if (!*q) break; av[n++] = q; say(" "); say(q); while (*q && *q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') q++; }
+            for (char *q = dbuf; *q && n < 120; ) { while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') *q++ = 0; if (!*q) break; av[n++] = q; say(" "); say(q); while (*q && *q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') q++; }
             say("\n"); }
     }
     av[n] = 0;
@@ -2310,25 +3537,46 @@ static int sys_check(int release) {
 }
 
 int e3_main(int argc, char **argv) {
+    g_fr_crash_fn = fr_crash_report;   /* w16_rel rc2 (device loss, fatal stops) */
+    /* w16_rel rc3: "--relaunched N:ADDR" (internal, always first) = this process is new start N because the game's fixed-address
+       window was partly taken by host memory in the start before (ADDR). Removed before anything else reads the options. */
+    if (argc > 2 && str_eq(argv[1], "--relaunched")) { const char *q = argv[2]; g_relaunched = (int)str_to_u64(q); while (*q && *q != ':') q++; if (*q == ':') q++;
+        u64 v = 0; if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) q += 2; for (; *q; q++) { int d = *q >= '0' && *q <= '9' ? *q - '0' : (*q | 0x20) >= 'a' && (*q | 0x20) <= 'f' ? (*q | 0x20) - 'a' + 10 : -1; if (d < 0) break; v = v * 16 + (u64)d; }
+        g_relaunch_prev = v; argv[2] = argv[0]; argv += 2; argc -= 2; }
+    for (int k = 1; k + 1 < argc; k++)   /* w16_rel rc3, TESTS ONLY: host memory placed in the window before the guard (--test-occupy ADDR: every start; --test-occupy-once ADDR: the first start only) */
+        if (str_eq(argv[k], "--test-occupy") || (str_eq(argv[k], "--test-occupy-once") && !g_relaunched)) { u64 v = 0; const char *q = argv[k + 1]; if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) q += 2;
+            for (; *q; q++) { int d = *q >= '0' && *q <= '9' ? *q - '0' : (*q | 0x20) >= 'a' && (*q | 0x20) <= 'f' ? (*q | 0x20) - 'a' + 10 : -1; if (d < 0) break; v = v * 16 + (u64)d; }
+            g_test_occupied = v && plat_test_occupy(v); }
     plat_guard_init(0x1200000000ull, 0x4C80000000ull);   /* t148: before any thread or allocation of ours (heap slots, t130 layout) */
+    /* w16_rel rc3: part of the window already taken (host memory placed there before our first instruction - v040b_clean:
+       private reservations at 0x1300000000 / 0x137fc00000): a fixed mapping of the game could land there and move (a sure crash).
+       Start again (new address-space layout) - at most twice; nothing has been opened or written yet. */
+    if (g_guard_busy_low && g_relaunched < 2) { int ec = plat_relaunch(g_relaunched + 1, g_guard_busy_low_at); if (ec >= 0) return ec; g_relaunch_failed = 1; }   /* rc4: only for the game's heap slots (see GUARD_GAME_SLOTS) */
     int timeout = 60;
     g_game_dir = 0;
-    if (argc <= 1) { int r = ud_player_start(&argc, &argv); if (r) return r; }
+    if (argc <= 1) { g_dopt_save = 1; int r = ud_player_start(&argc, &argv); if (r) return r; }   /* w6_disp: a player start saves display changes (the display system itself: display_system = auto in settings.ini) */
     else if (str_eq(argv[1], "--player")) {   /* t112 (test runs): start the game as a player start does (Config\settings.ini), plus the options after --player */
         int xa = argc - 2; char **xv = argv + 2;
+        for (int k = 0; k < xa; k++) if (str_eq(xv[k], "--display-save")) g_dopt_save = 1;   /* w16_rel: tests of a player start that may write Config\settings.ini (new lines, display migration) */
         int r = ud_player_start(&argc, &argv); if (r) return r;
-        say("options after --player:"); for (int k = 0; k < xa && argc < 63; k++) { argv[argc++] = xv[k]; say(" "); say(xv[k]); } argv[argc] = 0; say("\n");
+        say("options after --player:"); for (int k = 0; k < xa && argc < 127; k++) { argv[argc++] = xv[k]; say(" "); say(xv[k]); } argv[argc] = 0; say("\n");
     }
+    if (g_relaunched) { say("address guard (w16_rel): this is new start "); say_dec(g_relaunched); say(" of at most 2 - the start before found the game's address window taken at "); say_hex(g_relaunch_prev); say(" by host memory (Windows' address-space layout differs at every start)\n"); }
+    if (g_test_occupied) say("address guard: TEST --test-occupy: host memory reserved in the window before the guard\n");
+    if (g_guard_busy_low && g_relaunched >= 2) say("address guard (w16_rel): the game's heap slots are still partly taken after 2 new starts - going on; should one of the game's fixed mappings not get its address, the game stops with a message (instead of crashing later)\n");
+    if (g_relaunch_failed) say("address guard (w16_rel): a new start could not be made - going on\n");
+    if (g_guard_busy && !g_guard_busy_low) say("address guard (w16_rel): host memory only above the game's heap slots (0x1a00000000 and up) - no new start needed\n");
     say("address guard (t148): "); say_dec(g_guard_held); say(" blocks of 512 MB reserved over the game's fixed-address window 0x1200000000-0x4c80000000");
     if (g_guard_busy) { say(", "); say_dec(g_guard_busy); say(" already taken by host memory");
 #ifdef _WIN32
-        for (int k = 0; k < g_guard_busy && k < 4; k++) { say(k ? "; " : " ("); say_hex(g_guard_busy_at[k]); say(": allocation at "); say_hex(g_guard_busy_what[k]); say(" type/state "); say_hex(g_guard_busy_type[k]); }
+        for (int k = 0; k < g_guard_busy && k < 4; k++) { say(k ? "; " : " ("); say_hex(g_guard_busy_at[k]); say(": allocation at "); say_hex(g_guard_busy_what[k]); say(" type/state "); say_hex(g_guard_busy_type[k]); say(" size "); say_hex(g_guard_busy_size[k]); say(g_guard_busy_type[k] >> 32 == 0x2000 ? " reserved" : " committed"); say((g_guard_busy_type[k] & 0xFFFFFFFF) == 0x1000000 ? " image (a DLL)" : (g_guard_busy_type[k] & 0xFFFFFFFF) == 0x40000 ? " mapped (file / section)" : " private (heap, stack or VirtualAlloc)"); }
         say("; the free parts of those blocks are guarded)");
 #endif
     } say("\n");
     for (int i = 1; i < argc; i++) {
         if (str_eq(argv[i], "--main")) g_run_main = 1;
         else if (str_eq(argv[i], "--timeout") && i + 1 < argc) timeout = (int)str_to_u64(argv[++i]);
+        else if (str_eq(argv[i], "--timeout-play")) g_timeout_play = 1;   /* w6_fast: --timeout counts play only - not the shader preparation screen (a cold pipeline cache took 183-215 s of three runs' 240-300 s and made them look stalled) */
         else if (str_eq(argv[i], "--frames") && i + 1 < argc) g_opt_frames = (int)str_to_u64(argv[++i]);
         else if (str_eq(argv[i], "--dump") && i + 1 < argc) g_opt_dump = (int)str_to_u64(argv[++i]);
         else if (str_eq(argv[i], "--no-window")) g_opt_window = 0;
@@ -2338,6 +3586,15 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--append")) g_opt_append = 1;
         else if (str_eq(argv[i], "--no-append")) g_opt_append = 0;
         else if (str_eq(argv[i], "--memo-verify")) g2s_memo_verify = 1;
+        else if (str_eq(argv[i], "--unwatch-each")) g_opt_unwatch_each = 1;   /* w5_perf: e6_vk.c rm_unwatch_pages */
+        else if (str_eq(argv[i], "--hix-keep-marks")) g_opt_hix_marks = 1;   /* w5_perf: e6_vk.c hix_del */
+        else if (str_eq(argv[i], "--keep-pcache-file")) g_opt_keep_pcfile = 1;   /* w5_perf: e6_vk.c (the pipeline cache file's bytes stay allocated, as before) */
+        else if (str_eq(argv[i], "--image-idle-age")) g_opt_idle_age = 1;   /* w5_perf: e6_vk.c vk_scale_budgets */
+        else if (str_eq(argv[i], "--tex-dirty-ahead")) g_opt_dch_ahead = 1;   /* w5_perf: e6_vk.c dcp_thread */
+        else if (str_eq(argv[i], "--gw-pred")) g2s_gw_pred = 1;   /* w5_perf: gcn2spv.c gwp_get */
+        else if (str_eq(argv[i], "--memo-reloc-any")) g2s_reloc_any = 1;   /* w5_perf: gcn2spv.c g2s_translate_m */
+        else if (str_eq(argv[i], "--memo-rd-dups")) g2s_rd_dups = 1;   /* w3_perf: gcn2spv.c */
+        else if (str_eq(argv[i], "--stage-mb") && i + 1 < argc) { u64 v = str_to_u64(argv[++i]); if (v >= 128 && v <= 512) g_stage_mb_req = v & ~63ull; }   /* w5_perf */
         else if (str_eq(argv[i], "--stage-128")) g_stage_small_req = 1;   /* t112 experiment: the 128 MB staging ring of t111 (default 512 MB, as in t110) */
         else if (str_eq(argv[i], "--keep-spirv")) g2s_keep_spirv = 1;
         else if (str_eq(argv[i], "--module-probe")) g_opt_module_probe = 1;
@@ -2346,7 +3603,9 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-memo-reloc")) g2s_memo_reloc = 0;   /* STATUS 78: exact-key reuse only (the default since STATUS 79) */
         else if (str_eq(argv[i], "--memo-reloc")) g2s_memo_reloc = 1;      /* STATUS 79: the relocatable memo (verified in t80a; speed work pending) */
         else if (str_eq(argv[i], "--profile")) g_opt_profile = 1;
+        else if (str_eq(argv[i], "--hitch-profile")) { g_opt_hitch = 1; if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') { u32 v = 0; for (const char *q = argv[++i]; *q >= '0' && *q <= '9'; q++) v = v * 10 + (u32)(*q - '0'); if (v >= 20) g_hp_report_ms = v; } }   /* t190 */
         else if (str_eq(argv[i], "--profile-play")) { g_opt_profile = 2; g_prof_lo = 1800; g_prof_len = 1800; }
+        else if (str_eq(argv[i], "--replay-any-core")) g_opt_rp_anycore = 1;   /* t171: the replay thread left to Windows (not high priority, any core) */
         else if (str_eq(argv[i], "--profile-replay")) g_opt_profile = 3;   /* t115: sample the replay from its third repeat to the last (--replay-repeat 4 or more) */
         else if (str_eq(argv[i], "--strict-imports")) g_opt_strict_imports = 1;
         else if (str_eq(argv[i], "--recursive-mutexes")) g_opt_recursive_mutexes = 1;
@@ -2404,18 +3663,149 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--trace-visible")) g_opt_trace_vis = 1;   /* diagnostic: STATUS 83 */
         else if (str_eq(argv[i], "--big-bounds")) { g_opt_trace_vis = 1; g_opt_big_bounds = 1; }   /* experiment: STATUS 83 */
         else if (str_eq(argv[i], "--no-skin-check")) g_opt_no_skin_check = 1;   /* STATUS 68 */
-        else if (str_eq(argv[i], "--no-cloth-fix")) g_opt_no_cloth_fix = 1;   /* v0.3.2, STATUS 238 */
+        else if (str_eq(argv[i], "--cloth-onset")) g_opt_cloth_onset = 1;   /* t187: diagnostic, STATUS 236 */
+        else if (str_eq(argv[i], "--no-cloth-bend-fix")) g_opt_no_bend_fix = 1;   /* w2_cloth */
+        else if (str_eq(argv[i], "--cloth-log")) g_opt_cloth_log = 1;   /* w2_cloth: diagnostic */
+        else if (str_eq(argv[i], "--no-cloth-checks")) g_opt_no_cl_checks = 1;   /* w3_cloth */
+        else if (str_eq(argv[i], "--no-cloth-source-checks")) g_opt_no_cl_src = 1;   /* w5_cloth */
+        else if (str_eq(argv[i], "--no-cloth-wind-guard")) g_opt_no_wind_guard = 1;   /* w5_cloth */
+        else if (str_eq(argv[i], "--cloth-test-wind") && i + 1 < argc) {   /* w5_cloth test: FLIP:HEXBITS[:COUNT] */
+            const char *q = argv[++i]; u64 f = 0, b = 0, c = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0'); if (*q == ':') q++;
+            for (;; q++) { int d = *q >= '0' && *q <= '9' ? *q - '0' : *q >= 'a' && *q <= 'f' ? *q - 'a' + 10 : *q >= 'A' && *q <= 'F' ? *q - 'A' + 10 : -1; if (d < 0) break; b = b * 16 + (u64)d; }
+            if (*q == ':') q++; while (*q >= '0' && *q <= '9') c = c * 10 + (u64)(*q++ - '0');
+            g_tw_flip = f; g_tw_bits = (u32)b; g_tw_count = c ? (u32)c : 3; }
+        else if (str_eq(argv[i], "--no-cloth-input-guard")) g_opt_no_cl_inguard = 1;   /* w3_cloth */
+        else if (str_eq(argv[i], "--no-cloth-restore")) g_opt_no_cl_restore = 1;   /* w3_cloth */
+        else if (str_eq(argv[i], "--cloth-test-nan") && i + 1 < argc) {   /* w3_cloth test: FLIP:BONE:HEXBITS[:COUNT] */
+            const char *q = argv[++i]; u64 v[4] = {0, 0, 0x7fc00000, 1}; for (int k = 0; k < 4 && *q; k++) { u64 x = 0; if (k == 2) { for (;;) { int c = *q, d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; if (d < 0) break; x = x * 16 + (u64)d; q++; } } else while (*q >= '0' && *q <= '9') x = x * 10 + (u64)(*q++ - '0'); v[k] = x; if (*q == ':') q++; }
+            g_tn_flip = v[0]; g_tn_bone = (u32)v[1]; g_tn_bits = (u32)v[2]; g_tn_count = v[3] ? (u32)v[3] : 1; }
+        else if (str_eq(argv[i], "--cloth-delay") && i + 1 < argc) {   /* w3_cloth test: MS:EVERY:MASK[:FROM:TO] */
+            const char *q = argv[++i]; u64 v[5] = {0, 1, 1, 0, ~0ull}; for (int k = 0; k < 5 && *q; k++) { u64 x = 0; while (*q >= '0' && *q <= '9') x = x * 10 + (u64)(*q++ - '0'); v[k] = x; if (*q == ':') q++; }
+            g_opt_cl_delay_ms = (int)v[0]; g_opt_cl_delay_every = v[1] ? (int)v[1] : 1; g_opt_cl_delay_mask = (int)v[2]; g_opt_cl_delay_from = v[3]; g_opt_cl_delay_to = v[4]; }
+        else if (str_eq(argv[i], "--hitch-inject") && i + 1 < argc) {   /* w3_cloth test: FROM:TO:MS:EVERY */
+            const char *q = argv[++i]; u64 v[4] = {0, ~0ull, 0, 1}; for (int k = 0; k < 4 && *q; k++) { u64 x = 0; while (*q >= '0' && *q <= '9') x = x * 10 + (u64)(*q++ - '0'); v[k] = x; if (*q == ':') q++; }
+            g_hi_from = v[0]; g_hi_to = v[1]; g_hi_ms = (u32)v[2]; g_hi_every = v[3] ? v[3] : 1; }
+        else if (str_eq(argv[i], "--no-cloth-fix")) g_opt_no_cloth_fix = 1;   /* t188: STATUS 238 */
+        else if (str_eq(argv[i], "--no-cloth-wind-tiny-fix")) g_opt_no_wind_tiny = 1;   /* w6_cloth */
+        else if (str_eq(argv[i], "--ps4-mxcsr")) g_opt_ps4_mxcsr = 1;   /* t187: game threads with the PS4 libc default MXCSR 0x9FC0 (FTZ + DAZ), STATUS 236 */
         else if (str_eq(argv[i], "--no-arena-lock")) g_opt_no_arena_lock = 1;   /* t127 */
         else if (str_eq(argv[i], "--heap-slots-roundrobin")) g_opt_heap_rr = 1;   /* t131 */
         else if (str_eq(argv[i], "--ps4-sched")) g_opt_ps4_sched = 1;   /* t133 experiment */
         else if (str_eq(argv[i], "--no-image-pool")) g_opt_no_img_pool = 1;   /* t134 */
         else if (str_eq(argv[i], "--heap-slot-mb") && i + 1 < argc) { u64 v = str_to_u64(argv[++i]); g_heap_slot_mb = v == 2048 ? 2048 : v < 64 ? 64 : v > 512 ? 512 : (u32)v; }   /* t130: 64..512, or 2048 = the game's own */
         else if (str_eq(argv[i], "--no-par-detile")) g_opt_par_detile = 0;   /* t128 */
+        else if (str_eq(argv[i], "--hitch-renderer")) { g_opt_hitch = 1; g_hp_e6_detail = 1; }   /* t196: --hitch-profile with the renderer thread's code positions inside a submit */
+        else if (str_eq(argv[i], "--no-detile-ref-rows")) g_detile_ref_rows = 0;   /* t196: the reference de-tiling whole and element by element, as before */
+        else if (str_eq(argv[i], "--memo-entries") && i + 1 < argc) { u64 v = str_to_u64(argv[++i]); if (v >= 8192 && v <= 65536) g2s_memo_n = (int)v; }   /* w2: shader-setup memo entries (default 32768; about 4 KB each) */
+        else if (str_eq(argv[i], "--real-evict-any")) g_opt_real_evict_any = 1;   /* w2: the real-memory budget evicts as in t196 (any image not used in this frame, for every new image) */
+        else if (str_eq(argv[i], "--no-budget-recover")) g_opt_no_budget_recover = 1;   /* w2: an image budget lowered because the card was full stays lowered, as in t196 */
+        else if (str_eq(argv[i], "--image-headroom") && i + 1 < argc) { u64 v = str_to_u64(argv[++i]); if (v <= 2048) g_opt_img_headroom = (int)v; }   /* w2: free entries kept in the image table by freeing idle textures between frames (try 192; default 0 = off, as before) */
+        else if (str_eq(argv[i], "--spv-compress-inline")) g2s_spv_compress_lazy = 0;   /* w2: SPIR-V words compressed inside the draw that made the module, as before */
+        else if (str_eq(argv[i], "--full-mem-report")) g_opt_memrep_light = 0;   /* w2: the 60-second memory detail with the address-space walk and the heap summaries again (35-80 ms hitch each) */
+        else if (str_eq(argv[i], "--no-adaptive-mem")) g_opt_no_adaptive_mem = 1;   /* w2: no automatic --vram-fit / --image-max-age on small cards / PCs */
+        else if (str_eq(argv[i], "--light-mem-report")) g_opt_memrep_light = 1;   /* t196: the 60-second memory detail without the address-space walk and the heap summaries */
+        else if (str_eq(argv[i], "--long-frame-ms") && i + 1 < argc) { u32 v = (u32)str_to_u64(argv[++i]); if (v >= 20) g_long_frame_ms = v; }   /* t196: "long frame" detail lines from this length (default 250) */
         else if (str_eq(argv[i], "--no-movie-skip")) g_opt_no_movie_skip = 1;   /* STATUS 84 */
         else if (str_eq(argv[i], "--trace-ui")) g_opt_trace_ui = 1;   /* diagnostic: STATUS 85 */
         else if (str_eq(argv[i], "--trace-sound")) g_opt_trace_sound = 1;   /* diagnostic: t132 */
         else if (str_eq(argv[i], "--no-skip-audio")) g_opt_no_skip_audio = 1;   /* t135 */
         else if (str_eq(argv[i], "--old-rt-alias")) g_opt_old_rt_alias = 1;   /* t135: targets drawn into any image within 64 rows (as before) */
+        else if (str_eq(argv[i], "--direct-memory-mb") && i + 1 < argc) { u64 v = str_to_u64(argv[++i]); g_opt_dmem_mb = v <= 5056 ? 0 : v > 9728 ? 9728 : (u32)v; }   /* popin: 5057..9728; the pool must end below 0x1200000000 */
+        else if (str_eq(argv[i], "--mip-stats") && i + 1 < argc) { const char *v = argv[++i]; g_opt_mipstats = str_eq(v, "empty") ? 1 : str_eq(v, "drawn") ? 2 : str_eq(v, "drawn1") ? 3 : str_eq(v, "gpu") ? 4 : str_eq(v, "gpu") ? 4 : str_eq(v, "gpuz") ? 5 : str_eq(v, "gpufast") ? 6 : 0;
+            if (g_opt_mipstats == 5 && g2s_mip_fb < 2) g2s_mip_fb = 2; else if (g_opt_mipstats >= 4 && !g2s_mip_fb) g2s_mip_fb = 1;
+            if (g_opt_mipstats == 6) g_opt_mip_fast = 1; if (g_opt_mipstats > 4) g_opt_mipstats = 4; }
+        else if (str_eq(argv[i], "--mip-test") && i + 1 < argc) g2s_mip_test = (int)str_to_u64(argv[++i]);   /* w3_perf: cost isolation, see gcn2spv.c */
+        else if (str_eq(argv[i], "--mip-sample") && i + 1 < argc) { if (str_to_u64(argv[++i]) == 256) g2s_mip_test |= 2; }   /* w3_perf: one pixel in 256 measures (default one in 64) */
+        else if (str_eq(argv[i], "--mip-fast")) g_opt_mip_fast = 1;     /* w2_popin: with --mip-stats gpu */
+        else if (str_eq(argv[i], "--mip-sharp")) g_opt_mip_sharp = 1;   /* w2_popin: with --mip-stats gpu */
+        else if (str_eq(argv[i], "--mip-early-z")) g2s_mip_fb = 2;      /* w2_popin: with --mip-stats gpu / --mip-measure */
+        else if (str_eq(argv[i], "--mip-early-only")) g2s_mip_fb = 3;   /* w2_popin: --mip-early-z, and shaders tested late are not instrumented */
+        else if (str_eq(argv[i], "--mip-measure")) { g_opt_mip_measure = 1; if (!g2s_mip_fb) g2s_mip_fb = 1; }   /* w2_popin */   /* popin */
+        else if (str_eq(argv[i], "--stream-log") && i + 1 < argc) { u64 v = str_to_u64(argv[++i]); g_opt_stream_log = v > 100000 ? 100000 : (u32)v; }   /* popin: every N updates (0 = off) */
+        else if (str_eq(argv[i], "--phys-step-catchup")) g_opt_phys_catchup = 1;   /* w2_cloth: the t192 smoothing input (frames up to 0.1 s) */
+        else if (str_eq(argv[i], "--fixed-physics-step")) g_opt_fixed_phys = 1;   /* t192: the game's own 1/30 s per frame */
+        else if (str_eq(argv[i], "--sim-ram-gb") && i + 1 < argc) g_sim_ram = str_to_u64(argv[++i]) << 30;   /* t194 (tests) */
+        else if (str_eq(argv[i], "--no-ram-budgets")) g_opt_no_ram_budgets = 1;
+        else if (str_eq(argv[i], "--image-max-age") && i + 1 < argc) g_img_max_age = (u32)str_to_u64(argv[++i]), g_img_max_age_set = 1;   /* t196: frames; 0 = off (default) */
+        else if (str_eq(argv[i], "--image-soft-mb") && i + 1 < argc) g_img_soft = str_to_u64(argv[++i]) << 20;   /* t196 */
+        else if (str_eq(argv[i], "--image-budget-real")) g_opt_img_budget_real = 1;   /* t196 */
+        else if (str_eq(argv[i], "--vram-fit")) g_opt_vram_fit = 1;   /* t196 */
+        else if (str_eq(argv[i], "--sim-vram-gb") && i + 1 < argc) g_sim_vram = str_to_u64(argv[++i]) << 30;   /* t196 (tests) */
+        else if (str_eq(argv[i], "--no-image-pool-trim")) g_opt_no_pool_trim = 1;   /* t196 */
+        else if (str_eq(argv[i], "--mem-saver")) { g_img_max_age = 1800; g_opt_vram_fit = 1; g_stage_small_req = 1; }   /* t196 */
+        else if (str_eq(argv[i], "--no-maintenance8")) g_opt_no_m8 = 1;   /* t194 (A/B): depth <-> R32 syncs through a buffer, as before */
+        else if (str_eq(argv[i], "--early-labels")) g_opt_early_labels = 2;   /* t194 measurement, unsafe: what the label wait costs */
+        else if (str_eq(argv[i], "--label-policy") && i + 1 < argc) { g_opt_early_labels = (int)str_to_u64(argv[++i]); if (g_opt_early_labels == 5) { g_opt_early_labels = 4; g_opt_wbg_strict = 1; } g_opt_wbg = g_opt_early_labels == 4; }   /* w3_perf: 5 = 4 + labels wait for batches whose shaders read game RAM directly */
+        else if (str_eq(argv[i], "--label-guard-big")) g_opt_wbg_big = 1;   /* w3_perf */
+        else if (str_eq(argv[i], "--no-fast-rendering") || str_eq(argv[i], "--no-optimised-rendering")) { g_fr_req = 0; g_fr_src = 2; }   /* w16_rel: Optimised Rendering (Fast Mode) off (= optimised_rendering = 0) */
+        else if (str_eq(argv[i], "--fast-rendering") || str_eq(argv[i], "--optimised-rendering")) { g_fr_req = 1; g_fr_src = 2; }   /* w16_rel: on (= --label-policy 4 --label-trailing --label-read-guard 2 --label-guard-big) */
+        else if (str_eq(argv[i], "--no-gpu-optimisations")) { g_opt_ce_ahead = 0; g_opt_spec_cegate = 0; g2s_gw_pred = 0; g2s_reloc_any = 0; g2s_rd_dups = 0; g_opt_dch_ahead = 0; g_opt_spec_fast = 0; g_opt_spec_pcores = 0; g_opt_sync_pitch = 0; g_opt_dsync_cs = 0; g_opt_dsync_draw = 0; g_opt_fb_cover = 0; g_pc_early = 0; }   /* w16_rel: = gpu_optimisations = 0 */
+        else if (str_eq(argv[i], "--no-ce-ahead")) g_opt_ce_ahead = 0;   /* w16_rel: each v0.4.0 default can be turned off on its own (troubleshooting) */
+        else if (str_eq(argv[i], "--no-par-ce-gate")) g_opt_spec_cegate = 0;
+        else if (str_eq(argv[i], "--no-gw-pred")) g2s_gw_pred = 0;
+        else if (str_eq(argv[i], "--no-memo-reloc-any")) g2s_reloc_any = 0;
+        else if (str_eq(argv[i], "--no-memo-rd-dups")) g2s_rd_dups = 0;
+        else if (str_eq(argv[i], "--no-tex-dirty-ahead")) g_opt_dch_ahead = 0;
+        else if (str_eq(argv[i], "--no-par-fastcheck")) g_opt_spec_fast = 0;
+        else if (str_eq(argv[i], "--no-par-pcores")) g_opt_spec_pcores = 0;
+        else if (str_eq(argv[i], "--no-sync-pitch")) g_opt_sync_pitch = 0;
+        else if (str_eq(argv[i], "--no-dsync-cs")) g_opt_dsync_cs = 0;
+        else if (str_eq(argv[i], "--no-dsync-draw")) g_opt_dsync_draw = 0;
+        else if (str_eq(argv[i], "--no-pc-save-early")) g_pc_early = 0;
+        else if (str_eq(argv[i], "--no-rs-generic")) g_opt_rs_gen = 0;
+        else if (str_eq(argv[i], "--no-display-auto")) g_dopt_on = 0;
+        else if ((str_eq(argv[i], "--test-occupy") || str_eq(argv[i], "--test-occupy-once")) && i + 1 < argc) i++;   /* w16_rel rc3 (tests; handled at the start of e3_main) */
+        else if (str_eq(argv[i], "--no-fixed-stop")) g_fixed_stop = 0;   /* w16_rel rc3: a fixed mapping that moved is only logged, as before (the game then crashes on the address it asked for) */   /* w16_rel: the old display path (1920x1080, settings' window) in a --player run */
+        else if (str_eq(argv[i], "--no-coh-learn")) g_opt_coh_learn = 0;
+        else if (str_eq(argv[i], "--label-coh-early")) g_opt_wbg_coh_early = 1;   /* t199c */
+        else if (str_eq(argv[i], "--label-fault-old-slow")) g_opt_wbg_fold = 2;   /* w5_fast: the same with 1 ms between the guard's look and the protection query (makes the t199b crash likely) */
+        else if (str_eq(argv[i], "--label-policy-after") && i + 1 < argc) g_wbg_after = str_to_u64(argv[++i]);   /* w5_fast: label policy 4 from flip F on (tests whose scripted presses count flips) */
+        else if (str_eq(argv[i], "--label-full-old")) g_opt_wbg_full_old = 1;   /* w6_fast */
+        else if (str_eq(argv[i], "--label-trailing")) { g_opt_lbl_trail = 1; g_lbl_dn_fn = lbl_dn; }   /* w5_fast: with --label-policy 4, only the label writes that end a submit are early */
+        else if (str_eq(argv[i], "--label-fault-old")) g_opt_wbg_fold = 1;   /* w5_fast: the t199b fault path (to reproduce its crash with the page history logged) */
+        else if (str_eq(argv[i], "--label-read-guard") && i + 1 < argc) g_opt_rdg = (int)str_to_u64(argv[++i]);   /* w5_fast: 1 = pages a batch in flight reads straight from game RAM are read-only after an early label, game writes counted and let through; 2 = they wait for the batch */
+        else if (str_eq(argv[i], "--coh-learn")) g_opt_coh_learn = 1;   /* w3_perf: e6_vk.c coh_learn */   /* t194: 0 / 1 (experimental) / 2; t198: 4 = 1 + guarded write-backs (e6_vk.c wbg_note) */
+        else if (str_eq(argv[i], "--label-audit") && i + 1 < argc) g_wbg_audit = (int)str_to_u64(argv[++i]);   /* t198: N frames of GPU writes into RAM and label writes listed in e6_vulkan_log.txt */
+        else if (str_eq(argv[i], "--scripted-input")) g_opt_scripted_input = 1;   /* t198 */
+        else if (str_eq(argv[i], "--scripted-input-strict")) g_opt_scripted_input = 2;   /* t199f: the controller is ignored too */
+        else if (str_eq(argv[i], "--record-input") && i + 1 < argc) g_inrec_path = argv[++i];   /* t199d (e5_system.c) */
+        else if (str_eq(argv[i], "--replay-input") && i + 1 < argc) g_inrep_path = argv[++i];
+        else if (str_eq(argv[i], "--lum-log")) g_opt_lumlog = 1;   /* t198: flicker detector on the game's luminance target (UntilDawn.log, every 600 flips) */
+        else if (str_eq(argv[i], "--label-audit-from") && i + 1 < argc) g_wbg_audit_from = str_to_u64(argv[++i]);
+        else if (str_eq(argv[i], "--depth-ro-direct")) g_opt_depth_ro_direct = 1;   /* t193c (A/B) */
+        else if (str_eq(argv[i], "--stale-copies")) g_opt_stale_copies = 1;   /* t193 (A/B): region copies of a surface its own draw writes are kept as current, as before */
+        else if (str_eq(argv[i], "--display-auto")) g_dopt_on = 1;   /* w6_disp: the display system as a player start has it (settings.ini in a --player run, else borderless + automatic resolution) */
+        else if (str_eq(argv[i], "--display-mode") && i + 1 < argc) { i++; g_dopt_on = 1; g_dopt_mode = str_eq(argv[i], "windowed") ? 0 : 1; }   /* borderless | windowed */
+        else if (str_eq(argv[i], "--monitor") && i + 1 < argc) { g_dopt_on = 1; g_dopt_mon = (int)str_to_u64(argv[++i]); }   /* 0 = auto, 1.. = number in the log's list */
+        else if (str_eq(argv[i], "--window") && i + 1 < argc) { int m_, w_, h_; ud_parse_res(argv[++i], &m_, &w_, &h_); g_dopt_on = 1; if (m_ == 2) { g_dopt_cw = w_; g_dopt_ch = h_; } }   /* WxH: client size of the window (display mode windowed) */
+        else if (str_eq(argv[i], "--sim-monitor") && i + 1 < argc) { int m_, w_, h_; ud_parse_res(argv[++i], &m_, &w_, &h_); g_dopt_on = 1; if (m_ == 2) { g_dopt_simw = w_; g_dopt_simh = h_; } }   /* tests: WxH, as if the monitor had this size */
+        else if (str_eq(argv[i], "--render-res") && i + 1 < argc) ud_parse_res(argv[++i], &g_rr_mode, &g_rr_w, &g_rr_h);   /* auto | 1080p | 1440p | 2160p | WxH: the internal resolution (also in replays) */
+        else if (str_eq(argv[i], "--display-toggle-at") && i + 1 < argc) { const char *q = argv[++i]; while (*q && g_disp_tog_n < 4) { g_disp_tog_at[g_disp_tog_n++] = str_to_u64(q); while (*q && *q != ',') q++; if (*q) q++; } }   /* tests: the mode switches as on Alt+Enter at these flips */
+        else if (str_eq(argv[i], "--display-save")) g_dopt_save = 1;   /* display changes are written to Config\\settings.ini (a player start does) */
+        else if (str_eq(argv[i], "--no-vram-step")) g_dopt_no_vram = 1;   /* the internal resolution is not lowered for a small graphics card */
+        else if (str_eq(argv[i], "--render-scale") && i + 1 < argc) { i++; g_rs_pct = (int)str_to_u64(argv[i]); if (g_rs_pct < 100) g_rs_pct = 100; }   /* t196: screen-sized targets N percent of the game's size (133 = 4/3, 150, 200; default 100 = off) */
+        else if (str_eq(argv[i], "--present-shot-ui") && i + 1 < argc) { g_pshot_auto = (int)str_to_u64(argv[++i]); if (!g_npshot) g_pshot[g_npshot++] = ~0ull; }   /* w3: up to N presented + internal pictures, taken on flips where a large interface bitmap is put on the screen */
+        else if (str_eq(argv[i], "--present-shot") && i + 1 < argc) {   /* w3: save the swapchain image of these flips (what goes to the screen) as e6_present_<flip>.bmp */
+            const char *q = argv[++i];
+            while (*q && g_npshot < 64) { g_pshot[g_npshot++] = str_to_u64(q); while (*q && *q != ',') q++; if (*q) q++; } }
+        else if (str_eq(argv[i], "--rs-log") && i + 1 < argc) g_rsl_flip = (i64)str_to_u64(argv[++i]);   /* w3: every draw / dispatch of this flip (replay: of the frame) with its targets' and textures' sizes, scales and filters, in the Vulkan log */
+        else if (str_eq(argv[i], "--rs-subpass")) g_opt_rs_sub = 1;   /* w3 (experimental): compute passes with shared group data (LDS) and scaled storage images run once per sub-pixel position, not at the game's resolution */
+        else if (str_eq(argv[i], "--rs-no-subpass")) g_opt_rs_sub = 0;
+        else if (str_eq(argv[i], "--rs-ui") && i + 1 < argc) g_opt_rs_ui = (int)str_to_u64(argv[++i]);
+        else if (str_eq(argv[i], "--rs-ui-mem") && i + 1 < argc) g_opt_rs_ui_mem = (int)str_to_u64(argv[++i]);   /* w4: with --rs-ui 3, Scaleform's memory pool and reuse limit grow with the area (default 1; 0 = the game's 256 MB / 8 MB: render targets fail at 200 percent) */
+        else if (str_eq(argv[i], "--rs-ui-dmem") && i + 1 < argc) g_opt_rs_ui_dmem_off = !str_to_u64(argv[++i]);   /* w5: 0 = the enlarged Scaleform pool is not added to the direct memory (w4; the 200 percent cave crash) */
+        else if (str_eq(argv[i], "--rs-ui-rt") && i + 1 < argc) g_opt_rs_ui_rt = (int)str_to_u64(argv[++i]);   /* w4, experimental: Scaleform's default render target object at the physical size too (default 0) */
+        else if (str_eq(argv[i], "--trace-gfx-mem")) g_opt_trace_gfx_mem = 1;   /* w4, diagnostic */   /* w3: the interface on a scaled picture: 0 as w2 (enlarged by nearest neighbour), 1 filtered, 2 its render targets scaled too, 3 (default) Scaleform's full-screen viewport at the physical size (glyphs and shapes rasterised for the output; 1 for what is left), 4 = 3 + the movies rendered to a texture (subtitles) */
+        else if (str_eq(argv[i], "--rs-aa") && i + 1 < argc) g_opt_rs_aa = (int)str_to_u64(argv[++i]);   /* w5: see g_opt_rs_aa in e6_vk.c (defaults 1) */
+        else if (str_eq(argv[i], "--rs-box") && i + 1 < argc) g_opt_rs_box = (int)str_to_u64(argv[++i]);
+        else if (str_eq(argv[i], "--rs-down") && i + 1 < argc) g_opt_rs_down = (int)str_to_u64(argv[++i]);
+        else if (str_eq(argv[i], "--rs-const-log")) g_opt_rs_constlog = 1;
+        else if (str_eq(argv[i], "--rs-ui-log")) g_opt_rs_uilog = 1;
+        else if (str_eq(argv[i], "--sample-offsets")) g_opt_sample_offsets = 1;   /* w5: IMAGE_SAMPLE*_O texel offsets applied without a render scale too (changes the anti-aliasing pass's picture at 100 percent) */
+        else if (str_eq(argv[i], "--rs-movie-point")) g_opt_rs_movie = 0;   /* w3 (A/B): Bink movie frames on a scaled screen are enlarged by nearest neighbour (as before), not filtered */
+        else if (str_eq(argv[i], "--rs-keep-window")) g_opt_rs_keep_window = 1;   /* w2: with --render-scale the window stays as the settings say (the scaled picture is filtered down to it) */
+        else if (str_eq(argv[i], "--rs-no-shift")) g2s_opt_rs_noshift = 1;   /* w2 (A/B): --render-scale 150 etc. without the sub-pixel shift (as t196: pixelated) */
+        else if (str_eq(argv[i], "--padded-targets")) g_opt_padded_targets = 1;   /* t191: targets at their padded size, region copies for every read (as before) */
         else if (str_eq(argv[i], "--tex-audit")) { g_opt_tex_audit = 1; if (i + 1 < argc && str_eq(argv[i + 1], "fix")) { g_opt_tex_audit = 2; i++; } }   /* t135 diagnostic */
         else if (str_eq(argv[i], "--trace-movies")) g_opt_trace_movies = 1;   /* diagnostic: STATUS 86 */
         else if (str_eq(argv[i], "--watch-heap")) g_hw_on = 1;
@@ -2432,6 +3822,7 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--ik-probe")) g_opt_ik_probe = 1;   /* t151 */
         else if (str_eq(argv[i], "--fp-trap-full")) { g_fp_trap = 1; g_fp_full = 1; }   /* t151 */
         else if (str_eq(argv[i], "--fold-gpu-data")) g_opt_fold_gpu_data = 1;
+        else if (str_eq(argv[i], "--gw-sticky") && i + 1 < argc) { g_opt_gw_sticky = (int)str_to_u64(argv[++i]); if (g_opt_gw_sticky > 6) g_opt_gw_sticky = 6; }   /* w3_perf: e6_vk.c g2s_gpu_written */
         else if (str_eq(argv[i], "--gpu-sync")) g_opt_gpu_sync = 1;
         else if (str_eq(argv[i], "--gpu") && i + 1 < argc) g_opt_gpu_sel = argv[++i];   /* t121: which GPU (number from the log's list, or part of its name) */
         else if (str_eq(argv[i], "--acquire-timeout-ms") && i + 1 < argc) g_acq_timeout_ns = str_to_u64(argv[++i]) * 1000000ull;   /* t121 test */
@@ -2439,6 +3830,31 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--present-mode") && i + 1 < argc) { const char *m = argv[++i]; g_opt_pm = str_eq(m, "fifo") ? 1 : str_eq(m, "mailbox") ? 2 : str_eq(m, "immediate") ? 3 : 0; }   /* t121 */
         else if (str_eq(argv[i], "--replay") && i + 1 < argc) { g_replay_path = argv[++i]; g_prep_in_replay = 1; }
         else if (str_eq(argv[i], "--replay-trace")) g_rc_trace = 1;
+        else if (str_eq(argv[i], "--replay-mem-sync")) g_rc_memsync = 1;   /* w2 */
+        else if (str_eq(argv[i], "--gw-all")) g_opt_gw_all = 1;   /* w2 test */
+        else if (str_eq(argv[i], "--pc-save-normal-io")) g_pc_low_io = 0;   /* w3: as t198 */
+        else if (str_eq(argv[i], "--pc-save-early")) g_pc_early = 1;   /* w11_load (e6_vk.c); all default off */
+        else if (str_eq(argv[i], "--pc-save-quiet")) g_pc_quiet = 1;
+        else if (str_eq(argv[i], "--bg-io-low")) g_bg_io_low = 1;
+        else if (str_eq(argv[i], "--read-ahead")) g_ra_on = 1;   /* (e6_ahead.c) */
+        else if (str_eq(argv[i], "--read-ahead-n") && i + 1 < argc) { g_ra_n = (int)str_to_u64(argv[++i]); if (g_ra_n < 1) g_ra_n = 1; if (g_ra_n > 512) g_ra_n = 512; }
+        else if (str_eq(argv[i], "--smooth-load")) { g_pc_early = 1; g_pc_quiet = 1; g_bg_io_low = 1; g_ra_on = 1; }   /* the four together */
+        else if (str_eq(argv[i], "--read-delay-ms") && i + 1 < argc) g_opt_read_delay_ms = (int)str_to_u64(argv[++i]);   /* test: every game file read takes N ms longer (a slow / busy disk) */
+        else if (str_eq(argv[i], "--no-splash-skip-wait")) g_opt_splash_wait = 0;   /* w3: as t198 */
+        else if (str_eq(argv[i], "--splash-skip-wait")) g_opt_splash_wait = 1;
+        else if (str_eq(argv[i], "--savedata-delay-ms") && i + 1 < argc) g_opt_sd_delay_ms = (int)str_to_u64(argv[++i]);   /* w3 test */
+        else if (str_eq(argv[i], "--savedata-delay-nth") && i + 1 < argc) g_opt_sd_delay_nth = (int)str_to_u64(argv[++i]);   /* w3 test: which mount (1 = the first) */
+        else if (str_eq(argv[i], "--no-gw-late")) g_opt_gw_late = 0;   /* w3: as t198 */
+        else if (str_eq(argv[i], "--gw-late")) g_opt_gw_late = 1;
+        else if (str_eq(argv[i], "--gw-probe")) g_opt_gw_probe = 1;   /* w3 diagnostic (replays) */
+        else if (str_eq(argv[i], "--sh-verify")) g_opt_sh_verify = 1;   /* w3 diagnostic (with --replay-trace) */
+        else if (str_eq(argv[i], "--no-inflight-taint")) g_opt_inflight_taint = 0;   /* w2: as t197 */
+        else if (str_eq(argv[i], "--inflight-taint")) g_opt_inflight_taint = 1;
+        else if (str_eq(argv[i], "--no-inflight-wait")) g_opt_inflight_wait = 0;   /* w2: as t197 */
+        else if (str_eq(argv[i], "--inflight-wait")) g_opt_inflight_wait = 1;
+        else if (str_eq(argv[i], "--gw-why") && i + 1 < argc) g_opt_gw_why = (int)str_to_u64(argv[++i]);   /* w2 diagnostic */
+        else if (str_eq(argv[i], "--no-replay-mem-sync")) g_rc_memsync = 0;
+        else if (str_eq(argv[i], "--bk-delay-us") && i + 1 < argc) g_opt_bk_delay_us = (int)str_to_u64(argv[++i]);   /* w2 test */
         else if (str_eq(argv[i], "--renderer") && i + 1 < argc) { i++; if (str_eq(argv[i], "native")) { g_rnative = 1; g_win_title = "Until Dawn - native renderer (test build)"; } else if (str_eq(argv[i], "e6")) g_rnative = 0; else say("--renderer: native or e6\n"); }   /* RENDERER_PLAN 12 */
         else if (str_eq(argv[i], "--native-e6-equiv")) g_nv_e6equiv = 1;      /* native renderer: E6's behaviour, for step-by-step comparisons */
         else if (str_eq(argv[i], "--native-tess-real")) g_nv_tess_real = 1;
@@ -2450,6 +3866,23 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-chunk")) g_opt_nochunk = 1;
         else if (str_eq(argv[i], "--gpu-dma")) g_opt_gpu_dma = 1;
         else if (str_eq(argv[i], "--no-sync-points")) g_opt_no_sync_points = 1;
+        else if (str_eq(argv[i], "--no-gpu-lean")) { g_opt_bar_dedupe = 0; g_opt_lazy_sync = 0; g_opt_lazy_waw = 0; g_opt_lazy_copies = 0; g_opt_fb_rect = 0; }   /* t197: the barrier / copy reductions of t196 off (as t195) */
+        else if (str_eq(argv[i], "--gpu-lean")) { g_opt_bar_dedupe = 1; g_opt_lazy_sync = 3; g_opt_lazy_waw = 1; g_opt_lazy_copies = 7; g_opt_fb_rect = 1; }
+        else if (str_eq(argv[i], "--bar-dedupe")) g_opt_bar_dedupe = 1;            /* t196 (ws_gpu, see e6_vk.c): all off by default */
+        else if (str_eq(argv[i], "--lazy-sync") && i + 1 < argc) g_opt_lazy_sync = (int)str_to_u64(argv[++i]) & 3;
+        else if (str_eq(argv[i], "--lazy-waw")) g_opt_lazy_waw = 1;
+        else if (str_eq(argv[i], "--lazy-copies") && i + 1 < argc) g_opt_lazy_copies = (int)str_to_u64(argv[++i]) & 7;
+        else if (str_eq(argv[i], "--fb-rect")) g_opt_fb_rect = 1;
+        else if (str_eq(argv[i], "--dsync-cs")) g_opt_dsync_cs = 1;                /* w12_gpu: depth -> R32 syncs by a compute pass instead of the image copy (e6_vk.c dsy_pass) */
+        else if (str_eq(argv[i], "--dsync-draw")) g_opt_dsync_draw = 1;            /* w12_gpu: R32 -> depth syncs by a full-screen draw writing the depth (e6_vk.c dsy_pass) */
+        else if (str_eq(argv[i], "--fb-depth-only")) g_opt_fb_depth_only = 1;      /* w12_gpu: snapshots of depth + stencil targets copy the depth plane only (e6_vk.c vk_feedback_copy) */
+        else if (str_eq(argv[i], "--sync-pitch")) g_opt_sync_pitch = 1;            /* w6_gpu: no copy between surfaces over the same memory whose pitches differ (e6_vk.c vk_sync_newer) */
+        else if (str_eq(argv[i], "--fb-cover") && i + 1 < argc) { g_opt_fb_cover = (int)str_to_u64(argv[++i]); if (g_opt_fb_cover > 64) g_opt_fb_cover = 64; }   /* w10_res: snapshots kept current by drawing the writing draw's geometry again with a copy shader (e6_vk.c cov_after_draw); N > 1: + up to N - 1 writers in a row that do not sample */
+        else if (str_eq(argv[i], "--fb-cover-sync")) g_opt_fb_cover_sync = 1;     /* t203: --fb-cover copy pipelines compiled where first needed on the renderer thread (w10_res; default: background thread + the copy meanwhile) */
+        else if (str_eq(argv[i], "--present-lean")) g_opt_present_lean = 1;       /* w10_res: no clear of the window before a picture that covers all of it */
+        else if (str_eq(argv[i], "--fb-zseq")) g_opt_fb_zseq = 1;                  /* w6_gpu: no new depth snapshot for a draw that writes only the stencil when the depth has not changed (e6_vk.c vk_feedback_copy) */
+        else if (str_eq(argv[i], "--ld-cache")) g2s_ld_cache = 1;                  /* w6_gpu: gcn2spv.c */
+        else if (str_eq(argv[i], "--ld-group")) g2s_ld_group = 1;                  /* t196: gcn2spv.c */
         else if (str_eq(argv[i], "--sync-points-all")) g_opt_sync_points_all = 1;   /* t107b: every cache sync a barrier (before t107b) */
         else if (str_eq(argv[i], "--copy-barriers")) g_opt_copy_barriers = 1;      /* t107b: full barriers around every region copy (before t107b) */
         else if (str_eq(argv[i], "--tex-dirty-each")) g_opt_tex_dirty_each = 1;   /* t107b: one write-watch call per texture (before t107b) */
@@ -2460,9 +3893,29 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--full-hash-max") && i + 1 < argc) g_opt_full_hash_max = str_to_u64(argv[++i]);   /* t164 */
         else if (str_eq(argv[i], "--prep-background")) g_prep_bg_mode = 1;   /* t164: at most --prep-fg-seconds (20) before the game, the rest during play */
         else if (str_eq(argv[i], "--prep-fg-seconds") && i + 1 < argc) g_prep_fg_ms = (int)str_to_u64(argv[++i]) * 1000;   /* t164 */
+        /* w13_prep (e6_prep.c), all off by default */
+        else if (str_eq(argv[i], "--prep-variant-only")) g_prep_variant_only = 1;   /* only the records of the configuration in use are prepared */
+        else if (str_eq(argv[i], "--prep-order")) g_prep_order = 1;                 /* heaviest shader modules first */
+        else if (str_eq(argv[i], "--prep-all-threads")) g_prep_all_threads = 1; else if (str_eq(argv[i], "--no-prep-all-threads")) g_prep_all_threads = 0;     /* a worker per logical processor (default: processors - 1, at most 16) */
+        else if (str_eq(argv[i], "--prep-eta")) g_prep_eta = 1;                     /* progress bar and time left by estimated work, not by pipeline count */
+        else if (str_eq(argv[i], "--prep-import-fast")) g_prep_imp_thread = 1;      /* manifest import on its own thread (the screen does not hold it up), file reads in file order */
+        else if (str_eq(argv[i], "--no-prep-variant-only")) g_prep_variant_only = 0;   /* t203: back to t202 (every record prepared) */
+        else if (str_eq(argv[i], "--no-prep-import-fast")) g_prep_imp_thread = 0;      /* t203: back to t202 (import on the screen's thread) */
+        else if (str_eq(argv[i], "--prep-fast")) { g_prep_variant_only = g_prep_order = g_prep_all_threads = g_prep_eta = g_prep_imp_thread = 1; }
+        else if (str_eq(argv[i], "--prep-budget-s") && i + 1 < argc) { int s_ = (int)str_to_u64(argv[++i]); g_prep_bg_mode = s_ > 0; if (s_ > 0) g_prep_fg_ms = s_ * 1000; }   /* experiments only: N s on the screen, the rest in the background during play */
+        else if (str_eq(argv[i], "--prep-exit-wait-ms") && i + 1 < argc) g_prep_exit_wait_ms = (int)str_to_u64(argv[++i]);
+        else if (str_eq(argv[i], "--prep-close-after") && i + 1 < argc) g_prep_close_after_ms = (int)str_to_u64(argv[++i]);   /* test: the window-close path MS ms into the preparation */
+        else if (str_eq(argv[i], "--prep-min-words") && i + 1 < argc) g_prep_min_words = (int)str_to_u64(argv[++i]);          /* test: only pipelines with a module of N words or more */
         else if (str_eq(argv[i], "--no-prep")) g_prep_on = 0;   /* t159: no shader preparation records and no preparation at start-up */
         else if (str_eq(argv[i], "--prep")) g_prep_replay = 1;   /* t159 (replays): record, and prepare the recorded pipelines when the replay starts */
         else if (str_eq(argv[i], "--prep-force")) g_prep_force = 1;
+        else if (str_eq(argv[i], "--prep-threads") && i + 1 < argc) g_prep_threads_req = (int)str_to_u64(argv[++i]);   /* w7_prep (e6_prep.c) */
+        else if (str_eq(argv[i], "--prep-bg-threads") && i + 1 < argc) g_prep_bg_threads_req = (int)str_to_u64(argv[++i]);
+        else if (str_eq(argv[i], "--prep-limit") && i + 1 < argc) g_prep_limit = (int)str_to_u64(argv[++i]);
+        else if (str_eq(argv[i], "--prep-split-cache")) g_prep_split = 1;
+        else if (str_eq(argv[i], "--prep-follow")) g_prep_follow = 1;
+        else if (str_eq(argv[i], "--rs-generic")) g_opt_rs_gen = 1;   /* w7_prep (e6_vk.c): scaled shaders independent of the ratio */
+        else if (str_eq(argv[i], "--prep-done-old")) g_prep_done_old = 1;
         else if (str_eq(argv[i], "--prep-shot")) g_prep_shot = 1;
         else if (str_eq(argv[i], "--prep-cache-check")) g_prep_pcc_req = 1;   /* t159e test; the default again from t160 */
         else if (str_eq(argv[i], "--no-prep-cache-check")) g_prep_pcc_req = 0;   /* t160: preparation without the cache check (every recorded pipeline made) */
@@ -2501,7 +3954,16 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--cap-dir") && i + 1 < argc) g_cap_dir = argv[++i];
         else if (str_eq(argv[i], "--no-gpu-diag")) g_opt_no_gpu_diag = 1;
         else if (str_eq(argv[i], "--no-predication")) g_opt_no_pred = 1;
-        else if (str_eq(argv[i], "--fps") && i + 1 < argc) { int v = (int)str_to_u64(argv[++i]); g_opt_fps = v > 0 ? v : -1; }
+        else if ((str_eq(argv[i], "--fps-after") || str_eq(argv[i], "--fps-after-ms")) && i + 1 < argc) { int ms_ = str_eq(argv[i], "--fps-after-ms"); const char *q = argv[++i]; u64 f = 0, v = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0'); if (*q == ':') q++; while (*q >= '0' && *q <= '9') v = v * 10 + (u64)(*q++ - '0');
+            if (!ms_ && !g_fps_after_flip) { g_fps_after_flip = f; g_fps_after_val = v > 0 ? (int)v : -1; }
+            else if (g_nfpsa < 16) { g_fpsa_at[g_nfpsa] = f; g_fpsa_val[g_nfpsa] = v > 0 ? (int)v : -1; g_fpsa_ms[g_nfpsa] = (u8)ms_; g_nfpsa++; } }   /* w14_speed: several, and by time since the first flip */
+        else if (str_eq(argv[i], "--time-log")) { g_opt_tlog = 1; if (i + 1 < argc && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9') g_tlog_ms = (u32)str_to_u64(argv[++i]); if (g_tlog_ms < 100) g_tlog_ms = 100; }   /* w14_speed */
+        else if (str_eq(argv[i], "--uncapped-max") && i + 1 < argc) g_opt_uncapped_max = (int)str_to_u64(argv[++i]);   /* w14_speed */
+        else if (str_eq(argv[i], "--exit-ms") && i + 1 < argc) g_opt_exit_ms = str_to_u64(argv[++i]);   /* w14_speed */
+        else if (str_eq(argv[i], "--shots-ms") && i + 1 < argc) {   /* w14_speed */
+            const char *q = argv[++i];
+            while (*q && g_nshotms < 64) { g_shotms[g_nshotms++] = str_to_u64(q); while (*q && *q != ',') q++; if (*q) q++; } }
+        else if (str_eq(argv[i], "--fps") && i + 1 < argc) { int v = (int)str_to_u64(argv[++i]); g_opt_fps = v > 0 ? v : -1; g_fps_src = 2; }
         else if (str_eq(argv[i], "--trace-image") && i + 1 < argc && g_ntrace < 4) {   /* ADDR (hex) */
             const char *t = argv[++i]; u64 v = 0; if (t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) t += 2;
             for (; *t; t++) { int dgt = *t >= '0' && *t <= '9' ? *t - '0' : *t >= 'a' && *t <= 'f' ? *t - 'a' + 10 : *t >= 'A' && *t <= 'F' ? *t - 'A' + 10 : -1; if (dgt < 0) break; v = v * 16 + (u64)dgt; }
@@ -2522,11 +3984,22 @@ int e3_main(int argc, char **argv) {
             u64 last = 0; while (*q >= '0' && *q <= '9') last = last * 10 + (u64)(*q++ - '0');
             u32 bt = str_eq(bn, "x") ? PAD_CROSS : str_eq(bn, "o") ? PAD_CIRCLE : str_eq(bn, "options") ? PAD_OPTIONS : 0;
             if (bt && v[1] >= 16) { g_prr_start = v[0]; g_prr_every = v[1]; g_prr_btn = bt; g_prr_last = last ? last : v[0] + 20000; g_prr_state = 1; } }
+        else if ((str_eq(argv[i], "--stick") || str_eq(argv[i], "--stick-ms")) && i + 1 < argc && g_nstick < 64) {   /* t193 */
+            int ms = str_eq(argv[i], "--stick-ms"); const char *q = argv[++i]; u64 v[6] = {0, 0, 128, 128, 128, 128};
+            for (int k = 0; k < 6 && *q; k++) { u64 x = 0; while (*q >= '0' && *q <= '9') x = x * 10 + (u64)(*q++ - '0'); v[k] = x; if (*q == ':') q++; }
+            StickScr *k = &g_stick[g_nstick++]; k->at = v[0]; k->len = v[1]; k->ms = (u8)ms; for (int j = 0; j < 4; j++) k->v[j] = (u8)(v[2 + j] > 255 ? 255 : v[2 + j]); }
+        else if (str_eq(argv[i], "--press-ms") && i + 1 < argc && g_npressms < 64) {   /* t193: MS:BUTTON */
+            const char *q = argv[++i]; u64 f = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0');
+            if (*q == ':') q++;
+            u32 bt = str_eq(q, "x") ? PAD_CROSS : str_eq(q, "o") ? PAD_CIRCLE : str_eq(q, "up") ? PAD_UP : str_eq(q, "down") ? PAD_DOWN :
+                     str_eq(q, "left") ? PAD_LEFT : str_eq(q, "right") ? PAD_RIGHT : str_eq(q, "options") ? PAD_OPTIONS : str_eq(q, "r2") ? PAD_R2 : str_eq(q, "square") ? PAD_SQUARE : str_eq(q, "triangle") ? PAD_TRIANGLE : 0;
+            if (bt) { g_pressms_at[g_npressms] = f; g_pressms_btn[g_npressms] = bt; g_npressms++; } }
         else if (str_eq(argv[i], "--press") && i + 1 < argc && g_npress < 64) {   /* FLIP:BUTTON */
             const char *q = argv[++i]; u64 f = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0');
             if (*q == ':') q++;
             u32 bt = str_eq(q, "x") ? PAD_CROSS : str_eq(q, "o") ? PAD_CIRCLE : str_eq(q, "up") ? PAD_UP : str_eq(q, "down") ? PAD_DOWN :
-                     str_eq(q, "left") ? PAD_LEFT : str_eq(q, "right") ? PAD_RIGHT : str_eq(q, "options") ? PAD_OPTIONS : 0;
+                     str_eq(q, "left") ? PAD_LEFT : str_eq(q, "right") ? PAD_RIGHT : str_eq(q, "options") ? PAD_OPTIONS :
+                     str_eq(q, "l1") ? PAD_L1 : str_eq(q, "r1") ? PAD_R1 : str_eq(q, "l2") ? PAD_L2 : str_eq(q, "r2") ? PAD_R2 : str_eq(q, "square") ? PAD_SQUARE : str_eq(q, "triangle") ? PAD_TRIANGLE : str_eq(q, "touch") ? PAD_TOUCH : 0;   /* (w5: more buttons for the interface tests) */
             if (bt) { g_press_at[g_npress] = f; g_press_btn[g_npress] = bt; g_npress++; } }
         else if (str_eq(argv[i], "--no-structure")) g_opt_nostructure = 1;
         else if (str_eq(argv[i], "--no-wave-sync-at") && i + 1 < argc && g_nnows < 8) {
@@ -2544,6 +4017,8 @@ int e3_main(int argc, char **argv) {
             if (*x == '-') { x++; while (*x >= '0' && *x <= '9') b = b * 10 + (u64)(*x++ - '0'); } else b = a;
             g_rtl_lo = a; g_rtl_hi = b; }
         else if (str_eq(argv[i], "--replay-dumptex") && i + 1 < argc && g_nrdt < 8) { const char *x = argv[++i]; u32 nn = 0; while (*x >= '0' && *x <= '9') nn = nn * 10 + (u32)(*x++ - '0'); g_rdt_n[g_nrdt++] = nn; }   /* t107b */
+        else if (str_eq(argv[i], "--smrd-log")) g_opt_smrd_log = 1;   /* w5_smrd (diagnostic): list the literal-offset SMRD loads met, values as dwords / as bytes, in the end report */
+        else if (str_eq(argv[i], "--smrd-lit-bytes")) g2s_opt_smrd_lit_bytes = 1;   /* w4_hill (A/B): literal SMRD offsets taken as bytes, as before */
         else if (str_eq(argv[i], "--old-posw")) g2s_opt_old_posw = 1;   /* t168 (A/B): pixel shaders get 1 / w for POS_W_FLOAT, as before */
         else if (str_eq(argv[i], "--replay-dbg-ps") && i + 1 < argc) {   /* t168b: STEP:PC(hex):R0,R1,R2,R3 (decimal VGPRs), replay only */
             const char *x = argv[++i]; u32 st = 0, pc = 0, rg = 0; while (*x >= '0' && *x <= '9') st = st * 10 + (u32)(*x++ - '0');
@@ -2572,6 +4047,38 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--mem-slow")) g_opt_mem_slow = 1;
         else if (str_eq(argv[i], "--exp-flags") && i + 1 < argc) { g_exp_force = 1; g_exp_force_flags = (u32)str_to_u64(argv[++i]); }   /* --exp shaders: these experiment flags in every frame (decimal) */   /* diagnostic: count shader memory accesses that miss the page table */   /* --exp variants for tessellation passes: stores / LDS reads / LDS writes / barrier off */
         else if (str_eq(argv[i], "--no-gs")) g_opt_no_gs = 1;
+        else if (str_eq(argv[i], "--no-backend")) g_opt_bk = 0;   /* t180: Vulkan commands recorded and submitted on the renderer thread (before t180) */
+        else if (str_eq(argv[i], "--depth-ro-writes")) g_opt_depth_ro_writes = 1;   /* t173: depth bound for testing only counts as written (before t173) */
+        else if (str_eq(argv[i], "--no-par-lookups")) g_opt_spec = 0;   /* t181: no shader-setup lookups ahead of time */
+        else if (str_eq(argv[i], "--par-workers") && i + 1 < argc) g_opt_spec_workers = (int)str_to_u64(argv[++i]);   /* t194: helper threads for the look-ahead lookups (0: as t181) */
+        else if (str_eq(argv[i], "--par-ce-gate")) g_opt_spec_cegate = 1;   /* t198: the look-ahead thread does not run past constant-engine dumps the renderer has not made */
+        else if (str_eq(argv[i], "--batch-slots") && i + 1 < argc) { g_nslot = (int)str_to_u64(argv[++i]); if (g_nslot < 8) g_nslot = 8; if (g_nslot > NSLOT) g_nslot = NSLOT; }   /* t198 */
+        else if (str_eq(argv[i], "--pm4-prefetch")) g_opt_pm4_pf = 1;   /* w5_perf: e5_gpu.c pm4_prefetch */
+        else if (str_eq(argv[i], "--pm4-runs")) g_opt_pm4_runs = 1;   /* t198: collected packets that follow each other in memory are executed in one parser call */
+        else if (str_eq(argv[i], "--ce-ahead")) g_opt_ce_ahead = 1;   /* t198: the constant engine keeps its full lead over the draw engine */
+        else if (str_eq(argv[i], "--par-prefetch")) g_opt_spec_pf = 1;   /* t181c (slower) */
+        else if (str_eq(argv[i], "--ab-period") && i + 1 < argc) { int v = (int)str_to_u64(argv[++i]); g_opt_ab_period = v > 0 ? (v + 59) / 60 * 60 : 0; }   /* t183: t182 parts off / on every N flips */
+        else if (str_eq(argv[i], "--nan-vb")) g_opt_nan_vb = 1;
+        else if (str_eq(argv[i], "--vb-watch")) g_opt_vbw = 1;   /* t186: hardware write watch on the stranger's clothing vertices */
+        else if (str_eq(argv[i], "--vb-watch-at") && i + 1 < argc) { g_opt_vbw = 1; const char *x = argv[++i]; u64 v = 0; if (x[0] == '0' && (x[1] == 'x' || x[1] == 'X')) x += 2;
+            for (; *x; x++) { int d = *x >= '0' && *x <= '9' ? *x - '0' : *x >= 'a' && *x <= 'f' ? *x - 'a' + 10 : *x >= 'A' && *x <= 'F' ? *x - 'A' + 10 : -1; if (d < 0) break; v = v * 16 + (u64)d; }
+            if (!g_vbw_user) { g_vbw_user = 1; g_vbw_n = 0; } if (g_vbw_n < 4) g_vbw_a[g_vbw_n++] = v; }   /* t186: watch these addresses instead (up to 4) */
+        else if (str_eq(argv[i], "--nan-vb-vs") && i + 1 < argc) { g_opt_nan_vb = 1; const char *x = argv[++i]; u64 v = 0; if (x[0] == '0' && (x[1] == 'x' || x[1] == 'X')) x += 2;
+            for (; *x; x++) { int d = *x >= '0' && *x <= '9' ? *x - '0' : *x >= 'a' && *x <= 'f' ? *x - 'a' + 10 : *x >= 'A' && *x <= 'F' ? *x - 'A' + 10 : -1; if (d < 0) break; v = v * 16 + (u64)d; }
+            g_nanvb_watch = v; }   /* t185 */   /* t184 diagnostic: NaN in vertex shader inputs, logged */
+        else if (str_eq(argv[i], "--no-zclamp")) g_opt_no_zclamp = 1;   /* t183: draws with near / far clipping disabled are clipped (before t183) */
+        else if (str_eq(argv[i], "--no-bk-present")) g_opt_bk_present = 0;   /* t182: presents on the renderer thread (t180-t181f) */
+        else if (str_eq(argv[i], "--no-prescan")) g_opt_prescan = 0;   /* t182: no write-tracking scan ahead of the submits */
+        else if (str_eq(argv[i], "--prescan-ab")) g_opt_prescan = 2;   /* t182: the scan ahead before every other submit only (A/B in one run) */
+        else if (str_eq(argv[i], "--par-fastcheck")) g_opt_spec_fast = 1;   /* w5_perf: e6_spec.c spec_take */
+        else if (str_eq(argv[i], "--par-pcores")) g_opt_spec_pcores = 1;   /* t181f: the look-ahead thread on the performance cores (t181-t181e) */
+        else if (str_eq(argv[i], "--par-trust-log")) g_opt_spec_trustlog = 1;   /* t181b-d: memory read again only where our write log / GPU writes / the overlay say it may have changed (misses the game's own late writes) */
+        else if (str_eq(argv[i], "--par-verify")) g_opt_spec_verify = 1;   /* t181: every result made ahead compared with the renderer's own lookup */
+        else if (str_eq(argv[i], "--par-lookahead") && i + 1 < argc) { g_opt_spec_la = (int)str_to_u64(argv[++i]); if (g_opt_spec_la < 1) g_opt_spec_la = 1; if (g_opt_spec_la > 400) g_opt_spec_la = 400; }   /* t181 */
+        else if (str_eq(argv[i], "--lookup-stats")) g2s_ls_enable();   /* t181a: shader-setup lookup costs and write distances (diagnostic) */
+        else if (str_eq(argv[i], "--gpu-timeline-from") && i + 1 < argc) { g_opt_gpu_tl = 1; g_opt_gpu_times = 0; g_tl_from = str_to_u64(argv[++i]); }   /* t198: the timeline per frame from flip F on (live runs), with the costliest shaders in UntilDawn.log */
+        else if (str_eq(argv[i], "--gpu-pass-log")) { g_opt_gpu_tl = 2; g_opt_gpu_times = 0; }   /* w6_gpu: light GPU timeline for whole sessions (render passes as a whole, copies, dispatches); a line per perf window */
+        else if (str_eq(argv[i], "--gpu-timeline")) { g_opt_gpu_tl = 1; g_opt_gpu_times = 0; }   /* t172: GPU time split by kind of command (diagnostic) */
         else if (str_eq(argv[i], "--gpu-times")) g_opt_gpu_times = 1;      /* per-draw GPU timestamps in play too (slower) */
         else if (str_eq(argv[i], "--no-gpu-times")) g_opt_gpu_times = 0;   /* ... or not even in a replay */
         else if (str_eq(argv[i], "--no-controllers")) g_pad_no_controllers = 1;   /* STATUS 49: keyboard only */
@@ -2649,7 +4156,16 @@ int e3_main(int argc, char **argv) {
     }
     if (g_opt_gpu_times < 0) g_opt_gpu_times = g_replay_path ? 1 : 0;
     if (g_opt_dump < 0) g_opt_dump = g_replay_path ? 0 : 6;
+    if (!g_replay_path && g_fr_req == 1) { g_opt_early_labels = 4; g_opt_wbg = 1; g_opt_lbl_trail = 1; g_lbl_dn_fn = lbl_dn; g_opt_rdg = 2; g_opt_wbg_big = 1; }   /* w16_rel rc2: Optimised Rendering (Fast Mode) = --label-policy 4 --label-trailing --label-read-guard 2 --label-guard-big */
+    else if (!g_replay_path && g_fr_req == 0) { g_opt_early_labels = 0; g_opt_wbg = 0; g_opt_wbg_strict = 0; g_opt_lbl_trail = 0; g_lbl_dn_fn = 0; g_opt_rdg = 0; g_opt_wbg_big = 0; g_wbg_after = 0; }   /* (off: labels at the batch end, as policy 0) */
     if (g_replay_path) g_exp_div = 2;   /* --exp in replays: the variant changes at every repeat */   /* replays: no raw command-buffer files (writing ~200 files per submit slowed the first 5 repeats) */
+    disp_setup(g_replay_path != 0);   /* w6_disp */
+    if (g_rs_pct > 100 && !g_opt_rs_keep_window && !g_disp.on) {   /* w2: the window follows the scaled picture (see plat_window_thread) */
+        u64 n_ = (u64)g_rs_pct, d_ = 100; if (g_rs_pct == 133) { n_ = 4; d_ = 3; }
+        g_win_rs_w = (int)((1920 * n_ + d_ - 1) / d_); g_win_rs_h = (int)((1080 * n_ + d_ - 1) / d_); }
+    if (g_ra_on && !g_replay_path) {   /* w11_load: the list of the game's reads lives beside the pipeline cache */
+        static char rp_[1200]; int n_ = 0, cut_ = -1; for (; g_pcache_path[n_] && n_ < 1150; n_++) { rp_[n_] = g_pcache_path[n_]; if (rp_[n_] == '\\' || rp_[n_] == '/') cut_ = n_; }
+        const char *t_ = "read_order.bin"; int k_ = cut_ + 1; for (int j_ = 0; t_[j_]; j_++) rp_[k_++] = t_[j_]; rp_[k_] = 0; g_ra_file = rp_; }
     if (g_replay_path) {   /* replay a capture: no game code runs (e6_capture.c) */
         pm_init(&g_log_lock);
         g_trace = plat_open_write("replay_trace.txt");
@@ -2688,7 +4204,22 @@ int e3_main(int argc, char **argv) {
     if (g_opt_trace_atm) patch_atm_probes(&g_eboot);
     if (g_opt_trace_vis) patch_vis_probes(&g_eboot);
     if (!g_opt_no_skin_check) patch_skin_check(&g_eboot);
-    if (!g_opt_no_cloth_fix) patch_cloth_fix(&g_eboot);   /* v0.3.2 */
+    if (g_rs_pct > 100 && g_opt_rs_ui >= 3 && !g_gfx_vp_patched) {   /* w3 */
+        u64 n_ = (u64)g_rs_pct, d_ = 100; if (g_rs_pct == 133) { n_ = 4; d_ = 3; }
+        if (g_rs_pct > 400 || (g_rs_pct != 133 && g_rs_pct % 25)) g_opt_rs_ui = 1; else { patch_gfx_viewport(&g_eboot, (u32)((1920 * n_ + d_ - 1) / d_), (u32)((1080 * n_ + d_ - 1) / d_)); if (g_gfx_vp_patched) patch_gfx_mem(&g_eboot, n_, d_, (u32)((1920 * n_ + d_ - 1) / d_), (u32)((1080 * n_ + d_ - 1) / d_)); } }
+    if (g_opt_trace_gfx_mem && !g_gfx_vp_patched) patch_gfx_mem(&g_eboot, 1, 1, 1920, 1080);   /* (the trace alone) */
+    if (g_opt_cloth_onset || !g_opt_no_cloth_fix) patch_cloth_onset(&g_eboot);   /* t187 recorder, t188 cloth fix */
+    if (!g_opt_no_bend_fix) patch_cloth_bend(&g_eboot);   /* w2_cloth */
+    if (!g_opt_no_cl_checks) patch_cloth_ops(&g_eboot);   /* w3_cloth */
+    if (!g_opt_no_cl_src) { patch_cloth_src(&g_eboot); patch_cloth_wind(&g_eboot); }   /* w5_cloth */
+    if (!g_opt_fixed_phys) patch_phys_step(&g_eboot);   /* t192 */
+    fr_log_start();   /* w16_rel rc2: "Optimised Rendering: ...", "Early GPU handover: ...", "Frame-rate limit: ..." (e6_vk.c) */
+    if (g_opt_fps < 0 && g_opt_uncapped_max > 0) { say("  no frame-rate limit: at most "); say_dec(g_opt_uncapped_max); say(" frames a second (w14_speed: physics and cloth keep real time; --uncapped-max 0 = none)\n"); }
+    if (g_opt_tlog) patch_look_probes(&g_eboot);   /* w14_speed build 2 */
+    if (g_opt_tlog) { patch_anim_probe(&g_eboot); say("  time log on (w14_speed, --time-log): one line every "); say_dec(g_tlog_ms); say(" ms of wall time - game clocks, physics and Morpheme animation time per wall second\n"); }
+    if (g_opt_mipstats || g_opt_stream_log || g_opt_mip_measure) patch_popin(&g_eboot);   /* popin */
+    if (g_opt_dmem_mb) { say("  direct memory (popin, --direct-memory-mb): the game is told "); say_dec(g_opt_dmem_mb); say(" MB instead of 5056; its RenderData pool at 0x1015a00000 becomes "); say_dec((i64)g_opt_dmem_mb - 1903); say(" MB (3152 on the PS4)\n"); }
+    if (g_opt_ps4_mxcsr) say("  floating-point mode of game threads: MXCSR 0x9FC0 (flush-to-zero + denormals-are-zero, the PS4 libc default; --ps4-mxcsr, t187)\n");
     if (!g_opt_no_arena_lock) { patch_arena_lock(&g_eboot); g_hw_explain_fn = arena_explain; }   /* t127 / t128 */
     patch_heap_slots(&g_eboot);   /* t130 */
     patch_heap_slot_reuse(&g_eboot);   /* t131 */
@@ -2705,12 +4236,21 @@ int e3_main(int argc, char **argv) {
     say("  _init "); say_hex(g_eboot.init); say(", .ctors end "); say_hex(g_ctors_end);
     say(", main "); say_hex(g_main_va); say(", TLS "); say_hex(g_eboot.tls_memsz); say(" bytes\n");
     hle_init();
+    ra_init();   /* w11_load */
     e5_init();
     hw_start();
     int tr_ = plat_run_thread(game_thread_body, 64ull << 20, timeout);
-    if (tr_ == 1) { sample_other_threads(); say("\n>>> stopping: timeout\n"); e5_write_report(); e5_print_gpu_summary(); pm_lock(&g_gpu_lock); vkr_report(); }
+    if (tr_ == 1) { sample_other_threads();
+        /* w6_fast: what the time-out cut off - a run still producing frames, or a stall */
+        { u64 f_ = plat_ticks_per_sec(), ago_ = g_frame_tick ? (plat_ticks() - g_frame_tick) * 1000 / f_ : 0;
+          say("\n>>> timeout after "); say_dec(timeout); say(" s"); if (g_timeout_play) say(" of play (--timeout-play)");
+          say(": flip "); say_dec((i64)g_flips); say(", the last one "); say_dec((i64)ago_); say(" ms ago - ");
+          say(!g_flips ? "no frame yet" : ago_ < 2000 ? "frames were still coming (NOT a stall: the run was cut off)" : "NO FRAME for that long (a stall)");
+          say("; shader preparation took "); say_dec((i64)g_prep_ms_total); say(" ms of the run\n"); }
+        say("\n>>> stopping: timeout\n"); e5_write_report(); e5_print_gpu_summary(); pm_lock(&g_gpu_lock); vkr_report(); }
     print_summary();
     plat_close(g_trace);
+    if (g_plat_hard_exit) plat_exit(g_stage == 3 ? 0 : 1);   /* w13_prep */
     return g_stage == 3 ? 0 : 1;
 }
 #endif

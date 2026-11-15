@@ -23,13 +23,24 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release](https://github.com/SuperCatElvis/UntilDawn_PC/releases/latest)**
 
-**Current version: [v0.3.2](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.3.2)** — Released 9 November 2026
+**Current version: [v0.4.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.4.0)** — Release date: (to be filled in on release)
 
-Download `UntilDawn_0.3.2.zip` from the release's Assets section.
+Download `UntilDawn_0.4.0.zip` from the release's Assets section.
 
 The download includes the program, shader list, compatibility tester and documentation. Game files are not included.
 
-### What's new in v0.3.2
+### What's new in v0.4.0
+
+- Native-resolution rendering with borderless full screen by default (1080p, 1440p, 4K and others; Alt+Enter switches to a window).
+- Better performance, especially at 1440p and 4K.
+- Optimised Rendering (Fast Mode), on by default; can be turned off in `Config\settings.ini`.
+- Frame-rate limit choices: 30, 60 (default), 120, 240 or uncapped (uncapped still stops at 240 FPS).
+- Much faster first-run shader preparation: about 2-3 minutes on a modern 8-core or larger CPU (varies).
+- Characters' clothing no longer vanishes; Dr Hill's face, falling snow and mist, and skin shading fixed.
+
+See the [v0.4.0 changelog](docs/releases/v0.4.0.md) for details (also `CHANGELOG_v0.4.0.md` in the download).
+
+### Previously in v0.3.2
 
 v0.3.2 is a hotfix for v0.3.1:
 
@@ -72,8 +83,9 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 ### Graphics
 
 - Custom Vulkan renderer running the game's original graphics.
-- Renders internally at 1920×1080, with windowed and borderless display modes.
-- Adjustable window size and frame-rate limit, with 60 FPS as the default cap.
+- Renders at your monitor's own resolution (1920×1080, 2560×1440, 3840×2160 and others) in borderless full screen by default; Alt+Enter switches to a window. A fixed resolution can be chosen instead.
+- Optimised Rendering (Fast Mode), on by default.
+- Frame-rate limit of 30, 60 (default), 120, 240 or uncapped (uncapped stops at 240 FPS so physics and cloth stay correct).
 - Shader preparation before gameplay to reduce stuttering.
 - Shader caching so previously compiled shaders don't need to be compiled again.
 - GPU memory coherence to prevent certain graphical issues, enabled by default.
@@ -123,7 +135,7 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 
 The project has been tested on several different PCs. Results include both gameplay testing and hardware compatibility checks.
 
-A successful compatibility test does not guarantee that the game will run without issues. Most results are from earlier versions, and not all systems have been tested with v0.3.2.
+A successful compatibility test does not guarantee that the game will run without issues. Most results are from earlier versions, and not all systems have been tested with v0.4.0.
 
 | CPU | GPU | Driver | OS | RAM | Results |
 |---|---|---|---|---|---|
@@ -152,7 +164,7 @@ If you have different hardware, please consider submitting a [compatibility repo
 
 ### 1. Download the program
 
-Download `UntilDawn_0.3.2.zip` from the [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
+Download `UntilDawn_0.4.0.zip` from the [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 
 Extract the ZIP into a folder of your choice, such as:
 
@@ -194,7 +206,7 @@ Double-click `UntilDawn.exe`.
 
 The program will check your game files and hardware before starting.
 
-On the first launch, the game will prepare its shaders. This takes approximately **2¼ minutes on the development PC**, but may take longer on slower processors.
+On the first launch, the game will prepare its shaders. This takes about **2-3 minutes on a modern 8-core (or larger) CPU**, but may take longer on slower processors or while other programs are busy.
 
 Later launches are much quicker because compiled shaders are cached.
 
@@ -204,18 +216,18 @@ For more details, see the [Installation Guide](docs/INSTALLATION.md).
 
 ### Updating from an earlier version
 
-If you're updating from v0.3.1 or an earlier release, replace the program files with the new versions.
+If you're updating from v0.3.2 or an earlier release, replace the program files with the new versions.
 
 Make sure to update:
 
 - `UntilDawn.exe`
-- `pipelines.udm`
+- `pipelines.udm` (unchanged since v0.3.1)
 - `compat\ud_compat.exe`
 - The included documentation
 
 **Do not overwrite your existing `Game\`, `savedata\` or `Config\settings.ini`.**
 
-Your game files, saves and settings will carry over.
+Your game files, saves and settings will carry over. The new v0.4.0 settings are added to your `settings.ini` with their defaults on the first start; your own values are kept. As after every update, the first start prepares the shaders once more.
 
 ---
 
@@ -227,6 +239,10 @@ Some useful options include:
 
 | Setting | Description |
 |---|---|
+| `optimised_rendering` | Optimised Rendering (Fast Mode). Enabled by default; set to `0` to turn it off. |
+| `frame_rate_limit` | `30`, `60` (default), `120`, `240` or `uncapped` (stops at 240 FPS). Independent of Optimised Rendering. |
+| `display_mode` | `borderless` (default, full screen at the monitor's resolution) or `windowed`. Alt+Enter switches while playing. |
+| `render_resolution` | `auto` (default, the monitor's resolution) or `1080p`, `1440p`, `2160p`. |
 | `shader_preparation` | Controls shader preparation before gameplay. Enabled by default. |
 | `gpu_coherence` | Keeps CPU and GPU memory synchronised. Enabled by default; set to `0` to disable. |
 | `halloween_hunt` | Enables the original Halloween Hunt 2015 event when set to `1`. |
@@ -234,7 +250,7 @@ Some useful options include:
 | `gpu` | Selects which graphics card the game uses. |
 | `present_mode` | Changes how rendered frames are presented. |
 
-The program also supports changing window size, display mode and frame-rate limits.
+The program also supports choosing the monitor, the window size and the graphics optimisations (`gpu_optimisations`, for troubleshooting).
 
 See the [Installation Guide](docs/INSTALLATION.md) for the full list of settings.
 
@@ -271,8 +287,12 @@ See the [Full Controls Guide](docs/CONTROLS.md) for more information.
 The project is still in development, and some issues remain.
 
 - Intermittent memory corruption can still cause crashes.
+- The main-menu character's look-around moves too fast at high frame rates.
+- Brief dark lighting at the start of some scenes.
+- First-run shader preparation time depends on your CPU and on background programs.
+- Occasional brief stutters when entering new areas.
+- Optimised Rendering (Fast Mode) has mostly been tested on NVIDIA graphics cards; on problems, try `optimised_rendering = 0`.
 - Some demanding scenes run below 30 FPS.
-- Shader compilation stutters may occur when entering scenes for the first time.
 - Some graphical issues remain, including lighting problems, flickering UI elements and occasional character distortions.
 - Certain Chapter 10 graphical problems have not yet been fully re-tested.
 - Motion controls may drift during some Don't Move sequences.
@@ -381,7 +401,6 @@ Development is ongoing, with the main priorities being:
 
 Other features I'd like to explore in the future include:
 
-- Higher resolutions, including native 4K.
 - More consistent 60 FPS performance and possibly higher frame rates.
 - DLSS and FSR support.
 - A proper in-game settings menu.

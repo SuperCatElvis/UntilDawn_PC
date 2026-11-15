@@ -8,7 +8,7 @@ typedef signed char i8;
 typedef int i32;
 typedef long long i64;
 #define SYSV __attribute__((sysv_abi))
-#define UD_VERSION "0.3.2"   /* the release this program is (log, file properties, compatibility test) */
+#define UD_VERSION "0.4.0"   /* the release this program is (log, file properties, compatibility test) */
 
 static u64 g_main_va;
 
@@ -75,7 +75,7 @@ static int g_dev_mode = 1;   /* developer features: capture keys, status text in
    recorded (where, which thread, which flip) and the instruction is then re-run masked, so it produces the same
    result as normally (the default NaN / infinity) and the game continues. Single-stepping that one instruction
    re-arms the trap. Shows where NaN / inf values (e.g. bone matrices full of NaN) are first produced. */
-static int g_opt_host_fpu, g_fp_trap;
+static int g_opt_host_fpu, g_fp_trap, g_opt_ps4_mxcsr;   /* t187: --ps4-mxcsr = MXCSR 0x9FC0 (FTZ + DAZ), the default of the PS4's own libc (__fe_dfl_env, libc.prx 0x8aaa0; STATUS 236) */
 static volatile u64 g_plat_frame;   /* current flip, for the FP trap records */
 typedef struct { u64 rip; u32 n, fl; u64 frame; const char *thr; } FpSite;
 /* t145b: the first two hits of every site: registers, xmm0-15, 64 bytes at seven pointer registers, the stack top and
@@ -120,10 +120,12 @@ static int fp_note(u64 rip, u32 fl, const u8 *ctx) {   /* t145: returns 1 when t
 /* called at the start of every game thread (and before the game's constructors on the main thread) */
 static void plat_fp_thread_init(void) {
     if (!g_opt_host_fpu) { u16 cw = 0x037F; __asm__ volatile("fldcw %0" : : "m"(cw)); }
+    if (g_opt_ps4_mxcsr) { u32 m = 0x9FC0; __asm__ volatile("ldmxcsr %0" : : "m"(m)); }
     if (g_fp_trap) { u32 m; __asm__ volatile("stmxcsr %0" : "=m"(m)); m &= ~0x2BFu;   /* unmask IM (0x80) and ZM (0x200), clear the flags */ __asm__ volatile("ldmxcsr %0" : : "m"(m)); }
 }
 
 #include "e3_syscheck.h"
+static volatile int g_timeout_play, g_timeout_hold; static volatile u64 g_timeout_held;   /* w6_fast: --timeout-play (plat_run_thread) */
 #ifdef _WIN32
 /* ---------------- Windows (kernel32 + msvcrt, declared by hand) ---------------- */
 typedef u64 size_t;
@@ -195,17 +197,19 @@ static void *lp_CreateFile(const char *p, u32 acc, u32 share, u32 disp, u32 fl) 
 static void *hf_open_rb(const char *p) { void *h = lp_CreateFile(p, 0x80000000u, 1, 3, 0x80); return h == (void *)-1 ? 0 : h; }
 static void hf_close(void *f) { CloseHandle(f); }
 static void (*g_coh_ensure_fn)(u64 a, u64 n);   /* t165 --gpu-coherence: memory the GPU holds is brought to RAM before a Windows call reads or writes it */
+static void (*g_wbg_ensure_fn)(u64 a, u64 n);   /* t198 */
 static volatile u64 g_coh_kernel_refused;   /* t165: Windows calls that failed with ERROR_NOACCESS (998) on game memory */
 /* t165i --coh-test only: ReadFile straight into b (no coherence step), *err = GetLastError() on failure */
 static u64 hf_read_raw(void *f, void *b, u32 n, u32 *err) { u32 got = 0; *err = 0; if (!ReadFile(f, b, n, &got, 0)) { *err = GetLastError(); return 0; } return got; }
 static u64 hf_read(void *f, void *b, u64 n) {
     u64 tot = 0; u32 got;
+    if (g_wbg_ensure_fn && n) g_wbg_ensure_fn((u64)b, n);
     if (g_coh_ensure_fn && n) g_coh_ensure_fn((u64)b, n);
     for (int again = 0; tot < n; ) { u32 c = (u32)(n - tot > 0x40000000 ? 0x40000000 : n - tot);
         int rok = ReadFile(f, (u8 *)b + tot, c, &got, 0);
         if (!rok || !got) {
             if (!rok && GetLastError() == 998) {   /* (t165w, review 2 N16: only when the read failed - not a stale code at end of file) */ __atomic_add_fetch(&g_coh_kernel_refused, 1, __ATOMIC_RELAXED);   /* t165w: made GPU-held again meanwhile: once more after making it current */
-                if (g_coh_ensure_fn && again++ < 3) { g_coh_ensure_fn((u64)b + tot, n - tot); continue; } }
+                if ((g_coh_ensure_fn || g_wbg_ensure_fn) && again++ < (g_wbg_ensure_fn ? 8 : 3)) { if (g_wbg_ensure_fn) g_wbg_ensure_fn((u64)b + tot, n - tot); if (g_coh_ensure_fn) g_coh_ensure_fn((u64)b + tot, n - tot); continue; } }
             break; }
         tot += got; }
     return tot;
@@ -381,17 +385,23 @@ enum { GUARD_BLOCK = 512u << 20, GUARD_MAX = 512, GUARD_ENT = 16384 };
    at 0x1520000000 / 0x1904000000). Guard changes and the mapping between them happen under one lock. */
 typedef struct { u64 lo, hi; } GuardEnt;
 static GuardEnt *g_gr; static int g_ngr, g_guard_held, g_guard_busy, g_guard_n; static u64 g_guard_lo, g_guard_hi, g_guard_rereserved, g_guard_lost;
-static volatile int g_guard_spin; static u64 g_guard_busy_at[4], g_guard_busy_what[4], g_guard_busy_type[4];
+static volatile int g_guard_spin; static u64 g_guard_busy_at[4], g_guard_busy_what[4], g_guard_busy_type[4], g_guard_busy_size[4];
+/* w16_rel rc4: the game's own heaps take the lowest 512 MB slots of the window (t130; user sessions: highest slot ever 15-42).
+   Host memory found in the first 64 slots (0x1200000000-0x1a00000000) means a likely moved fixed mapping -> start again;
+   above them it is only logged (and the clean stop of e3_hle.c h_map_direct remains the safety net). */
+enum { GUARD_GAME_SLOTS = 64 };
+static int g_guard_busy_low; static u64 g_guard_busy_low_at;
 static void guard_lock(void) { while (__atomic_exchange_n(&g_guard_spin, 1, __ATOMIC_ACQUIRE)) { while (__atomic_load_n(&g_guard_spin, __ATOMIC_RELAXED)) __builtin_ia32_pause(); } }
 static void guard_unlock(void) { __atomic_store_n(&g_guard_spin, 0, __ATOMIC_RELEASE); }
 static void plat_guard_init(u64 lo, u64 hi) {
-    g_gr = (GuardEnt *)VirtualAlloc(0, sizeof(GuardEnt) * GUARD_ENT, 0x3000, 0x04); if (!g_gr) return;
+    g_gr = (GuardEnt *)VirtualAlloc(0, sizeof(GuardEnt) * GUARD_ENT, 0x103000, 0x04); if (!g_gr) return;   /* w16_rel rc3: MEM_TOP_DOWN - the guard's own list never lands in the window it guards */
     g_guard_lo = lo; g_guard_hi = hi; g_guard_n = (int)((hi - lo) / GUARD_BLOCK); if (g_guard_n > GUARD_MAX) g_guard_n = GUARD_MAX;
     for (int i = 0; i < g_guard_n; i++) { u64 a = lo + (u64)i * GUARD_BLOCK;
         if (VirtualAlloc((void *)a, GUARD_BLOCK, 0x2000, 0x01) == (void *)a) { g_gr[g_ngr].lo = a; g_gr[g_ngr].hi = a + GUARD_BLOCK; g_ngr++; g_guard_held++; }
         else {   /* t163: something is already there: guard the free parts of the block around it */
             if (g_guard_busy < 4) g_guard_busy_at[g_guard_busy] = a;
             g_guard_busy++;
+            if (a < lo + (u64)GUARD_GAME_SLOTS * GUARD_BLOCK) { if (!g_guard_busy_low) g_guard_busy_low_at = a; g_guard_busy_low++; }   /* w16_rel rc4 */
             for (u64 q = a; q < a + GUARD_BLOCK; ) {
                 struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
                 if (VirtualQuery((const void *)q, &mi, sizeof mi) != sizeof mi || !mi.size) break;
@@ -399,7 +409,7 @@ static void plat_guard_init(u64 lo, u64 hi) {
                 if (mi.state == 0x10000 && g_ngr < GUARD_ENT) {   /* MEM_FREE */
                     u64 lo = (q + 0xFFFF) & ~0xFFFFull, hi = e & ~0xFFFFull;
                     if (hi > lo && VirtualAlloc((void *)lo, hi - lo, 0x2000, 0x01) == (void *)lo) { g_gr[g_ngr].lo = lo; g_gr[g_ngr].hi = hi; g_ngr++; }
-                } else if (g_guard_busy <= 4 && !g_guard_busy_what[g_guard_busy - 1]) { g_guard_busy_what[g_guard_busy - 1] = mi.abase; g_guard_busy_type[g_guard_busy - 1] = mi.type | (u64)mi.state << 32; }
+                } else if (g_guard_busy <= 4 && !g_guard_busy_what[g_guard_busy - 1]) { g_guard_busy_what[g_guard_busy - 1] = mi.abase; g_guard_busy_type[g_guard_busy - 1] = mi.type | (u64)mi.state << 32; g_guard_busy_size[g_guard_busy - 1] = mi.size; }
                 if (e <= q) break; q = e;
             }
         } }   /* MEM_RESERVE, PAGE_NOACCESS */
@@ -588,7 +598,9 @@ static i64 plat_any_dirty(void *base, u64 size) {
     if (GetWriteWatch(0, base, size, pg, &cnt, &gran)) return -1;
     return cnt ? 1 : 0;
 }
-static void plat_exit(int c) { plat_log_flush(0, 5000, 1); ExitProcess((u32)c); }   /* t146: the queued log text first */
+static volatile int g_plat_hard_exit;   /* w13_prep: shader-preparation workers are still inside the driver's compiler: the process ends without unloading the driver under them */
+__declspec(dllimport) void *WINAPI GetCurrentProcess(void);
+static void plat_exit(int c) { plat_log_flush(0, 5000, 1); if (g_plat_hard_exit) TerminateProcess(GetCurrentProcess(), (u32)c); ExitProcess((u32)c); }   /* t146: the queued log text first */
 static void plat_sleep_ms(u32 ms) { Sleep(ms); }
 static u32 g_tls_idx;
 static u32 plat_tls_alloc_disp(void) {
@@ -618,6 +630,11 @@ static volatile u32 g_veh_ignore_tid, g_veh_ignore_tid2;   /* host-only threads 
 __declspec(dllimport) u32 WINAPI GetCurrentThreadId(void);
 static int (*g_lz_fault_fn)(u64 addr, int write);   /* t111: game memory committed on first use (e3_hle.c lz_fault) */
 static int (*g_coh_fault_fn)(u64 addr, int write, u64 rip);   /* t165 --gpu-coherence: CPU access to memory whose current bytes the GPU holds (e6_vk.c) */
+static int (*g_wbg_fault_fn)(u64 addr, int write, u64 rip);   /* t198 label policy 4: a page with a GPU write into RAM in flight (e6_vk.c) */
+#define HAVE_WBG_GUARDED 1
+static void (*g_hp_stall_fn)(void);   /* w5_fast: more lines for the hitch profiler's stall report (e6_vk.c wbg_stall) */
+static int (*g_wbg_last_fn)(u64 addr, int write, u64 rip);   /* w5_fast: label policy 4 - the last word on a fault in game memory no handler claimed (e6_vk.c wbg_fault_last) */
+static int (*g_wbg_guarded_fn)(u64 a);   /* w3_perf: is this 4 KB page guarded now? (racy read, for scanners that would otherwise open it) */
 static int plat_protect(void *a, u64 n, u32 prot, u32 *old) { u32 o = 0; int ok = VirtualProtect(a, n, prot, &o) != 0; if (old) *old = o; return ok; }   /* t165 */
 /* t148: --fp-trap: a noisy site that only compares (an AVX compare with a signalling predicate, or a comiss / comisd)
    gets the quiet form of the same comparison - identical results, no exception for NaN inputs - instead of pausing
@@ -644,8 +661,10 @@ static int fp_quiet_patch(u8 *ip) {
 static int (*g_rsq_bp_fn)(u8 *ctx), (*g_rsq_ss_fn)(u8 *ctx);   /* t149 --rsqrt-trap (e5_gpu.c) */
 static WINAPI long plat_veh(ExcPtrs *ep) {
     u32 code = ep->rec->code;
+    if (code == 0xC0000005 && g_wbg_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_wbg_fault_fn(ep->rec->info[1], ep->rec->info[0] == 1, *(u64 *)(ep->ctx + CTX_RIP))) return -1;   /* t198 */
     if (code == 0xC0000005 && g_coh_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_coh_fault_fn(ep->rec->info[1], ep->rec->info[0] == 1, *(u64 *)(ep->ctx + CTX_RIP))) return -1;   /* t165 */
     if (code == 0xC0000005 && g_lz_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_lz_fault_fn(ep->rec->info[1], ep->rec->info[0] == 1)) return -1;   /* read / write, not execute */
+    if (code == 0xC0000005 && g_wbg_last_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_wbg_last_fn(ep->rec->info[1], ep->rec->info[0] == 1, *(u64 *)(ep->ctx + CTX_RIP))) return -1;   /* w5_fast */
     if (code == 0x80000004 && g_dr_hook && (*(u64 *)(ep->ctx + 0x68) & 0xF)) {   /* a hardware write watchpoint (STATUS 69) */
         g_dr_hook(ep->ctx, *(u64 *)(ep->ctx + 0x68)); *(u64 *)(ep->ctx + 0x68) = 0; return -1; }
     if (g_veh_ignore_tid || g_veh_ignore_tid2) { u32 me = GetCurrentThreadId(); if (me == g_veh_ignore_tid || me == g_veh_ignore_tid2) return 0; }
@@ -695,11 +714,18 @@ __declspec(dllimport) u32 WINAPI SuspendThread(void *);
 __declspec(dllimport) u32 WINAPI ResumeThread(void *);
 __declspec(dllimport) int WINAPI GetThreadContext(void *, void *);
 static void report_where(u64 rip, u64 rbp, u64 rsp); static void plat_stop_lock(void); static void plat_stop_unlock(void);
+static u64 plat_ticks_per_sec(void); static u64 plat_ticks(void);
 static int plat_run_thread(thread_body_fn fn, u64 stack, int timeout_s) {
     g_body = fn;
     void *t = CreateThread(0, stack, (void *)thread_tramp, 0, 0 /* commit the whole stack: PS4 code never probes its stack */, 0);
     if (!t) return -1;
-    if (WaitForSingleObject(t, timeout_s <= 0 ? 0xFFFFFFFFu /* INFINITE: the player-facing program */ : (u32)timeout_s * 1000u) == 0) return 0;
+    if (!g_timeout_play) { if (WaitForSingleObject(t, timeout_s <= 0 ? 0xFFFFFFFFu /* INFINITE: the player-facing program */ : (u32)timeout_s * 1000u) == 0) return 0; }
+    else {   /* w6_fast --timeout-play: the seconds of the shader preparation screen do not count (g_timeout_hold) */
+        u64 f = plat_ticks_per_sec(), left = (u64)timeout_s * f, last = plat_ticks();
+        for (;;) { if (WaitForSingleObject(t, 200) == 0) return 0;
+            u64 now = plat_ticks(), d = now - last; last = now;
+            if (g_timeout_hold) { g_timeout_held += d; continue; }
+            if (d >= left) break; left -= d; } }
     static __attribute__((aligned(16))) u8 ctx[1232];
     for (int k = 0; k < 3; k++) {
         plat_stop_lock();   /* t165w (review 2, N5) */
@@ -912,23 +938,187 @@ static PlatWin g_win;
 static void (*g_on_window_close)(void);
 static volatile int g_mcap_hide;   /* mouse aiming (e5_input_win.h): no pointer over the window */
 __declspec(dllimport) void *WINAPI SetCursor(void *);
+static int *g_disp_on_p; static volatile int *g_disp_toggle_p, *g_disp_refit_p;   /* w6_disp (g_disp is defined below) */
 static WINAPI i64 plat_wndproc(void *hw, u32 msg, u64 wp, i64 lp) {
     if (msg == 0x0010 /*WM_CLOSE*/) { if (g_on_window_close) g_on_window_close(); return 0; }
     if (msg == 0x0020 /*WM_SETCURSOR*/ && g_mcap_hide && (lp & 0xFFFF) == 1 /*HTCLIENT*/) { SetCursor(0); return 1; }
     if (msg == 0x0014 /*WM_ERASEBKGND*/) return 1;
     if (msg == 0x0007 /*WM_SETFOCUS*/) g_win.focused = 1;
     if (msg == 0x0008 /*WM_KILLFOCUS*/) g_win.focused = 0;
+    if (g_disp_on_p && *g_disp_on_p) {   /* w6_disp */
+        if (msg == 0x0104 /*WM_SYSKEYDOWN*/ && wp == 0x0D && (lp & (1ll << 29)) && !(lp & (1ll << 30))) { *g_disp_toggle_p = 1; return 0; }   /* Alt+Enter (not its auto-repeat) */
+        if (msg == 0x0106 /*WM_SYSCHAR*/ && wp == 0x0D) return 0;   /* (no beep) */
+        if (msg == 0x0047 /*WM_WINDOWPOSCHANGED*/ || msg == 0x007E /*WM_DISPLAYCHANGE*/) *g_disp_refit_p |= 1;
+        if (msg == 0x0232 /*WM_EXITSIZEMOVE*/) *g_disp_refit_p |= 2;
+        if (msg == 0x02E0 /*WM_DPICHANGED*/) return 0;   /* the window keeps its size in pixels on a monitor with another scaling */
+    }
     return DefWindowProcA(hw, msg, wp, lp);
 }
 static const char *g_win_title = "Until Dawn - E6 renderer (test build)";
 static int g_win_borderless, g_win_cw = 1280, g_win_ch = 720;
 __declspec(dllimport) int WINAPI GetSystemMetrics(int);
+__declspec(dllimport) int WINAPI SetProcessDPIAware(void);
+static int g_win_rs_w, g_win_rs_h, g_win_rs_mon_w, g_win_rs_mon_h;   /* w2: the scaled picture's size (--render-scale; 0 = the settings' window as it is); the monitor found */
 __declspec(dllimport) void *WINAPI LoadIconA(void *, const char *);
 __declspec(dllimport) int WINAPI AdjustWindowRect(i32 *, u32, int);
 /* t105: the window title can be changed from any thread (the window thread applies it; no cross-thread SendMessage) */
 static char g_win_title_buf[256]; static volatile int g_win_title_new;
 static void plat_set_title(const char *t) { u32 i = 0; while (t[i] && i < sizeof g_win_title_buf - 1) { g_win_title_buf[i] = t[i]; i++; } g_win_title_buf[i] = 0; __atomic_store_n(&g_win_title_new, 1, __ATOMIC_RELEASE); }
 static int plat_win_focused(void) { return g_win.focused; }
+/* w3: the window as Windows has it (for the present check): client rectangle, window rectangle, monitor, DPI */
+__declspec(dllimport) int WINAPI GetWindowRect(void *, i32 *);
+static int g_win_dpi_called, g_win_dpi_before_window;
+static void say(const char *s); static void say_dec(i64 v);
+static void plat_win_report(void) {
+    void *u = GetModuleHandleA("user32.dll"); i32 rc[4] = {0, 0, 0, 0}, wr[4] = {0, 0, 0, 0};
+    if (!g_win.hwnd) { say("no window"); return; }
+    GetClientRect(g_win.hwnd, rc); GetWindowRect(g_win.hwnd, wr);
+    say("window client "); say_dec(rc[2]); say("x"); say_dec(rc[3]); say(", window rect "); say_dec(wr[0]); say(","); say_dec(wr[1]); say(" - "); say_dec(wr[2]); say(","); say_dec(wr[3]);
+    say(g_win_borderless ? " (borderless)" : " (with a frame)");
+    say(", primary monitor "); say_dec(GetSystemMetrics(0)); say("x"); say_dec(GetSystemMetrics(1));
+    if (u) {
+        void *(WINAPI *mfw)(void *, u32) = (void *(WINAPI *)(void *, u32))GetProcAddress(u, "MonitorFromWindow");
+        int (WINAPI *gmi)(void *, void *) = (int (WINAPI *)(void *, void *))GetProcAddress(u, "GetMonitorInfoA");
+        u32 (WINAPI *gdw)(void *) = (u32 (WINAPI *)(void *))GetProcAddress(u, "GetDpiForWindow");
+        u32 (WINAPI *gds)(void) = (u32 (WINAPI *)(void))GetProcAddress(u, "GetDpiForSystem");
+        int (WINAPI *ipa)(void) = (int (WINAPI *)(void))GetProcAddress(u, "IsProcessDPIAware");
+        void *(WINAPI *gwc)(void *) = (void *(WINAPI *)(void *))GetProcAddress(u, "GetWindowDpiAwarenessContext");
+        int (WINAPI *gac)(void *) = (int (WINAPI *)(void *))GetProcAddress(u, "GetAwarenessFromDpiAwarenessContext");
+        if (mfw && gmi) { struct { u32 cb; i32 mon[4], work[4]; u32 fl; } mi; mi.cb = sizeof mi; void *hm = mfw(g_win.hwnd, 2);
+            if (hm && gmi(hm, &mi)) { say(", the window's monitor "); say_dec(mi.mon[0]); say(","); say_dec(mi.mon[1]); say(" - "); say_dec(mi.mon[2]); say(","); say_dec(mi.mon[3]); } }
+        if (gdw) { say(", window DPI "); say_dec(gdw(g_win.hwnd)); }
+        if (gds) { say(", system DPI "); say_dec(gds()); }
+        if (ipa) say(ipa() ? ", process DPI-aware" : ", process NOT DPI-aware");
+        if (gwc && gac) { say(", window awareness "); say_dec(gac(gwc(g_win.hwnd))); say(" (0 unaware, 1 system, 2 per monitor)"); }
+    }
+    say(g_win_dpi_called ? (g_win_dpi_before_window ? ", SetProcessDPIAware called before the window was made" : ", SetProcessDPIAware called AFTER the window") : ", SetProcessDPIAware not called");
+}
+/* ------------------------------------------------------------------ w6_disp: the display system
+   Display mode (borderless window covering one monitor | window), the monitor, the window's size and place. The process is
+   DPI-aware per monitor (one window pixel = one monitor pixel at any Windows scaling), monitors are numbered primary
+   first, then left to right / top to bottom. plat_disp_resolve() (main thread, before the window exists) turns the
+   request in g_disp into the window's rectangle; the window thread makes the window from it, switches the mode on
+   Alt+Enter, keeps a borderless window on the whole of the monitor it is on (moved with Win+Shift+arrow, resolution
+   changed) and tells g_disp_changed_cb when something worth saving changed. Off (g_disp.on 0): the window as before. */
+__declspec(dllimport) int WINAPI EnumDisplayMonitors(void *, const i32 *, void *, i64);
+__declspec(dllimport) int WINAPI GetMonitorInfoA(void *, void *);
+__declspec(dllimport) void *WINAPI MonitorFromWindow(void *, u32);
+__declspec(dllimport) int WINAPI SetWindowPos(void *, void *, int, int, int, int, u32);
+__declspec(dllimport) i64 WINAPI SetWindowLongPtrA(void *, int, i64);
+typedef struct { void *h; i32 x, y, w, ht, wx, wy, ww, wh; int primary; char name[32]; } PlatMon;
+static PlatMon g_mon[8]; static int g_nmon;
+static struct {
+    int on;                    /* the display system is in charge of the window */
+    int borderless;            /* request, then the current mode */
+    int mon_req;               /* 0 = auto (primary), else 1-based number */
+    int cw_req, ch_req;        /* windowed: client size wanted */
+    int have_pos; i32 px, py;  /* windowed: saved place of the window (outer top-left) */
+    int sim_w, sim_h;          /* tests: as if the monitor had this size (borderless window of this size at the monitor's origin) */
+    int mon;                   /* resolved: index into g_mon */
+    i32 x, y; int w, h;        /* resolved: borderless: the window; windowed: place and CLIENT size */
+    int out_w, out_h;          /* the client area's size at start (what the picture is fitted into) */
+    int dpi_mode;              /* 2 per monitor v2, 1 system, 0 none */
+    volatile int toggle_req, refit, changed;
+    i32 rest[4]; int have_rest;   /* the window's rectangle before it went borderless */
+} g_disp;
+static void (*g_disp_changed_cb)(void);
+static void plat_dpi_init(void) {
+    static int done; if (done) return; done = 1;
+    void *u = GetModuleHandleA("user32.dll");
+    int (WINAPI *ctx)(i64) = u ? (int (WINAPI *)(i64))GetProcAddress(u, "SetProcessDpiAwarenessContext") : 0;
+    if (ctx && ctx(-4)) g_disp.dpi_mode = 2;   /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (Windows 10 1703) */
+    else if (SetProcessDPIAware()) g_disp.dpi_mode = 1;
+    g_win_dpi_called = 1; g_win_dpi_before_window = !g_win.hwnd;
+}
+static WINAPI int plat_mon_cb(void *hm, void *dc, i32 *rc, i64 lp) {
+    (void)dc; (void)rc; (void)lp;
+    struct { u32 cb; i32 mon[4], work[4]; u32 fl; char dev[32]; } mi; mi.cb = sizeof mi;
+    if (g_nmon >= 8 || !GetMonitorInfoA(hm, &mi)) return 1;
+    PlatMon *m = &g_mon[g_nmon++]; m->h = hm; m->x = mi.mon[0]; m->y = mi.mon[1]; m->w = mi.mon[2] - mi.mon[0]; m->ht = mi.mon[3] - mi.mon[1];
+    m->wx = mi.work[0]; m->wy = mi.work[1]; m->ww = mi.work[2] - mi.work[0]; m->wh = mi.work[3] - mi.work[1]; m->primary = (int)(mi.fl & 1);
+    for (int i = 0; i < 31; i++) { m->name[i] = mi.dev[i]; if (!mi.dev[i]) break; } m->name[31] = 0;
+    return 1;
+}
+static void plat_mon_enum(void) {
+    g_nmon = 0; EnumDisplayMonitors(0, 0, (void *)plat_mon_cb, 0);
+    for (int i = 1; i < g_nmon; i++) for (int j = i; j > 0; j--) {   /* primary first, then by place */
+        PlatMon *a = &g_mon[j - 1], *b = &g_mon[j];
+        int lt = b->primary != a->primary ? b->primary : b->x != a->x ? b->x < a->x : b->y < a->y;
+        if (!lt) break;
+        PlatMon t = *a; *a = *b; *b = t; }
+}
+static int plat_mon_of_window(void *hw) { void *hm = MonitorFromWindow(hw, 2); for (int i = 0; i < g_nmon; i++) if (g_mon[i].h == hm) return i; return -1; }
+/* 0: no monitor found (the caller keeps the old window code) */
+static int plat_disp_resolve(void) {
+    plat_dpi_init(); plat_mon_enum();
+    if (!g_nmon) return 0;
+    int mi = 0; if (g_disp.mon_req >= 1 && g_disp.mon_req <= g_nmon) mi = g_disp.mon_req - 1;
+    g_disp.mon = mi; PlatMon *m = &g_mon[mi];
+    int mw = g_disp.sim_w ? g_disp.sim_w : m->w, mh = g_disp.sim_h ? g_disp.sim_h : m->ht;
+    if (g_disp.borderless) { g_disp.x = m->x; g_disp.y = m->y; g_disp.w = mw; g_disp.h = mh; g_disp.out_w = mw; g_disp.out_h = mh; return 1; }
+    int cw = g_disp.cw_req > 0 ? g_disp.cw_req : 1280, ch = g_disp.ch_req > 0 ? g_disp.ch_req : 720;
+    i32 r[4] = {0, 0, cw, ch}; AdjustWindowRect(r, 0x00CF0000u, 0);
+    int fw = (r[2] - r[0]) - cw, fh = (r[3] - r[1]) - ch, aw = (g_disp.sim_w ? mw : m->ww) - fw, ah = (g_disp.sim_h ? mh : m->wh) - fh;
+    if (aw > 160 && ah > 90 && (cw > aw || ch > ah)) {   /* larger than the monitor's work area: the largest window of the same shape that fits */
+        if ((i64)aw * ch <= (i64)ah * cw) { ch = (int)((i64)ch * aw / cw); cw = aw; } else { cw = (int)((i64)cw * ah / ch); ch = ah; } }
+    g_disp.w = cw; g_disp.h = ch; g_disp.out_w = cw; g_disp.out_h = ch;
+    g_disp.x = m->wx + (m->ww - (cw + fw)) / 2; g_disp.y = m->wy + (m->wh - (ch + fh)) / 2;
+    if (g_disp.have_pos && !g_disp.mon_req) {   /* the saved place, if its title bar is still on a monitor */
+        for (int i = 0; i < g_nmon; i++) { PlatMon *q = &g_mon[i];
+            if (g_disp.px + 120 > q->wx && g_disp.px + 120 < q->wx + q->ww && g_disp.py >= q->wy - 8 && g_disp.py + 40 < q->wy + q->wh) { g_disp.x = g_disp.px; g_disp.y = g_disp.py; g_disp.mon = i; break; } } }
+    return 1;
+}
+static void plat_disp_window_rect(i32 *o) {   /* outer rectangle (x, y, w, h) for the resolved state */
+    if (g_disp.borderless) { o[0] = g_disp.x; o[1] = g_disp.y; o[2] = g_disp.w; o[3] = g_disp.h; return; }
+    i32 r[4] = {0, 0, g_disp.w, g_disp.h}; AdjustWindowRect(r, 0x00CF0000u, 0);
+    o[0] = g_disp.x; o[1] = g_disp.y; o[2] = r[2] - r[0]; o[3] = r[3] - r[1];
+}
+/* window thread: the client area exactly w x h (the frame's size depends on the monitor's DPI, which AdjustWindowRect does not know) */
+static void plat_disp_fix_client(void *hw, int w, int h) {
+    i32 rc[4], wr[4]; if (!GetClientRect(hw, rc) || !GetWindowRect(hw, wr)) return;
+    if (rc[2] == w && rc[3] == h) return;
+    SetWindowPos(hw, 0, 0, 0, (wr[2] - wr[0]) + (w - rc[2]), (wr[3] - wr[1]) + (h - rc[3]), 0x0002 | 0x0004 | 0x0010 /* NOMOVE | NOZORDER | NOACTIVATE */);
+}
+/* window thread: Alt+Enter */
+static void plat_disp_toggle(void *hw) {
+    plat_mon_enum(); int mi = plat_mon_of_window(hw); if (mi < 0) mi = 0; if (!g_nmon) return;
+    PlatMon *m = &g_mon[mi];
+    if (!g_disp.borderless) {
+        g_disp.have_rest = GetWindowRect(hw, g_disp.rest) != 0;
+        g_disp.borderless = 1; g_disp.mon = mi;
+        SetWindowLongPtrA(hw, -16, (i64)0x90000000u);
+        SetWindowPos(hw, 0, m->x, m->y, g_disp.sim_w ? g_disp.sim_w : m->w, g_disp.sim_h ? g_disp.sim_h : m->ht, 0x0004 | 0x0020 | 0x0040 /* NOZORDER | FRAMECHANGED | SHOWWINDOW */);
+    } else {
+        g_disp.borderless = 0; g_disp.mon = mi;
+        SetWindowLongPtrA(hw, -16, (i64)0x10CF0000u);
+        if (g_disp.have_rest) SetWindowPos(hw, 0, g_disp.rest[0], g_disp.rest[1], g_disp.rest[2] - g_disp.rest[0], g_disp.rest[3] - g_disp.rest[1], 0x0004 | 0x0020 | 0x0040);
+        else {
+            int cw = g_disp.cw_req > 0 ? g_disp.cw_req : 1280, ch = g_disp.ch_req > 0 ? g_disp.ch_req : 720;
+            i32 r[4] = {0, 0, cw, ch}; AdjustWindowRect(r, 0x00CF0000u, 0);
+            int ow = r[2] - r[0], oh = r[3] - r[1];
+            if (ow > m->ww || oh > m->wh) { int fw = ow - cw, fh = oh - ch, aw = m->ww - fw, ah = m->wh - fh;
+                if ((i64)aw * ch <= (i64)ah * cw) { ch = (int)((i64)ch * aw / cw); cw = aw; } else { cw = (int)((i64)cw * ah / ch); ch = ah; }
+                ow = cw + fw; oh = ch + fh; }
+            SetWindowPos(hw, 0, m->wx + (m->ww - ow) / 2, m->wy + (m->wh - oh) / 2, ow, oh, 0x0004 | 0x0020 | 0x0040);
+            plat_disp_fix_client(hw, cw, ch); }
+    }
+    g_disp.changed = 1;
+}
+/* window thread: a borderless window covers the monitor it is on (after Win+Shift+arrow, a resolution change, a monitor unplugged) */
+static void plat_disp_refit(void *hw) {
+    if (!g_disp.borderless || g_disp.sim_w) return;
+    plat_mon_enum(); int mi = plat_mon_of_window(hw); if (mi < 0) return;
+    PlatMon *m = &g_mon[mi]; i32 wr[4]; if (!GetWindowRect(hw, wr)) return;
+    if (mi != g_disp.mon) { g_disp.mon = mi; g_disp.changed = 1; }
+    if (wr[0] != m->x || wr[1] != m->y || wr[2] - wr[0] != m->w || wr[3] - wr[1] != m->ht) SetWindowPos(hw, 0, m->x, m->y, m->w, m->ht, 0x0004 | 0x0010);
+}
+/* window thread: the window (not borderless) was moved or resized by the user */
+static void plat_disp_moved(void *hw) {
+    if (g_disp.borderless) return;
+    i32 rc[4], wr[4]; if (!GetClientRect(hw, rc) || !GetWindowRect(hw, wr) || rc[2] < 160 || rc[3] < 90) return;
+    plat_mon_enum(); int mi = plat_mon_of_window(hw);
+    if (rc[2] != g_disp.w || rc[3] != g_disp.h || wr[0] != g_disp.x || wr[1] != g_disp.y) { g_disp.w = rc[2]; g_disp.h = rc[3]; g_disp.cw_req = rc[2]; g_disp.ch_req = rc[3]; g_disp.x = wr[0]; g_disp.y = wr[1]; if (mi >= 0) g_disp.mon = mi; g_disp.changed = 1; }
+}
 static WINAPI u32 plat_window_thread(void *arg) {
     (void)arg;
     void *inst = GetModuleHandleA(0);
@@ -938,6 +1128,22 @@ static WINAPI u32 plat_window_thread(void *arg) {
     wc.icon = LoadIconA(inst, (const char *)1); wc.sm = wc.icon;   /* the game icon embedded in the exe (resource 1), if present */
     RegisterClassExA(&wc);
     void *hw;
+    if (g_win_rs_w) {   /* w2 (--render-scale): one window pixel = one monitor pixel (no DPI stretching by Windows), and a window as large as the
+                           scaled picture when the monitor has room for it, else one covering the monitor (the picture is then filtered down) */
+        SetProcessDPIAware(); g_win_dpi_called = 1; g_win_dpi_before_window = 1;
+        i32 r[4] = {0, 0, g_win_rs_w, g_win_rs_h}; AdjustWindowRect(r, 0x00CF0000u, 0);
+        if (g_win_rs_w == GetSystemMetrics(0) && g_win_rs_h == GetSystemMetrics(1)) g_win_borderless = 1;   /* exactly the monitor: borderless, pixel for pixel */
+        else if (r[2] - r[0] <= GetSystemMetrics(0) && r[3] - r[1] <= GetSystemMetrics(1)) { if (!g_win_borderless) { g_win_cw = g_win_rs_w; g_win_ch = g_win_rs_h; } }
+        else g_win_borderless = 1;
+        g_win_rs_mon_w = GetSystemMetrics(0); g_win_rs_mon_h = GetSystemMetrics(1);
+    }
+    g_disp_on_p = &g_disp.on; g_disp_toggle_p = &g_disp.toggle_req; g_disp_refit_p = &g_disp.refit;
+    if (g_disp.on) {   /* w6_disp: the rectangle plat_disp_resolve() chose */
+        i32 o[4]; plat_disp_window_rect(o); g_win_borderless = g_disp.borderless;
+        hw = CreateWindowExA(0, "UD_E5", g_win_title, g_disp.borderless ? 0x90000000u : 0x10CF0000u, o[0], o[1], o[2], o[3], 0, 0, inst, 0);
+        if (hw && !g_disp.borderless) plat_disp_fix_client(hw, g_disp.w, g_disp.h);
+        g_disp.refit = 0;
+    } else
     if (g_win_borderless) hw = CreateWindowExA(0, "UD_E5", g_win_title, 0x90000000u /* WS_POPUP | WS_VISIBLE */, 0, 0, GetSystemMetrics(0), GetSystemMetrics(1), 0, 0, inst, 0);
     else {   /* outer size for the requested client size */
         i32 r[4] = {0, 0, g_win_cw, g_win_ch}; AdjustWindowRect(r, 0x00CF0000u, 0);
@@ -951,6 +1157,11 @@ static WINAPI u32 plat_window_thread(void *arg) {
     for (;;) {
         while (PeekMessageA(msg, 0, 0, 0, 1)) { TranslateMessage(msg); DispatchMessageA(msg); }
         if (g_win_title_new) { g_win_title_new = 0; SetWindowTextA(hw, g_win_title_buf); }   /* t105: title set by another thread */
+        if (g_disp.on) {   /* w6_disp */
+            if (g_disp.toggle_req) { g_disp.toggle_req = 0; plat_disp_toggle(hw); g_win_borderless = g_disp.borderless; g_disp.refit = 0; }
+            if (g_disp.refit) { int k_ = g_disp.refit; g_disp.refit = 0; if (g_disp.borderless) plat_disp_refit(hw); else if (k_ & 2) plat_disp_moved(hw); }
+            if (g_disp.changed) { g_disp.changed = 0; if (g_disp_changed_cb) g_disp_changed_cb(); }
+        }
         if (g_win.gdi_off) { Sleep(5); continue; }   /* Vulkan presents now */
         i32 rc[4]; GetClientRect(hw, rc);
         void *dc = GetDC(hw);
@@ -1036,9 +1247,9 @@ static void *hf_open_rw(const char *p, int create, int trunc) {
     void *h = lp_CreateFile(p, 0xC0000000u, 3, disp, 0x80); return h == (void *)-1 ? 0 : h;
 }
 static u64 hf_write(void *f, const void *b, u64 n) {   /* (t165w, review 3 NF10: like hf_read - a page held again between making it current and the call: once more) */
-    u32 w; u64 t = 0; if (g_coh_ensure_fn && n) g_coh_ensure_fn((u64)b, n);
+    u32 w; u64 t = 0; if (g_wbg_ensure_fn && n) g_wbg_ensure_fn((u64)b, n); if (g_coh_ensure_fn && n) g_coh_ensure_fn((u64)b, n);
     for (int again = 0; t < n; ) { u32 c = (u32)(n - t > 0x40000000 ? 0x40000000 : n - t); int ok = WriteFile(f, (const u8 *)b + t, c, &w, 0);
-        if (!ok || !w) { if (!ok && GetLastError() == 998) { __atomic_add_fetch(&g_coh_kernel_refused, 1, __ATOMIC_RELAXED); if (g_coh_ensure_fn && again++ < 3) { g_coh_ensure_fn((u64)b + t, n - t); continue; } } break; }
+        if (!ok || !w) { if (!ok && GetLastError() == 998) { __atomic_add_fetch(&g_coh_kernel_refused, 1, __ATOMIC_RELAXED); if ((g_coh_ensure_fn || g_wbg_ensure_fn) && again++ < (g_wbg_ensure_fn ? 8 : 3)) { if (g_wbg_ensure_fn) g_wbg_ensure_fn((u64)b + t, n - t); if (g_coh_ensure_fn) g_coh_ensure_fn((u64)b + t, n - t); continue; } } break; }
         t += w; }
     return t; }
 __declspec(dllimport) u32 WINAPI GetFileAttributesW(const u16 *);
@@ -1073,6 +1284,41 @@ static int plat_run_child(char *cmdline) {
     return (int)code;
 }
 static void plat_exe_path(char *out, u32 n) { u32 k = GetModuleFileNameA(0, out, n); if (k >= n) k = n - 1; out[k] = 0; }
+/* w16_rel rc4: start this program again with EXACTLY its own command line (GetCommandLineW: untouched - entry() tokenizes the
+   ANSI copy in place, which truncated rc3's copy), the internal marker "--relaunched N:ADDR" inserted after the program token
+   (an earlier marker dropped); same program file, same working directory (inherited; nothing has changed it yet), same std
+   handles. Waits for it and returns its exit code (-1: could not start). Nothing of ours has been opened at this point. */
+__declspec(dllimport) u16 *WINAPI GetCommandLineW(void);
+__declspec(dllimport) int WINAPI CreateProcessW(const u16 *, u16 *, void *, void *, int, u32, void *, const u16 *, void *, void *);
+__declspec(dllimport) u32 WINAPI GetModuleFileNameW(void *, u16 *, u32);
+static int plat_relaunch(int n, u64 addr) {
+    static u16 cl[32768], exe[32768]; u32 en = GetModuleFileNameW(0, exe, 32767); if (!en || en >= 32767) return -1; exe[en] = 0;
+    const u16 *s = GetCommandLineW(); if (!s) return -1;
+    const u16 *t0 = s;   /* the program token, kept as written (with its quotes) */
+    if (*s == '"') { s++; while (*s && *s != '"') s++; if (*s) s++; } else while (*s && *s != ' ' && *s != '\t') s++;
+    const u16 *t1 = s;
+    while (*s == ' ' || *s == '\t') s++;
+    { static const char mk[] = "--relaunched"; int m = 1; for (int i = 0; mk[i]; i++) if (s[i] != (u16)mk[i]) { m = 0; break; }
+      if (m && (s[12] == ' ' || s[12] == '\t')) { s += 12; while (*s == ' ' || *s == '\t') s++; while (*s && *s != ' ' && *s != '\t') s++; while (*s == ' ' || *s == '\t') s++; } }
+    u32 k = 0, cap = 32767;
+    for (const u16 *c = t0; c < t1 && k < cap; c++) cl[k++] = *c;
+    char mb[48]; { int j = 0; const char *p0 = " --relaunched "; while (*p0) mb[j++] = *p0++;
+        u32 v = (u32)n; char tt[12]; int m = 0; do { tt[m++] = (char)('0' + v % 10); v /= 10; } while (v); while (m) mb[j++] = tt[--m];
+        mb[j++] = ':'; mb[j++] = '0'; mb[j++] = 'x'; static const char hx[] = "0123456789abcdef"; int st = 0;
+        for (int sh = 60; sh >= 0; sh -= 4) { int d = (int)((addr >> sh) & 15); if (d || st || !sh) { mb[j++] = hx[d]; st = 1; } } mb[j] = 0; }
+    for (const char *c = mb; *c && k < cap; c++) cl[k++] = (u16)(u8)*c;
+    if (*s) { if (k < cap) cl[k++] = ' '; for (const u16 *c = s; *c && k < cap; c++) cl[k++] = *c; }
+    if (k >= cap) return -1;
+    cl[k] = 0;
+    __attribute__((aligned(8))) u8 si[104] = {0}, pi[24] = {0}; *(u32 *)si = 104;
+    *(u32 *)(si + 60) = 0x100;   /* STARTF_USESTDHANDLES */
+    *(void **)(si + 80) = GetStdHandle((u32)-10); *(void **)(si + 88) = GetStdHandle((u32)-11); *(void **)(si + 96) = GetStdHandle((u32)-12);
+    if (!CreateProcessW(exe, cl, 0, 0, 1, 0, 0, 0, si, pi)) return -1;
+    void *ph = *(void **)pi, *th = *(void **)(pi + 8); u32 code = 0;
+    WaitForSingleObject(ph, 0xFFFFFFFFu); GetExitCodeProcess(ph, &code); CloseHandle(th); CloseHandle(ph);
+    return (int)code;
+}
+static int plat_test_occupy(u64 a) { return VirtualAlloc((void *)a, 0x10000, 0x2000, 0x01) == (void *)a; }   /* (tests: MEM_RESERVE, PAGE_NOACCESS) */
 static void plat_message_box(const char *title, const char *text) { MessageBoxA(0, text, title, 0x10 /* MB_ICONERROR */ | 0x10000 /* MB_SETFOREGROUND */); }
 /* system facts for the log and the compatibility check (STATUS 88): physical memory, logical processors, Windows version */
 typedef struct { u32 len, load; u64 phys_total, phys_avail, page_total, page_avail, virt_total, virt_avail, virt_ext; } PlatMemStatus;
@@ -1124,6 +1370,23 @@ static int plat_thread_on_pcores(void *thread) {
     static u32 ids[256]; u32 n = 0;
     for (u32 o = 0; o + 24 <= len && n < 256; ) { u32 sz = *(u32 *)(buf + o), ty = *(u32 *)(buf + o + 4); if (sz < 24) break;
         if (ty == 0 && buf[o + 18] == best) ids[n++] = *(u32 *)(buf + o + 8); o += sz; }
+    return n && ss(thread, ids, n) ? (int)n : 0;
+}
+/* t181f: the efficiency cores of a hybrid CPU (lowest efficiency class); 0 when not hybrid */
+static int plat_thread_on_ecores(void *thread) {
+    void *k = GetModuleHandleA("kernel32.dll"); if (!k || !thread) return 0;
+    int (WINAPI *gi)(void *, u32, u32 *, void *, u32) = (int (WINAPI *)(void *, u32, u32 *, void *, u32))GetProcAddress(k, "GetSystemCpuSetInformation");
+    int (WINAPI *ss)(void *, const u32 *, u32) = (int (WINAPI *)(void *, const u32 *, u32))GetProcAddress(k, "SetThreadSelectedCpuSets");
+    if (!gi || !ss) return 0;
+    static u8 buf[64 * 1024]; u32 len = 0;
+    if (!gi(buf, sizeof buf, &len, 0, 0) || len > sizeof buf) return 0;
+    int best = -1, lo = 256;
+    for (u32 o = 0; o + 24 <= len; ) { u32 sz = *(u32 *)(buf + o), ty = *(u32 *)(buf + o + 4); if (sz < 24) break;
+        if (ty == 0) { int ec = buf[o + 18]; if (ec > best) best = ec; if (ec < lo) lo = ec; } o += sz; }
+    if (best < 0 || best == lo) return 0;
+    static u32 ids[256]; u32 n = 0;
+    for (u32 o = 0; o + 24 <= len && n < 256; ) { u32 sz = *(u32 *)(buf + o), ty = *(u32 *)(buf + o + 4); if (sz < 24) break;
+        if (ty == 0 && buf[o + 18] == lo) ids[n++] = *(u32 *)(buf + o + 8); o += sz; }
     return n && ss(thread, ids, n) ? (int)n : 0;
 }
 /* t133: a set of 6 logical processors on 6 different physical cores (the PS4's 6 game cores), as an affinity mask; the
@@ -1228,7 +1491,7 @@ static u64 plat_module_of(u64 a, char *name, u32 n) { (void)a; (void)n; name[0] 
 #include <asm/prctl.h>
 static void *hf_open_rb(const char *p) { return fopen(p, "rb"); }
 static void hf_close(void *f) { fclose((FILE *)f); }
-static void (*g_coh_ensure_fn)(u64 a, u64 n); static volatile u64 g_coh_kernel_refused;
+static void (*g_coh_ensure_fn)(u64 a, u64 n); static volatile u64 g_coh_kernel_refused; static void (*g_wbg_ensure_fn)(u64 a, u64 n); static int (*g_wbg_fault_fn)(u64 addr, int write, u64 rip);
 static u64 hf_read(void *f, void *b, u64 n) { return fread(b, 1, n, (FILE *)f); }
 static u64 hf_read_raw(void *f, void *b, u32 n, u32 *err) { *err = 0; return fread(b, 1, n, (FILE *)f); }
 static i64 hf_seek(void *f, i64 o, int w) { return fseeko((FILE *)f, o, w) == 0 ? ftello((FILE *)f) : -1; }
@@ -1239,6 +1502,8 @@ static void plat_write(void *h, const char *s) {
 static void *plat_open_write(const char *p) { return fopen(p, "wb"); }
 static i64 plat_file_size(const char *p) { struct stat st; if (stat(p, &st) || S_ISDIR(st.st_mode)) return -1; return (i64)st.st_size; }
 static int plat_run_child(char *cmdline) { int r = system(cmdline); return r < 0 ? -1 : (r >> 8) & 255; }
+static int plat_relaunch(int n, u64 addr) { (void)n; (void)addr; return -1; }   /* (w16_rel rc3: Windows only) */
+static int plat_test_occupy(u64 a) { (void)a; return 0; }
 static void plat_exe_path(char *out, u32 n) { ssize_t k = readlink("/proc/self/exe", out, n - 1); if (k < 0) k = 0; out[k] = 0; }
 static void plat_exe_dir(char *out, u32 n) { ssize_t k = readlink("/proc/self/exe", out, n - 1); if (k <= 0) { out[0] = '.'; out[1] = 0; return; } out[k] = 0; while (k && out[k - 1] != '/') k--; if (k) k--; out[k] = 0; }
 static void plat_chdir(const char *p) { if (chdir(p)) {} }
@@ -1248,6 +1513,7 @@ static u64 plat_commit_avail(void) { return plat_phys_mem(); }
 typedef struct { u64 priv, priv_peak, ws, ws_peak, sys_avail, sys_total, commit_avail, commit_total; } PlatProcMem;
 static int plat_proc_mem(PlatProcMem *o) { for (u32 i = 0; i < sizeof *o; i++) ((u8 *)o)[i] = 0; o->sys_total = plat_phys_mem(); return 0; }
 static u32 plat_ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (u32)n : 1; }
+static int plat_thread_on_ecores(void *thread) { (void)thread; return 0; }
 static int plat_thread_on_pcores(void *thread) { (void)thread; return 0; }
 static int plat_os_version(u32 *major, u32 *minor, u32 *build) { *major = 0; *minor = 0; *build = 0; return 0; }
 static void plat_free_pages(void *p) { (void)p; }
@@ -1255,6 +1521,7 @@ static void plat_set_title(const char *t) { (void)t; }
 static int plat_win_focused(void) { return 0; }
 static void plat_set_log(void *h) { (void)h; }
 static const char *g_win_title = "Until Dawn"; static int g_win_borderless, g_win_cw = 1280, g_win_ch = 720;   /* window settings (Windows only) */
+static int g_win_rs_w, g_win_rs_h, g_win_rs_mon_w, g_win_rs_mon_h;
 static void *plat_log_handle(void) { return 0; }
 static void plat_suspend_thread(void *h) { (void)h; }
 static int plat_replace_file(const char *from, const char *to) { return rename(from, to) == 0; }
@@ -1282,7 +1549,7 @@ static void *plat_alloc_rw(u64 n) { void *p = mmap(0, n, 3, MAP_PRIVATE | MAP_AN
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 static void plat_guard_init(u64 lo, u64 hi) { (void)lo; (void)hi; }
-static int g_guard_held, g_guard_busy, g_ngr; static u64 g_guard_rereserved, g_guard_lost;
+static int g_guard_held, g_guard_busy, g_ngr; static u64 g_guard_rereserved, g_guard_lost; static u64 g_guard_busy_at[4], g_guard_busy_size[4]; static int g_guard_busy_low; static u64 g_guard_busy_low_at;
 static void *plat_alloc_at(void *a, u64 n) { void *p = mmap(a, n, 7, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0); return (p == MAP_FAILED || p != a) ? 0 : p; }
 static void *plat_reserve_at(void *a, u64 n) { void *p = mmap(a, n, 0, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0); return (p == MAP_FAILED || p != a) ? 0 : p; }
 static int plat_commit(void *a, u64 n) { return mprotect(a, n, 7) == 0; }
@@ -1308,6 +1575,7 @@ static int plat_dr_arm_all(const u64 *addr, int n) { (void)addr; (void)n; return
 static int plat_stop_others(void **hs, int max) { (void)hs; (void)max; return 0; }
 static void plat_resume_others(void **hs, int n) { (void)hs; (void)n; }
 static void (*g_dr_hook)(u8 *ctx, u64 dr6);
+static volatile int g_plat_hard_exit;
 static void plat_exit(int c) { fflush(0); _exit(c); }
 static void plat_sleep_ms(u32 ms) { usleep(ms * 1000); }
 static __thread u64 g_gs_cell;
@@ -1440,6 +1708,12 @@ typedef struct { volatile const u8 *pixels; volatile u32 w, h, pitch, linear; ch
 static PlatWin g_win;
 static void (*g_on_window_close)(void);
 static void plat_window_open(void) {}
+static void plat_win_report(void) {}
+typedef struct { void *h; i32 x, y, w, ht, wx, wy, ww, wh; int primary; char name[32]; } PlatMon;
+static PlatMon g_mon[8]; static int g_nmon;
+static struct { int on, borderless, mon_req, cw_req, ch_req, have_pos; i32 px, py; int sim_w, sim_h, mon; i32 x, y; int w, h, out_w, out_h, dpi_mode; volatile int toggle_req, refit, changed; } g_disp;
+static void (*g_disp_changed_cb)(void);
+static int plat_disp_resolve(void) { return 0; }
 static void plat_timer_1ms(void) {}
 static int plat_key(int vk) { (void)vk; return 0; }
 

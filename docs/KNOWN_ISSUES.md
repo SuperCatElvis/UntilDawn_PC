@@ -1,4 +1,4 @@
-# Known issues — v0.3.2
+# Known issues — v0.4.0
 
 [← Back to README](../README.md)
 
@@ -73,6 +73,22 @@ GPUs, and the flickering menus may remain. Things to try:
 3. `present_mode = fifo` in `Config\settings.ini`.
 
 Please report what happened, with `Logs\UntilDawn.log`.
+
+## New in v0.4.0
+
+- **Main menu:** the character's look-around in the main menu moves too fast at high frame rates. Gameplay is not
+  affected.
+- **Brief dark lighting at the start of some scenes** (for example the start of the Chapter 5 grate cutscene). It
+  corrects itself after a moment. Under investigation.
+- **First-start shader preparation time** depends on the CPU and on other programs running at the same time: about 2-3
+  minutes on a modern 8-core or larger CPU, more on smaller CPUs or while antivirus scans or downloads run.
+- **Occasional brief stutters** when entering new areas (the game streaming new data, or a shader that is not in the
+  list yet).
+- **Optimised Rendering (Fast Mode)** is on by default and has mostly been tested on NVIDIA graphics cards. If you see
+  flickering, missing objects or crashes on AMD or Intel graphics cards, try `optimised_rendering = 0` in
+  `Config\settings.ini` and please report the result.
+- The glowing wall conduit in Chapter 5 (near the moving-hand interactable) is not a bug: the PS4 version shows it the
+  same way.
 
 ## New in v0.3.2
 

@@ -37,7 +37,7 @@ __declspec(dllimport) void *WINAPI GetProcAddress(void *, const char *);
     X(vkCmdPushDescriptorSetKHR) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCmdCopyBuffer) X(vkCmdClearAttachments) X(vkCmdSetBlendConstants) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
     X(vkGetMemoryHostPointerPropertiesEXT) \
-    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkGetQueryPoolResults) X(vkCreatePipelineCache) X(vkGetPipelineCacheData)
+    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkGetQueryPoolResults) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) X(vkMergePipelineCaches) X(vkDestroyPipelineCache)
 
 #define VK_DECL(f) static PFN_##f f;
 VK_INSTANCE_FNS(VK_DECL)

@@ -159,9 +159,11 @@ static void cpu_tests(void) {
     /* FP control words of a game thread: x87 extended precision like FreeBSD (0x037F), MXCSR default 0x1F80 */
     { plat_fp_thread_init(); u16 cw; u32 mx; __asm__ volatile("fnstcw %0" : "=m"(cw)); __asm__ volatile("stmxcsr %0" : "=m"(mx));
       char det[48]; Sb s = {det, 0, sizeof det}; sb_s(&s, "fpcw "); sb_x(&s, cw); sb_s(&s, " mxcsr "); sb_x(&s, mx);
-      check("x87 control word 0x037F and MXCSR 0x1F80 on a game thread (PS4 numerics)", cw == 0x037F && (mx & 0xFFC0) == 0x1F80, det);
+      u32 want = g_opt_ps4_mxcsr ? 0x9FC0 : 0x1F80;   /* t187: --ps4-mxcsr */
+      check(g_opt_ps4_mxcsr ? "x87 control word 0x037F and MXCSR 0x9FC0 on a game thread (--ps4-mxcsr)" : "x87 control word 0x037F and MXCSR 0x1F80 on a game thread", cw == 0x037F && (mx & 0xFFC0) == want, det);
       volatile float den = 1.0e-40f, one = 1.0f; volatile float r = den * one; u32 ru; mem_copy(&ru, (const void *)&r, 4);
-      check("CPU keeps fp32 denormals (no flush-to-zero in game threads)", ru != 0, ""); }
+      if (g_opt_ps4_mxcsr) check("fp32 denormals flushed in game threads (--ps4-mxcsr)", ru == 0, "");
+      else check("CPU keeps fp32 denormals (no flush-to-zero in game threads)", ru != 0, ""); }
 #endif
     /* threads and synchronisation: 8 threads, atomics, the port's mutex and condition variable */
     { pm_init(&g_tm); pc_init(&g_tcv);

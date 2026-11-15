@@ -32,6 +32,7 @@ say "== 5. game memory: lazily committed arenas, pools, range lookups (t109) =="
 say "== 6. translator: SPIR-V words freed once the shader module exists (t112; AddressSanitizer) =="
 gcc -O1 -g -fsanitize=address -fno-omit-frame-pointer -DG2S_MEMO_N=256 -Wno-unused-function -Wno-unused-result -Wno-misleading-indentation -I$HERE -o $W/spvrel_host_test $HERE/tests/spvrel_host_test.c $HERE/gcn2spv.c || fail=1
 $W/spvrel_host_test $(ls $CORPUS/*.bin | awk 'NR%30==0') || fail=1
+SPVREL_INLINE=1 $W/spvrel_host_test $(ls $CORPUS/*.bin | awk 'NR%30==0') || fail=1   # w2: --spv-compress-inline
 say "== 7. translator: memo results packed (t113): unpacking gives what the full copy gave (AddressSanitizer) =="
 gcc -O1 -g -fsanitize=address -fno-omit-frame-pointer -w -I$HERE -o $W/mpack_host_test $HERE/tests/mpack_host_test.c && $W/mpack_host_test || fail=1
 say "== 8. heap-watch detector (STATUS 40) =="; (cd $HERE && sh heapwatch_test.sh) || fail=1

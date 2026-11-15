@@ -36,6 +36,9 @@ int main(int argc, char **argv) {
             in.gs_vpp = 3; in.gs_esgs_itemsize = 24; in.gs_maxv = 20; in.gs_wave_bytes = 64 * 4 * 320; in.gs_out_prim = getenv("G2S_GSLINES") ? 1 : 2; in.gs_base = G2S_GS_BASE;
             in.cs_threads[0] = 64; in.cs_threads[1] = 1; in.cs_threads[2] = 1; in.rsrc2 = 10u << 1; in.n_user = 10; in.rsrc1 = 3u << 24;
         }
+        if (getenv("G2S_PSENA")) in.ps_input_ena = (u32)strtoul(getenv("G2S_PSENA"), 0, 0);
+        if (getenv("G2S_NTO")) in.no_tex_offsets = atoi(getenv("G2S_NTO"));   /* w5: 2 = IMAGE_SAMPLE*_O offsets applied */
+        if (getenv("G2S_RS")) in.diag_salt = (u32)strtoul(getenv("G2S_RS"), 0, 0);   /* t196: render scale, G2S_RS_TAG | num << 8 | den */
         G2SOut out;
         if (!g2s_translate(&in, &out)) { printf("%-10s FAIL: %s\n", b, out.err); fails++; free(g_mem); continue; }
         if (g_edges) { fclose(g_edges); g_edges = 0; }

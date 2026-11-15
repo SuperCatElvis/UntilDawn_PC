@@ -19,6 +19,12 @@ static void cpu_wrote_note(u64 a, u64 n) {
 static int g_opt_shot = -1;        /* --shot N: save the presented image of flip N as e6_shot_N.bmp */
 static u64 g_shot_more[64]; static int g_nshot_more;   /* --shots a,b,c: more screenshots */
 static int shot_due(u64 f) { if (g_opt_shot >= 0 && (u64)g_opt_shot == f) return 1; for (int i = 0; i < g_nshot_more; i++) if (g_shot_more[i] == f) return 1; return 0; }
+/* w3 (--present-shot a,b,c): developer check of what really goes to the screen - the swapchain image is read back after the
+   final blit and saved as e6_present_<flip>.bmp, with a log line about the window / surface / monitor / DPI */
+static u64 g_pshot[64]; static int g_npshot, g_pshot_usage_ok;
+static int g_rp_running;
+static int g_pshot_auto; static u64 g_pshot_auto_last; static u32 g_draw_tgt_w;   /* --present-shot-ui N: up to N more, taken by themselves on flips where a large interface bitmap is put on the screen, 300 flips apart */
+static int pshot_due(u64 f) { if (g_rp_running && g_npshot) return 1; for (int i = 0; i < g_npshot; i++) if (g_pshot[i] == f) return 1; return 0; }   /* (a replay: every flip) */
 static int g_opt_nocull;           /* --no-cull: draw back faces too (diagnostic) */
 static int g_opt_dumpimg = -1, g_dumpimg_last = -1, g_dumpimg_rt;   /* image dump: first frame, last frame (-1: just the first), render targets only */
 static int g_opt_no_gpu_diag;         /* --no-gpu-diag: no checkpoint markers / device-fault reporting */
@@ -79,6 +85,35 @@ static u64 g_opt_nan_probe;        /* --nan-probe ADDR: per instruction of the s
 static int g_opt_nowavesync;       /* --no-wave-sync: do not emulate 64-lane lockstep in LDS compute shaders */
 static int g_opt_append = 1;       /* DS_APPEND shaders run (emulated GDS counters); --no-append turns them off (diagnostic) */
 static int g_opt_nobounds;         /* --no-bounds: no buffer range checks in shaders (diagnostic) */
+/* t196 (ws_gpu): our own GPU overhead - all off by default (the behaviour of t195), each switchable on its own:
+   --bar-dedupe      a full barrier asked for when no command that does GPU work was recorded since the last full barrier
+                     of this batch is not recorded again (WRITE_DATA runs, tessellation / geometry passes back to back,
+                     "vk_begin_cb(); vk_barrier();"). Exact: two full barriers with nothing between are one.
+   --lazy-sync N     the game's flush events (bit 0) / waits on a label (bit 1) after draws that wrote nothing but their
+                     render targets are left to the lazy hazard check, as cache syncs are since t107b.
+   --lazy-waw        a change of render targets needs no barrier for a new target that was only written AS A RENDER
+                     TARGET since the last barrier (attachment writes of successive passes keep their order: rasterization
+                     order). Copies, uploads and storage writes into it, and reads of it, still get the barrier.
+   --lazy-copies N   barriers around the copies made for a draw the way t107b does it for region copies (the one before
+                     only if the source was written / the destination used since the last barrier, the one after left
+                     to the hazard check of the draw that uses the result): bit 0 snapshots of a target the draw reads
+                     and writes, bit 1 "newer image of another format" syncs of a draw's target, bit 2 depth <-> R32
+                     syncs of a draw's target (single-copy path, VK_KHR_maintenance8).
+   --fb-rect         a snapshot of a target the draw reads and writes copies only what changed since the snapshot was
+                     last current: the union of the scissor rectangles of the draws that wrote the target since then
+                     (nothing at all when that is empty). Any other write to the target makes the next copy a full one. */
+static int g_opt_bar_dedupe = 1, g_opt_lazy_sync = 3, g_opt_lazy_waw = 1, g_opt_lazy_copies = 7, g_opt_fb_rect = 1;   /* t197: on by default (9 recorded frames picture-identical, cave 17.5 -> 16.0 ms); --no-gpu-lean: off */
+static int g_opt_fb_cover, g_opt_present_lean, g_has_consraster; static u64 g_n_cov_draws, g_n_cov_imgs, g_n_cov_blind, g_n_cov_hit, g_n_cov_px, g_n_cov_pipes, g_t_cov_pipes, g_n_cov_no[10], g_n_fbc_calls, g_n_present_lean;   /* w10_res: see cov_after_draw */
+static int g_opt_fb_zseq; static u64 g_n_fbz_cand, g_n_fbz_skip, g_n_fb_kind[3];   /* w6_gpu: see vk_feedback_copy */
+static u64 g_n_bar_dedup, g_n_lazy_why[3], g_n_lazy_waw_skip, g_n_sync_lazy2[3], g_n_lc[3], g_n_fb_part, g_n_fb_none, g_n_fb_px, g_n_fb_px_full;
+static int g_sync_lazy_ok;         /* (vk_sync_newer is being called for a draw's render target: its copy's barriers may be lazy) */
+static i32 g_dsc_x0, g_dsc_y0, g_dsc_x1, g_dsc_y1;   /* --fb-rect: the scissor rectangle of the draw being recorded (not yet clamped to its targets) */
+/* w11_load (all default off): --pc-save-early: after a start-up preparation that compiled pipelines the cache is written before the game starts
+   (not during the first scenes); --pc-save-quiet: a background save waits for a pause in the game's file reads, is skipped when the cache
+   has hardly grown since the last write (the whole 1.2 GB file was rewritten after every 1000 pipelines MADE, new or not: fast_04, 285 s),
+   and its record / module writes run with background priority too; --bg-io-low: the capture writer uses background I/O priority */
+static int g_pc_early, g_pc_quiet, g_bg_io_low; static volatile int g_pc_quit; static u64 g_pc_saved_bytes, g_pc_skips, g_pc_quiet_wait_ms;
+static void vk_save_pcache_now(void);
 static const char *g_pcache_path = "e6_pipeline_cache.bin", *g_pcache_tmp = "e6_pipeline_cache.tmp";   /* UntilDawn.exe: Cache\\ */
 static int g_opt_nofold;           /* --no-fold: scalar loads always go to memory (diagnostic) */
 static int g_opt_fold_gpu_data;    /* --fold-gpu-data: fold memory even while GPU work that writes it is in flight (the old behaviour) */
@@ -87,6 +122,7 @@ static int g_rc_req, g_rc_active;  /* replay capture requested / running (e6_cap
 static int g_rc_trace;   /* --replay-trace: hash what every draw / dispatch wrote (finds where two replays diverge) */
 static int g_rc_nsync; static u64 g_rc_sync[32][2], g_rcs_step;   /* --replay-sync a-b,c-d: wait for the GPU after these draws / dispatches */
 static void rc_trace_step(void); static void rc_trace_shadow_write(u64 lo, u64 hi);
+static int g_opt_sh_verify;   /* w3 diagnostic */
 static u32 g_snap_n[16]; static u64 g_snap_a[16]; static int g_nsnap;   /* --snap N:ADDR: save image ADDR right after draw/dispatch N of the dump frame */
 /* --replay-snap STEP:ADDR (replay only): save the newest GPU-written image at ADDR - colour or depth - right after replay
    step STEP (the numbering of --replay-trace and udcap_steps.py). File: replay_snap<STEP>_<addr>_<w>x<h>_f<vkformat>.bin,
@@ -96,7 +132,7 @@ static u32 g_snap_n[16]; static u64 g_snap_a[16]; static int g_nsnap;   /* --sna
    unblended, to an RGBA32F image of its own at G_RDBG_ADDR (dump it with --replay-snap STEP:G_RDBG_ADDR). */
 #define G_RDBG_ADDR 0xDB00000000ull
 static u32 g_rdbg_step, g_rdbg_pc, g_rdbg_regs; static int g_tr_dbg;
-static u32 g_rsnap_n[32]; static u64 g_rsnap_a[32]; static int g_nrsnap; static int g_rp_running; static u64 g_rp_step;
+static u32 g_rsnap_n[32]; static u64 g_rsnap_a[32]; static int g_nrsnap; static u64 g_rp_step;
 static u64 g_rskip[16][2]; static int g_nrskip;   /* t164f --replay-skip A-B: replay steps not drawn / dispatched (diagnostic; counted with --replay-snap) */
 /* t107b: --replay-dumptex STEP: the textures the draw / dispatch at that replay step samples, saved as the GPU has them */
 static u32 g_rdt_n[8]; static int g_nrdt; typedef struct { void *m; u32 lb; u32 T[12]; int storage; } RdtEnt; static RdtEnt g_rdt[48]; static int g_nrdte;
@@ -104,6 +140,8 @@ static u64 g_rtl_lo, g_rtl_hi;   /* --replay-texlog A-B: log how each texture of
 /* --replay-snapmem STEP:ADDR:BYTES: save game memory (or its VRAM copy) right after replay step STEP, once the GPU is idle */
 static u32 g_rsm_n[16]; static u64 g_rsm_a[16], g_rsm_len[16]; static int g_nrsm;
 static u64 g_nows_at[8]; static int g_nnows;   /* --no-wave-sync-at ADDR: no lockstep emulation for that shader only (diagnostic) */
+static int g_zclamp_ok, g_opt_no_zclamp; static u64 g_n_zclamp_draws;
+static int g_opt_nan_vb;   /* t184 --nan-vb: NaN in the memory a draw's vertex shader reads (vertex buffers, bone palettes) - logged */   /* t183: depth clamp for draws with near / far clipping disabled (--no-zclamp) */
 static int g_opt_nostructure;      /* --no-structure: translate branches as a state machine (the old way) */
 #ifndef _WIN32
 static int vkr_on(void) { return 0; }
@@ -113,6 +151,9 @@ static void vkr_snap(u32 n) { (void)n; }
 static void vkr_init(void) {}
 static void vkr_begin_submit(void) {}
 static void vkr_end_submit(void) {}
+static void vkr_prescan(void) {}
+static void vkr_ab_flip(u64 flips) { (void)flips; }
+static void spec_submit_begin(u32 count, void **dcb, u32 *dsz) { (void)count; (void)dcb; (void)dsz; } static void spec_ce(u32 k, u32 ce) { (void)k; (void)ce; } static void spec_submit_end(void) {} static void spec_wait_reg_mem(void) {} static void spec_play_line(void) {}
 static void vkr_draw(const char *kind, u32 count, int indexed, u32 first_index) { (void)kind; (void)count; (void)indexed; (void)first_index; }
 static void vkr_dispatch(u32 x, u32 y, u32 z) { (void)x; (void)y; (void)z; }
 static void vkr_occlusion_dump(u64 addr) { (void)addr; }
@@ -153,6 +194,7 @@ static void vl(const char *s) { if (g_vklog) plat_write(g_vklog, s); }
 static void vl_x(u64 v) { char b[20]; fmt_hex(b, v); vl(b); }
 static void vl_d(i64 v) { char b[24]; fmt_dec(b, v); vl(b); }
 
+static int g_opt_hix_marks; static u64 g_n_hix_cleaned;   /* w5_perf (hix_del) */
 /* hash index: u64 key -> int value, open addressing with tombstones (for lookups that ran linearly over big tables) */
 typedef struct { u64 *k; int *v; u32 cap; } HIdx;   /* v: 0 empty, -1 deleted, else value + 1 */
 static u32 hix_h(u64 k) { k ^= k >> 33; k *= 0xff51afd7ed558ccdull; k ^= k >> 33; return (u32)k; }
@@ -167,7 +209,14 @@ static void hix_put(HIdx *H, u64 k, int v) {
 }
 static void hix_del(HIdx *H, u64 k, int v) {
     if (!H->k) return;
-    for (u32 i = hix_h(k) & (H->cap - 1), n = 0; n < H->cap; i = (i + 1) & (H->cap - 1), n++) { if (!H->v[i]) return; if (H->v[i] == v + 1 && H->k[i] == k) { H->v[i] = -1; return; } }
+    for (u32 i = hix_h(k) & (H->cap - 1), n = 0; n < H->cap; i = (i + 1) & (H->cap - 1), n++) { if (!H->v[i]) return; if (H->v[i] == v + 1 && H->k[i] == k) { H->v[i] = -1;
+        /* w5_perf: a deleted mark whose next slot is empty ends every search that reaches it, so it (and deleted marks
+           right before it) can be empty again. Without this the marks only piled up: the image and view indexes lose
+           and gain entries all session (texture streaming), searches for keys that are not there ran on to the next
+           really empty slot - hix_get was the renderer's second-hottest line (9.3 % of its own code, Chapter 10 cave
+           after 14,000 frames), and it grew with play time. Results are the same. --hix-keep-marks: as before. */
+        if (!g_opt_hix_marks && !H->v[(i + 1) & (H->cap - 1)]) { u32 j = i; for (u32 q = 0; q < H->cap && H->v[j] == -1; q++) { H->v[j] = 0; g_n_hix_cleaned++; j = (j - 1) & (H->cap - 1); } }
+        return; } }
 }
 typedef struct { u64 lo, hi; VkBuffer buf; VkDeviceMemory mem; u64 dev; int ok; } VReg;
 #define HAVE_SENT_DECL 1
@@ -179,8 +228,9 @@ typedef struct {
     VkImage img; VkDeviceMemory mem; VkImageView view;   /* default view (identity swizzle) */
     int gpu_written; u64 hash; u32 frame_uploaded;
     int watched; u64 up_seq, wlen;                           /* CPU write tracking valid since the last upload check; GPU-write log position */
-    u32 bpe; int arrayed; VkImageUsageFlags usage; u64 wseq; u32 last_use; u64 use_seq;   /* use_seq: GPU batch that last used it (freed only once that batch finished) */
+    u32 bpe; int arrayed; VkImageUsageFlags usage; u64 wseq, dseq; u32 last_use; u64 use_seq;   /* use_seq: GPU batch that last used it (freed only once that batch finished) */
     int is_copy; u64 copy_seq; VkImage copy_src;      /* exact-size copy of a render target region (see vk_texture) */
+    u64 zseq, zat, copy_zid;                          /* w6_gpu (--fb-zseq): identity of a depth target's DEPTH contents (zseq, valid while zat == wseq; otherwise wseq is); a snapshot's: the identity it holds (0 unknown) */
     u32 levels;                                       /* mip levels (memory textures); render targets have 1 */
     u64 bytes;                                        /* device memory of the image */
     int anext;                                        /* next image with the same address (index chain, see img_ix) */
@@ -188,6 +238,8 @@ typedef struct {
     int wb;                                           /* written back to game memory (small linear target, see wb_flush) */
     int stencil;                                      /* depth image with a stencil aspect (m->view covers depth + stencil; sampling views depth only) */
     u64 w_ep, r_ep;                                   /* barrier epoch + 1 in which a draw last wrote it as a target / sampled it (STATUS 57) */
+    u64 wx_ep;                                        /* t196: ... in which something other than a draw's attachment write wrote it (copy, upload, storage) */
+    u64 fb_base, fb_last; i32 fb_x0, fb_y0, fb_x1, fb_y1; int fb_full;   /* t196 (--fb-rect): what draws wrote since its snapshot was current (fb_base: wseq then, 0 = not tracked; fb_last: wseq after the last tracked write) */
     u32 n_up, n_clean, n_same, up_frame, up_first, up_nlev;   /* STATUS 81 diagnostics: uploads, "unchanged" skips, same-hash skips, last upload frame / first level / levels */
     u32 lay_tm, lay_pitch;                            /* t107e: memory layout (tile mode index + 1, pitch in texels) of a depth target / storage image; 0 unknown */
     u64 up_lo, up_len;                                /* t107k: the memory range of the last upload (frame dumps compare its hash with memory now) */
@@ -196,7 +248,77 @@ typedef struct {
     u32 pool; u64 poff, plen;                         /* t134: memory from pool block pool-1 at poff (plen bytes); 0: a dedicated allocation (mem) */
     u32 audit_frame;                                  /* t135: --tex-audit: the frame its bytes were last compared in full */
     u8 audit_stale;                                   /* t135: that comparison found other bytes */
+    u64 fb_at;                                        /* t193: (a region copy) made for the draw / dispatch with this number, which also writes the source */
+    u32 lw, lh;                                       /* t191: the surface's size in the game's registers (pitch x padded height); w x h is smaller for a view-sized target */
+    u8 rs;                                            /* t196: the Vulkan image is rs_up(w) x rs_up(h) (--render-scale); w, h, lw, lh stay the game's sizes */
+    u64 cv_id, cv_prev, cov_id; u32 cov_blind;        /* w10_res (--fb-cover): a target's contents identity after / before the draw that last bound it (0 unknown); a snapshot: the identity it equals; draws covered without being sampled */
 } VImg;
+/* t196: --render-scale N (percent; 100 = off, nothing below runs). Render targets and storage images the size of the
+   screen (rs_elig) get Vulkan images num / den times larger; every table and lookup keeps the game's sizes (VImg.w / h),
+   only what is handed to Vulkan (image extents, render areas, viewports, scissors, copy regions) is scaled. The
+   translated shaders learn per draw / dispatch what is scaled (six push-constant words at offset 128, see "render scale"
+   in gcn2spv.c). Passes whose targets are not the size of the screen (shadow maps, half-resolution buffers, the
+   occlusion / light-culling targets, linear targets written back to memory) run exactly as before. */
+static int g_opt_rs_keep_window;
+/* w3 (--rs-ui N): the game's user interface (Scaleform: its shaders, textures and render targets all live at 0x10_xxxxxxxx) on a
+   scaled picture. The interface is composed in Scaleform's own render targets (not the size of the screen, so not scaled)
+   and copied to the screen with a point sampler, texel for pixel - which on a scaled screen is a nearest-neighbour
+   enlargement (blocky text and logos). 0: as w2. 1: such copies are filtered (linear). 2: the interface's render targets
+   are scaled as well, so its shapes and bitmaps are rasterised at the output resolution (and 1 for anything left). */
+/* w3 (--rs-ui 3): the game's Scaleform movies are given the physical size as their viewport (e3_loader.c patch_gfx_viewport),
+   so Scaleform itself rasterises glyphs and shapes for the output resolution and sizes its own render targets for it. Its
+   draws to the screen then come with a viewport of exactly the physical size (larger than the game's target): those draws'
+   viewport and scissors are taken as physical pixels (g_rs_phys), not scaled again. */
+static int g_rs_phys; static u64 g_n_rs_phys, g_n_rs_phys_sc;
+static int g_opt_rs_movie = 1; static u64 g_n_rs_movie;   /* w3: Bink movie planes filtered on a scaled screen (--rs-movie-point: as before, point-sampled) */
+static void (*g_gfx_mem_report_fn)(void);   /* w4 */
+static int g_opt_rs_ui = 3, g_rs_draw_ui, g_rs_draw_scaled; static u64 g_n_rs_ui_lin, g_n_rs_ui_tgt, g_n_rs_ui_draws;
+#define RS_UI_ADDR(a) (((u64)(a) >> 32) == 0x10)
+/* w5 (--render-scale): passes that take the size of a pixel from the game's constants or read the scaled picture at the game's size
+   --rs-aa 1 (default): the anti-aliasing pass (FXAA 3.11 quality, PS hash RS_PS_FXAA) gets its 1/width, 1/height constants for the
+       PHYSICAL picture, so its edge search steps one physical pixel and its taps lie half a physical pixel apart (with the game's
+       1/1920, 1/1080 they were 4/3 or 2 physical pixels: taps between the wrong texels, a blur wider than the stair it removes);
+       and IMAGE_SAMPLE*_O texel offsets are applied (gcn2spv.c; the pass reads its NE / SW neighbours with them). 0: as before.
+       --rs-aa 2: also (a) the sharpening pass after the temporal pass (RS_PS_SHARP) gets the physical pixel size for its four
+       taps, and (b) the temporal pass (RS_PS_TAA) takes its 3x3 neighbourhood from the physical pixels next to its own
+       (at 150 / 200 percent the game's +-1 pixel became +-2 physical pixels).
+   --rs-box 1 (default): a pass at a fixed lower resolution (bloom, exposure, the depth-of-field prefilter: targets 960x540 and
+       smaller) that reads the scaled picture with a linear sampler gets a copy reduced to the game's 1920x1080 by a box filter,
+       i.e. the picture the PS4 pass read: one bilinear tap on the 4/3 or 2 times larger image would skip texels (highlights
+       flicker in the bloom). 0: as before (the scaled image itself).
+   --rs-down 1 (default): a picture MORE than twice the window's size is reduced by a box filter (blits: interpolated to 4 times
+       the window, halved twice); up to 2 the single bilinear blit stays (it is close to the area filter there). 2: the
+       two-step path for every reduction (softer, A/B). 0: always one bilinear blit.
+   Film grain (128x128 texture, coordinates from the composite's vertex data, linear sampler) keeps the PS4's apparent size: it is
+       enlarged with the picture (not re-tiled per physical pixel) - the look the game was graded for on a screen of the same size.
+   --rs-const-log (with --rs-log N): the folded constants of every draw / dispatch of that flip (hex words), in the Vulkan log.
+   --rs-ui-log: the interface's draws into render targets that are not the screen (size, viewport, scissor), first 400. */
+static u64 g_disp_tog_at[4]; static int g_disp_tog_n;   /* w6_disp tests: --display-toggle-at A,B: Alt+Enter at these flips */
+static int g_opt_sample_offsets;   /* --sample-offsets: IMAGE_SAMPLE*_O texel offsets applied at any scale (default: only with --render-scale and --rs-aa 1) */
+static int g_opt_rs_aa = 1, g_opt_rs_box = 1, g_opt_rs_down = 1, g_opt_rs_constlog, g_opt_rs_uilog;
+static u64 g_n_rs_aa, g_n_rs_box, g_n_rs_box_blit, g_n_rs_down;
+#define RS_PS_SHARP 0x9558f231230a930full   /* 0x24f32aa00: the sharpening pass after the temporal pass (4 bilinear taps half a pixel away, size from constants) */
+#define RS_PS_TAA 0x1328db08206257e5ull    /* 0x24f32a100: the temporal pass (3x3 neighbourhood by texel loads at +-1) */
+#define RS_PS_COMP 0x524f05da89030e45ull   /* 0x24f327900: the final composite (depth of field, bloom, vignette, film grain, colour table) */
+#define RS_PS_FXAA 0x720024cb12cfef6bull   /* FNV-1a of the first 256 bytes of the program (0x24f329600 in every capture so far) */
+static int g_opt_rs_sub; static u64 g_n_rs_sub;   /* w3 (--rs-subpass, experimental, off): LDS dispatches with scaled storage images run once per sub-pixel position instead of at the game's resolution */
+static int g_rs_on, g_rs_pct = 100; static u32 g_rs_num = 1, g_rs_den = 1;
+/* w7_prep --rs-generic: the scaled shaders take the ratio from push-constant words 38..45 (gcn2spv.h G2S_RS_GEN) - one set of
+   translations, modules and driver pipelines for every scale above 1 (a change of the internal resolution then prepares
+   nothing new) */
+static int g_opt_rs_gen;
+#define RS_SALT_ND() (g_opt_rs_gen ? G2S_RS_GEN : ((g_rs_num << 8) | g_rs_den | (g2s_opt_rs_noshift ? 0x80u : 0u)))
+static int g_rs_mk, g_rs_tgt;       /* the image being created is scaled; this draw's targets are scaled */
+static u32 g_rs_tm[2], g_rs_nst;    /* bindings with a scaled image per stage slot (0: VS / CS, 1: PS); scaled storage images bound */
+static u64 g_n_rs_img, g_n_rs_conv[2], g_n_rs_draws, g_n_rs_disp, g_n_rs_disp1, g_n_rs_mixed, g_n_rs_noblit, g_n_rs_resample;
+/* w3 (--rs-log FLIP; in a replay: the replayed frame): one line per draw / dispatch of that frame in the Vulkan log - targets
+   (logical size, scaled or not), viewport, and every texture with its image size, scale and sampler filter */
+static i64 g_rsl_flip = -1; static int g_rsl_nt; static u64 g_rsl_seq;
+static struct { u64 addr; u32 w, h, fl, smp, tw, th; } g_rsl_t[48];
+static int rsl_on(void);
+static u32 rs_up(u32 v) { return (u32)(((u64)v * g_rs_num + g_rs_den - 1) / g_rs_den); }
+#define RSV(m, v) ((m)->rs ? rs_up(v) : (u32)(v))
+static int rs_elig(u32 w, u32 h) { return g_rs_on && w >= 1920 && w <= 2048 && h >= 1080 && h <= 1152; }
 typedef struct { u64 key[4]; VkSampler s; } VSamp;
 static VImg *g_rd_img[64]; static int g_nrd_img;   /* images the draw being recorded samples (lazy barriers, STATUS 57) */
 /* t135 NaN hunt (--nan-hunt; --nan-scan for the scan alone), see nan_scan below */
@@ -266,7 +388,11 @@ static void prof_add(u64 a, u64 b, double ms, u32 verts) {
    Like the PS4: a submit hands the work to the GPU and returns; the CPU builds the next batch while the GPU runs this
    one. Two command buffers alternate. End-of-pipe label writes / interrupts that follow a batch are attached to it and
    applied by a completion thread as soon as that batch has finished on the GPU (the game waits on those labels). */
-enum { NSLOT = 8, QPS = 8192 / NSLOT, CHUNK = 64 };   /* t107e: 8 batches in flight (was 4: in the stranger scene the CPU waited 3-4 ms per frame for a free one while the GPU worked through a burst; the staging buffer and index ring grew with it, so each batch keeps its share) */
+/* t198 --batch-slots N (8..32, default 8): batches that may be in flight. With the labels written early (policy 1 / 4)
+   the renderer is no longer paced by the game's wait for the GPU, and 8 batches (a quarter of a frame) of lead made it
+   wait for a free slot whenever the GPU fell behind in one part of the frame (0.8 ms a frame in the cave). */
+enum { NSLOT = 32, QPS_MAX = 1024, CHUNK = 64 }; static int g_nslot = 8;
+#define QPS (8192u / (u32)g_nslot)   /* t107e: 8 batches in flight (was 4: in the stranger scene the CPU waited 3-4 ms per frame for a free one while the GPU worked through a burst; the staging buffer and index ring grew with it, so each batch keeps its share) */
 /* CHUNK: draws/dispatches per batch handed to the GPU while the frame is still being translated (32 until STATUS 62: 64 was 6 ms faster in the station frame) */
 /* GPU timing. Per-draw timestamps (the "GPU time by shader" table) cost GPU time: a bottom-of-pipe timestamp after every
    draw keeps draws from overlapping. They are on in replays (where the table is the point) and off in play unless
@@ -274,21 +400,67 @@ enum { NSLOT = 8, QPS = 8192 / NSLOT, CHUNK = 64 };   /* t107e: 8 batches in fli
    last two queries of the slot): their difference, minus any overlap with the previous batch, is the GPU's busy time. */
 static int g_opt_gpu_times = -1;   /* -1: decided at start (replay on, play off); --gpu-times / --no-gpu-times */
 static u64 g_gpu_busy_ns, g_gpu_last_end, g_gpu_batches;
+static u64 g_tl_from, g_tl_from_frame;   /* t198 */
+static int g_opt_gpu_tl; static void tl_batch(u32 base, u32 n, u64 start, u64 end);   /* t172 (e6_defer.c) */
 static u64 g_t_submit, g_t_pace, g_n_vkbar;   /* CPU ticks in the game's submit calls / in flip pacing; full barriers recorded */
-typedef struct { u64 addr, val; u32 n; int irq; } VDefW;
+typedef struct { u64 addr, val; u32 n; int irq; u64 dn; } VDefW;   /* dn (w5_fast): draws + dispatches parsed when the write was queued */
 static void gpu_defw_apply1(u64 addr, u64 val, u32 n, int irq);   /* e5_gpu.c */
-typedef struct { VkCommandBuffer cb; VkFence fence; VkSemaphore acq, done; int pending; u64 seq, gw; u32 qn; VDefW *w; int nw, cap; } VSlot;
-static void coh_device_lost(const char *where); static void rm_unwatch_runs(const u64 *lo, const u64 *hi, u32 n);
+typedef struct { VkCommandBuffer cb; VkFence fence; VkSemaphore acq, done; int pending; u64 seq, gw; u32 qn; VDefW *w; int nw, cap; volatile int submitted, failed; VkCommandPool pool; int moved; } VSlot;   /* t180: submitted / failed (back-end), own command pool */
+static void coh_device_lost(const char *where); static void rm_unwatch_runs(const u64 *lo, const u64 *hi, u32 n); static void rm_unwatch_pages(void **pgs, i64 n); static int g_opt_unwatch_each;
 static void coh_rearm(u64 done); static void coh_at_submit(void); static void coh_post_submit(void); static void coh_fatal(const char *why); static int coh_stale4k(u64 a); static int coh_nosync4k(u64 a); static u16 *coh_on(void); enum { COH_CS = 256u << 20, COH_CS_REC = 8192 };
+static VkBuffer g_mipfb_buf, g_mipfb_host;   /* popin: the mip statistics feedback table and its host copies */
 static VkBuffer g_cs_buf; static VkDeviceMemory g_cs_mem; static u8 *g_cs_map; static u64 g_cs_head, g_cs_tail, g_cs_bytes, g_cs_full;
 static PMutex g_coh_m; static u64 g_sh_rs[4096]; static u32 g_sh_nrs;   /* (t165w: the merge in vk_shadow) */ static int g_coh_mask_any(void); static void qm_lock(void); static void qm_unlock(void); static PMutex g_qm; static int g_qm_init;   /* t165: the queue (submits, presents, idle waits; the coherence read-backs come from other threads) */
 static VSlot g_slot[NSLOT]; static int g_slot_cur; static u32 g_chunk_n; static u64 g_sub_seq, g_done_seq;
+static volatile u64 g_qsub_seq; static int g_bk_on; static void bk_flush(void); static void bk_begin(void); static void bk_handoff(int slot, VkSemaphore ws, VkSemaphore ss);   /* t180: batches the back-end has submitted to the queue; back-end on (e6_defer.c) */
 static PMutex g_slock; static PCond g_scond;
 static u64 g_gw_seq, g_gw_done;   /* GPU-write log (see gw_note): next position; position up to which the GPU has finished */
+/* w3 (--no-gw-late: as t198). A GPU write is logged while its draw / dispatch is being SET UP (vk_shadow_for), and a batch
+   took the whole log (S->gw = g_gw_seq) when it was handed over. But the set-up itself can end the batch before the
+   draw's command is recorded (a buffer moved to VRAM, a texture upload that waits for its writer, a full staging slot,
+   a region copy's barrier...): the write was then counted as finished when THAT batch finished, one or more batches
+   before the batch that really holds the writer. In between, scalar loads were folded from RAM that the write had not
+   reached yet (the old constants: capture 7514's stray highlights whenever the GPU was a few batches behind), texture
+   checks trusted the old bytes, and a written-back VRAM copy was copied to RAM before its writer ran and not again
+   after it. Now a batch handed over during a set-up covers the log only up to where that set-up began, the ranges to
+   write back are kept for the batch that gets the command, and a repeated write is only merged with a log entry of
+   the same batch. */
+static int g_opt_gw_late = 1; static int g_gw_pending; static u64 g_gw_pend_from, g_gw_batch0, g_n_gw_late, g_n_gw_late_ent, g_n_gw_late_wb, g_n_gw_redup;
+static struct { u64 lo, hi; } g_wrp[64]; static int g_nwrp;
+static u64 gw_cover(void) {   /* the log position a batch handed over now accounts for */
+    u64 v = (g_opt_gw_late && g_gw_pending && g_gw_pend_from < g_gw_seq) ? g_gw_pend_from : g_gw_seq;
+    if (v != g_gw_seq) { g_n_gw_late++; g_n_gw_late_ent += g_gw_seq - v; }
+    g_gw_batch0 = v; return v; }
+static void gw_setup_begin(void) { if (!g_gw_pending) { g_gw_pending = 1; g_gw_pend_from = g_gw_seq; } }
+static void gw_setup_done(void);   /* the draw / dispatch command has been recorded */
+static void wbg_note_read(u32 pg, u64 lo, u64 hi); static int g_opt_rdg; static u64 g_wbg_after; static void wbg_note(u64 lo, u64 hi, int kind, int line); static void wbg_arm(const u64 *skip, int nskip, int first); static void wbg_done(u64 seq); static void wbg_label(u64 addr, u64 val, u32 n, int irq, int early); static int g_opt_wbg, g_wbg_audit;   /* t198: label policy 4 (see wbg_note) */
+/* w16_rel rc2: Optimised Rendering (Fast Mode) state - see fr_flip_check */
+static int g_fr_req = -1, g_fr_src;   /* requested 1 / 0 (-1: no setting or switch - a developer run with raw label options); source 0 default, 1 settings.ini, 2 command line */
+static int g_fps_src = -1;            /* frame-rate limit: 0 default, 1 settings.ini, 2 command line (--fps), -1 the game's own rate */
+static volatile int g_fr_state;       /* 0 not decided yet, 1 active (logged at the first early release), 2 logged as NOT active */
+static u64 g_fr_active_flip; static volatile int g_fr_rdg_fail; static int g_fr_rdg_warned;
+static void (*g_fr_crash_fn)(void *f);   /* (e3_loader.c fr_crash_report: GPU, Optimised Rendering, frame-rate limit, guard state) */
+static int g_opt_wbg_strict, g_wbg_dr_flag; static u64 g_wbg_direct, g_wbg_moved_arms, g_wbg_coh_early; static void wbg_coh_early(u64 seq);   /* w3_perf */
+/* w5_fast --label-trailing (with label policy 4): only the label writes at the very end of a game submit - no draw or
+   dispatch after them, the frame label the main thread waits for before its next submit - are written at the hand-over;
+   every other one (a job's end-of-pipe write in mid-frame: the game frees or reuses that job's memory when it sees it,
+   while the renderer may still be translating the rest of the frame) waits for its batch as under policy 0. */
+static int g_opt_lbl_trail, g_lbl_end_submit; static u64 (*g_lbl_dn_fn)(void); static u64 g_lbl_trail_early, g_lbl_trail_kept;
 static void slot_push(VSlot *S, u64 addr, const void *src, u32 n, int irq) {
     if (S->nw == S->cap) { int nc = S->cap ? S->cap * 2 : 256; VDefW *nw = (VDefW *)realloc(S->w, (size_t)nc * sizeof(VDefW)); if (!nw) return; S->w = nw; S->cap = nc; }
-    VDefW *d = &S->w[S->nw++]; d->addr = addr; d->val = 0; d->n = n; d->irq = irq; if (n) mem_copy(&d->val, src, n);
+    VDefW *d = &S->w[S->nw++]; d->addr = addr; d->val = 0; d->n = n; d->irq = irq; d->dn = g_lbl_dn_fn ? g_lbl_dn_fn() : 0; if (n) mem_copy(&d->val, src, n);
 }
+/* t194: when the game's GPU labels are written (--label-policy N). The game waits for the label of frame N-1 before it
+   submits frame N, so every frame cost: renderer time + the GPU's tail + the game's reaction (Chapter 10 cave, uncapped:
+   17.3 ms of which the renderer waited 4.9 ms for the game; with the labels at the hand-over 13.9 ms, the renderer
+   setting the pace).
+   0 (default): when the batch has finished on the GPU, as on the PS4.
+   1: when the batch is handed over AND the GPU has finished every copy that reads game memory (the copies that bring CPU
+      writes into the VRAM mirror / VRAM copies at the start of a submit read the game's memory when the GPU runs
+      them); otherwise with that copy's batch. What a shader reads straight from game memory (pages not mirrored yet)
+      is not covered: EXPERIMENTAL.
+   2: at the hand-over, whatever is in flight (measurement only). */
+/* (variables declared before e6_defer.c) policy 3 (t196) = 1 + batches with write-backs to game memory hold the labels */
 /* batch finished on the GPU (called with g_slock held): GPU timings, then the label writes in order */
 static void slot_complete(VSlot *S) {
     if (V.qp && S->cb) {   /* batch start / end timestamps (see g_opt_gpu_times) */
@@ -300,14 +472,25 @@ static void slot_complete(VSlot *S) {
             g_gpu_batches++;
         }
     }
+    if (g_opt_gpu_tl && S->qn && V.qp && S->cb) {   /* t172 */
+        u64 r3[2]; u32 b3 = (u32)(S - g_slot) * QPS + QPS - 2;
+        if (vkGetQueryPoolResults(V.dev, V.qp, b3, 2, sizeof r3, r3, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) tl_batch((u32)(S - g_slot) * QPS, S->qn, r3[0], r3[1]);
+    } else
     if (S->qn && V.qp) {
-        static u64 res[QPS]; u32 base = (u32)(S - g_slot) * QPS;
+        static u64 res[QPS_MAX]; u32 base = (u32)(S - g_slot) * QPS;
         if (vkGetQueryPoolResults(V.dev, V.qp, base, S->qn, sizeof res, res, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             for (u32 i = 0; i + 1 < S->qn; i += 2) prof_add(V.qkey_a[(base + i) / 2], V.qkey_b[(base + i) / 2], (double)(res[i + 1] - res[i]) * V.ts_period / 1e6, g_qverts[(base + i) / 2]);
     }
     S->qn = 0;
     g_gw_done = S->gw;   /* (t165w: coh_rearm for this batch ran in vk_done_thread before g_slock was taken - review 1) */
+    if (g_opt_wbg) wbg_done(S->seq);   /* t198: pages guarded for this batch's writes into game memory are accessible again - before its label writes */
+    if (g_wbg_audit) for (int i = 0; i < S->nw; i++) wbg_label(S->w[i].addr, S->w[i].val, S->w[i].n, S->w[i].irq, 0);
+    /* w3_perf: labels of LATER batches moved here (bk_handoff) are early for those batches: their writes in flight are guarded as at a hand-over */
+    u64 mlp[16]; int nmlp = 0, marm = g_opt_wbg && S->moved && S->nw;
+    if (marm) { for (int i = 0; i < S->nw && nmlp < 16; i++) if (S->w[i].n) mlp[nmlp++] = S->w[i].addr; wbg_arm(mlp, nmlp, 3); g_wbg_moved_arms++; }
     for (int i = 0; i < S->nw; i++) gpu_defw_apply1(S->w[i].addr, S->w[i].val, S->w[i].n, S->w[i].irq);
+    if (marm && nmlp) wbg_arm(mlp, nmlp, 2);
+    S->moved = 0;
     S->nw = 0; S->pending = 0; g_done_seq = S->seq;
 }
 static void vk_fail(const char *what, VkResult r);
@@ -315,12 +498,12 @@ static void vk_done_thread(void *arg) {
     (void)arg;
     for (;;) {
         pm_lock(&g_slock);
-        while (g_done_seq == g_sub_seq) pc_wait(&g_scond, &g_slock, -1);
+        while (g_done_seq == (g_bk_on ? g_qsub_seq : g_sub_seq)) pc_wait(&g_scond, &g_slock, -1);   /* t180: only batches already submitted */
         VSlot *S = 0; for (int i = 0; i < NSLOT; i++) if (g_slot[i].pending && g_slot[i].seq == g_done_seq + 1) S = &g_slot[i];
         if (!S) { pm_unlock(&g_slock); continue; }
-        VkFence f = S->fence; u64 sq = S->seq;
+        VkFence f = S->fence; u64 sq = S->seq; int failed = S->failed;
         pm_unlock(&g_slock);
-        VkResult r = vkWaitForFences(V.dev, 1, &f, 1, 1000000000ull);
+        VkResult r = failed ? VK_SUCCESS : vkWaitForFences(V.dev, 1, &f, 1, 1000000000ull);
         if (r == VK_TIMEOUT) continue;
         if (r == VK_ERROR_DEVICE_LOST) vk_fail("vkWaitForFences", r);
         coh_rearm(sq);   /* t165 coherence: pages copied back during this batch held again - before its label writes, and (t165w) without g_slock held */
@@ -380,8 +563,55 @@ static void slow_pipe_note(const char *kind, u64 a, u64 b, u64 ms, u64 ka, u64 k
     if (b) { sb_s(&t, " PS "); sb_x(&t, b); } sb_s(&t, " (flip "); sb_d(&t, (i64)g_flips); sb_s(&t, ", keys "); sb_x(&t, ka); if (b) { sb_s(&t, " / "); sb_x(&t, kb); } sb_s(&t, ")\n"); say(l);
 }
 static void prep_mark(void);   /* t163 (e6_prep.c) */
+static int g_opt_early_labels; static int g_ramcopy_mark; static u64 g_n_early_labels, g_n_moved_labels, g_ramcopy_seq;   /* t194 / t196: label policy, see slot_complete */
 #include "e6_defer.c"    /* parallel pipeline compilation (records the batch while its pipelines compile) */
+#define vkCmdCopyImage(...) (g_tl_site = (u32)__LINE__, (vkCmdCopyImage)(__VA_ARGS__))   /* w6_gpu: image copies by source line in the GPU timeline */
+#define vkCmdCopyBuffer(...) (g_tl_site = (u32)__LINE__, (vkCmdCopyBuffer)(__VA_ARGS__))   /* w12_gpu: and buffer copies, buffer <-> image copies */
+#define vkCmdCopyBufferToImage(...) (g_tl_site = (u32)__LINE__, (vkCmdCopyBufferToImage)(__VA_ARGS__))
+#define vkCmdCopyImageToBuffer(...) (g_tl_site = (u32)__LINE__, (vkCmdCopyImageToBuffer)(__VA_ARGS__))
+/* w6_gpu: one line per perf window (n frames) when --gpu-timeline / --gpu-pass-log is on; all = the whole-run table */
+static void tl_sub_name(Sb *t, const TlSub *e) {
+    if (e->kind == 1) { sb_d(t, e->key & 0x3FFF); sb_s(t, "x"); sb_d(t, (e->key >> 14) & 0x3FFF); sb_s(t, " c"); sb_d(t, (e->key >> 28) & 7); if ((e->key >> 31) & 1) sb_s(t, "+d"); }
+    else if (e->kind == 4) { u32 st = (u32)(e->key >> 56); sb_s(t, st == 'L' ? "LS " : st == 'H' ? "HS " : st == 'E' ? "ES " : st == 'G' ? "GS " : st == 'o' ? "own " : "CS "); sb_x(t, e->key & 0x00FFFFFFFFFFFFFFull); }   /* w12_gpu */
+    else { sb_s(t, e->kind == 2 ? "copy@" : e->kind == 3 ? "barrier@" : e->kind == 5 ? "bcopy@" : e->kind == 6 ? "b2i@" : e->kind == 7 ? "i2b@" : "brk@"); sb_d(t, (i64)e->key); }
+}
+static void tl_window(u64 n, int all) {
+    if (!g_opt_gpu_tl || !n) return;
+    static TlSub cp[TLS_N]; int ns; double wms[TL_N], oth[9] = {0}; u64 wn[TL_N], othn[9] = {0}, tot[9] = {0};
+    pm_lock(&g_slock);
+    ns = g_tl_nsub; for (int i = 0; i < ns; i++) { cp[i] = g_tl_sub[i]; if (!all) { g_tl_sub[i].wms = 0; g_tl_sub[i].wn = 0; g_tl_sub[i].waux = 0; g_tl_sub[i].wmax = 0; } }
+    for (int i = 0; i < TL_N; i++) { wms[i] = all ? g_tl_ms[i] : g_tl_wms[i]; wn[i] = all ? g_tl_n[i] : g_tl_wn[i]; if (!all) { g_tl_wms[i] = 0; g_tl_wn[i] = 0; } }
+    pm_unlock(&g_slock);
+    static char b[8192]; Sb t = {b, 0, sizeof b};
+    static const char *const head[9] = {0, " | passes by target:", " | image copies by e6_vk.c line:", " | barriers by line:", " | dispatches by shader:", " | buffer copies by line:",
+        " | buffer-to-image copies by line:", " | image-to-buffer copies by line:", 0};
+    sb_s(&t, all ? "      w6_gpu detail, us per frame (x count per frame): kinds:" : "    GPU passes (w6_gpu, us per frame, x count per frame): kinds:");
+    for (int i = 1; i < TL_N; i++) if (wn[i] && (all || wms[i] * 1000.0 / (double)n >= 20)) { sb_s(&t, " "); sb_s(&t, g_tl_name[i]); sb_s(&t, " "); sb_d(&t, (i64)(wms[i] * 1000.0 / (double)n)); sb_s(&t, " x"); sb_d(&t, (i64)(wn[i] / n)); sb_s(&t, ";"); }
+    for (int i = 0; i < ns; i++) if (cp[i].kind < 9) tot[cp[i].kind] += all ? cp[i].n : cp[i].wn;
+    for (int kind = 1; kind <= 8; kind++) {   /* (w12_gpu: kinds 4 - 8, see e6_defer.c) */
+        int any = 0;
+        if (kind == 8) { sb_s(&t, " | passes begun again on the same targets "); sb_d(&t, (i64)(tot[8] / n)); sb_s(&t, " per frame, by the line that ended them:"); any = 1; }
+        for (int r = 0; r < ns; r++) { int bi = -1; double bm = -1;
+            for (int i = 0; i < ns; i++) { double m = kind == 8 ? (double)(all ? cp[i].n : cp[i].wn) : all ? cp[i].ms : cp[i].wms; if (cp[i].kind == (u32)kind && m > bm) { bm = m; bi = i; } }
+            if (bi < 0) break;
+            TlSub *e = &cp[bi]; u64 cnt = all ? e->n : e->wn, aux = all ? e->aux : e->waux; double mx = all ? e->max : e->wmax; TlSub nm = *e; e->kind = 0;
+            if (!cnt) continue;
+            if (kind == 8) bm = 0;
+            if (!all && ((kind == 8 ? cnt * 10 / n < 1 : bm * 1000.0 / (double)n < 40) || t.n > 7400)) { oth[kind] += bm; othn[kind] += cnt; continue; }
+            if (t.n > 7800) break;
+            if (!any) { sb_s(&t, head[kind]); any = 1; }
+            sb_s(&t, " "); tl_sub_name(&t, &nm); sb_s(&t, " "); sb_d(&t, (i64)(bm * 1000.0 / (double)n)); sb_s(&t, " x"); sb_d(&t, (i64)(cnt * 10 / n) / 10); sb_s(&t, "."); sb_d(&t, (i64)(cnt * 10 / n) % 10);
+            int mxs = kind != 1 && kind != 8 && (all || mx * 1000.0 >= 350);   /* the largest single one, when it is large */
+            if (kind == 1) { sb_s(&t, " ("); sb_d(&t, (i64)(aux / n)); sb_s(&t, " draws)"); }
+            if (kind == 2 || kind == 6 || kind == 7) { sb_s(&t, " ("); sb_d(&t, (i64)(aux / n / 1000)); sb_s(&t, " kpx"); if (mxs) { sb_s(&t, ", max "); sb_d(&t, (i64)(mx * 1000.0)); } sb_s(&t, ")"); }
+            if (kind == 4) { sb_s(&t, " ("); sb_d(&t, (i64)(aux / cnt)); sb_s(&t, " groups"); if (mxs) { sb_s(&t, ", max "); sb_d(&t, (i64)(mx * 1000.0)); } sb_s(&t, ")"); }
+            if (kind == 5) { sb_s(&t, " ("); sb_d(&t, (i64)(aux / n / 1024)); sb_s(&t, " KB"); if (mxs) { sb_s(&t, ", max "); sb_d(&t, (i64)(mx * 1000.0)); } sb_s(&t, ")"); }
+            sb_s(&t, ";"); }
+        if (othn[kind]) { if (!any) sb_s(&t, head[kind]); sb_s(&t, " others "); sb_d(&t, (i64)(oth[kind] * 1000.0 / (double)n)); sb_s(&t, " x"); sb_d(&t, (i64)(othn[kind] / n)); sb_s(&t, ";"); } }
+    sb_s(&t, "\n"); say(b);
+}
 static void prep_init(void); static void prep_run(void); static void prep_save(void); static u64 g_prep_new_bytes; static int prep_pcc, g_prep_pcc_req = 1;   /* t159 (e6_prep.c) */
+static int g_prep_in_replay;   /* t203: (tentative; defined in e6_prep.c) cov_pipe compiles on the renderer thread in replays */
 static void prep_tnote(const G2SIn *in, const G2SOut *out);   /* t160 (e6_prep.c) */
 /* ---- GPU crash diagnostics: a checkpoint marker before every draw / dispatch (VK_NV_device_diagnostic_checkpoints)
    and the driver's fault report (VK_EXT_device_fault). After VK_ERROR_DEVICE_LOST the draws the GPU had started but
@@ -446,6 +676,7 @@ static void vk_lost_report(void) {
             }
         }
     } else say("    (no device-fault report in this driver)\n");
+    if (g_fr_crash_fn) g_fr_crash_fn(0);   /* w16_rel rc2 */
     say("*** end of GPU diagnostics\n");
     __atomic_store_n(&g_lost_done, 1, __ATOMIC_RELEASE);
 }
@@ -466,7 +697,8 @@ typedef struct {
     int fc_den_pres16, fc_den_ftz16, fc_den_pres64, fc_den_ftz64;
 } DevCaps;
 static DevCaps g_dev;
-static int g_has_mem_budget; static void vk_mem_report(void); static void vk_scale_budgets(void);   /* t109 */
+static int g_has_m8, g_opt_no_m8; static u64 g_n_depth_sync8;   /* t194 */
+static int g_has_mem_budget; static void vk_mem_report(void); static void vk_scale_budgets(void); static void mem_pressure_tick(u64 sys_avail, u64 commit_avail);   /* t109 */
 static void vk_lz_traps(void); static void vk_lz_trap_check(void);   /* t111 */
 static u64 g_stage_base, g_ring_base, g_stage_peak, g_ring_peak, g_stage_n16, g_stage_n32, g_stage_nb;   /* t110: staging / ring use per batch */
 /* t111: the staging ring is 128 MB, 16 MB per batch slot (it was 512 MB, 64 MB per slot, all of it resident in RAM; t110
@@ -475,6 +707,7 @@ static u64 g_stage_base, g_ring_base, g_stage_peak, g_ring_peak, g_stage_n16, g_
    whole buffer at once: the first of them switches to a 512 MB ring for the rest of the run (stage_dev). */
 static int g_stage_big_req;   /* replays: 512 MB from the start (set by the loader) */
 static int g_stage_small_req;   /* t112: --stage-128 (the t111 ring; default 512 MB as in t110) */
+static u64 g_stage_mb_req;     /* w5_perf --stage-mb N (128..512): the upload ring's size; an upload larger than a slot (an eighth) gets a buffer of its own, as with --stage-128 */
 static int g_opt_keep_modules;   /* t114: --keep-modules (see vk_module) */
 static int g_opt_module_stress;   /* t114 test: --module-stress (see vk_module) */
 static u64 g_n_tex_span;   /* t111 diagnostic: textures over two game mappings (mem_spans) */
@@ -648,7 +881,9 @@ static u64 g_acq_timeout_ns = 250000000ull; static int g_opt_slow_present_test; 
 static u64 g_sw_made_flip;   /* the flip of the last swapchain (re)creation */
 static int g_pm_fallback, g_pm_cur = -1; static u64 g_pm_fallback_flip, g_n_acq_timeout, g_n_slow_present, g_slow_win[3];
 static const char *pm_name(int pm) { return pm == VK_PRESENT_MODE_FIFO_KHR ? "FIFO" : pm == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : pm == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : pm == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "FIFO_RELAXED" : "?"; }
+static u8 *g_pshot_map; static int g_pshot_pend, g_pshot_bgr; static u32 g_pshot_w, g_pshot_h;
 static int vk_make_swapchain(void) {
+    bk_flush(); { u64 d_; bk_present_result(&d_); }   /* t182: no present of the old swapchain still queued; its outcome is the old one's */
     VkSurfaceCapabilitiesKHR caps; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, V.surf, &caps);
     VkSurfaceFormatKHR fmts[32]; u32 nf = 32; vkGetPhysicalDeviceSurfaceFormatsKHR(V.pd, V.surf, &nf, fmts);
     VkSurfaceFormatKHR sf = fmts[0];
@@ -666,17 +901,22 @@ static int vk_make_swapchain(void) {
     u32 n = caps.minImageCount + (pm == VK_PRESENT_MODE_MAILBOX_KHR ? 2 : 1); if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
     VkSwapchainKHR old = V.sw;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, 0, 0, V.surf, n, sf.format, sf.colorSpace, V.ext, 1,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0, caps.currentTransform,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (g_npshot && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0), VK_SHARING_MODE_EXCLUSIVE, 0, 0, caps.currentTransform,
         VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, pm, 1, old};
     VkResult r = vkCreateSwapchainKHR(V.dev, &ci, 0, &V.sw);
     if (old) vkDestroySwapchainKHR(V.dev, old, 0);
     if (r) { vk_fail("vkCreateSwapchainKHR", r); V.sw = 0; return 0; }
     V.sfmt = sf.format; V.nsimg = 8; vkGetSwapchainImagesKHR(V.dev, V.sw, &V.nsimg, V.simg);
+    g_pshot_usage_ok = g_npshot && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (g_npshot) { say("    present check (w3): swapchain "); say_dec(V.ext.width); say("x"); say_dec(V.ext.height); say(" format "); say_dec(sf.format); say(" colour space "); say_dec(sf.colorSpace); say(", images "); say_dec(V.nsimg);
+        say("; surface current "); say_dec((i64)(i32)caps.currentExtent.width); say("x"); say_dec((i64)(i32)caps.currentExtent.height); say(" min "); say_dec(caps.minImageExtent.width); say("x"); say_dec(caps.minImageExtent.height);
+        say(" max "); say_dec(caps.maxImageExtent.width); say("x"); say_dec(caps.maxImageExtent.height); say(", transform "); say_dec(caps.currentTransform); say(g_pshot_usage_ok ? ", readable" : ", NOT readable (no TRANSFER_SRC)"); say("; "); plat_win_report(); say("\n"); }
     g_sw_made_flip = V.frame;   /* t121 */
     return 1;
 }
 
 /* STATUS 88: the pipeline cache file is only given to the driver when its header names this GPU and driver build */
+static int g_opt_keep_pcfile;   /* w5_perf --keep-pcache-file */
 static int pcache_header_ok(const void *data, u64 n) {
     int same = 0; if (!pcache_header_ok_for(data, n, g_dev.vendor_id, g_dev.device_id, g_dev.cache_uuid, &same)) { vl("  pipeline cache: unknown header\n"); return 0; }
     const u8 *d = (const u8 *)data; vl("  pipeline cache header: vendor "); vl_x(*(const u32 *)(d + 8)); vl(" device "); vl_x(*(const u32 *)(d + 12)); vl(same ? " uuid matches this GPU and driver\n" : " - NOT this GPU/driver, ignored\n");
@@ -759,6 +999,29 @@ static void dev_report(const DevCaps *c, u32 idx) {
     vl(b); say("    "); say(b);
 }
 
+/* w6_disp: the video memory of the GPU the renderer will use, before the game starts (the internal resolution is chosen
+   from it). Makes the Vulkan instance vkr_init then uses; the same choice of GPU as there, without the report. 0: unknown. */
+static u64 vk_early_vram(char *name, int cap) {
+    if (cap) name[0] = 0;
+    if (!V.inst) {
+        if (!vk_load_global()) return 0;
+        const char *iexts[] = {"VK_KHR_surface", "VK_KHR_win32_surface"};
+        VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, 0, "UntilDawnNative", 1, "UD", 1, VK_API_VERSION_1_3};
+        VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, 0, 0, &app, 0, 0, 2, iexts};
+        if (vkCreateInstance(&ici, 0, &V.inst)) { V.inst = 0; return 0; }
+        vk_load_instance(V.inst);
+    }
+    VkPhysicalDevice pds[16]; u32 npd = 16; if (vkEnumeratePhysicalDevices(V.inst, &npd, pds) < 0) return 0;
+    int best = -1; u64 best_score = 0, vram = 0;
+    for (u32 i = 0; i < npd; i++) {
+        static DevCaps c; dev_query(pds[i], &c);
+        if (!c.ok) continue;
+        u64 score = (c.discrete ? (1ull << 62) : 0) + (c.vram >> 20);
+        if (g_opt_gpu_sel && gpu_sel_match(g_opt_gpu_sel, i, npd, c.name)) score |= 1ull << 63;
+        if (best < 0 || score > best_score) { best = (int)i; best_score = score; vram = c.vram; for (int k = 0; k < cap; k++) { name[k] = k + 1 < cap ? c.name[k] : 0; if (!name[k]) break; } }
+    }
+    return vram;
+}
 /* ---------------------------------------------------------------- init */
 static void vkr_init(void) {
     g_vklog = cap_open("e6_vulkan_log.txt");
@@ -767,7 +1030,7 @@ static void vkr_init(void) {
     const char *iexts[] = {"VK_KHR_surface", "VK_KHR_win32_surface"};
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, 0, "UntilDawnNative", 1, "UD", 1, VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, 0, 0, &app, 0, 0, 2, iexts};
-    VkResult r = vkCreateInstance(&ici, 0, &V.inst); if (r) { vk_fail("vkCreateInstance", r); return; }
+    VkResult r = V.inst ? VK_SUCCESS : vkCreateInstance(&ici, 0, &V.inst); if (r) { vk_fail("vkCreateInstance", r); return; }   /* (w6_disp: vk_early_vram may have made it) */
     vk_load_instance(V.inst);
     /* ---- device choice and capability report (STATUS 88: hardware compatibility) ----
        Every GPU is examined for what the renderer needs; the report goes to the Vulkan log and the main log. The best
@@ -800,6 +1063,10 @@ static void vkr_init(void) {
         return;
     }
     V.pd = pds[best];
+    {   /* w16_rel rc2: the player-facing GPU line (vendor from the PCI vendor id) */
+        const char *vn = dev_vendor_name(g_dev.vendor_id); int pre = 1; for (int k = 0; vn[k]; k++) if ((g_dev.name[k] | 0x20) != (vn[k] | 0x20)) { pre = 0; break; }
+        say("GPU: "); if (!pre && g_dev.vendor_id != 0x10005) { say(vn); say(" "); } say(g_dev.name); say(" (driver "); say(g_dev.driver_info[0] ? g_dev.driver_info : g_dev.driver_name[0] ? g_dev.driver_name : "?");
+        say(", PCI vendor "); say_hex(g_dev.vendor_id); say(")\n"); }
     vl("GPU: "); vl(g_dev.name); vl("\n"); say("    Vulkan renderer on "); say(g_dev.name); say(" ("); say(g_dev.driver_name); say(" "); say(g_dev.driver_info); say(")\n");
     VkWin32SurfaceCreateInfoKHR_ sci = {VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR_, 0, 0, g_win.hinst, g_win.hwnd};
     r = vkCreateWin32SurfaceKHR(V.inst, &sci, 0, &V.surf); if (r) { vk_fail("surface", r); return; }
@@ -813,7 +1080,7 @@ static void vkr_init(void) {
     vkGetPhysicalDeviceFeatures2(V.pd, &f2);
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, 0, 0, V.qfi, 1, &prio};
-    const char *dexts[8] = {"VK_KHR_swapchain", "VK_EXT_external_memory_host", "VK_KHR_push_descriptor"}; u32 ndext = 3;
+    const char *dexts[12] = {"VK_KHR_swapchain", "VK_EXT_external_memory_host", "VK_KHR_push_descriptor"}; u32 ndext = 3;
     int has_ck = !g_opt_no_gpu_diag && vk_has_ext(V.pd, "VK_NV_device_diagnostic_checkpoints");
     int has_fault = !g_opt_no_gpu_diag && vk_has_ext(V.pd, "VK_EXT_device_fault");
     int has_cond = !g_opt_no_pred && vk_has_ext(V.pd, "VK_EXT_conditional_rendering");
@@ -828,7 +1095,16 @@ static void vkr_init(void) {
     if (g_has_mem_budget) dexts[ndext++] = "VK_EXT_memory_budget";
     VkPhysicalDeviceFaultFeaturesEXT ffe = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT}; ffe.deviceFault = 1;
     VkPhysicalDeviceConditionalRenderingFeaturesEXT cre = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT}; cre.conditionalRendering = 1;
+    /* t194: VK_KHR_maintenance8 lets one image copy go between a depth aspect and a colour image of the matching format
+       (D32 <-> R32F): the depth <-> R32 syncs (6 per frame in play, the two at 1920x1080 about 0.45 ms of GPU time each
+       way through a buffer: buffer <-> image copies were 2.3 of 10.3 ms per frame in 14124) become single copies. */
+    int has_m8 = !g_opt_no_m8 && vk_has_ext(V.pd, "VK_KHR_maintenance8");
+    VkPhysicalDeviceMaintenance8FeaturesKHR m8f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR}; m8f.maintenance8 = 1;
+    if (has_m8) dexts[ndext++] = "VK_KHR_maintenance8";
+    int has_cr = g_opt_fb_cover && vk_has_ext(V.pd, "VK_EXT_conservative_rasterization");   /* w10_res (--fb-cover) */
+    if (has_cr) dexts[ndext++] = "VK_EXT_conservative_rasterization";
     void *fchain = 0;
+    if (has_m8) { m8f.pNext = fchain; fchain = &m8f; }
     if (has_fault) { ffe.pNext = fchain; fchain = &ffe; }
     if (has_cond) { cre.pNext = fchain; fchain = &cre; }
     VkPhysicalDeviceVulkan13Features e13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, fchain}; e13.dynamicRendering = 1;
@@ -839,20 +1115,35 @@ static void vkr_init(void) {
        sg_min < 32, which left out AMD (min 32): 239 cross-lane modules ran with 64 lanes there. Fixed-size GPUs (NVIDIA 32..32) as before. */
     g_dev.sg_ctl = f13.subgroupSizeControl && g_dev.sg_min <= 32 && g_dev.sg_max >= 32 && g_dev.sg_min != g_dev.sg_max;
     if (g_opt_quad_branch_all < 0) g_opt_quad_branch_all = g_dev.vendor_id != 0x10DE;
+    if (g_rs_pct > 100) {   /* t196: --render-scale */
+        u32 n_ = (u32)g_rs_pct, d_ = 100;
+        if (g_rs_pct == 133) { n_ = 4; d_ = 3; }
+        else { u32 a_ = n_, b_ = d_; while (b_) { u32 t_ = a_ % b_; a_ = b_; b_ = t_; } n_ /= a_; d_ /= a_; }
+        /* (the pixel mapping L / R / F of gcn2spv.c was checked exhaustively for these ratios and the game's surface sizes; others can leave a last physical row without a logical pixel) */
+        if (g_rs_pct > 400 || (g_rs_pct != 133 && g_rs_pct % 25)) say("    render scale: this value is not supported (125, 133 (= 4/3), 150, 175, 200, 225 ... 400) - off\n");
+        else if (g_dev.max_push_const < (g_opt_rs_gen ? 184u : 152u)) say("    render scale: this GPU's push constants are too small (152 bytes needed; 184 with --rs-generic) - off\n");
+        else { g_rs_on = 1; g_rs_num = n_; g_rs_den = d_;
+            if (g_opt_rs_gen && n_ > 2 * d_) { g_opt_rs_gen = 0; say("    --rs-generic: only for scales up to 2 - shaders with this scale built in are used\n"); }
+            if (g_opt_rs_gen) say("    --rs-generic (w7): the scaled shaders take the ratio from push constants - one set of shaders and pipelines for every scale up to 2\n");
+            say("    render scale (t196, --render-scale "); say_dec(g_rs_pct); say("): screen-sized targets and storage images are "); say_dec(n_); say("/"); say_dec(d_); say(" of the game's size (1920x1080 -> ");
+            say_dec(rs_up(1920)); say("x"); say_dec(rs_up(1080)); say("); every shader is translated anew for it\n"); } }
     VkPhysicalDeviceVulkan12Features e12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &e13}; e12.bufferDeviceAddress = 1;
     VkPhysicalDeviceFeatures2 ef = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e12};
     ef.features.shaderInt64 = 1; ef.features.shaderStorageImageWriteWithoutFormat = 1; ef.features.shaderStorageImageReadWithoutFormat = 1;
     ef.features.textureCompressionBC = 1; ef.features.samplerAnisotropy = f2.features.samplerAnisotropy; V.aniso_ok = (int)f2.features.samplerAnisotropy; ef.features.shaderImageGatherExtended = f2.features.shaderImageGatherExtended; g_gather_ext_ok = (int)f2.features.shaderImageGatherExtended; ef.features.independentBlend = 1;
     ef.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics; ef.features.vertexPipelineStoresAndAtomics = f2.features.vertexPipelineStoresAndAtomics;
     ef.features.imageCubeArray = f2.features.imageCubeArray;
+    ef.features.depthClamp = f2.features.depthClamp; g_zclamp_ok = (int)f2.features.depthClamp;   /* t183 */
     ef.features.occlusionQueryPrecise = f2.features.occlusionQueryPrecise; V.oq_precise = (int)f2.features.occlusionQueryPrecise;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &ef, 0, 1, &qci, 0, 0, ndext, dexts, 0};
     r = vkCreateDevice(V.pd, &dci, 0, &V.dev);
-    if (r && (has_ck || has_fault || has_cond)) {   /* retry without the optional extensions */
+    if (r && (has_ck || has_fault || has_cond || has_m8 || has_cr)) {   /* retry without the optional extensions */
         vl("  device creation with optional extensions failed, retrying without\n");
-        has_ck = has_fault = has_cond = g_has_mem_budget = 0; e13.pNext = 0; dci.enabledExtensionCount = 3; r = vkCreateDevice(V.pd, &dci, 0, &V.dev);
+        has_ck = has_fault = has_cond = g_has_mem_budget = 0; has_m8 = 0; has_cr = 0; e13.pNext = 0; dci.enabledExtensionCount = 3; r = vkCreateDevice(V.pd, &dci, 0, &V.dev);
     }
     if (r) { vk_fail("vkCreateDevice", r); say("*** the Vulkan driver refused to create a device with the required features (see Logs\\captures\\e6_vulkan_log.txt)\n"); return; }
+    g_has_consraster = has_cr; if (g_opt_fb_cover) say(has_cr ? "    --fb-cover (w10_res): snapshots of a target a draw samples and writes are kept current by drawing the writing draw's geometry again with a copy shader (conservative rasterisation)\n" : "    --fb-cover (w10_res): no VK_EXT_conservative_rasterization - not used\n");
+    g_has_m8 = has_m8; vl(has_m8 ? "  VK_KHR_maintenance8: depth <-> R32 syncs as single image copies (t194)\n" : "  no VK_KHR_maintenance8: depth <-> R32 syncs through a buffer\n");
     vk_load_device(V.dev);
     if (has_ck) { real_vkCmdSetCheckpointNV = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(V.dev, "vkCmdSetCheckpointNV");
                   p_vkGetQueueCheckpointDataNV = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(V.dev, "vkGetQueueCheckpointDataNV");
@@ -881,7 +1172,8 @@ static void vkr_init(void) {
     vkAllocateCommandBuffers(V.dev, &cbai, &V.cb);
     pm_init(&g_slock); pc_init(&g_scond); pm_init(&g_qm); g_qm_init = 1;
     for (int i = 0; i < NSLOT; i++) {
-        vkAllocateCommandBuffers(V.dev, &cbai, &g_slot[i].cb);
+        if (!vkCreateCommandPool(V.dev, &cpi, 0, &g_slot[i].pool)) { VkCommandBufferAllocateInfo ca2 = cbai; ca2.commandPool = g_slot[i].pool; if (vkAllocateCommandBuffers(V.dev, &ca2, &g_slot[i].cb)) g_slot[i].cb = 0; }   /* t180: a pool per slot (recorded on the back-end thread) */
+        if (!g_slot[i].cb) vkAllocateCommandBuffers(V.dev, &cbai, &g_slot[i].cb);
         vkCreateFence(V.dev, &fci, 0, &g_slot[i].fence);
         vkCreateSemaphore(V.dev, &semi, 0, &g_slot[i].acq); vkCreateSemaphore(V.dev, &semi, 0, &g_slot[i].done);
     }
@@ -898,6 +1190,7 @@ static void vkr_init(void) {
         /* t111: 128 MB (8 batch slots of 16 MB) - t112: 512 MB again by default (t110's behaviour; --stage-128 for the
            smaller ring, an experiment: see stage_tmp / stage_dev) */
         V.stage_size = g_stage_small_req && !g_stage_big_req ? (128ull << 20) : (512ull << 20);
+        if (g_stage_mb_req && !g_stage_big_req && !g_stage_small_req) V.stage_size = g_stage_mb_req << 20;
         if (!stage_make(V.stage_size, &V.stage, &V.stage_mem, &V.stage_map)) { say("    renderer: could not allocate the upload buffer (out of memory?)\n"); vk_fail("vkAllocateMemory (staging)", VK_ERROR_OUT_OF_HOST_MEMORY); }
         mem_name(V.stage_map, "renderer: upload (staging) buffer");
         /* page table: prefer GPU memory the CPU can write directly (resizable BAR / 256 MB window) */
@@ -919,7 +1212,7 @@ static void vkr_init(void) {
             }
         }
         /* quad-list index ring */
-        V.qsize = 48ull << 20;   /* t107e: 6 MB per batch slot (8 MB with 4 slots before) */
+        V.qsize = (48ull << 20) * (u64)g_nslot / 8;   /* t107e: 6 MB per batch slot (8 MB with 4 slots before) */
         VkBufferCreateInfo qbci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, V.qsize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
         vkCreateBuffer(V.dev, &qbci, 0, &V.qbuf);
         vkGetBufferMemoryRequirements(V.dev, V.qbuf, &mr);
@@ -939,12 +1232,15 @@ static void vkr_init(void) {
         { VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(V.pd, &pp); V.ts_period = pp.limits.timestampPeriod; g_max_shared = pp.limits.maxComputeSharedMemorySize; }
         /* pipeline cache, kept across runs */
         u64 csz = 0; void *cdata = g_opt_cold_pipes ? 0 : plat_read_file(g_pcache_path, &csz);   /* (t116 --cold-pipelines: none) */
+        void *cfile = cdata;   /* w5_perf: the file's bytes are given back once the driver has taken them (they stayed committed and in RAM for the whole session: 360 MB after a first shader preparation, 1,150 MB in the development sandbox, 1,900 MB in the shared test sandbox) */
         if (g_opt_cold_pipes) { g_cold_val = (u32)plat_ticks() | 1; say("    --cold-pipelines: no pipeline cache file, every pipeline compiled by the driver\n"); }
         if (cdata && !pcache_header_ok(cdata, csz)) { say("    pipeline cache file is from another GPU or driver - not used (a new one is written at the end of this run)\n"); cdata = 0; csz = 0; }
         VkPipelineCacheCreateInfo pcci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, 0, 0, cdata ? csz : 0, cdata};
         if (vkCreatePipelineCache(V.dev, &pcci, 0, &V.pcache)) { pcci.initialDataSize = 0; pcci.pInitialData = 0; vkCreatePipelineCache(V.dev, &pcci, 0, &V.pcache); }
+        if (cdata) g_pc_saved_bytes = csz;   /* w11_load */
         if (cdata) { vl("  pipeline cache loaded: "); vl_d((i64)csz); vl(" bytes\n"); say("    pipeline cache from the previous run loaded ("); say_dec((i64)(csz >> 20)); say(" MB)\n"); }
         else say("    no pipeline cache file yet (e6_pipeline_cache.bin is written at the end of this run)\n");
+        if (cfile && !g_opt_keep_pcfile) { plat_free_pages(cfile); vl("  pipeline cache file buffer given back (w5_perf; --keep-pcache-file: kept as before)\n"); }
     }
     /* emulated GDS (append/consume counters), reachable by shaders through the region table at G2S_GDS_BASE */
     {
@@ -962,6 +1258,34 @@ static void vkr_init(void) {
                 if (V.pt_map) V.pt_map[(G2S_GDS_BASE - G2S_PT_BASE) >> 16] = R->dev;
             }
         }
+    }
+    /* popin: the mip statistics feedback table (--mip-stats gpu; gcn2spv.c mipfb_note): video memory the pixel shaders
+       write through the page table at G2S_MIPFB_BASE. Once a frame (first batch after a present) it is copied to one of
+       four host-memory copies in turn and set back to "nothing sampled" from a template; the game thread reads the
+       copies that are at least two presents old (e3_loader.c ms_report). (A table in host memory made every frame take
+       ~200 ms: each atomic of a pixel shader then goes to system memory.) */
+    if (g2s_mip_fb && V.pt_map && V.nreg < (int)(sizeof V.reg / sizeof V.reg[0])) {
+        VkBufferCreateInfo fbci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, G2S_MIPFB_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
+        VkBufferCreateInfo hbci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, G2S_MIPFB_SIZE * 5, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
+        VkMemoryRequirements fmr, hmr; VkDeviceMemory fmem, hmem; void *map = 0; int ok = 0;
+        if (!vkCreateBuffer(V.dev, &fbci, 0, &g_mipfb_buf) && !vkCreateBuffer(V.dev, &hbci, 0, &g_mipfb_host)) {
+            vkGetBufferMemoryRequirements(V.dev, g_mipfb_buf, &fmr); vkGetBufferMemoryRequirements(V.dev, g_mipfb_host, &hmr);
+            VkMemoryAllocateFlagsInfo fl = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, 0, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+            VkMemoryAllocateInfo fmai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, fmr.size, vk_find_mem(V.pd, fmr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            u32 mt = vk_find_mem(V.pd, hmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            if (mt == 0xFFFFFFFFu) mt = vk_find_mem(V.pd, hmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkMemoryAllocateInfo hmai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, hmr.size, mt};
+            if (mt != 0xFFFFFFFFu && fmai.memoryTypeIndex != 0xFFFFFFFFu && !vkAllocateMemory(V.dev, &fmai, 0, &fmem) && !vkBindBufferMemory(V.dev, g_mipfb_buf, fmem, 0)
+                && !vkAllocateMemory(V.dev, &hmai, 0, &hmem) && !vkBindBufferMemory(V.dev, g_mipfb_host, hmem, 0) && !vkMapMemory(V.dev, hmem, 0, G2S_MIPFB_SIZE * 5, 0, &map) && map) {
+                for (u64 k = 0; k < G2S_MIPFB_SIZE * 5 / 16; k++) { u32 *q = (u32 *)map + 4 * k; q[0] = 0xFFFFFFFFu; q[1] = q[2] = q[3] = 0; }   /* (copy 4 = the template) */
+                VkBufferDeviceAddressInfo bdai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, 0, g_mipfb_buf};
+                VReg *R = &V.reg[V.nreg++]; R->lo = G2S_MIPFB_BASE; R->hi = G2S_MIPFB_BASE + G2S_MIPFB_SIZE; R->buf = g_mipfb_buf; R->mem = fmem;
+                R->dev = vkGetBufferDeviceAddress(V.dev, &bdai); R->ok = 1; V.reg_dirty = 1; reg_pg_set((int)(R - V.reg));
+                for (u64 a = R->lo; a < R->hi; a += 0x10000) V.pt_map[(a - G2S_PT_BASE) >> 16] = R->dev + a - R->lo;
+                g_mipfb_map = (volatile u32 *)map; g_mipfb_turn = 1; ok = 1;
+            }
+        }
+        say(ok ? "    mip statistics feedback table (popin, --mip-stats gpu): 65536 slots, written by pixel shaders (1 pixel in 64)\n" : "    mip statistics feedback table (popin): could not be made - --mip-stats gpu reports nothing sampled by the GPU\n");
     }
     /* tessellation scratch buffer: LDS of the LS/HS threadgroups, as seen by the LS (compute) and domain (vertex) shaders */
     if (V.pt_map) {
@@ -1004,7 +1328,7 @@ static void vkr_init(void) {
     par_init();   /* t128 */
     vk_import_regions(); g_vk_nmem_seen = g_nmem;
     g_mem_new_hook = vk_preimport;   /* t107: later mappings are imported when they are made */
-    g_mem_report_gpu = vk_mem_report;   /* t109 */
+    g_mem_report_gpu = vk_mem_report;   /* t109 */ g_mem_pressure_fn = mem_pressure_tick;   /* t194 */
     g2s_spv_compress = !g_opt_keep_modules;   /* t114: released words kept compressed, so destroyed modules can be made again */
     g_mem_import_hook = vk_preimport_r;   /* t111: lazily committed granules are imported while still read-only */
     vk_scale_budgets();
@@ -1083,15 +1407,17 @@ static void vk_begin_cb(void) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, 0, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (g_slot[g_slot_cur].pending) { T0(); slot_wait_idle(g_slot_cur); TADD1(g_t_wait); g_t_slotw += t1_ - t0_; }   /* normally free already: the other slot is the one in flight */
     V.cb = g_slot[g_slot_cur].cb;
+    if (g_bk_on) { bk_begin(); V.recording = 1; }   /* t180: the commands are recorded into a list; the back-end thread resets, records and submits the command buffer */
+    else {
     if (g_dsp_n) dsp_slot_reset(g_slot_cur);   /* t168: this slot's descriptor sets (its last batch has finished) */
-    vkResetCommandBuffer(V.cb, 0); vkBeginCommandBuffer(V.cb, &bi); V.recording = 1;
+    vkResetCommandBuffer(V.cb, 0); vkBeginCommandBuffer(V.cb, &bi); V.recording = 1; }
     if (g_nstmp) stage_tmp_reap(0);   /* t111 */
     /* t110: how much of its staging and ring space the batch before used (memory report) */
     if (g_stage_nb++) { u64 u = V.stage_used > g_stage_base ? V.stage_used - g_stage_base : 0, qu = V.qused > g_ring_base ? V.qused - g_ring_base : 0;
         if (u > g_stage_peak) g_stage_peak = u; if (u > (16ull << 20)) g_stage_n16++; if (u > (32ull << 20)) g_stage_n32++; if (qu > g_ring_peak) g_ring_peak = qu; }
     /* this slot's halves of the staging buffer, the per-draw ring and the timestamp pool */
-    V.stage_used = (u64)g_slot_cur * (V.stage_size / NSLOT); V.stage_lim = V.stage_used + V.stage_size / NSLOT;
-    V.qused = (u64)g_slot_cur * (V.qsize / NSLOT); V.qlim = V.qused + V.qsize / NSLOT;
+    V.stage_used = (u64)g_slot_cur * (V.stage_size / (u64)g_nslot); V.stage_lim = V.stage_used + V.stage_size / (u64)g_nslot;
+    V.qused = (u64)g_slot_cur * (V.qsize / (u64)g_nslot); V.qlim = V.qused + V.qsize / (u64)g_nslot;
     g_stage_base = V.stage_used; g_ring_base = V.qused;
     V.qbase = (u32)g_slot_cur * QPS;
     if (V.qp) vkCmdResetQueryPool(V.cb, V.qp, V.qbase, QPS);
@@ -1100,7 +1426,18 @@ static void vk_begin_cb(void) {
         vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb0, 0, 0, 0, 0);
     }
     V.bar_ep++;   /* (the barrier above) */
+    g_bar_dirty = 0;   /* t196 */
     if (V.qp) vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, V.qp, V.qbase + QPS - 2);   /* batch start */
+    if (g_mipfb_turn && g_mipfb_map && !((g2s_mip_test & 1) && g_mipfb_init)) {   /* popin: the frame's mip statistics to the next host copy; the table starts again (the first time: only that) */
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+        vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, 0, 0, 0);
+        u32 seq = g_mipfb_seq;
+        if (g_mipfb_init) { VkBufferCopy c = {0, (u64)(seq & 3) * G2S_MIPFB_SIZE, G2S_MIPFB_SIZE}; vkCmdCopyBuffer(V.cb, g_mipfb_buf, g_mipfb_host, 1, &c); }
+        VkBufferCopy c2 = {4 * G2S_MIPFB_SIZE, 0, G2S_MIPFB_SIZE}; vkCmdCopyBuffer(V.cb, g_mipfb_host, g_mipfb_buf, 1, &c2);
+        vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, 0, 0, 0);
+        if (g_mipfb_init) __atomic_store_n(&g_mipfb_seq, seq + 1, __ATOMIC_RELEASE);
+        g_mipfb_init = 1; g_mipfb_turn = 0;
+    }
     if (V.gds_reset && V.gds) {   /* append counters start at 0 every frame */
         vkCmdFillBuffer(V.cb, V.gds, 0, 65536, 0); V.gds_reset = 0;
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
@@ -1108,20 +1445,25 @@ static void vk_begin_cb(void) {
     }
     V.qn = 0;
 }
-static void vk_end_rendering(void) { if (V.rendering) { vkCmdEndRendering(V.cb); V.rendering = 0; } }
+static void vk_end_rendering_at(int line) { if (V.rendering) { g_tl_end_line = (u32)line; vkCmdEndRendering(V.cb); V.rendering = 0; } }
+#define vk_end_rendering() vk_end_rendering_at(__LINE__)   /* w12_gpu: the pass log names the line that ended a pass begun again on the same targets */
 #define vk_barrier() vk_barrier_at(__LINE__)
 static u32 g_bar_line[8192];   /* full barriers by source line (report: where they come from) */
 static u64 g_n_bar_newcb;
 static void vk_barrier_at(int line) {
+    if (g_opt_bar_dedupe && g_bar_hooked && V.recording && !g_bar_dirty && !V.rendering) {   /* t196: nothing since the last full barrier */
+        V.bar_ep++; V.drew = 0; V.drew_mem = 0; g_n_bar_dedup++; return; }
     if (line > 0 && line < 8192) g_bar_line[line]++;
     if (!V.recording) {   /* the batch was just handed to the GPU (a chunk boundary): the next one starts with a full barrier
                              (STATUS 62: vk_draw_hazards recorded this barrier into the submitted command buffer - the driver crash of tests 59-61) */
         vk_begin_cb(); V.drew = 0; V.drew_mem = 0; g_n_vkbar++; g_n_bar_newcb++; return; }
     V.bar_ep++;
-    vk_end_rendering();
+    vk_end_rendering_at(line);
     V.drew = 0; V.drew_mem = 0; g_n_vkbar++;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    g_tl_site = (u32)line;   /* w6_gpu */
     vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, 0, 0, 0);
+    g_bar_dirty = 0;   /* t196 */
 }
 /* hand the batch being recorded to the GPU without waiting (optionally waiting on / signalling the slot's
    swapchain semaphores for a present) */
@@ -1132,7 +1474,8 @@ static void vk_barrier_at(int line) {
    the CPU - so after each pass that writes them their contents are copied into the game memory too (GPU order). */
 typedef struct { VImg *m; u64 addr; u32 pitch, w, h, bpe; } WbEnt;
 static WbEnt g_wb[32]; static int g_nwb; static u64 g_n_wb, g_n_wb_rows, g_n_wb_rowskip;   /* t109: written back row by row (across a region end), rows not locatable */
-static void gw_note(u64 lo, u64 hi);
+static void gw_note_at(u64 lo, u64 hi, int line);
+#define gw_note(lo, hi) gw_note_at((lo), (hi), __LINE__)
 static int vk_locate(u64 a, u64 n, VkBuffer *buf, u64 *off);
 static void rm_never(u64 lo, u64 hi); static void rm_request(u64 lo, u64 hi); static void rm_note_cpu_write(u64 a);   /* read mirror (STATUS 55) */
 static void rm_unwatch_images(u64 lo, u64 hi); static void sh_note_cpu_write(u64 a);
@@ -1143,15 +1486,18 @@ static void wb_add(VImg *m, u64 addr, u32 pitch, u32 w, u32 h, u32 bpe) {
     for (int i = 0; i < g_nwb; i++) if (g_wb[i].m == m) return;
     if (g_nwb < 32) { g_wb[g_nwb].m = m; g_wb[g_nwb].addr = addr; g_wb[g_nwb].pitch = pitch; g_wb[g_nwb].w = w; g_wb[g_nwb].h = h; g_wb[g_nwb].bpe = bpe; g_nwb++; m->wb = 1; }
 }
+static int g_opt_lumlog; static u64 g_lum_addr; static u32 g_lum_pitch, g_lum_bpe;   /* t198 --lum-log */
 static void wb_flush(void) {
     if (!g_nwb || !V.recording) return;
     int n = g_nwb; g_nwb = 0;
-    if (V.rendering) { vkCmdEndRendering(V.cb); V.rendering = 0; }
+    if (g_opt_early_labels == 3) g_ramcopy_mark = 1;   /* t196: label policy 3 - a batch that writes results back to game memory holds the labels too */
+    vk_end_rendering();
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
     vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
     for (int i = 0; i < n; i++) {
         WbEnt *e = &g_wb[i];
         if (!e->m->img) continue;
+        if (g_opt_lumlog && e->w == 32 && e->h == 8) { g_lum_addr = e->addr; g_lum_pitch = e->pitch; g_lum_bpe = e->bpe; }
         u64 bytes = (u64)e->pitch * (e->h - 1) * (e->bpe / 8) + (u64)e->w * (e->bpe / 8);
         VkBuffer buf; u64 off;
         u32 w = e->w < e->m->w ? e->w : e->m->w, h = e->h < e->m->h ? e->h : e->m->h;
@@ -1190,18 +1536,28 @@ static PendFill g_pf[NSLOT][PF_N]; static int g_npf[NSLOT];
    "textures" in one frame). Now a level of 256 KB or more is split into row ranges done by a small pool of helper
    threads and the renderer thread together (each 8-row tile band is independent). --no-par-detile: the old way. */
 static int g_opt_par_detile = 1; static int g_par_n;   /* helper threads */
+static u32 g_long_frame_ms = 250;   /* t196: --long-frame-ms */
 typedef struct { const u8 *src; u64 srclen; u8 *dst; u32 w, h, depth; const TileInfo *t; u32 rows; } ParDet;
 static ParDet g_par_job; static volatile u32 g_par_gen, g_par_done; static PMutex g_par_m; static PCond g_par_c;
 #include "par_claim.h"   /* t161: the parts of a job handed out by generation (the t128 hand-out could hang) */
 static volatile u64 g_par_claim;
 static int par_claim(u32 gen, u32 *k) { return par_claim_take(&g_par_claim, gen, k); }
-static u64 g_n_par_lv, g_n_par_parts, g_t_par;
+static u64 g_n_par_lv, g_n_par_parts, g_t_par; static u64 g_n_par_ref;   /* t196: levels on the reference path split by rows */
 static void par_detile_part(u32 k) { u32 y0 = k * g_par_job.rows, y1 = y0 + g_par_job.rows; if (y0 < g_par_job.h) detile_t_rows(g_par_job.src, g_par_job.srclen, g_par_job.dst, g_par_job.w, g_par_job.h, g_par_job.depth, g_par_job.t, y0, y1 > g_par_job.h ? g_par_job.h : y1); }
 static void (*g_par_fn)(u32 part) = par_detile_part;   /* the work of the current job */
 static void par_do_part(u32 k) { g_par_fn(k); }
+static volatile u32 g_par_owner; static u64 g_par_contended, g_par_nested;   /* w2 guard (par_run) */
 /* run fn(0..parts-1) on the helpers and this thread; returns when all parts are done */
 static void par_run(void (*fn)(u32), u32 parts) {
     if (parts > PAR_CLAIM_MAX) { for (u32 q = 0; q < parts; q++) fn(q); return; }   /* (never: a handful of parts) */
+    /* w2 guard: one job at a time. The job (g_par_job / g_ph_*, g_par_fn, g_par_done) is global: two threads here at once
+       would run each other's parts with mixed sizes and destinations (writes past a staging buffer). Every caller is the
+       renderer thread today; a second thread waits and is counted (reported at the end if it ever happens). */
+    { u32 me_ = GetCurrentThreadId(), z_ = 0; int waited_ = 0;
+      while (!__atomic_compare_exchange_n(&g_par_owner, &z_, me_, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+          if (z_ == me_) { g_par_nested++; for (u32 q = 0; q < parts; q++) fn(q); return; }   /* (a job started from inside a part: done here, serially) */
+          if (!waited_) { waited_ = 1; __atomic_add_fetch(&g_par_contended, 1, __ATOMIC_RELAXED); }
+          z_ = 0; __builtin_ia32_pause(); } }
     g_par_fn = fn;
     __atomic_store_n(&g_par_done, 0, __ATOMIC_RELAXED);
     pm_lock(&g_par_m); g_par_gen++; u32 gen = g_par_gen;
@@ -1209,6 +1565,7 @@ static void par_run(void (*fn)(u32), u32 parts) {
     pc_broadcast(&g_par_c); pm_unlock(&g_par_m);
     u32 k; while (par_claim(gen, &k)) { par_do_part(k); __atomic_add_fetch(&g_par_done, 1, __ATOMIC_RELEASE); }
     while (__atomic_load_n(&g_par_done, __ATOMIC_ACQUIRE) < parts) { for (volatile int q = 0; q < 32; q++) {} }
+    __atomic_store_n(&g_par_owner, 0, __ATOMIC_RELEASE);
 }
 static void par_thread(void *arg) {
     (void)arg; u32 seen = 0;
@@ -1229,7 +1586,11 @@ static void par_init(void) {
 }
 static int detile_par(const u8 *src, u64 srclen, u8 *dst, u32 w, u32 h, u32 depth, const TileInfo *t) {
     u64 out = (u64)w * h * depth * (t->bpp / 8);
-    if (!g_opt_par_detile || !g_par_n || depth != 1 || h < 64 || out < (256u << 10) || !detile_fast_ok(t)) return detile_t(src, srclen, dst, w, h, depth, t);
+    if (!g_opt_par_detile || !g_par_n || depth != 1 || h < 64 || out < (256u << 10) || (!detile_fast_ok(t) && !g_detile_ref_rows)) return detile_t(src, srclen, dst, w, h, depth, t);
+    if (!detile_fast_ok(t)) {   /* t196: a level on the reference path (no fast path for its layout), shared by rows as well */
+        int lin = t->am == AM_LINEAR_GENERAL || t->am == AM_LINEAR_ALIGNED;
+        if (lin && out < (4u << 20)) return detile_t(src, srclen, dst, w, h, depth, t);   /* (row copies: a small one is quicker alone) */
+        g_n_par_ref++; }
     u64 t0 = plat_ticks();
     u32 parts = g_par_n + 1, rows = ((h + parts - 1) / parts + 7) & ~7u; parts = (h + rows - 1) / rows;
     g_par_job.src = src; g_par_job.srclen = srclen; g_par_job.dst = dst; g_par_job.w = w; g_par_job.h = h; g_par_job.depth = depth; g_par_job.t = t; g_par_job.rows = rows;
@@ -1283,6 +1644,15 @@ static int vk_submit_async(VkSemaphore wait_sem, VkSemaphore signal_sem) {
         VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
         vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, 0, 0, 0); }
     if (V.qp) vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, V.qp, V.qbase + QPS - 1);   /* batch end */
+    if (g_bk_on) {   /* t180: hand the recorded list to the back-end thread */
+        u64 th0_ = plat_ticks();
+        bk_handoff(g_slot_cur, wait_sem, signal_sem);
+        g_t_qsub += plat_ticks() - th0_;
+        V.recording = 0; g_chunk_n = 0;
+        g_slot_cur = (g_slot_cur + 1) % g_nslot;
+        coh_post_submit();
+        return 1;
+    }
     u64 tq0_ = plat_ticks();
     vkEndCommandBuffer(V.cb);
     VSlot *S = &g_slot[g_slot_cur];
@@ -1290,7 +1660,7 @@ static int vk_submit_async(VkSemaphore wait_sem, VkSemaphore signal_sem) {
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, wait_sem ? 1u : 0u, wait_sem ? &wait_sem : 0, wait_sem ? &ws : 0, 1, &V.cb, signal_sem ? 1u : 0u, signal_sem ? &signal_sem : 0};
     vkResetFences(V.dev, 1, &S->fence);
     pm_lock(&g_slock);
-    S->qn = V.qn; V.qn = 0; S->gw = g_gw_seq;
+    S->qn = V.qn; V.qn = 0; S->gw = gw_cover();
     const char *st0_ = g_rstep; g_rstep = "vkQueueSubmit"; CRUMB(109, S->fence, 3);
     qm_lock(); VkResult r = vkQueueSubmit(V.q, 1, &si, S->fence); qm_unlock();
     g_rstep = st0_;
@@ -1301,7 +1671,7 @@ static int vk_submit_async(VkSemaphore wait_sem, VkSemaphore signal_sem) {
     pm_unlock(&g_slock);
     g_t_qsub += plat_ticks() - tq0_;
     V.recording = 0; g_chunk_n = 0;
-    g_slot_cur = (g_slot_cur + 1) % NSLOT;
+    g_slot_cur = (g_slot_cur + 1) % g_nslot;
     coh_post_submit();   /* t165w (review 2, N6) */
     return 1;
 }
@@ -1379,7 +1749,7 @@ static void stage_dev(void) {
     if (V.recording && g_npf[g_slot_cur]) pf_fill_slot(g_slot_cur);   /* pending fills point into the old buffer */
     stage_retire(V.stage, V.stage_mem, V.stage_size);
     V.stage = b; V.stage_mem = m; V.stage_map = map; V.stage_size = 512ull << 20; g_stage_dev_on = 1; mem_name(map, "renderer: upload (staging) buffer, developer tools");
-    V.stage_used = (u64)g_slot_cur * (V.stage_size / NSLOT); V.stage_lim = V.stage_used + V.stage_size / NSLOT; g_stage_base = V.stage_used;
+    V.stage_used = (u64)g_slot_cur * (V.stage_size / (u64)g_nslot); V.stage_lim = V.stage_used + V.stage_size / (u64)g_nslot; g_stage_base = V.stage_used;
     vl("  developer tools: staging buffer now 512 MB\n");
 }
 
@@ -1433,7 +1803,35 @@ static int vk_locate(u64 a, u64 n, VkBuffer *buf, u64 *off) {
    happened to finish first. That is a race (values that change from frame to frame by chance: flicker). Such loads stay
    real loads in the shader, which run in GPU order. Once the writer has finished, the bytes in memory are final. */
 static int gw_inflight(u64 lo, u64 hi);
-static int g2s_gpu_written(void *ctx, u64 a, u32 n) { (void)ctx; return shadow_overlaps_rw(a, 4ull * n) || (!g_opt_fold_gpu_data && gw_inflight(a, a + 4ull * n)); }
+static int g_opt_gw_all;   /* w2 test option --gw-all */
+static int g_opt_inflight_wait = 0; static u64 g_n_inflight_waits, g_t_inflight_wait;   /* w2: a scalar load over a GPU write still in flight (not a WRITE_DATA block): the renderer waits for that GPU work and reads the value, so the shader gets the same form whatever the backlog (--no-inflight-wait: as t197, the form depends on timing) */
+static void vk_carry_uses(void);
+static int g_opt_inflight_taint = 0;   /* w2: --no-inflight-taint = as t197 (a load over a GPU write in flight is made by the GPU, the loads after it still folded from RAM) */
+static u64 g_n_inflight2, g_n_inflight3;
+extern unsigned long long g2s_n_taint_unfold_get(void);
+static u64 g_gw_hit_lo, g_gw_hit_hi, g_gw_hit_k; static int g_opt_gw_why;   /* w2 diagnostic --gw-why N: the first N scalar loads found over a GPU write in flight (which shader, which address, which write) */
+static int g_opt_gw_probe; static struct { u64 a; u32 n, draw; u32 v[16]; } g_gwpr[96]; static int g_gwpr_n;   /* w3 diagnostic --gw-probe: scalar loads left to the GPU because of a write in flight - RAM then, RAM and VRAM once the GPU is idle (replays, at the flip) */
+static int g_opt_gw_sticky, g_gw_stk; static u64 g_gw_fseq[8], g_gw_fidx, g_n_gw_sticky;   /* w3_perf --gw-sticky: not merged in t199 (inert) */
+static u32 g_gwp_ord;   /* w5_perf --gw-pred: the current draw's number in its submit (spec_take) */
+static int g2s_gpu_written_i(void *ctx, u64 a, u32 n);
+static int g2s_gpu_written(void *ctx, u64 a, u32 n) { int r = g2s_gpu_written_i(ctx, a, n); if (g2s_gw_pred) g2s_gwp_note(a, n, g_gwp_ord, r); return r; }
+static int g2s_gpu_written_i(void *ctx, u64 a, u32 n) { (void)ctx;
+    if (shadow_overlaps_rw(a, 4ull * n)) return 1;
+    int fl_ = g_opt_fold_gpu_data ? 0 : gw_inflight(a, a + 4ull * n);
+    if (!fl_) return 0;
+    if (fl_ == 1 && g_opt_inflight_wait && !g_opt_gw_all && g_main_tid && GetCurrentThreadId() == g_main_tid) {
+        u64 t0_ = plat_ticks(); int rec_ = V.recording;
+        vk_submit_wait(); if (rec_) { vk_begin_cb(); vk_carry_uses(); }
+        g_n_inflight_waits++; g_t_inflight_wait += plat_ticks() - t0_;
+        fl_ = gw_inflight(a, a + 4ull * n);
+        if (!fl_) return 0; }
+    if (g_opt_gw_why > 0 && g_main_tid && GetCurrentThreadId() == g_main_tid) { g_opt_gw_why--;
+        vl("  gw-why: load "); vl_x(a); vl(" + "); vl_d((i64)n); vl(" dwords over the GPU write "); vl_x(g_gw_hit_lo); vl("-"); vl_x(g_gw_hit_hi); vl(" (log "); vl_d((i64)g_gw_hit_k); vl(", finished up to "); vl_d((i64)__atomic_load_n(&g_gw_done, __ATOMIC_ACQUIRE));
+        vl("); draw "); vl_d((i64)(g_draws + g_dispatches)); vl(" VS "); vl_x((u64)g_shr[SH_PGM_LO_VS] << 8); vl(" PS "); vl_x((u64)g_shr[SH_PGM_LO_PS] << 8); vl(" CS "); vl_x((u64)g_shr[SH_COMPUTE_PGM_LO] << 8); vl("; value in RAM now "); if (mem_ok(a, 4)) vl_x(*(const u32 *)a); vl(fl_ == 2 ? " (WRITE_DATA: the reader has the new bytes)\n" : "\n"); }
+    if (g_opt_gw_probe && fl_ == 1 && g_gwpr_n < 96 && g_main_tid && GetCurrentThreadId() == g_main_tid && mem_ok(a, 4ull * n)) { int q_ = g_gwpr_n++; g_gwpr[q_].a = a; g_gwpr[q_].n = n > 16 ? 16 : n; g_gwpr[q_].draw = (u32)(g_draws + g_dispatches); for (u32 k_ = 0; k_ < g_gwpr[q_].n; k_++) g_gwpr[q_].v[k_] = ((const u32 *)a)[k_]; }   /* w3 */
+    if (fl_ == 2) g_n_inflight3++; else g_n_inflight2++;
+    if (!g_opt_inflight_taint) return 1;
+    return fl_ == 2 ? 3 : 2; }
 static int g_opt_no_small_shadows; static u64 g_n_sh_wb, g_sh_wb_bytes, g_n_sh_small, g_small_shadow_min = 16u << 10;   /* --small-shadow-bytes N */
 static void vk_shadow(u64 lo, u64 hi) {
     if (!V.pt_map) return;
@@ -1587,6 +1985,30 @@ static i64 ww_scan_reset(u64 lo, u64 n, void **out, u64 max, int pass) {
     g_t_wwm[g_ww_mode == 3 ? 1 : g_ww_mode] += plat_ticks() - t;
     return r;
 }
+/* t182: state of the write-tracking scans ahead of the submit (vkr_prescan, below) */
+static int g_opt_prescan = 1;   /* 0 off, 1 on, 2 every other submit */
+static u64 *g_ps_rm; static u32 g_ps_nrm, g_ps_rmcap; static int g_ps_done;
+static u64 *g_ps_sh; static u32 g_ps_nsh, g_ps_shcap;   /* (review: pages of VRAM copies in a list of their own - g_sh_rs overflowing makes whole-copy syncs) */
+static int (*g_ps_stop)(void);   /* (set by e5_gpu.c: a submit is queued - the scan ahead stops between ranges; what it found is kept) */
+static u64 g_n_ps_stopped, g_n_ps_coh;
+static u64 g_n_ps, g_n_ps_rm, g_n_ps_sh, g_n_ps_rm_used, g_n_ps_full, g_t_ps, g_t_bsub_ps[2], g_n_bsub_ps[2];
+static void ps_sort(u64 *v, u32 n) {   /* heapsort */
+    if (n < 2) return;
+    for (u32 st = n / 2; st-- > 0; ) { u32 r = st; for (;;) { u32 c = 2 * r + 1; if (c >= n) break; if (c + 1 < n && v[c + 1] > v[c]) c++; if (v[r] >= v[c]) break; u64 t = v[r]; v[r] = v[c]; v[c] = t; r = c; } }
+    for (u32 end = n - 1; end > 0; end--) { u64 t = v[0]; v[0] = v[end]; v[end] = t; u32 r = 0;
+        for (;;) { u32 c = 2 * r + 1; if (c >= end) break; if (c + 1 < end && v[c + 1] > v[c]) c++; if (v[r] >= v[c]) break; u64 t2 = v[r]; v[r] = v[c]; v[c] = t2; r = c; } }
+}
+static int ps_has(u64 a) { u32 l = 0, h = g_ps_nrm; while (l < h) { u32 m = (l + h) / 2; if (g_ps_rm[m] < a) l = m + 1; else h = m; } return l < g_ps_nrm && g_ps_rm[l] == a; }
+static int ps_grow(u64 **v, u32 n, u32 *cap, u32 need) {
+    if (*cap - n >= need) return 1;
+    u32 nc = *cap ? *cap * 2 : 16384; while (nc - n < need) nc *= 2;
+    if (nc > (1u << 20)) return 0;
+    u64 *na = (u64 *)realloc(*v, (size_t)nc * 8); if (!na) return 0;
+    *v = na; *cap = nc; return 1;
+}
+static int ps_room(u32 need) { return ps_grow(&g_ps_rm, g_ps_nrm, &g_ps_rmcap, need); }
+static int ps_sh_has(u64 a) { u32 l = 0, h = g_ps_nsh; while (l < h) { u32 m = (l + h) / 2; if (g_ps_sh[m] < a) l = m + 1; else h = m; } return l < g_ps_nsh && g_ps_sh[l] == a; }
+static u32 ps_sh_lower(u64 a) { u32 l = 0, h = g_ps_nsh; while (l < h) { u32 m = (l + h) / 2; if (g_ps_sh[m] < a) l = m + 1; else h = m; } return l; }
 static u64 g_coh_unw[1024]; static u32 g_coh_nunw; static int g_coh_unw_all; static u64 g_coh_unw_ovf;   /* (t165x, R5-2: pages to un-watch, filled under g_coh_m) */
 static void coh_apply_patches(void); static u32 g_coh_npatch, g_coh_nsnap; static void coh_log_copies(VShadow *S, const VkBufferCopy *c, u32 n);
 static void vk_shadow_sync(void) {
@@ -1618,9 +2040,25 @@ static void vk_shadow_sync(void) {
       }
       if (nr) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(PS, rc, nr); } }
     __atomic_store_n(&g_sh_nrs, 0, __ATOMIC_RELEASE);
+    if (g_ps_nsh) {   /* t182: pages the scan ahead found (sorted, repeats dropped) */
+        ps_sort(g_ps_sh, g_ps_nsh);
+        u32 m = 0; for (u32 k = 0; k < g_ps_nsh; k++) if (!m || g_ps_sh[k] != g_ps_sh[m - 1]) g_ps_sh[m++] = g_ps_sh[k];
+        g_ps_nsh = m; }
     for (int i = 0; i < g_nsh; i++) {
         VShadow *S = &g_sh[i];
         if (!S->live || !S->watch) continue;
+        if (g_ps_nsh && !S->rs_all) {   /* t182: this copy's pages found by the scan ahead (their tracking was reset then) */
+            u32 nr = 0;
+            for (u32 k = ps_sh_lower(S->lo); k < g_ps_nsh && g_ps_sh[k] < S->hi; k++) {
+                u64 a = g_ps_sh[k];
+                if (coh_nosync4k(a)) continue;
+                if (nr && rc[nr - 1].srcOffset + rc[nr - 1].size == S->hoff + (a - S->lo)) { rc[nr - 1].size += 4096; continue; }
+                if (nr == 4096) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(S, rc, nr); nr = 0; }
+                rc[nr].srcOffset = S->hoff + (a - S->lo); rc[nr].dstOffset = a - S->lo; rc[nr].size = 4096; nr++;
+            }
+            for (u32 k = 0; k < nr; k++) { if (rc[k].dstOffset + rc[k].size > S->hi - S->lo) rc[k].size = S->hi - S->lo - rc[k].dstOffset; }
+            if (nr) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(S, rc, nr); V.n_sh_sync_pages += nr; }
+        }
         if (S->rs_all) {
             if (!g_coh_mask_any()) { VkBufferCopy c = {S->hoff, 0, S->hi - S->lo}; vk_begin_cb(); vk_end_rendering(); vkCmdCopyBuffer(V.cb, S->hbuf, S->buf, 1, &c); }
             else {   /* t165 --gpu-coherence: not over GPU-held pages (RAM is the stale copy there) */
@@ -1641,6 +2079,7 @@ static void vk_shadow_sync(void) {
             for (i64 k = 0; k < n; k++) {
                 u64 a = (u64)g_sh_pages[k] & ~0xFFFull;
                 if (coh_nosync4k(a)) continue;   /* t165: written before the GPU write that made it GPU-held (rare); the GPU's bytes win */
+                if (g_ps_nsh && ps_sh_has(a)) continue;   /* t182: copied above (from the scan ahead) */
                 if (nr && rc[nr - 1].srcOffset + rc[nr - 1].size == S->hoff + (a - S->lo)) { rc[nr - 1].size += 4096; continue; }
                 if (nr == 4096) { vk_begin_cb(); vk_end_rendering(); coh_sync_copy(S, rc, nr); nr = 0; }
                 rc[nr].srcOffset = S->hoff + (a - S->lo); rc[nr].dstOffset = a - S->lo; rc[nr].size = 4096; nr++;
@@ -1676,12 +2115,97 @@ static int g_rm_isoff; static u32 *g_rm_offl; static u32 g_rm_noff, g_rm_offcap;
 /* t109: VRAM copies get at most a quarter and the read mirror an eighth of the GPU's memory (they were 6 GB and 3 GB on
    every GPU: more than an 8 GB card has next to the images, and the driver then moves memory out to system RAM). The
    development card (24 GB) keeps 6 GB and 3 GB. --vram-mirror-mb still sets the mirror. */
+/* t194: the PC's memory counts too. What the renderer keeps in video memory is charged to the program's committed memory
+   by Windows (v0.3.2 on the development PC: 10.4 GB of video memory, 21 GB committed, 9.7 GB in RAM). With less than
+   20 GB of RAM the budgets are also held to a share of it (16 GB: images 4 GB, VRAM copies 2 GB, read mirror 1 GB;
+   8 GB: half of that), and while the PC is short of memory (commit left under 2 GB or RAM left under 1.2 GB) the image
+   budget follows what is in use downwards, never under 1.5 GB (mem_pressure_tick, every 10 s). --sim-ram-gb N: as if
+   the PC had N GB (tests); --no-ram-budgets: off. */
+static u64 g_sim_ram; static int g_opt_no_ram_budgets; static volatile u64 g_img_budget_req; static u64 g_n_pressure, g_ram_img_cap;
+static u64 ram_total(void) { return g_sim_ram ? g_sim_ram : plat_phys_mem(); }
+/* t196 (memory workstream; all off by default except the pool trim, which changes no image):
+   --image-max-age N    memory textures (not GPU-written, not depth, not copies) unused for N frames are freed, at most
+                        16 per flip, while the image memory really allocated is over the soft target
+   --image-soft-mb M    that soft target (default: half the image budget)
+   --image-budget-real  the image budget counts what is allocated (whole 256 MB pool blocks + own allocations), not the
+                        bytes of the images in them (60_01: 5,452 MB of images held 8,247 MB of video memory)
+   --vram-fit           cards under 12 GB: images + VRAM copies + read mirror fit in VRAM - 2 GB (driver, fixed buffers,
+                        desktop); implies --image-budget-real; the image budget follows the driver's heap budget down
+   --sim-vram-gb N      as if the card had N GB (tests)
+   --no-image-pool-trim empty 256 MB pool blocks are kept for good, as before (default: all but one are freed)
+   --mem-saver          --image-max-age 1800 --vram-fit --stage-128 */
+static u64 g_sim_vram, g_img_soft, g_vram_img_cap, g_n_vram_pressure, g_n_age_evict, g_age_evict_bytes, g_n_real_evict, g_imp_blocks_freed;
+static int g_opt_vram_fit, g_opt_img_budget_real, g_opt_no_pool_trim, g_imp_live; static u32 g_img_max_age;
+static u64 img_real_bytes(void);
+static volatile u64 g_img_budget_up; static u64 g_img_budget0, g_n_budget_up; static int g_opt_no_budget_recover;   /* w2 (see mem_pressure_tick) */
+static void vk_ram_budgets(void) {
+    u64 ram = ram_total(); if (g_opt_no_ram_budgets || !ram || ram >= (20ull << 30)) return;
+    u64 img = (ram / 4 + (256ull << 20) - 1) & ~((256ull << 20) - 1), sh = ram / 8, rm = (ram / 16 + RM_BLK - 1) & ~((u64)RM_BLK - 1);
+    if (img < (1536ull << 20)) img = 1536ull << 20; if (sh < (1ull << 30)) sh = 1ull << 30; if (rm < RM_BLK) rm = RM_BLK;
+    g_ram_img_cap = img;
+    if (sh < g_sh_budget) g_sh_budget = sh;
+    if (rm < g_rm_budget) g_rm_budget = rm;
+    vl("  memory budgets for a PC with "); vl_d((i64)(ram >> 20)); vl(" MB of RAM (t194): images at most "); vl_d((i64)(img >> 20)); vl(" MB, VRAM copies "); vl_d((i64)(g_sh_budget >> 20)); vl(" MB, read mirror "); vl_d((i64)(g_rm_budget >> 20)); vl(" MB\n");
+}
+static void mem_pressure_tick(u64 sys_avail, u64 commit_avail) {   /* any thread (the housekeeping thread, every 10 s) */
+    if (g_opt_vram_fit && g_has_mem_budget && V.img_budget && V.pd) {   /* t196: the card is nearly full (other programs use it too) */
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
+        vkGetPhysicalDeviceMemoryProperties2(V.pd, &p2);
+        u32 hi = 0xFFFFFFFFu; for (u32 i = 0; i < p2.memoryProperties.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++)
+            if ((p2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && (hi == 0xFFFFFFFFu || p2.memoryProperties.memoryHeaps[i].size > p2.memoryProperties.memoryHeaps[hi].size)) hi = i;
+        if (hi != 0xFFFFFFFFu) {
+            u64 size = p2.memoryProperties.memoryHeaps[hi].size, bud = b.heapBudget[hi], use = b.heapUsage[hi];
+            if (g_sim_vram && size > g_sim_vram) bud = bud > size - g_sim_vram ? bud - (size - g_sim_vram) : 1;
+            if (bud && use + (384ull << 20) > bud) {
+                u64 real = img_real_bytes(), want = real - real / 8; if (want < (1536ull << 20)) want = 1536ull << 20;
+                if (want < V.img_budget) { __atomic_store_n(&g_img_budget_req, want, __ATOMIC_RELEASE); g_n_vram_pressure++; } }
+            /* w2: the lowering was for good - one peak while a level loaded (cave, --sim-vram-gb 8: once, to 2,907 MB) held
+               the budget down for the rest of the session. With 1 GB of the driver's budget free again it goes back up,
+               256 MB every 10 s, to where it started. --no-budget-recover: off. */
+            else if (!g_opt_no_budget_recover && g_img_budget0 && V.img_budget < g_img_budget0 && bud && use + (1024ull << 20) < bud) {
+                u64 up = V.img_budget + (256ull << 20); if (up > g_img_budget0) up = g_img_budget0;
+                __atomic_store_n(&g_img_budget_up, up, __ATOMIC_RELEASE); } }
+    }
+    if (g_opt_no_ram_budgets || !V.img_budget) return;
+    if (g_sim_ram) { u64 used = plat_phys_mem() > sys_avail ? plat_phys_mem() - sys_avail : 0; sys_avail = g_sim_ram > used ? g_sim_ram - used : 0; if (commit_avail > sys_avail + (4ull << 30)) commit_avail = sys_avail + (4ull << 30); }
+    if ((commit_avail && commit_avail < (2ull << 30)) || (sys_avail && sys_avail < (1228ull << 20))) {
+        u64 want = V.img_bytes - V.img_bytes / 8; if (want < (1536ull << 20)) want = 1536ull << 20;
+        if (want < V.img_budget) { __atomic_store_n(&g_img_budget_req, want, __ATOMIC_RELEASE); g_n_pressure++; } }
+}
+/* w2: the t196 memory options chosen from the PC instead of by hand. A card under 12 GB gets --vram-fit; a card under
+   12 GB or a PC under 20 GB of RAM gets --image-max-age 1800 (unless --image-max-age was given, 0 included). Nothing
+   changes on a PC with a 12 GB+ card and 20 GB+ of RAM. --no-adaptive-mem: off. */
+static int g_opt_no_adaptive_mem, g_img_max_age_set;
+/* w5_perf --image-idle-age (default off until a play session has confirmed it): on a PC the adaptive rule leaves alone (12 GB+ card, 20 GB+ RAM) memory
+   textures unused for 3600 frames are freed too, while more than 3 GB (or half the image budget, if less) of image
+   memory is allocated. The Chapter 10 cave keeps 3,300 of its 4,096 images unused for 600+ frames (4.5 GB; textures
+   the game itself has long streamed out): video memory that Windows also charges to the program's commit. A freed
+   texture that is used again is uploaded again like a new one (as after the table-full eviction). */
+static int g_opt_idle_age, g_img_age_default;
 static void vk_scale_budgets(void) {
-    if (!g_dev.vram) return;
-    u64 q = (g_dev.vram / 4 + (512ull << 20) - 1) & ~((512ull << 20) - 1), e = (g_dev.vram / 8 + RM_BLK - 1) & ~((u64)RM_BLK - 1);   /* (rounded up: 24 GB keeps 6 GB / 3 GB; t109 gave 6078 / 2816 MB there) */
+    if (!g_opt_no_adaptive_mem) {
+        u64 ram_ = ram_total(), vr_ = g_sim_vram ? g_sim_vram : g_dev.vram; int sc = vr_ && vr_ < (12ull << 30), sr = ram_ && ram_ < (20ull << 30);
+        if (sc && !g_opt_vram_fit) { g_opt_vram_fit = 1; vl("  adaptive memory (w2): card under 12 GB -> --vram-fit\n"); say("  adaptive memory (w2): video card under 12 GB: budgets fitted to the card (--vram-fit)\n"); }
+        if ((sc || sr) && !g_img_max_age_set && !g_img_max_age) { g_img_max_age = 1800; vl("  adaptive memory (w2): --image-max-age 1800\n"); say("  adaptive memory (w2): textures unused for 1800 frames are freed above the soft target (--image-max-age 1800)\n"); }
+    }
+    if (g_opt_idle_age && !g_img_max_age_set && !g_img_max_age) { g_img_max_age = 3600; g_img_age_default = 1; vl("  idle textures (w5_perf --image-idle-age): unused for 3600 frames -> freed while over 3 GB of image memory\n"); }
+    vk_ram_budgets();
+    u64 vram_ = g_sim_vram ? g_sim_vram : g_dev.vram;
+    if (!vram_) return;
+    u64 q = (vram_ / 4 + (512ull << 20) - 1) & ~((512ull << 20) - 1), e = (vram_ / 8 + RM_BLK - 1) & ~((u64)RM_BLK - 1);   /* (rounded up: 24 GB keeps 6 GB / 3 GB; t109 gave 6078 / 2816 MB there) */
     if (g_sh_budget == (6ull << 30) && q < g_sh_budget) g_sh_budget = q;
     if (g_rm_budget == (3072ull << 20) && e < g_rm_budget) g_rm_budget = e;
-    vl("  VRAM budgets (t109): VRAM copies "); vl_d((i64)(g_sh_budget >> 20)); vl(" MB, read mirror "); vl_d((i64)(g_rm_budget >> 20)); vl(" MB of "); vl_d((i64)(g_dev.vram >> 20)); vl(" MB\n");
+    vl("  VRAM budgets (t109): VRAM copies "); vl_d((i64)(g_sh_budget >> 20)); vl(" MB, read mirror "); vl_d((i64)(g_rm_budget >> 20)); vl(" MB of "); vl_d((i64)(vram_ >> 20)); vl(" MB\n");
+    if (g_opt_vram_fit && vram_ < (12ull << 30)) {   /* t196: the three budgets together fit in what the card has left */
+        u64 usable = vram_ > (4ull << 30) ? vram_ - (2ull << 30) : vram_ / 2;
+        u64 img = (usable * 9 / 16) & ~((256ull << 20) - 1), sh = usable / 4, rm = (usable * 3 / 16) & ~((u64)RM_BLK - 1);
+        if (img < (1536ull << 20)) img = 1536ull << 20; if (rm < RM_BLK) rm = RM_BLK;
+        g_vram_img_cap = img; g_opt_img_budget_real = 1;
+        if (sh < g_sh_budget) g_sh_budget = sh;
+        if (rm < g_rm_budget) g_rm_budget = rm;
+        vl("  VRAM budgets to fit the card (t196, --vram-fit): images at most "); vl_d((i64)(img >> 20)); vl(" MB (counted as allocated), VRAM copies "); vl_d((i64)(g_sh_budget >> 20)); vl(" MB, read mirror "); vl_d((i64)(g_rm_budget >> 20)); vl(" MB of "); vl_d((i64)(vram_ >> 20)); vl(" MB\n");
+    }
 }
 #define RM_NPG ((u32)(G2S_PT_SIZE >> 16))
 typedef struct { VkBuffer buf; VkDeviceMemory mem; u64 dev; u32 used; } RmBlk;
@@ -1724,6 +2248,9 @@ static void rm_request(u64 lo, u64 hi) {
     if (g_rm_isoff) return;   /* t135 diagnostic mode 8 */
     if (!rm_init() || hi <= lo || lo < G2S_PT_BASE || hi > G2S_PT_BASE + G2S_PT_SIZE || hi - lo > (256ull << 20)) return;
     for (u32 pg = (u32)((lo - G2S_PT_BASE) >> 16), e = (u32)((hi - 1 - G2S_PT_BASE) >> 16); pg <= e; pg++) {
+        if (g_opt_wbg && !g_wbg_dr_flag && g_rm_st[pg] != RM_ST_ON) {   /* w3_perf: the GPU reads this page from game RAM itself (not mirrored (yet), not in a VRAM copy) */
+            u64 a0 = rm_addr(pg); if (g_rm_st[pg] != RM_ST_NEVER || (a0 < G2S_TESS_BASE && !shadow_overlaps(a0, 0x10000))) g_wbg_dr_flag = 1; }
+        if (g_opt_rdg && g_rm_st[pg] != RM_ST_ON) { u64 a0 = rm_addr(pg); if (g_rm_st[pg] != RM_ST_NEVER || (a0 < G2S_TESS_BASE && !shadow_overlaps(a0, 0x10000))) wbg_note_read(pg, lo > a0 ? lo : a0, hi < a0 + 0x10000 ? hi : a0 + 0x10000); }   /* w5_fast */
         if (g_rm_st[pg] != RM_ST_NONE) continue;
         u64 a = rm_addr(pg); VReg *R = vreg_of(a, 1);
         if (!R && lz_is_lazy(a)) continue;   /* t111: not committed yet (reads zero): asked again later */
@@ -1772,6 +2299,18 @@ static void rm_unwatch_runs(const u64 *lo, const u64 *hi, u32 n) {
         u64 a = o->addr, e = o->addr + o->wlen; u32 l = 0, h = n;   /* first run whose end is past the image's start */
         while (l < h) { u32 m = (l + h) / 2; if (hi[m] <= a) l = m + 1; else h = m; }
         if (l < n && lo[l] < e) o->watched = 0; }
+}
+/* w5_perf: the pages one write-tracking call handed back (ascending), as runs, in ONE pass over the images. The scans
+   called rm_unwatch_images once per run of written pages - each a loop over all 4,096 images (3.9 % of the renderer's
+   own code in the Chapter 10 cave, ~1,390 written pages a frame). The same images lose their "unchanged" state.
+   --unwatch-each: as before. */
+static void rm_unwatch_pages(void **pgs, i64 n) {
+    static u64 ul[4096], uh[4096]; u32 nr = 0;
+    for (i64 q = 0; q < n; q++) { u64 a = (u64)pgs[q] & ~0xFFFull;
+        if (nr && uh[nr - 1] == a) { uh[nr - 1] += 4096; continue; }
+        if (nr == 4096 || (nr && a < uh[nr - 1])) { rm_unwatch_runs(ul, uh, nr); nr = 0; }   /* (full, or not ascending: what there is first) */
+        ul[nr] = a; uh[nr] = a + 4096; nr++; }
+    rm_unwatch_runs(ul, uh, nr);
 }
 /* copy n bytes at RAM address a into the mirror slot of its page (offset within the page kept) */
 static VkBufferCopy g_rm_bc[RM_MAXBLK][256]; static u32 g_rm_nbc[RM_MAXBLK]; static VkBuffer g_rm_bcsrc[RM_MAXBLK];
@@ -1827,6 +2366,74 @@ static void rm_diag_switch(void) {
     }
     g_rm_isoff = off;
 }
+/* t182: the write-tracking scans ahead of the submit. While the renderer thread waits for the game's next submit (about
+   4 ms a frame in heavy scenes, the game setting the pace), it asks the OS write tracking - with reset, as the submit
+   does - about the mirrored runs and the VRAM copies once. The pages found are kept: the next submit copies them (and
+   still asks about everything as before, which now finds only what was written after the scan ahead). So most of the
+   submit's memory sync is done before the submit arrives, off the frame's critical path. Nothing is copied earlier on
+   the GPU: the copies are recorded at the submit as before. Images over the pages are told at once (as at the submit).
+   Pages of VRAM copies go into the copies' own list of CPU-written pages (sh_note_cpu_write, as the texture path does).
+   Off with --gpu-coherence, in replays, and with --no-prescan; --prescan-ab: before every other submit only (A/B in
+   one run: the submit's sync time is reported per way). */
+static void vkr_prescan(void) {   /* renderer thread, GPU lock held, between submits */
+    if (!g_vk_on || !g_opt_prescan || g_ps_done || g_rp_running || g_rc_req || g_rc_active || g_ww_mode == 3) return;
+    /* t183: with GPU coherence (on by default in the game) only the mirrored runs: the coherence code asks whether the
+       CPU wrote a VRAM copy's page (coh_cpu_dirty: the write tracking and the copies' own list) from the completion
+       thread, and a page found by the scan ahead would be in neither until the submit. (t182 left the whole scan out
+       with coherence on: it ran in the menus only.) */
+    int coh = coh_on() != 0; if (coh) g_n_ps_coh++;
+    if (g_opt_prescan == 2 && (g_ww_nsub & 1)) return;   /* (--prescan-ab: before even submits only) */
+    g_ps_done = 1; u64 t0 = plat_ticks(); g_n_ps++;
+    static void *pgs[4096];
+    /* mirrored runs (as rm_submit_sync step 2) */
+    if (g_rm_st && !g_rm_isoff) {
+        if (!g_rm_sorted) { u32 j = 0; for (u32 i = 0; i < g_rm_non; i++) if (g_rm_st[g_rm_on[i]] == RM_ST_ON) g_rm_on[j++] = g_rm_on[i]; g_rm_non = j; rm_sort_u32(g_rm_on, g_rm_non); g_rm_sorted = 1; }
+        for (u32 i = 0; i < g_rm_non; ) {
+            u32 p0 = g_rm_on[i], p1 = p0; i++;
+            VReg *R = vreg_of(rm_addr(p0), 1);
+            while (i < g_rm_non && g_rm_on[i] == p1 + 1 && g_rm_st[g_rm_on[i]] == RM_ST_ON && R && rm_addr(g_rm_on[i]) < R->hi) { p1 = g_rm_on[i]; i++; }
+            if (g_rm_st[p0] != RM_ST_ON || !R) continue;
+            if (g_ps_stop && g_ps_stop()) { g_n_ps_stopped++; goto sh_done; }   /* (review: a submit is waiting) */
+            u64 lo = rm_addr(p0), hi = rm_addr(p1) + 0x10000; if (hi > R->hi) hi = R->hi;
+            for (int pass = 0; pass < 1024; pass++) {
+                if (!ps_room(4096)) { g_n_ps_full++; goto rm_done; }   /* (no room for what a reset could hand back: the rest is left to the submit) */
+                i64 n = ww_scan_reset(lo, hi - lo, pgs, 4096, pass);
+                if (n <= 0) break;
+                u64 rlo = 0, rhi = 0;
+                for (i64 q = 0; q < n; q++) {
+                    u64 a = (u64)pgs[q] & ~0xFFFull;
+                    g_ps_rm[g_ps_nrm++] = a; g_n_ps_rm++;   /* (every page the reset handed back is kept, whatever its state) */
+                    if (g_opt_unwatch_each) { if (a == rhi) rhi += 4096; else { if (rhi) rm_unwatch_images(rlo, rhi); rlo = a; rhi = a + 4096; } }
+                }
+                if (rhi) rm_unwatch_images(rlo, rhi);
+                if (!g_opt_unwatch_each) rm_unwatch_pages(pgs, n);
+                if (n < 4096) break;
+            }
+        }
+    }
+    rm_done:
+    /* VRAM copies (as vk_shadow_sync's scan): the pages are kept in g_ps_sh; vk_shadow_sync copies them */
+    for (int i = 0; i < g_nsh && !coh; i++) {
+        VShadow *S = &g_sh[i];
+        if (!S->live || !S->watch || S->rs_all) continue;
+        if (g_ps_stop && g_ps_stop()) { g_n_ps_stopped++; goto sh_done; }
+        for (int pass = 0; pass < 1024; pass++) {
+            if (!ps_grow(&g_ps_sh, g_ps_nsh, &g_ps_shcap, 4096)) { g_n_ps_full++; goto sh_done; }   /* (no room: the rest is left to the submit's own scan) */
+            i64 n = ww_scan_reset(S->lo, S->hi - S->lo, pgs, 4096, pass);
+            if (n <= 0) break;
+            static u64 ul[4096], uh[4096]; u32 nu = 0;
+            for (i64 q = 0; q < n; q++) {
+                u64 a = (u64)pgs[q] & ~0xFFFull;
+                g_ps_sh[g_ps_nsh++] = a; g_n_ps_sh++;
+                if (nu && uh[nu - 1] == a) uh[nu - 1] += 4096; else { ul[nu] = a; uh[nu] = a + 4096; nu++; }
+            }
+            if (S->wb || S->ro) { rm_unwatch_runs(ul, uh, nu); g_n_sh_unwatch += nu; }   /* (as the submit's scan: images there check their bytes again) */
+            if (n < 4096) break;
+        }
+    }
+    sh_done:
+    g_t_ps += plat_ticks() - t0;
+}
 /* at the start of each game submit, before its draws are recorded */
 static void rm_submit_sync(void) {
     if (!g_rm_st) return;
@@ -1869,6 +2476,16 @@ static void rm_submit_sync(void) {
         g_rm_non = j; rm_sort_u32(g_rm_on, g_rm_non); g_rm_sorted = 1;
     }
     static void *pgs[4096]; u64 runs = 0;
+    if (g_ps_nrm) {   /* t182: the pages the scan ahead found written (their tracking was reset then) */
+        ps_sort(g_ps_rm, g_ps_nrm);
+        u32 m = 0; for (u32 i = 0; i < g_ps_nrm; i++) if (!m || g_ps_rm[i] != g_ps_rm[m - 1]) g_ps_rm[m++] = g_ps_rm[i];
+        g_ps_nrm = m;
+        for (u32 i = 0; i < g_ps_nrm; i++) {
+            u64 a = g_ps_rm[i]; u32 pg = (u32)((a - G2S_PT_BASE) >> 16); VReg *R = vreg_of(a, 1);
+            if (g_rm_st[pg] == RM_ST_ON && R) { rm_copy(pg, a, a + 4096 <= R->hi ? 4096 : R->hi - a); g_rm_sync4k++; g_n_ps_rm_used++; any = 1; }
+            else rm_note_cpu_write(a);   /* (its first copy on its way: copied again in full below; other states read RAM) */
+        }
+    }
     for (u32 i = 0; i < g_rm_non; ) {
         u32 p0 = g_rm_on[i], p1 = p0; i++;
         VReg *R = vreg_of(rm_addr(p0), 1);
@@ -1883,10 +2500,11 @@ static void rm_submit_sync(void) {
             u64 rlo = 0, rhi = 0;
             for (i64 q = 0; q < n; q++) {
                 u64 a = (u64)pgs[q] & ~0xFFFull; u32 pg = (u32)((a - G2S_PT_BASE) >> 16);
-                if (g_rm_st[pg] == RM_ST_ON) { rm_copy(pg, a, a + 4096 <= R->hi ? 4096 : R->hi - a); g_rm_sync4k++; any = 1; }
-                if (a == rhi) rhi += 4096; else { if (rhi) rm_unwatch_images(rlo, rhi); rlo = a; rhi = a + 4096; }
+                if (g_rm_st[pg] == RM_ST_ON && !(g_ps_nrm && ps_has(a))) { rm_copy(pg, a, a + 4096 <= R->hi ? 4096 : R->hi - a); g_rm_sync4k++; any = 1; }
+                if (g_opt_unwatch_each) { if (a == rhi) rhi += 4096; else { if (rhi) rm_unwatch_images(rlo, rhi); rlo = a; rhi = a + 4096; } }
             }
             if (rhi) rm_unwatch_images(rlo, rhi);
+            if (!g_opt_unwatch_each) rm_unwatch_pages(pgs, n);
             if (n < 4096) break;
         }
     }
@@ -1964,6 +2582,17 @@ static int rm_locate(u64 a, u64 n, VkBuffer *buf, u64 *off) {
     return 1;
 }
 /* end of a batch: the ranges of written-back VRAM copies that the GPU wrote in it are copied to RAM (STATUS 56) */
+static void sh_wr_add(VShadow *S, u64 a, u64 b);
+static void gw_setup_done(void) {
+    if (!g_gw_pending) return;
+    g_gw_pending = 0;
+    for (int q = 0; q < g_nwrp; q++) { u64 lo = g_wrp[q].lo, hi = g_wrp[q].hi; g_n_gw_late_wb++;
+        for (int i = 0; i < g_nsh; i++) { VShadow *S = &g_sh[i];
+            if (!S->live || !S->wb || lo >= S->hi || hi <= S->lo) continue;
+            u64 a = lo > S->lo ? lo : S->lo, b = hi < S->hi ? hi : S->hi;
+            sh_wr_add(S, a, b); } }
+    g_nwrp = 0;
+}
 static void sh_writeback(void) {
     int any = 0;
     for (int i = 0; i < g_nsh; i++) { VShadow *S = &g_sh[i];
@@ -1972,6 +2601,7 @@ static void sh_writeback(void) {
             VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
             vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0); any = 1; }
         VkBufferCopy bc[8];   /* (sh_wr_add keeps the ranges disjoint, as one copy command requires) */
+        if (g_opt_wbg | g_wbg_audit) for (u32 k = 0; k < S->nwr; k++) wbg_note(S->wr[k][0], S->wr[k][1], 4, 0);
         for (u32 k = 0; k < S->nwr; k++) { bc[k] = (VkBufferCopy){S->wr[k][0] - S->lo, S->hoff + (S->wr[k][0] - S->lo), S->wr[k][1] - S->wr[k][0]}; g_sh_wb_bytes += S->wr[k][1] - S->wr[k][0]; }
         vkCmdCopyBuffer(V.cb, S->buf, S->hbuf, S->nwr, bc);
         g_n_sh_wb++; S->nwr = 0;
@@ -1983,16 +2613,18 @@ static void sh_writeback(void) {
    VRAM): the OS write tracking cannot see these, so they are logged here for the texture change check */
 enum { GW_N = 4096 };
 static struct { u64 lo, hi; } g_gw[GW_N];
+static u8 g_gw_wd[GW_N], g_gw_wd_next;   /* w2: the write is a WRITE_DATA block whose bytes the CPU-side readers already see (overlay) */
 static void gw_log(u64 lo, u64 hi);
 static void rm_cp_written(u64 lo, u64 hi); static void rm_cp_update(u64 a, const u32 *src, u32 n);
 /* a write by the command processor / copy engine (WRITE_DATA, DMA, query results, write-backs) into RAM: mirrored pages get it too */
-static void gw_note(u64 lo, u64 hi) { rm_cp_written(lo, hi); gw_log(lo, hi); }
+static void gw_note_at(u64 lo, u64 hi, int line) { rm_cp_written(lo, hi); gw_log(lo, hi); if (g_opt_wbg | g_wbg_audit) wbg_note(lo, hi, 1, line); }
 /* a shader's store into RAM: its pages are not mirrored any more (the store goes wherever the page table points) */
 static void gw_log_as(u64 lo, u64 hi, const char *who, int ctx);
 /* t165w (review 2, N4): a shader store's range is an upper bound and its command is not recorded yet - for the
    coherence code a write before its command (ctx 1: the CPU's bytes in the range go to VRAM first), not an exact write
    already recorded (ctx 2 left the CPU's bytes the shader never stores out of VRAM, and a copy-back then lost them) */
-static void gw_note_shader(u64 lo, u64 hi) { rm_never(lo, hi); gw_log_as(lo, hi, "shader store", 1); }
+static int shadow_overlaps_rw(u64 a, u64 n);
+static void gw_note_shader(u64 lo, u64 hi) { rm_never(lo, hi); gw_log_as(lo, hi, "shader store", 1); if (g_opt_wbg | g_wbg_audit) wbg_note(lo, hi, 2, 0); }
 /* add [a, b) to the ranges written back at the end of the batch; the list stays disjoint (merged when ranges overlap or
    touch; when all 8 are used, the new range joins the one it extends least) */
 static void sh_wr_add(VShadow *S, u64 a, u64 b) {
@@ -2428,6 +3060,34 @@ static int coh_cpu_dirty(VShadow *S, u64 a) {
 /* subpages add of 64 KB page pg become GPU-held; g_coh_m held. ctx 0: their batch completed (completion thread);
    1: a GPU write recorded before its command; 2: recorded after its command, which wrote [xl, xh). CPU bytes VRAM does
    not have yet go there first (before / around the GPU's write, or as patches). */
+/* w3_perf (--coh-learn): coh_hold protects a 64 KB page 4 KB at a time until all 16 pages were seen with one protection
+   (VirtualProtect reports the first page's old protection only). A level start holds ~65,000 pages that way, one call
+   each (~150 ms in one frame; each call interrupts every processor). Here the pages' protections are asked in one call
+   per 256 x 64 KB (K32QueryWorkingSetEx: per page, no region walk); a 64 KB page whose 16 pages are all present and
+   all read-write (or all execute-read-write) is marked uniform, so coh_hold protects it with one call. Pages it cannot
+   tell (not in RAM, mixed) go the old way. g_coh_m held. */
+static int g_opt_coh_learn = 1;   /* t199: on by default (--no-coh-learn) */ static u64 g_cl_calls, g_cl_asked, g_cl_uniform, g_cl_ticks; static u8 *g_cl_tried;
+__declspec(dllimport) void *WINAPI GetModuleHandleA(const char *); __declspec(dllimport) void *WINAPI GetProcAddress(void *, const char *);
+static void coh_learn(u64 a, u64 b) {
+    static int (WINAPI *qws)(void *, void *, u32); static int looked;
+    if (!looked) { looked = 1; void *k = GetModuleHandleA("kernel32.dll"); if (k) qws = (int (WINAPI *)(void *, void *, u32))GetProcAddress(k, "K32QueryWorkingSetEx"); g_cl_tried = (u8 *)calloc(G2S_PT_SIZE >> 16, 1); }
+    if (!qws || !g_cl_tried || b <= a) return;
+    static struct { u64 va, attr; } q[4096]; static u32 qp[256];
+    u64 t0 = plat_ticks(); u32 n = 0;
+    for (u64 pg = (a - G2S_PT_BASE) >> 16, pe = (b - 1 - G2S_PT_BASE) >> 16; ; pg++) {
+        if (pg <= pe && !g_cl_tried[pg] && g_coh_mixed[pg] == 0 && !g_coh_mask[pg] && !g_coh_ro[pg] && !g_coh_rr[pg] && !g_coh_pend[pg]) {
+            g_cl_tried[pg] = 1; qp[n] = (u32)pg; for (u32 s2 = 0; s2 < 16; s2++) q[n * 16 + s2].va = G2S_PT_BASE + (pg << 16) + ((u64)s2 << 12); n++; }
+        if (n == 256 || (pg >= pe && n)) {
+            g_cl_calls++; g_cl_asked += n;
+            if (qws((void *)(i64)-1, q, n * 16 * 16)) for (u32 i = 0; i < n; i++) {
+                u32 pr = (u32)(q[i * 16].attr >> 4) & 0x7FF; int ok = pr == 0x04 || pr == 0x40;
+                for (u32 s2 = 0; s2 < 16 && ok; s2++) ok = (q[i * 16 + s2].attr & 1) && ((u32)(q[i * 16 + s2].attr >> 4) & 0x7FF) == pr;
+                if (ok) { g_coh_mixed[qp[i]] = 1; g_coh_seen[qp[i]] = 0xFFFF; g_coh_seenprot[qp[i]] = (u8)pr; g_cl_uniform++; } }
+            n = 0; }
+        if (pg >= pe) break;
+    }
+    g_cl_ticks += plat_ticks() - t0;
+}
 static void coh_hold(u64 pg, u16 add, int ctx, u64 xl, u64 xh) {
     u64 base = G2S_PT_BASE + (pg << 16); u16 cur = g_coh_mask[pg]; add &= (u16)~cur;
     if (!add) return;
@@ -2575,6 +3235,7 @@ static void coh_gpu_wrote(u64 lo, u64 hi, const char *who, int ctx) {
         if (!S->live || S->wb || S->ro || lo >= S->hi || hi <= S->lo) continue;
         nsh0++;
         u64 a = (lo > S->lo ? lo : S->lo) & ~0xFFFull, b = ((hi < S->hi ? hi : S->hi) + 0xFFF) & ~0xFFFull;
+        if (g_opt_coh_learn && b - a >= 0x20000) { u64 c0 = __builtin_ia32_rdtsc(); coh_learn(a, b); cp_hold += __builtin_ia32_rdtsc() - c0; }   /* w3_perf */
         for (u64 pg = (a - G2S_PT_BASE) >> 16, pe = (b - 1 - G2S_PT_BASE) >> 16; pg <= pe; pg++) {
             u64 pb = G2S_PT_BASE + (pg << 16), s0 = a > pb ? (a - pb) >> 12 : 0, s1 = b < pb + 0x10000 ? (b - pb + 0xFFF) >> 12 : 16;
             u16 m = (u16)(((1u << (s1 - s0)) - 1) << s0);
@@ -2614,6 +3275,12 @@ static void coh_rearm(u64 done) {
         if (!coh_ra_pending(p, s)) coh_snap_free((int)i, p, s); }
     pm_unlock(&g_coh_m);
 }
+/* w3_perf (label policy 4): a GPU-held page copied back while its batch was being recorded is held again when that
+   batch completes - before its label writes under policy 0. With the labels written at the hand-over the game could read
+   the page (readable, bytes from before the batch) between the label and the completion. So: held again at the
+   hand-over; a fault from then on copies back after every batch handed over, which includes this one. */
+static int g_opt_wbg_coh_early;   /* t199c: off by default (--label-coh-early). Holding copied-back pages again when their batch is only handed over (w3_perf) is the one guard change of t199 that touches the coherence code's pages before the batch has finished; both policy 4 crashes (fast_02, live_j_ch10_p4b) were our translator reading such a page (0x10256a0xxx) with no handler claiming the fault */
+static void wbg_coh_early(u64 seq) { if (!g_opt_wbg_coh_early || !coh_on() || !g_coh_nra) return; u64 n0 = g_coh_nrearm; coh_rearm(seq); g_wbg_coh_early += g_coh_nrearm - n0; }
 static const CohWr *coh_writer(u64 a) {
     for (u64 k = g_coh_nwr, n = 0; k > 0 && n < COH_WR; k--, n++) { const CohWr *W = &g_coh_wr[(k - 1) % COH_WR]; if (a >= W->lo && a < W->hi) return W; }
     return 0;
@@ -2638,6 +3305,7 @@ static int coh_readback(VShadow *S, u64 pg, u32 n) {
     real_vkCmdPipelineBarrier(g_coh_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, 0, 0, 0);
     if (real_vkEndCommandBuffer(g_coh_cb)) return 0;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &g_coh_cb, 0, 0};
+    bk_flush_batches();   /* t180: after every batch handed over, as before (they were on the queue already); t182: not the presents */
     qm_lock(); VkResult r = vkQueueSubmit(V.q, 1, &si, g_coh_fence); qm_unlock();
     if (r == VK_ERROR_DEVICE_LOST) { vk_fail("vkQueueSubmit (copy-back read)", r); coh_device_lost("submitting a copy-back's GPU read"); }   /* (review 6 X2-1) */
     if (r) return 0;
@@ -2780,6 +3448,369 @@ static void coh_own_ro(u64 pg, u32 s) {
     __atomic_store_n(&g_coh_mask[pg], (u16)(g_coh_mask[pg] & ~(1u << s)), __ATOMIC_RELEASE);
     g_coh_nro++; __atomic_add_fetch(&g_coh_gen, 1, __ATOMIC_RELEASE); __atomic_add_fetch(&g_coh_epoch, 1, __ATOMIC_RELEASE);
 }
+
+/* ---------------------------------------------------------------- t198 (w2_perf): label policy 4 - guarded write-backs
+   Policy 1 writes the game's labels when a batch is handed over. What the GPU writes into game memory that stays in
+   RAM - write-backs of small VRAM copies and of linear targets, WRITE_DATA / DMA in GPU order, shader stores into RAM -
+   then lands AFTER the label that announces it: a game thread that reads such a result once the label is there gets
+   the bytes of an earlier frame, or of the frame half done. (The large VRAM copies are covered by the coherence code:
+   a CPU access faults and is copied back behind every batch handed over.)
+   Policy 4 = policy 1 + this guard: every 4 KB page a batch writes that way is noted (wbg_note); when labels are
+   written early, the pages with a write still in flight are made inaccessible (wbg_arm) until the GPU has finished
+   the batch (wbg_done, before its own label writes). A game thread touching one in between waits in the page fault
+   for that batch - exactly the wait the label gave under policy 0, but only for threads that really use a result,
+   and only when they do. Our own threads are let through (they read what they read under policy 1) and counted.
+   --label-audit N: the first N frames from flip 9300 on, every such write and every label write is listed in
+   e6_vulkan_log.txt; game code that touches guarded pages is listed at exit (UntilDawn.log). */
+static int lum_guarded(void); static void lum_sample(void); static volatile int g_lum_pending;
+enum { WBG_N = 16384, WBG_RIPS = 48 };   /* w3_perf: 2048 was full 20706 times in the user's session fast_01 */
+typedef struct { u64 pg, seq, sprev, pseq, rseq, rpseq; u32 orig; u8 prot, kind, bad, own, src; u16 line, rlo, rhi; i32 hnext; } WbgEnt;   /* w5_fast: prot 0 open, 1 no access (GPU write in flight), 2 read-only (GPU read in flight, --label-read-guard); rseq / rpseq: last batch reading the page from RAM / the one it is held for */
+static int g_opt_wbg_full_old; static u64 g_wbg_full_holds;   /* w6_fast: --label-full-old = a full guard table leaves pages unguarded (t200) */
+static int g_opt_wbg_fold;   /* w5_fast: --label-fault-old (the t199b fault path, to reproduce its crash), --label-read-guard N */
+enum { WBG_EV = 1 << 17 };
+static struct { u64 pg, seq, done, t; u32 tid; u8 ty, lvl; } g_wbg_ev[WBG_EV]; static u32 g_wbg_nev;
+static u64 g_wbg_dseq, g_wbg_passed, g_wbg_race_own; static u32 g_wbg_nracel; static struct { u64 a, rip, f; const char *tn; u8 src, twice; } g_wbg_racel[12]; static u64 g_wbg_race[4], g_wbg_twice, g_wbg_last_coh, g_wbg_last_ok, g_wbg_last_exact, g_wbg_last_bad, g_wbg_pseq_up;
+static u64 g_rdg_notes, g_rdg_pages, g_rdg_big, g_rdg_prot, g_rdg_gfault_true, g_rdg_gfault_share, g_rdg_own, g_rdg_skip;
+static WbgEnt g_wbg[WBG_N]; static int g_wbg_n; static PMutex g_wbg_m; static PCond g_wbg_cv; static volatile int g_wbg_init;
+static u64 g_wbg_recent[256]; static u32 g_wbg_nrecent;
+static struct { u64 rip, a, n, nw, wait, f0; u8 kind; u16 line; const char *tn; } g_wbg_rips[WBG_RIPS], g_wbg_own[WBG_RIPS]; static int g_wbg_nrips, g_wbg_nown;
+static u64 g_wbg_notes, g_wbg_big, g_wbg_full, g_wbg_arms, g_wbg_prot, g_wbg_unprot, g_wbg_skip_sh, g_wbg_badprot, g_wbg_gfaults, g_wbg_gwait, g_wbg_gwait_max, g_wbg_ofaults, g_wbg_timeouts, g_wbg_late, g_wbg_maxn, g_wbg_ensure;
+static u64 g_wbg_audit_from = 9300;
+static u64 g_wbg_bigc[4]; static struct { u64 lo, n, cnt, f0; u8 cls, kind; u16 line; } g_wbg_bigl[24]; static int g_wbg_nbigl, g_opt_wbg_big;   /* w3_perf */
+static u64 g_wbg_t_arm, g_wbg_t_done, g_wbg_reprot, g_wbg_nownopen;   /* w3_perf */
+static int wbg_fault(u64 a, int write, u64 rip); static int wbg_fault_last(u64 a, int write, u64 rip); static void wbg_ensure(u64 a, u64 n); static void wbg_reprotect(u64 d);
+static void wbg_hsetup(void);
+static void wbg_stall(void);
+static void wbg_setup(void) { if (!g_wbg_init) { wbg_hsetup(); pm_init(&g_wbg_m); pc_init(&g_wbg_cv); g_hp_stall_fn = wbg_stall; g_wbg_init = 1; } }
+static int wbg_in_audit(void) { return g_wbg_audit && g_flips >= g_wbg_audit_from && g_flips < g_wbg_audit_from + (u64)g_wbg_audit; }
+/* w3_perf: chained hash of the page number (was a count per hash + a linear search of the whole table) */
+static i32 g_wbg_head[1 << 14]; static int g_wbg_hinit;
+#define WBG_H(pg) ((u32)((((pg) >> 12) * 0x9E3779B1u) >> 18) & 0x3FFF)
+static void wbg_hsetup(void) { if (!g_wbg_hinit) { for (int i = 0; i < (1 << 14); i++) g_wbg_head[i] = -1; g_wbg_hinit = 1; } }
+static WbgEnt *wbg_find(u64 pg) { if (!g_wbg_hinit) return 0; for (i32 i = g_wbg_head[WBG_H(pg)]; i >= 0; i = g_wbg[i].hnext) if (g_wbg[i].pg == pg) return &g_wbg[i]; return 0; }
+static void wbg_hunlink(i32 x) { i32 *q = &g_wbg_head[WBG_H(g_wbg[x].pg)]; while (*q >= 0 && *q != x) q = &g_wbg[*q].hnext; if (*q == x) *q = g_wbg[x].hnext; }
+static void wbg_hlink(i32 x) { u32 h = WBG_H(g_wbg[x].pg); g_wbg[x].hnext = g_wbg_head[h]; g_wbg_head[h] = x; }
+static int wbg_guarded(u64 a) { WbgEnt *e = wbg_find(a & ~0xFFFull); return e && e->prot == 1; }   /* (no lock: a wrong answer costs one fault) */
+static void wbg_del(WbgEnt *e) { i32 x = (i32)(e - g_wbg), l = g_wbg_n - 1; wbg_hunlink(x); if (x != l) { wbg_hunlink(l); *e = g_wbg[l]; wbg_hlink(x); } g_wbg_n--; }
+/* a GPU write into game RAM is being recorded (renderer thread). kind: 1 copy / fill / CP write, 2 shader store, 4 write-back of a VRAM copy */
+static void wbg_note(u64 lo, u64 hi, int kind, int line) {
+    if (hi <= lo) return;
+    if (wbg_in_audit()) { say("  audit f "); say_dec((i64)g_flips); say(" b "); say_dec((i64)(g_sub_seq + 1)); say(kind == 1 ? " gpu-write " : kind == 2 ? " shader-store " : " write-back "); say_hex(lo); say(" +"); say_dec((i64)(hi - lo)); say(" line "); say_dec(line); say("\n"); }
+    if (!g_opt_wbg) return;
+    if (!g_wbg_init) { wbg_setup(); g_wbg_ensure_fn = wbg_ensure; g_wbg_guarded_fn = wbg_guarded; g_wbg_last_fn = wbg_fault_last; __atomic_store_n(&g_wbg_fault_fn, wbg_fault, __ATOMIC_RELEASE); }
+    g_wbg_notes++;
+    if (hi - lo > (1u << 20) || lo < G2S_PT_BASE || hi > G2S_PT_BASE + G2S_PT_SIZE) {   /* w3_perf: counted by class, the first 24 distinct ones listed at exit */
+        int cls = (lo < G2S_PT_BASE || hi > G2S_PT_BASE + G2S_PT_SIZE) ? 0 : shadow_overlaps_rw(lo, hi - lo) ? 1 : shadow_overlaps(lo, hi - lo) ? 2 : 3;
+        g_wbg_big++; g_wbg_bigc[cls]++;
+        int k = 0; while (k < g_wbg_nbigl && !(g_wbg_bigl[k].lo == lo && g_wbg_bigl[k].cls == cls)) k++;
+        if (k == g_wbg_nbigl && k < 24) { g_wbg_bigl[k].lo = lo; g_wbg_bigl[k].n = hi - lo; g_wbg_bigl[k].cls = (u8)cls; g_wbg_bigl[k].kind = (u8)kind; g_wbg_bigl[k].line = (u16)line; g_wbg_bigl[k].cnt = 0; g_wbg_bigl[k].f0 = g_flips; g_wbg_nbigl++; }
+        if (k < g_wbg_nbigl) { g_wbg_bigl[k].cnt++; if (hi - lo > g_wbg_bigl[k].n) g_wbg_bigl[k].n = hi - lo; }
+        if (cls != 3 || !g_opt_wbg_big || hi - lo > (16u << 20)) return;   /* --label-guard-big: plain RAM ranges up to 16 MB are guarded too */
+    }
+    if (hi - lo > 0x10000 && shadow_overlaps_rw(lo, hi - lo)) { g_wbg_skip_sh++; return; }   /* inside a GPU-held VRAM copy: the coherence code's pages */
+    u64 seq = g_sub_seq + 1;
+    pm_lock(&g_wbg_m);
+    wbg_reprotect(__atomic_load_n(&g_done_seq, __ATOMIC_ACQUIRE));
+    for (u64 p = lo & ~0xFFFull; p < hi; p += 4096) {
+        WbgEnt *e = wbg_find(p);
+        if (e) { if (e->seq != seq) { e->sprev = e->seq; e->seq = seq; } e->kind |= (u8)kind; if (line) e->line = (u16)line; continue; }   /* (sprev: the write before this batch's - w5_fast) */
+        if (g_wbg_n == WBG_N) { g_wbg_full++; if (!g_opt_wbg_full_old && !g_ramcopy_mark) { g_ramcopy_mark = 1; g_wbg_full_holds++; } continue; }   /* w6_fast: a page that cannot be noted cannot be guarded - this batch's labels (and later ones) wait for it, as under policy 0 (Chapter 1's loading burst filled the table in every run: 10,800 pages unguarded) */
+        if (shadow_overlaps_rw(p, 4096)) { g_wbg_skip_sh++; continue; }
+        e = &g_wbg[g_wbg_n++]; mem_fill(e, 0, sizeof *e); e->pg = p; e->seq = seq; e->kind = (u8)kind; e->line = (u16)line; wbg_hlink((i32)(e - g_wbg));
+        if ((u64)g_wbg_n > g_wbg_maxn) g_wbg_maxn = (u64)g_wbg_n;
+    }
+    pm_unlock(&g_wbg_m);
+}
+static void wbg_label(u64 addr, u64 val, u32 n, int irq, int early) {
+    if (!wbg_in_audit()) return;
+    say("  audit f "); say_dec((i64)g_flips); vl(early ? " label-early " : " label-done "); say_hex(addr); say(" n "); say_dec(n); say(" val "); say_hex(val); if (irq) say(" irq"); say("\n");
+}
+/* labels are about to be written early (bk_handoff, g_slock held): pages with a write in flight become inaccessible.
+   skip: pages the label writes themselves go to (first = 1: all but those; first = 0: only those, after the writes) */
+static void wbg_evt(const WbgEnt *e, u8 ty, u64 d) { u32 k = g_wbg_nev++ % WBG_EV; g_wbg_ev[k].pg = e->pg; g_wbg_ev[k].seq = ty == 'r' || e->prot == 2 ? e->rpseq : e->pseq ? e->pseq : e->seq; g_wbg_ev[k].done = d; g_wbg_ev[k].t = plat_ticks(); g_wbg_ev[k].tid = GetCurrentThreadId(); g_wbg_ev[k].ty = ty; g_wbg_ev[k].lvl = e->prot; }
+/* w5_fast: the level a page should have once batch d is done: 1 while a GPU write it was released for is in flight,
+   2 (read-only) while a batch reading it straight from RAM is (read guard), else open */
+static u8 wbg_want(const WbgEnt *e, u64 d) { return e->pseq > d ? 1 : e->rpseq > d ? 2 : 0; }
+/* the one place a guarded page's protection changes (g_wbg_m held) */
+static int wbg_set(WbgEnt *e, u8 lvl, u8 ty, u64 d) {
+    if (e->prot == lvl) return 1;
+    u32 old = 0, o2;
+    if (!e->prot) {
+        if (!plat_protect((void *)e->pg, 4096, lvl == 1 ? 0x01 : 0x02, &old)) { e->bad = 1; g_wbg_badprot++; return 0; }
+        if (old != 0x04 && old != 0x40) { plat_protect((void *)e->pg, 4096, old, &o2); e->bad = 1; g_wbg_badprot++; return 0; }
+        e->orig = old; if (lvl == 2 && old == 0x40) plat_protect((void *)e->pg, 4096, 0x20, &o2);
+        if (lvl == 1) g_wbg_prot++; else g_rdg_prot++;
+    } else if (!lvl) { plat_protect((void *)e->pg, 4096, e->orig, &o2); g_wbg_unprot++; g_wbg_recent[g_wbg_nrecent++ & 255] = e->pg; }
+    else { plat_protect((void *)e->pg, 4096, lvl == 1 ? 0x01 : e->orig == 0x40 ? 0x20 : 0x02, &o2); if (lvl == 1) g_wbg_prot++; }
+    e->prot = lvl; wbg_evt(e, ty, d); return 1;
+}
+/* labels are about to be written early (first & 1: before the label writes, every page but the labels' own; else those).
+   first & 2: at a batch end, for labels moved there (completion thread) */
+static void wbg_arm(const u64 *skip, int nskip, int first) {
+    if (!g_wbg_n) return;
+    int moved = (first & 2) != 0; first &= 1;
+    u64 ta0 = plat_ticks(), d = g_done_seq, sub = g_sub_seq;   /* (g_slock held at both callers) */
+    pm_lock(&g_wbg_m); if (first) g_wbg_arms++;
+    if (g_wbg_dseq > d) d = g_wbg_dseq;   /* w5_fast: a release at a batch end comes after wbg_done for that batch but before g_done_seq moves - its pages were closed again (for a batch already finished) until the next batch ended */
+    for (int i = 0; i < g_wbg_n; i++) { WbgEnt *e = &g_wbg[i];
+        if (e->bad) continue;
+        if (!e->prot && e->seq <= d && e->rseq <= d) { wbg_evt(e, 'D', d); wbg_del(e); i--; continue; }
+        int sk = 0; for (int k = 0; k < nskip; k++) if ((skip[k] & ~0xFFFull) == e->pg) sk = 1;
+        if (sk == first) continue;
+        /* w5_fast: a page already guarded for an earlier batch and written again by a later one was skipped here (t198) and
+           opened when the earlier batch finished - with the later write in flight and its label out */
+        /* (a page noted for the batch still being recorded - a release on the completion thread sees those - is held for
+           the batches handed over only: nobody has been told that batch is done, and a game thread waiting for a batch
+           the renderer has not handed over could be the thread the renderer is waiting for) */
+        u64 ws = e->seq > sub ? e->sprev : e->seq;   /* the last write by a batch handed over (sprev can be older than that: then nothing is in flight) */
+        u64 np = ws > d ? (ws > sub ? sub : ws) : e->pseq, nr = (g_opt_rdg && e->rseq > d) ? (e->rseq > sub ? sub : e->rseq) : e->rpseq;
+        if (np < e->pseq) np = e->pseq; if (nr < e->rpseq) nr = e->rpseq;
+        u8 want = np > d ? 1 : nr > d ? 2 : 0;
+        if (!want) continue;
+        if (!e->prot && shadow_overlaps_rw(e->pg, 4096)) { g_wbg_skip_sh++; e->bad = 1; continue; }   /* the coherence code owns these pages' protection */
+        if (e->prot == 1 && np != e->pseq) g_wbg_pseq_up++;
+        e->pseq = np; e->rpseq = nr; e->own = 0;
+        if (want != e->prot) { e->src = (u8)(want == 2 ? 3 : moved ? 1 : 0); wbg_set(e, want, want == 2 ? 'r' : moved ? 'M' : 'A', d); }
+    }
+    pm_unlock(&g_wbg_m);
+    g_wbg_t_arm += plat_ticks() - ta0;
+}
+/* w3_perf: a guarded page one of our own threads opened (wbg_fault) stayed open until the next early label release - a
+   game thread could read it in between. Such pages are guarded again at the next GPU write noted and the next batch
+   finished (g_wbg_m held), while their write is still in flight. d: the last batch known finished */
+static void wbg_reprotect(u64 d) {
+    if (!g_wbg_nownopen) return;
+    if (g_wbg_dseq > d) d = g_wbg_dseq;
+    g_wbg_nownopen = 0;
+    for (int i = 0; i < g_wbg_n; i++) { WbgEnt *e = &g_wbg[i];
+        if (!e->own || e->prot || e->bad) continue;
+        e->own = 0;
+        u8 want = wbg_want(e, d);
+        if (!want || shadow_overlaps_rw(e->pg, 4096)) continue;
+        e->src = 2; if (wbg_set(e, want, 'R', d)) g_wbg_reprot++; }
+}
+/* batch seq has finished on the GPU (g_slock held, before its label writes) */
+static void wbg_done(u64 seq) {
+    if (!g_wbg_n) return;
+    u64 td0 = plat_ticks();
+    pm_lock(&g_wbg_m);
+    for (int i = 0; i < g_wbg_n; i++) { WbgEnt *e = &g_wbg[i];
+        if (e->prot) { u8 want = wbg_want(e, seq); if (want != e->prot) wbg_set(e, want, 'O', seq); }
+        if (e->seq <= seq && e->rseq <= seq && !e->prot) { wbg_evt(e, 'D', seq); wbg_del(e); i--; } }
+    g_wbg_dseq = seq;
+    if (g_lum_pending && !lum_guarded()) { g_lum_pending = 0; lum_sample(); }
+    wbg_reprotect(seq);
+    pc_broadcast(&g_wbg_cv);
+    pm_unlock(&g_wbg_m);
+    g_wbg_t_done += plat_ticks() - td0;
+}
+/* w5_fast (--label-read-guard): a batch being recorded reads [lo, hi) of 64 KB page pg straight from game RAM (not from
+   the read mirror, not from a VRAM copy). Renderer thread, per draw: one note per page and batch unless the range grows */
+static struct { u64 seq; u32 lo, hi; } *g_rdg_st;
+static void wbg_note_read(u32 pg, u64 lo, u64 hi) {
+    if (hi <= lo || !g_opt_wbg) return;
+    if (!g_rdg_st) { g_rdg_st = calloc(RM_NPG, sizeof *g_rdg_st); if (!g_rdg_st) { g_opt_rdg = 0; g_fr_rdg_fail = 1; return; } }   /* (w16_rel rc2: reported, fr_flip_check) */
+    u64 seq = g_sub_seq + 1, a0 = rm_addr(pg); u32 l = (u32)(lo - a0), h = (u32)(hi - a0);
+    if (g_rdg_st[pg].seq == seq) { if (l >= g_rdg_st[pg].lo && h <= g_rdg_st[pg].hi) return; if (l < g_rdg_st[pg].lo) g_rdg_st[pg].lo = l; if (h > g_rdg_st[pg].hi) g_rdg_st[pg].hi = h; }
+    else { g_rdg_st[pg].seq = seq; g_rdg_st[pg].lo = l; g_rdg_st[pg].hi = h; }
+    if (!g_wbg_init) { wbg_setup(); g_wbg_ensure_fn = wbg_ensure; g_wbg_guarded_fn = wbg_guarded; g_wbg_last_fn = wbg_fault_last; __atomic_store_n(&g_wbg_fault_fn, wbg_fault, __ATOMIC_RELEASE); }
+    g_rdg_notes++;
+    u64 d = __atomic_load_n(&g_done_seq, __ATOMIC_ACQUIRE);
+    pm_lock(&g_wbg_m);
+    for (u64 p = lo & ~0xFFFull; p < hi; p += 4096) {
+        WbgEnt *e = wbg_find(p);
+        u32 rl = (u32)(lo > p ? lo - p : 0), rh = (u32)(hi < p + 4096 ? hi - p : 4096);
+        if (e) { if (e->rseq <= d) { e->rlo = (u16)rl; e->rhi = (u16)rh; } else { if (rl < e->rlo) e->rlo = (u16)rl; if (rh > e->rhi) e->rhi = (u16)rh; } e->rseq = seq; continue; }
+        if (g_wbg_n == WBG_N) { g_wbg_full++; if (!g_opt_wbg_full_old && !g_ramcopy_mark) { g_ramcopy_mark = 1; g_wbg_full_holds++; } continue; }   /* w6_fast */
+        if (shadow_overlaps_rw(p, 4096)) { g_rdg_skip++; continue; }
+        e = &g_wbg[g_wbg_n++]; mem_fill(e, 0, sizeof *e); e->pg = p; e->rseq = seq; e->rlo = (u16)rl; e->rhi = (u16)rh; e->kind = 8; wbg_hlink((i32)(e - g_wbg)); g_rdg_pages++;
+        if ((u64)g_wbg_n > g_wbg_maxn) g_wbg_maxn = (u64)g_wbg_n;
+    }
+    pm_unlock(&g_wbg_m);
+}
+static int wbg_fault(u64 a, int write, u64 rip) {
+    if (!g_wbg_init) return 0;
+    u64 pg = a & ~0xFFFull;
+    pm_lock(&g_wbg_m);
+    WbgEnt *e = wbg_find(pg);
+    if (!e || !e->prot || (e->prot == 2 && !write)) {
+        /* not guarded (any more). w5_fast: no answer here - wbg_fault_last (after the other handlers) decides. t199b asked
+           Windows for the protection after dropping the lock: a release on another thread (labels moved to a batch end, the
+           re-guard of a page opened for one of our threads - both w3_perf, both on the completion thread) could close the
+           page again in between, the answer was "no access", the coherence code's own check said the same, and the
+           fault was nobody's: the fast_02 / live_j_ch10_p4b crash. */
+        pm_unlock(&g_wbg_m);
+        if (g_opt_wbg_fold) { if (g_opt_wbg_fold == 2) plat_sleep_ms(1);   /* (--label-fault-old-slow: the window between the two looks, widened) */
+            u32 pr = plat_query_prot(pg); if (!(pr & 0x101) && (write ? (pr & 0xCC) != 0 : (pr & 0xEE) != 0)) { g_wbg_late++; return 1; } }
+        return 0; }
+    const char *tn = cur_thread_name(); int own = (!tn || tn[0] == '(' || (tn[0] == 'E' && tn[1] == '6' && tn[2] == ' ')) && !ct_is_game();
+    int ro = e->prot == 2, hit = ro && (a & 0xFFF) + 64 > e->rlo && (a & 0xFFF) < e->rhi;
+    if (ro) { if (own) g_rdg_own++; else if (hit) g_rdg_gfault_true++; else g_rdg_gfault_share++; }
+    if (own) {
+        g_wbg_ofaults++;
+        { int k = 0; while (k < g_wbg_nown && g_wbg_own[k].rip != rip) k++;
+          if (k == g_wbg_nown && k < WBG_RIPS) { g_wbg_own[k].rip = rip; g_wbg_own[k].a = a; g_wbg_own[k].n = 0; g_wbg_own[k].nw = 0; g_wbg_own[k].tn = tn; g_wbg_own[k].kind = e->kind; g_wbg_own[k].line = e->line; g_wbg_own[k].f0 = g_flips; g_wbg_nown++; }
+          if (k < g_wbg_nown) { g_wbg_own[k].n++; if (write) g_wbg_own[k].nw++; } }
+        wbg_set(e, 0, 'W', 0); e->own = 1; g_wbg_nownopen++; pm_unlock(&g_wbg_m); return 1; }
+    if (!ro) g_wbg_gfaults++;
+    u64 rkey = ro ? rip ^ (hit ? 1ull << 63 : 1ull << 62) : rip;   /* (read-guard stops listed apart: bit 63 inside the bytes read, bit 62 the page only) */
+    int k = 0; while (k < g_wbg_nrips && g_wbg_rips[k].rip != rkey) k++;
+    if (k == g_wbg_nrips && k < WBG_RIPS) { g_wbg_rips[k].rip = rkey; g_wbg_rips[k].a = a; g_wbg_rips[k].n = 0; g_wbg_rips[k].nw = 0; g_wbg_rips[k].wait = 0; g_wbg_rips[k].tn = tn; g_wbg_rips[k].kind = e->kind; g_wbg_rips[k].line = e->line; g_wbg_rips[k].f0 = g_flips; g_wbg_nrips++; }
+    if (k < g_wbg_nrips) { g_wbg_rips[k].n++; if (write) g_wbg_rips[k].nw++; }
+    if (ro && g_opt_rdg == 1) { wbg_set(e, 0, 'W', 0); e->own = 1; g_wbg_nownopen++; pm_unlock(&g_wbg_m); return 1; }   /* audit: counted, let through */
+    u64 t0 = plat_ticks(), lim = plat_ticks_per_sec() * 2, need = ro ? e->rpseq : e->pseq;
+    for (;;) {   /* until the GPU has finished the batch (wbg_done opens the page) */
+        e = wbg_find(pg); if (!e || !e->prot || (e->prot == 2 && !write)) break;
+        /* w5_fast: the batch the page was closed for when this thread came is done, but the page is held on for a later
+           write (wbg_arm): this thread has waited as long as the label did under policy 0 - opened for it, and closed
+           again like a page opened for one of our own threads (a page written by every batch would never open) */
+        if (g_wbg_dseq >= need) { g_wbg_passed++; wbg_set(e, 0, 'P', g_wbg_dseq); e->own = 1; g_wbg_nownopen++; break; }
+        if (plat_ticks() - t0 > lim) { g_wbg_timeouts++; wbg_set(e, 0, 'T', 0); break; }
+        pc_wait(&g_wbg_cv, &g_wbg_m, 2000);
+    }
+    u64 dt = plat_ticks() - t0; g_wbg_gwait += dt; if (dt > g_wbg_gwait_max) g_wbg_gwait_max = dt; if (k < g_wbg_nrips) g_wbg_rips[k].wait += dt;
+    pm_unlock(&g_wbg_m); return 1;
+}
+/* w5_fast: what is known about a page when its fault is nobody's (UntilDawn.log, before the crash dump) */
+static void wbg_diag(u64 a, int write, u64 rip, u32 pr) {
+    u64 pg = a & ~0xFFFull, now = plat_ticks(), us = plat_ticks_per_sec() / 1000000; if (!us) us = 1;
+    say("*** label guard (w5_fast): unclaimed "); say(write ? "write" : "read"); say(" fault at "); say_hex(a); say(" rip "); say_hex(rip); say(" thread id "); say_dec((i64)GetCurrentThreadId()); say(" ("); say(cur_thread_name()); say("), flip "); say_dec((i64)g_flips);
+    say("\n    page protection now "); say_hex(pr); say(" (0 = not committed); batches handed over "); say_dec((i64)g_sub_seq); say(", finished "); say_dec((i64)g_done_seq); say("\n");
+    WbgEnt *e = wbg_find(pg);
+    if (!e) say("    guard table: no entry\n");
+    else { say("    guard table: level "); say_dec(e->prot); say(" (1 no access, 2 read-only), written by batch "); say_dec((i64)e->seq); say(", held for "); say_dec((i64)e->pseq); say(", read by "); say_dec((i64)e->rseq); say(", held for "); say_dec((i64)e->rpseq); say(", original protection "); say_hex(e->orig); say(", not guardable "); say_dec(e->bad); say(", opened for an own thread "); say_dec(e->own); say(", kinds "); say_dec(e->kind); say(", last closed by "); say_dec(e->src); say(" (0 hand-over, 1 moved label, 2 re-guard, 3 read guard)\n"); }
+    u32 n = g_wbg_nev < WBG_EV ? g_wbg_nev : WBG_EV, shown = 0;
+    say("    guard history of this page (newest first; us before now, thread id, event, level after, batch, finished):\n");
+    for (u32 i = 0; i < n && shown < 40; i++) { u32 k = (g_wbg_nev - 1 - i) % WBG_EV; if (g_wbg_ev[k].pg != pg) continue;
+        say("      -"); say_dec((i64)((now - g_wbg_ev[k].t) / us)); say(" us  tid "); say_dec((i64)g_wbg_ev[k].tid); say("  "); { char c[2] = { (char)g_wbg_ev[k].ty, 0 }; say(c); } say("  level "); say_dec(g_wbg_ev[k].lvl); say("  batch "); say_dec((i64)g_wbg_ev[k].seq); say("  finished "); say_dec((i64)g_wbg_ev[k].done); say("\n"); shown++; }
+    say("      (A closed at a hand-over, M for a moved label at a batch end, R closed again after an own thread, r read-only, O changed at a batch end, W opened for an own thread, P for a game thread whose batch was done, T timeout, D entry dropped; "); say_dec(shown); say(" of the last "); say_dec(n); say(" events)\n");
+    u16 *M = coh_on();
+    if (M && a >= G2S_PT_BASE && a < G2S_PT_BASE + G2S_PT_SIZE) { u64 p = (a - G2S_PT_BASE) >> 16; u32 s = (u32)((a >> 12) & 15);
+        say("    coherence: held "); say_dec(M[p] >> s & 1); say(", read-only "); say_dec(g_coh_ro[p] >> s & 1); say(", read-only after a copy-back "); say_dec(g_coh_rr[p] >> s & 1); say(", waiting re-holds for it "); { int w = 0; for (u32 q = 0; q < g_coh_nra; q++) if (g_coh_ra[q].pg == (u32)p && (g_coh_ra[q].mask >> s & 1)) w++; say_dec(w); }
+        say(" (of "); say_dec((i64)g_coh_nra); say("), in a GPU-written VRAM copy "); say_dec(shadow_overlaps_rw(pg, 4096)); say(", in any VRAM copy "); say_dec(shadow_overlaps(pg, 4096)); say(", early re-holds so far "); say_dec((i64)g_wbg_coh_early); say("\n"); }
+    else say("    coherence: off or outside its range\n");
+}
+/* w5_fast: the last handler for an access violation in game memory (after wbg_fault, the coherence handler and the lazy
+   commit). A fault reaches it when no guard had the page closed at the moment its handler looked:
+   1. the label guard has closed it (again) since: tried again - wbg_fault takes it then. (This is the t199 / t199b crash.)
+   2. the first six times for this thread and address, each within 2 ms of the last: tried again (a page some thread opened a moment ago).
+   3. else both guards' locks are taken - no protection of theirs can change - and each is asked; if neither has the
+      page, Windows is: accessible = tried again, not accessible = a real fault (wbg_diag, then the crash path). */
+static int wbg_fault_last(u64 a, int write, u64 rip) {
+    if (!g_wbg_init || a < G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE) return 0;   /* (the guards only ever close pages of the game's GPU-visible memory) */
+    u64 pg = a & ~0xFFFull; u32 me = GetCurrentThreadId(), k = (me >> 2) % 64;
+    static struct { u32 tid, n; u64 a, t; } nr[64], rc[64];
+    if (g_opt_wbg_fold) { pm_lock(&g_wbg_m); wbg_diag(a, write, rip, plat_query_prot(pg)); pm_unlock(&g_wbg_m); return 0; }
+    pm_lock(&g_wbg_m);
+    WbgEnt *e = wbg_find(pg); int closed = e && e->prot && !(e->prot == 2 && !write); u8 src = e ? e->src : 0;
+    pm_unlock(&g_wbg_m);
+    if (closed) { __atomic_add_fetch(&g_wbg_race[src & 3], 1, __ATOMIC_RELAXED);
+        { const char *tn = cur_thread_name(); int own = (!tn || tn[0] == '(' || (tn[0] == 'E' && tn[1] == '6' && tn[2] == ' ')) && !ct_is_game(); if (own) __atomic_add_fetch(&g_wbg_race_own, 1, __ATOMIC_RELAXED);
+          u32 q = __atomic_fetch_add(&g_wbg_nracel, 1, __ATOMIC_RELAXED); if (q < 12) { g_wbg_racel[q].a = a; g_wbg_racel[q].rip = rip; g_wbg_racel[q].tn = tn; g_wbg_racel[q].src = src; g_wbg_racel[q].f = g_flips; g_wbg_racel[q].twice = rc[k].tid == me && rc[k].a == a; } }
+        if (rc[k].tid == me && rc[k].a == a) __atomic_add_fetch(&g_wbg_twice, 1, __ATOMIC_RELAXED); else { rc[k].tid = me; rc[k].a = a; }
+        return 1; }
+    u64 now = plat_ticks();
+    if (!(nr[k].tid == me && nr[k].a == a && now - nr[k].t < plat_ticks_per_sec() / 500)) { nr[k].tid = me; nr[k].a = a; nr[k].t = now; nr[k].n = 0; __atomic_add_fetch(&g_wbg_late, 1, __ATOMIC_RELAXED); return 1; }
+    if (++nr[k].n < 6) { nr[k].t = now; __atomic_add_fetch(&g_wbg_late, 1, __ATOMIC_RELAXED); return 1; }   /* (a page closed and opened again in quick succession: live_w5_fast_1_new1 went to the locks 401 times, 400 of them for an accessible page; a real fault comes back at once, six times) */
+    nr[k].tid = 0;
+    u16 *M = coh_on(); int cm = M && a >= G2S_PT_BASE && a < G2S_PT_BASE + G2S_PT_SIZE;
+    for (;;) { pm_lock(&g_wbg_m); if (!cm || pm_trylock(&g_coh_m) == 0) break; pm_unlock(&g_wbg_m); pt_yield(); }
+    g_wbg_last_exact++;
+    e = wbg_find(pg);
+    if (e && e->prot && !(e->prot == 2 && !write)) { g_wbg_race[e->src & 3]++; if (cm) pm_unlock(&g_coh_m); pm_unlock(&g_wbg_m); return 1; }
+    if (cm) { u64 p = (a - G2S_PT_BASE) >> 16; u16 bit = (u16)(1u << ((a >> 12) & 15));
+        if ((M[p] | g_coh_ro[p] | g_coh_rr[p]) & bit) { g_wbg_last_coh++; pm_unlock(&g_coh_m); pm_unlock(&g_wbg_m); return 1; } }   /* (its handler takes it at the next fault) */
+    u32 pr = plat_query_prot(pg);
+    if (!(pr & 0x101) && (write ? (pr & 0xCC) != 0 : (pr & 0xEE) != 0)) { g_wbg_last_ok++; if (cm) pm_unlock(&g_coh_m); pm_unlock(&g_wbg_m); return 1; }
+    g_wbg_last_bad++;
+    wbg_diag(a, write, rip, pr);
+    if (cm) pm_unlock(&g_coh_m); pm_unlock(&g_wbg_m);
+    return 0;
+}
+/* before a Windows call reads or writes game memory: guarded pages in the range are waited for like a fault */
+static void wbg_ensure(u64 a, u64 n) {
+    if (!g_wbg_init || !g_wbg_n || !n) return;
+    for (u64 p = a & ~0xFFFull; p < a + n; p += 4096) {
+        pm_lock(&g_wbg_m); WbgEnt *e = wbg_find(p); int pr = e && e->prot; pm_unlock(&g_wbg_m);
+        if (pr) { g_wbg_ensure++; wbg_fault(p, 1, 0); } }
+}
+/* w5_fast: the renderer's and the guard's state when no flip has come for seconds (hitch profiler thread) */
+static void wbg_stall(void) {
+    say("      renderer step: "); say(g_rstep ? g_rstep : "-"); say(" ("); say_hex(g_rstep_a); say(", "); say_hex(g_rstep_b); say("); batches handed over "); say_dec((i64)g_sub_seq); say(", queued "); say_dec((i64)g_qsub_seq); say(", finished "); say_dec((i64)g_done_seq);
+    say("; back-end queue "); say_dec((i64)(g_bk_head - g_bk_tail)); say("; draws "); say_dec((i64)g_draws); say(", submits "); say_dec((i64)g_submits); say("\n      slots:");
+    for (int i = 0; i < NSLOT; i++) if (g_slot[i].pending || g_slot[i].nw) { say(" ["); say_dec(i); say("] batch "); say_dec((i64)g_slot[i].seq); say(g_slot[i].pending ? " in flight, label writes " : " NOT handed over, label writes "); say_dec(g_slot[i].nw); if (g_slot[i].moved) say(" (moved here)"); if (g_slot[i].nw) { say(" first "); say_hex(g_slot[i].w[0].addr); say("="); say_hex(g_slot[i].w[0].val); say(" last "); say_hex(g_slot[i].w[g_slot[i].nw - 1].addr); say("="); say_hex(g_slot[i].w[g_slot[i].nw - 1].val); } }
+    say("\n      label hold: batch "); say_dec((i64)g_ramcopy_seq); say(", mark "); say_dec(g_ramcopy_mark); say("; labels early "); say_dec((i64)g_n_early_labels); say(", moved "); say_dec((i64)g_n_moved_labels);
+    say("; guard: table "); say_dec(g_wbg_n); say(", closed "); say_dec((i64)(g_wbg_prot + g_rdg_prot)); say(", opened "); say_dec((i64)g_wbg_unprot); say(", game stops "); say_dec((i64)g_wbg_gfaults); say(", own "); say_dec((i64)g_wbg_ofaults); say(", late "); say_dec((i64)g_wbg_late); say(", timeouts "); say_dec((i64)g_wbg_timeouts);
+    say("; coherence: own reads "); say_dec((i64)g_coh_nown); say(", faults r/w "); say_dec((i64)g_coh_nfault_r); say("/"); say_dec((i64)g_coh_nfault_w); say(", retries "); say_dec((i64)g_coh_retry_ret); say("\n");
+}
+/* ---- w16_rel rc2 (v0.4.0): Optimised Rendering (Fast Mode) - requested vs active, rate-limited warnings, exit summary and
+   the state for crash / device-loss reports. It only READS the guard's own counters: once per flip (never per draw), at exit
+   and in the crash path (racy reads; no lock taken, nothing allocated there). Never switched by GPU vendor. */
+enum { FRW_FULL, FRW_TIMEOUT, FRW_BADPROT, FRW_UNCLAIMED, FRW_TWICE, FRW_N };
+static const char *const k_frw_name[FRW_N] = {
+    "guard table full - the labels of a batch waited for the GPU (safe path)",
+    "a game thread waited 2 s at a guarded page - the page was opened (guard timeout)",
+    "page protection could not be installed - the page was left unguarded",
+    "a memory fault no guard could claim (read-guard / guard fault not handled)",
+    "the same fault twice at one address (re-guard race, retried)" };
+static u64 g_frw_seen[FRW_N], g_frw_pend[FRW_N], g_frw_tick; static u32 g_frw_nrep[FRW_N];
+static u64 frw_count(int k) { return k == FRW_FULL ? g_wbg_full_holds : k == FRW_TIMEOUT ? g_wbg_timeouts : k == FRW_BADPROT ? g_wbg_badprot : k == FRW_UNCLAIMED ? g_wbg_last_bad : g_wbg_twice; }
+static int fr_active_now(void) { return g_opt_wbg && g_opt_early_labels == 4 && g_wbg_init && (g_n_early_labels + g_lbl_trail_early) > 0; }
+static const char *fr_src_name(int s) { return s == 1 ? "settings.ini" : s == 2 ? "command line" : "default"; }
+/* once per flip (vkr_flip_body, g_gpu_lock held): the "active" line when the hand-over has really happened, the warnings */
+static void fr_flip_check(void) {
+    if (!g_opt_wbg && g_fr_req != 1) return;
+    if (!g_fr_state) {
+        if (fr_active_now()) { g_fr_state = 1; g_fr_active_flip = g_flips;
+            say("Early GPU handover: active (first early release at flip "); say_dec((i64)g_flips); say("; guard table "); say_dec(WBG_N); say(" pages, read guard "); say(g_opt_rdg ? "on" : "OFF"); say(")\n"); }
+        else if (g_flips >= 1800) { g_fr_state = 2;
+            say("Early GPU handover: NOT active by flip 1800 ("); say(!g_opt_wbg || g_opt_early_labels != 4 ? "turned off" : !g_wbg_init ? "the guard was never set up: no GPU write into game memory noted" : "no label was released early");
+            say(") - frames are handed over the safe way\n"); }
+    }
+    if (g_fr_rdg_fail && !g_fr_rdg_warned) { g_fr_rdg_warned = 1; say("Optimised Rendering warning: the read guard could not be set up (out of memory) - it is off for this session\n"); }
+    if (g_flips & 15) return;   /* (the counters: every 16 flips) */
+    for (int k = 0; k < FRW_N; k++) { u64 c = frw_count(k); if (c == g_frw_seen[k]) continue;
+        u64 d = c - g_frw_seen[k]; g_frw_seen[k] = c;
+        if (g_frw_nrep[k] < 3) { g_frw_nrep[k]++; say("Optimised Rendering warning: "); say(k_frw_name[k]); say(" - "); say_dec((i64)d); say(" new, "); say_dec((i64)c); say(" in all (flip "); say_dec((i64)g_flips);
+            say(g_frw_nrep[k] == 3 ? "; from now on counted once a minute)\n" : ")\n"); }
+        else g_frw_pend[k] += d; }
+    u64 now = plat_ticks();
+    if (now - g_frw_tick >= plat_ticks_per_sec() * 60) { g_frw_tick = now; int any = 0;
+        for (int k = 0; k < FRW_N; k++) if (g_frw_pend[k]) { say(any ? "; " : "Optimised Rendering warnings in the last minute: "); say(k_frw_name[k]); say(" "); say_dec((i64)g_frw_pend[k]); g_frw_pend[k] = 0; any = 1; }
+        if (any) say("\n"); }
+}
+/* one line at exit */
+static void fr_exit_summary(void) {
+    u64 ms = plat_ticks_per_sec() / 1000; if (!ms) ms = 1;
+    say("Optimised Rendering summary: requested "); say(g_fr_req == 1 ? "on" : g_fr_req == 0 ? "off" : g_opt_wbg ? "by developer options" : "off"); say(" ("); say(fr_src_name(g_fr_src)); say("), early GPU handover ");
+    if (g_fr_state == 1) { say("active from flip "); say_dec((i64)g_fr_active_flip); } else say(g_opt_wbg ? "never active" : "not used");
+    if (g_opt_wbg) { say("; early releases "); say_dec((i64)g_wbg_arms); say(", early labels "); say_dec((i64)g_n_early_labels); say(", pages guarded "); say_dec((i64)(g_wbg_prot + g_rdg_prot));
+        say(", game-thread waits "); say_dec((i64)g_wbg_gfaults); say(" (longest "); say_dec((i64)(g_wbg_gwait_max / ms)); say(" ms), most pages in flight "); say_dec((i64)g_wbg_maxn); say(" of "); say_dec(WBG_N);
+        say("; table full (labels waited) "); say_dec((i64)g_wbg_full_holds); say(", guard timeouts "); say_dec((i64)g_wbg_timeouts); say(", unguardable pages "); say_dec((i64)g_wbg_badprot);
+        say(", unclaimed faults "); say_dec((i64)g_wbg_last_bad); say(", read guard "); say(g_opt_rdg ? "on" : g_fr_rdg_fail ? "OFF (could not be set up)" : "off"); }
+    say("\n");
+}
+static void wbg_report(void) {
+    if (!g_opt_wbg) return;
+    u64 us = plat_ticks_per_sec() / 1000000; if (!us) us = 1; u64 fr = g_flips ? g_flips : 1;
+    say("    label policy 4 guard (t198): GPU writes into RAM noted "); say_dec((i64)g_wbg_notes); say(" (over 2 MB / outside game memory, not guarded "); say_dec((i64)g_wbg_big); say(", table full "); say_dec((i64)g_wbg_full); say(", most pages in flight "); say_dec((i64)g_wbg_maxn);
+    say("); early label releases "); say_dec((i64)g_wbg_arms); say(", pages guarded "); say_dec((i64)g_wbg_prot); say(" ("); say_dec((i64)(g_wbg_prot / fr)); say(" per flip), not guardable: in a GPU-held VRAM copy "); say_dec((i64)g_wbg_skip_sh); say(", protection "); say_dec((i64)g_wbg_badprot);
+    say("\n      game threads stopped at a guarded page "); say_dec((i64)g_wbg_gfaults); say(" (waited "); say_dec((i64)(g_wbg_gwait / us / fr)); say(" us per flip, longest "); say_dec((i64)(g_wbg_gwait_max / us)); say(" us, timeouts "); say_dec((i64)g_wbg_timeouts);
+    say("); our own threads let through "); say_dec((i64)g_wbg_ofaults); say("; faults after the page was opened "); say_dec((i64)g_wbg_late); say("; Windows calls "); say_dec((i64)g_wbg_ensure); say("\n");
+    say("      w3_perf: table "); say_dec(WBG_N); say(" pages; not guarded by class: outside game memory "); say_dec((i64)g_wbg_bigc[0]); say(", over 1 MB in a GPU-held VRAM copy "); say_dec((i64)g_wbg_bigc[1]); say(", over 1 MB in a written-back / read-only VRAM copy "); say_dec((i64)g_wbg_bigc[2]); say(", over 1 MB in plain RAM "); say_dec((i64)g_wbg_bigc[3]); say(g_opt_wbg_big ? " (guarded up to 16 MB: --label-guard-big)" : " (--label-guard-big guards them)");
+    say("; protection calls: at releases "); say_dec((i64)(g_wbg_t_arm / us / fr)); say(" us per flip, at batch ends "); say_dec((i64)(g_wbg_t_done / us / fr)); say(" us per flip; releases at a batch end for labels moved there "); say_dec((i64)g_wbg_moved_arms);
+    say("; pages opened for our own threads guarded again "); say_dec((i64)g_wbg_reprot); say("; coherence pages held again at the hand-over "); say_dec((i64)g_wbg_coh_early);
+    say("; batches whose shaders may read game RAM directly "); say_dec((i64)g_wbg_direct); say(g_opt_wbg_strict ? " (their labels wait: --label-policy 5)\n" : " (counted only; --label-policy 5 makes their labels wait)\n");
+    say("      w6_fast: batches whose labels waited because the guard table was full "); say_dec((i64)g_wbg_full_holds); say(g_opt_wbg_full_old ? " (--label-full-old: pages left unguarded)\n" : "\n");
+    if (g_opt_lbl_trail) { say("      --label-trailing: label writes at the hand-over (end of a submit, nothing drawn after them) "); say_dec((i64)g_lbl_trail_early); say(", left to their batch's end "); say_dec((i64)g_lbl_trail_kept); say("\n"); }
+    say("      w5_fast: faults no handler claimed at first: guarded again meanwhile "); say_dec((i64)(g_wbg_race[0] + g_wbg_race[1] + g_wbg_race[2] + g_wbg_race[3])); say(" (by a hand-over release "); say_dec((i64)g_wbg_race[0]); say(", a moved-label release "); say_dec((i64)g_wbg_race[1]); say(", the re-guard of an own page "); say_dec((i64)g_wbg_race[2]); say(", read guard "); say_dec((i64)g_wbg_race[3]);
+    say("; of these on our own threads "); say_dec((i64)g_wbg_race_own); say("; twice running at one address = the t199 / t199b crash "); say_dec((i64)g_wbg_twice); say("), checked with both locks "); say_dec((i64)g_wbg_last_exact); say(" (the coherence code's "); say_dec((i64)g_wbg_last_coh); say(", accessible "); say_dec((i64)g_wbg_last_ok); say(", nobody's "); say_dec((i64)g_wbg_last_bad); say("); held longer for a later write "); say_dec((i64)g_wbg_pseq_up); say(", game threads let on when their batch was done "); say_dec((i64)g_wbg_passed); say(g_opt_wbg_fold ? " (--label-fault-old: the t199b fault path)\n" : "\n");
+    for (u32 i = 0; i < g_wbg_nracel && i < 12; i++) { say("        guarded again meanwhile: "); say(g_wbg_racel[i].tn ? g_wbg_racel[i].tn : "?"); say(" at "); say_hex(g_wbg_racel[i].a); say(" rip "); say_hex(g_wbg_racel[i].rip); say(" flip "); say_dec((i64)g_wbg_racel[i].f); say(", closed by "); say_dec(g_wbg_racel[i].src); say(g_wbg_racel[i].twice ? " (0 hand-over, 1 moved label, 2 re-guard, 3 read guard) - second time at this address\n" : " (0 hand-over, 1 moved label, 2 re-guard, 3 read guard)\n"); }
+    if (g_opt_rdg) { say("      read guard (--label-read-guard "); say_dec(g_opt_rdg); say("): direct-read ranges noted "); say_dec((i64)g_rdg_notes); say(" ("); say_dec((i64)g_rdg_pages); say(" pages, over 1 MB not guarded "); say_dec((i64)g_rdg_big); say(", in a GPU-held copy "); say_dec((i64)g_rdg_skip); say("), pages made read-only "); say_dec((i64)g_rdg_prot); say(" ("); say_dec((i64)(g_rdg_prot / fr)); say(" per flip); game writes to one: inside the bytes a batch in flight reads "); say_dec((i64)g_rdg_gfault_true); say(", only the same page "); say_dec((i64)g_rdg_gfault_share); say("; our own writes "); say_dec((i64)g_rdg_own); say("\n"); }
+    for (int i = 0; i < g_wbg_nbigl; i++) { say("        not guarded: "); say_hex(g_wbg_bigl[i].lo); say(" +"); say_dec((i64)g_wbg_bigl[i].n); say(" class "); say_dec(g_wbg_bigl[i].cls); say(" kind "); say_dec(g_wbg_bigl[i].kind); say(" line "); say_dec(g_wbg_bigl[i].line); say(", "); say_dec((i64)g_wbg_bigl[i].cnt); say(" times, first flip "); say_dec((i64)g_wbg_bigl[i].f0); say("\n"); }
+    for (int i = 0; i < g_wbg_nrips; i++) { say("      game "); say_hex(g_wbg_rips[i].rip); say(" ("); say(g_wbg_rips[i].tn ? g_wbg_rips[i].tn : "?"); say("): "); say_dec((i64)g_wbg_rips[i].n); say(" accesses ("); say_dec((i64)g_wbg_rips[i].nw); say(" writes), waited "); say_dec((i64)(g_wbg_rips[i].wait / us / 1000)); say(" ms in all, first at "); say_hex(g_wbg_rips[i].a); say(" flip "); say_dec((i64)g_wbg_rips[i].f0); say(", page written by kinds "); say_dec(g_wbg_rips[i].kind); say(" line "); say_dec(g_wbg_rips[i].line); say("\n"); }
+    for (int i = 0; i < g_wbg_nown; i++) { say("      own  "); say_hex(g_wbg_own[i].rip); say(" ("); say(g_wbg_own[i].tn ? g_wbg_own[i].tn : "?"); say("): "); say_dec((i64)g_wbg_own[i].n); say(" accesses ("); say_dec((i64)g_wbg_own[i].nw); say(" writes), first at "); say_hex(g_wbg_own[i].a); say(" flip "); say_dec((i64)g_wbg_own[i].f0); say(", kinds "); say_dec(g_wbg_own[i].kind); say(" line "); say_dec(g_wbg_own[i].line); say("\n"); }
+}
 static int coh_fault(u64 a, int write, u64 rip) {
     u16 *M = coh_on(); if (!M || a < G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE) return 0;
     u64 pg = (a - G2S_PT_BASE) >> 16; u32 sub = (u32)((a >> 12) & 15); u16 bit = (u16)(1u << sub);
@@ -2793,6 +3824,7 @@ static int coh_fault(u64 a, int write, u64 rip) {
         /* (w17: once without asking Windows - the usual case is a page another thread released meanwhile; VirtualQuery
            sizes its answer by walking the whole region's page tables, ~11 ms here. The same thread faulting at the same
            address again goes to the check, so a real access violation still reaches the crash path on its second fault) */
+        if (g_wbg_init && !g_opt_wbg_fold) { pm_unlock(&g_coh_m); return 0; }   /* w5_fast: label policy 4 - wbg_fault_last decides with both guards' locks held (the check below can see a page the label guard closed again meanwhile and call it nobody's) */
         { static struct { u32 tid; u64 a; } nr[64]; u32 me = GetCurrentThreadId(), k = (me >> 2) % 64;   /* (review 4, F2: thread ids are multiples of 4) */
           if (!(nr[k].tid == me && nr[k].a == a)) { nr[k].tid = me; nr[k].a = a; g_coh_retry_ret++; pm_unlock(&g_coh_m); return 1; }
           nr[k].tid = 0; }
@@ -2910,6 +3942,7 @@ static void coh_report(void) {
       for (int k = 0; k < g_coh_nownr; k++) { const CohOwn *O = &g_coh_own[k]; say("        own read at "); say_hex(O->rip); say(": "); say_dec((i64)O->n); say(" times, thread "); say(O->tn ? O->tn : "(unnamed)");
           say(", first at "); say_hex(O->a); say(", GPU writer "); say(O->who); say(" PS "); say_hex(O->ps); say(" CS "); say_hex(O->cs); say("\n"); } }
     { u64 fr = g_flips ? g_flips : 1, t0c = __builtin_ia32_rdtsc(), q0 = plat_ticks(); plat_sleep_ms(50); u64 cps = (__builtin_ia32_rdtsc() - t0c) * plat_ticks_per_sec() / ((plat_ticks() - q0) ? (plat_ticks() - q0) : 1); u64 cpu = cps / 1000000; if (!cpu) cpu = 1;
+      if (g_opt_coh_learn) { u64 us_ = plat_ticks_per_sec() / 1000000; if (!us_) us_ = 1; say("      --coh-learn (w3_perf): protection queries "); say_dec((i64)g_cl_calls); say(" for "); say_dec((i64)g_cl_asked); say(" pages of 64 KB, "); say_dec((i64)g_cl_uniform); say(" found uniform (held with one call each), "); say_dec((i64)(g_cl_ticks / us_ / 1000)); say(" ms in all\n"); }
       say("      t165w15 profile (TSC "); say_dec((i64)(cps / 1000000)); say(" MHz): GPU-write bookkeeping "); say_dec((i64)(g_cp_all / cpu / fr)); say(" us per flip under the lock - holding pages "); say_dec((i64)(g_cp_hold / cpu / fr));
       say(" us ("); say_dec((i64)(g_cp_nhold / fr)); say(" pages per flip), patches "); say_dec((i64)(g_cp_fp / cpu / fr)); say(" us, pushes "); say_dec((i64)(g_cp_pf / cpu / fr)); say(" us, the rest (walking "); say_dec((i64)(g_cp_nheld / fr));
       say(" held pages per flip) "); say_dec((i64)((g_cp_all - g_cp_hold - g_cp_fp - g_cp_pf) / cpu / fr)); say(" us; calls skipped as repeats "); say_dec((i64)(g_cp_dedupe / fr)); say(" per flip; VRAM copies per call "); say_dec((i64)(g_cp_nsh * 10 / (g_coh_nwrote_calls ? g_coh_nwrote_calls : 1)));
@@ -2950,12 +3983,17 @@ static void gw_log_as(u64 lo, u64 hi, const char *who, int ctx) {
     if (hi > lo) lw_own(lo, hi - lo);   /* t107g: ours (the late-write check does not count it as the game's) */
     shwb_one_off(lo, hi, who);   /* t165 (experimental, off by default) */
     coh_gpu_wrote(lo, hi, who, ctx);   /* t165 --gpu-coherence (experimental, off by default) */
+    if (g_opt_gw_late && g_gw_pending && g_nwrp < 64) { g_wrp[g_nwrp].lo = lo; g_wrp[g_nwrp].hi = hi; g_nwrp++; }   /* w3: written back by the batch that gets the command (gw_setup_done) */
+    else
     for (int i = 0; i < g_nsh; i++) { VShadow *S = &g_sh[i];   /* written-back VRAM copies: this range goes back to RAM at the end of the batch */
         if (!S->live || !S->wb || lo >= S->hi || hi <= S->lo) continue;
         u64 a = lo > S->lo ? lo : S->lo, b = hi < S->hi ? hi : S->hi;
         sh_wr_add(S, a, b); }
-    for (u64 k = g_gw_seq > g_gw_done + 64 ? g_gw_seq - 64 : g_gw_done; k < g_gw_seq; k++) if (g_gw[k % GW_N].lo == lo && g_gw[k % GW_N].hi == hi) return;   /* already logged this frame */
-    g_gw[g_gw_seq % GW_N].lo = lo; g_gw[g_gw_seq % GW_N].hi = hi; gwp_mark(lo, hi, g_gw_seq + 1); g_gw_seq++; }
+    { u64 k0 = g_gw_seq > g_gw_done + 64 ? g_gw_seq - 64 : g_gw_done;
+      if (g_opt_gw_late) { u64 own = g_gw_pending ? g_gw_pend_from : g_gw_batch0;   /* w3: only an entry the same batch will account for (an older one retires with ITS batch, before this write has run) */
+          if (own > k0) { for (u64 k = k0; k < own && k < g_gw_seq; k++) if (g_gw[k % GW_N].lo == lo && g_gw[k % GW_N].hi == hi) { g_n_gw_redup++; break; } k0 = own; } }
+      for (u64 k = k0; k < g_gw_seq; k++) if (g_gw[k % GW_N].lo == lo && g_gw[k % GW_N].hi == hi) { if (!g_gw_wd_next) g_gw_wd[k % GW_N] = 0; return; } }   /* already logged this frame */
+    g_gw[g_gw_seq % GW_N].lo = lo; g_gw[g_gw_seq % GW_N].hi = hi; g_gw_wd[g_gw_seq % GW_N] = g_gw_wd_next; gwp_mark(lo, hi, g_gw_seq + 1); g_gw_seq++; }
 /* 1 when [lo, hi) may have been written by the GPU since log position since (or the log no longer reaches back) */
 static int gw_since(u64 since, u64 lo, u64 hi) {
     if (g_gwp_pg && !g_gwp_off && lo >= G2S_PT_BASE && hi <= G2S_PT_BASE + G2S_PT_SIZE && hi > lo) {   /* t107e */
@@ -2975,6 +4013,7 @@ static u64 g_n_fold_inflight, g_n_tex_inflight_waits;
 static u64 g_gwbb_done, g_gwbb_seq, g_gwbb_lo = ~0ull, g_gwbb_hi;   /* t107b: bounds of the writes in flight (a superset: entries may have retired since) */
 static int gw_inflight(u64 lo, u64 hi) {
     u64 done = __atomic_load_n(&g_gw_done, __ATOMIC_ACQUIRE), seq = g_gw_seq;
+    if (g_opt_gw_all) done = 0;   /* w2 test (--gw-all): every logged GPU write counts as in flight, finished or not - the shader forms a deep backlog gives, without the backlog */
     if (seq > done + GW_N) done = seq - GW_N;   /* the log keeps the last GW_N writes */
     /* t107b: most queries (every fold candidate of every translation, every relocated reuse's GPU-written answers) are far
        from anything the GPU writes: reject them against the bounds before scanning the log */
@@ -2982,7 +4021,11 @@ static int gw_inflight(u64 lo, u64 hi) {
     for (u64 k = g_gwbb_seq < done ? done : g_gwbb_seq; k < seq; k++) { u64 i = k % GW_N; if (g_gw[i].lo < g_gwbb_lo) g_gwbb_lo = g_gw[i].lo; if (g_gw[i].hi > g_gwbb_hi) g_gwbb_hi = g_gw[i].hi; }
     g_gwbb_seq = seq;
     if (hi <= g_gwbb_lo || lo >= g_gwbb_hi) return 0;
-    for (u64 k = done; k < seq; k++) { u64 i = k % GW_N; if (g_gw[i].lo < hi && g_gw[i].hi > lo) { g_n_fold_inflight++; return 1; } }
+    int wd_only = 0;   /* w2: 1 = a write whose new bytes the CPU cannot read yet; 2 = only WRITE_DATA blocks (the overlay has their bytes) */
+    for (u64 k = done; k < seq; k++) { u64 i = k % GW_N; if (g_gw[i].lo < hi && g_gw[i].hi > lo) { g_gw_hit_lo = g_gw[i].lo; g_gw_hit_hi = g_gw[i].hi; g_gw_hit_k = k;
+        if (!g_gw_wd[i]) { g_n_fold_inflight++; return 1; }
+        wd_only = 1; } }
+    if (wd_only) { g_n_fold_inflight++; return 2; }
     return 0;
 }
 /* --mem-report ADDR (diagnostic): for the shader at ADDR, where the memory it reads and writes lives (RAM, read mirror,
@@ -3047,6 +4090,7 @@ static void vk_adopt_new_memory(void) {
     vk_lz_traps();
 }
 static void vk_shadow_for(const G2SOut *o) {
+    gw_setup_begin();   /* w3 */
     if (__atomic_load_n(&g_nlz, __ATOMIC_ACQUIRE)) {   /* t111 (--lazy-memory only since t112: without it, new memory is adopted per submit as in t110) */
         for (u32 i = 0; i < o->nwr; i++) lz_ensure(o->wr_lo[i], o->wr_hi[i] - o->wr_lo[i]);   /* memory the GPU writes must exist */
         vk_adopt_new_memory(); }
@@ -3149,7 +4193,10 @@ static void tc_note_evict(const VImg *m) {
 static u64 g_n_evict_waits;
 static void img_mem_free(VImg *m);   /* t134 */
 static u64 g_n_vcreate, g_t_vcreate, g_n_vevict, g_t_vevict, g_n_vevict_gw;   /* t107f: image creations / evictions (count, ticks; GPU-written ones evicted) */
-static int vimg_evict_(void);
+static int vimg_evict_(void); static int vimg_drop(int bi);
+/* w2: limits for one eviction pass (set around the call): only images unused for more than g_evict_min_idle frames, and
+   no GPU-written ones. Used by the real-memory budget (--vram-fit / --image-budget-real), see vimg_create_lv_. */
+static u32 g_evict_min_idle; static int g_evict_no_gw, g_opt_real_evict_any;
 static int vimg_evict(void) {
     u64 t0 = plat_ticks(); int r = vimg_evict_(); g_t_vevict += plat_ticks() - t0;
     return r;
@@ -3160,12 +4207,16 @@ static int vimg_evict_(void) {
         u64 done = __atomic_load_n(&g_done_seq, __ATOMIC_ACQUIRE);
         for (int pass = 0; pass < 2 && bi < 0; pass++)   /* GPU-written images last: their contents exist only on the GPU */
             for (int i = 0; i < V.nimg; i++) { VImg *m = &V.img[i];
-                if (m->img && m->addr > 1 && m->last_use + 2 < V.frame + 1 && m->use_seq <= done && (pass || !m->gpu_written) && (bi < 0 || m->last_use < V.img[bi].last_use)) bi = i; }
+                if (pass && g_evict_no_gw) break;
+                if (m->img && m->addr > 1 && (u64)m->last_use + 2 + g_evict_min_idle < (u64)V.frame + 1 && m->use_seq <= done && (pass || !m->gpu_written) && (bi < 0 || m->last_use < V.img[bi].last_use)) bi = i; }
         /* every candidate is still used by GPU work in flight: let that finish first (freeing it now = a GPU page fault) */
-        if (bi < 0 && !tries) { int any = 0; for (int i = 0; i < V.nimg && !any; i++) { VImg *m = &V.img[i]; if (m->img && m->addr > 1 && m->last_use + 2 < V.frame + 1) any = 1; }
+        if (bi < 0 && !tries) { int any = 0; for (int i = 0; i < V.nimg && !any; i++) { VImg *m = &V.img[i]; if (m->img && m->addr > 1 && (u64)m->last_use + 2 + g_evict_min_idle < (u64)V.frame + 1 && !(g_evict_no_gw && m->gpu_written)) any = 1; }
                                 if (!any) break; int rec = V.recording; vk_submit_wait(); if (rec) vk_begin_cb(); g_n_evict_waits++; }
     }
     if (bi < 0) return -1;
+    return vimg_drop(bi);
+}
+static int vimg_drop(int bi) {   /* t196: the freeing half of vimg_evict_ (also used by vimg_trim_tick) */
     VImg *m = &V.img[bi];
     g_n_vevict++; tc_note_evict(m); chix_drop(m);
     if (m->gpu_written && !m->is_copy) { if (g_n_vevict_gw++ < 30) { vl("  evicted a GPU-written image (its contents exist only on the GPU; t107f log): "); vl_x(m->addr); vl(" "); vl_d(m->w); vl("x"); vl_d(m->h);
@@ -3219,11 +4270,21 @@ static void imb_free(ImBlock *B, u64 off, u64 len) {
     else if (mn) { B->fr[i].off = off; B->fr[i].len += len; }
     else if (!imb_fr_insert(B, i, off, len)) { /* (no memory for the list: the range is lost until exit) */ }
     B->used -= len;
+    if (!B->used && B->mem && !g_opt_no_pool_trim) {   /* t196: an empty block goes back to the driver, except one kept for the next images */
+        int empty = 0; for (int k = 0; k < g_nimb; k++) if (g_imb[k].mem && !g_imb[k].used) empty++;
+        if (empty > 1) { vkFreeMemory(V.dev, B->mem, 0); B->mem = 0; B->size = 0; B->nfr = 0; g_imp_live--; g_imp_blocks_freed++; }
+    }
 }
+static int imb_fits(const ImBlock *B, u64 size, u64 align) {
+    for (u32 i = 0; i < B->nfr; i++) { u64 fo = B->fr[i].off, a = (fo + align - 1) & ~(align - 1); if (a + size <= fo + B->fr[i].len) return 1; }
+    return 0;
+}
+/* t196: video memory really allocated for images: whole pool blocks + the images with their own allocation */
+static u64 img_real_bytes(void) { return ((u64)g_imp_live * IMP_BLOCK_MB << 20) + (V.img_bytes > g_imp_bytes_pooled ? V.img_bytes - g_imp_bytes_pooled : 0); }
 /* t145: where a slow image creation spends its time */
 static u64 g_ic_t[9]; static int g_ic_kind; static u32 g_ic_nlog;   /* phase ticks of the current creation; memory kind 0 pooled, 1 new block, 2 own allocation */
 /* memory for an image: pooled when possible; *pool = block index + 1 or 0 (dedicated: *mem is its own allocation) */
-static int img_mem_alloc(VkImage img, const VkMemoryRequirements *mr, VkDeviceMemory *mem, u32 *pool, u64 *poff) {
+static int img_mem_kind(VkImage img, const VkMemoryRequirements *mr, u32 *pmt) {   /* 1: an allocation of its own */
     u32 mt = vk_find_mem(V.pd, mr->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     int dedicated = g_opt_no_img_pool || mr->size >= IMP_DEDICATED_MIN || mt == 0xFFFFFFFFu;
     if (!dedicated && vkGetImageMemoryRequirements2) {
@@ -3233,16 +4294,30 @@ static int img_mem_alloc(VkImage img, const VkMemoryRequirements *mr, VkDeviceMe
         vkGetImageMemoryRequirements2(V.dev, &ii, &r2);
         if (dr.requiresDedicatedAllocation || dr.prefersDedicatedAllocation) dedicated = 1;
     }
+    *pmt = mt; return dedicated;
+}
+/* t196 (--image-budget-real): the video memory an image of these requirements would add now: nothing when it fits
+   in a pool block, a whole block otherwise, its size when it gets an allocation of its own */
+static u64 img_mem_need(VkImage img, const VkMemoryRequirements *mr) {
+    u32 mt; if (img_mem_kind(img, mr, &mt)) return mr->size;
+    u64 align = mr->alignment ? mr->alignment : 1; if (align < 4096) align = 4096;
+    for (int k = 0; k < g_nimb; k++) if (g_imb[k].mem && g_imb[k].mt == mt && imb_fits(&g_imb[k], mr->size, align)) return 0;
+    return (u64)IMP_BLOCK_MB << 20;
+}
+static int img_mem_alloc(VkImage img, const VkMemoryRequirements *mr, VkDeviceMemory *mem, u32 *pool, u64 *poff) {
+    u32 mt; int dedicated = img_mem_kind(img, mr, &mt);
     u64 align = mr->alignment ? mr->alignment : 1; if (align < 4096) align = 4096;
     if (!dedicated) {
-        for (int k = 0; k < g_nimb; k++) if (g_imb[k].mt == mt && imb_alloc_in(&g_imb[k], mr->size, align, poff)) { *mem = g_imb[k].mem; *pool = (u32)k + 1; g_imp_n_pooled++; g_imp_bytes_pooled += mr->size; g_ic_kind = 0; return 1; }
-        if (g_nimb < IMP_BLOCKS) {
+        for (int k = 0; k < g_nimb; k++) if (g_imb[k].mem && g_imb[k].mt == mt && imb_alloc_in(&g_imb[k], mr->size, align, poff)) { *mem = g_imb[k].mem; *pool = (u32)k + 1; g_imp_n_pooled++; g_imp_bytes_pooled += mr->size; g_ic_kind = 0; return 1; }
+        int bslot = g_nimb; for (int k = 0; k < g_nimb; k++) if (!g_imb[k].mem) { bslot = k; break; }   /* t196: the slot of a freed block first */
+        if (bslot < IMP_BLOCKS) {
             u64 bs = (u64)IMP_BLOCK_MB << 20; VkDeviceMemory bm = 0;
             VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, bs, mt};
             if (vkAllocateMemory(V.dev, &mai, 0, &bm) == VK_SUCCESS) {
-                ImBlock *B = &g_imb[g_nimb]; h_memset(B, 0, sizeof *B); B->mem = bm; B->size = bs; B->mt = mt;
-                if (imb_fr_insert(B, 0, 0, bs) && imb_alloc_in(B, mr->size, align, poff)) { g_nimb++; g_ic_kind = 1; *mem = bm; *pool = (u32)g_nimb; g_imp_n_pooled++; g_imp_bytes_pooled += mr->size;
-                    vl("  image memory pool (t134): block "); vl_d(g_nimb); vl(" of "); vl_d(IMP_BLOCK_MB); vl(" MB, memory type "); vl_d(mt); vl("\n"); return 1; }
+                ImBlock *B = &g_imb[bslot]; { ImFree *kf = B->fr; u32 kc = B->frcap; h_memset(B, 0, sizeof *B); B->fr = kf; B->frcap = kc; } B->size = bs; B->mt = mt;   /* (B->mem stays 0 until it holds the image: a failure leaves the slot free) */
+                if (imb_fr_insert(B, 0, 0, bs) && imb_alloc_in(B, mr->size, align, poff)) { B->mem = bm; if (bslot == g_nimb) g_nimb++; g_imp_live++; g_ic_kind = 1; *mem = bm; *pool = (u32)bslot + 1; g_imp_n_pooled++; g_imp_bytes_pooled += mr->size;
+                    vl("  image memory pool (t134): block "); vl_d(bslot + 1); vl(" of "); vl_d(IMP_BLOCK_MB); vl(" MB, memory type "); vl_d(mt); vl("\n"); return 1; }
+                B->nfr = 0; B->used = 0; B->size = 0;
                 vkFreeMemory(V.dev, bm, 0);
             } else g_imp_n_block_fail++;
         }
@@ -3256,7 +4331,47 @@ static void img_mem_free(VImg *m) {
     else if (m->mem) vkFreeMemory(V.dev, m->mem, 0);
     m->mem = 0;
 }
+/* t196 (--image-max-age N): once per flip, under the GPU lock. Memory textures only: their bytes are in game memory
+   and they are uploaded again like any new texture when the game uses them again (what the table-full eviction
+   already does to the least recently used one). GPU-written images, depth targets and region copies are never taken (retired copies, is_copy 9, are: they are inert). */
+static void vimg_trim_tick(void) {
+    if (!g_img_max_age || V.frame < g_img_max_age || !V.img_budget || (V.frame & 7)) return;
+    u64 soft = g_img_soft ? g_img_soft : V.img_budget / 2;
+    if (g_img_age_default && !g_img_soft && soft > (3072ull << 20)) soft = 3072ull << 20;
+    if (img_real_bytes() <= soft) return;
+    u64 done = __atomic_load_n(&g_done_seq, __ATOMIC_ACQUIRE), age = g_img_max_age < 60 ? 60 : g_img_max_age; int n = 0; static int cur;
+    g_evict_reason = 3;
+    for (int k = 0; k < V.nimg && n < 16; k++) {
+        cur = (cur + 1) % V.nimg; int i = cur; VImg *m = &V.img[i];
+        if (!m->img || m->addr <= 1 || m->gpu_written || m->depth || (m->is_copy && m->is_copy != 9) || (u64)m->last_use + age >= V.frame || m->use_seq > done) continue;
+        g_age_evict_bytes += m->bytes; g_n_age_evict++; vimg_drop(i); n++;
+        if (img_real_bytes() <= soft) break;
+    }
+    g_evict_reason = 0;
+}
+/* w2 (--image-headroom N, e.g. 192; default 0 = off): once the 4,096-entry table is full, every new image first evicts the
+   least recently used one inside the draw that needs it (0.04-0.12 ms each: 60_02 / uncapped_02 / sharpbig_01 have
+   the table full from flip ~1,500 and 100-700 new images per 60 flips in the windows with long frames). Here, once per
+   flip, up to 6 of the least recently used memory textures that have not been used for 600 frames are freed while
+   fewer than N entries are free - the images the table-full eviction would take next, taken between frames instead of
+   in the middle of a burst. GPU-written images, depth targets and region copies are never taken (as vimg_trim_tick). */
+static int g_opt_img_headroom = 0;   /* (off by default: not yet exercised by a test run - the table did not fill) */ static u64 g_n_headroom_evict;
+static void vimg_headroom_tick(void) {
+    if (g_opt_img_headroom <= 0 || V.nimg < 4096 || V.frame < 600) return;
+    int live = 0; for (int i = 0; i < V.nimg; i++) if (V.img[i].img) live++;
+    int want = 4096 - g_opt_img_headroom; if (live <= want) return;
+    u64 done = __atomic_load_n(&g_done_seq, __ATOMIC_ACQUIRE);
+    for (int n = 0; n < 6 && live > want; n++) {
+        int bi = -1;
+        for (int i = 0; i < V.nimg; i++) { VImg *m = &V.img[i];
+            if (!m->img || m->addr <= 1 || m->gpu_written || m->depth || (m->is_copy && m->is_copy != 9) || (u64)m->last_use + 600 >= V.frame || m->use_seq > done) continue;
+            if (bi < 0 || m->last_use < V.img[bi].last_use) bi = i; }
+        if (bi < 0) break;
+        g_evict_reason = 1; vimg_drop(bi); g_evict_reason = 0; g_n_headroom_evict++; live--;
+    }
+}
 static volatile int g_pc_busy;   /* a background pipeline-cache save is running (t145: declared here) */
+static int g_pc_low_io = 1; static u32 g_pc_saver_tid; static u64 g_pc_low_saves;   /* w3: --pc-save-normal-io */
 /* t145: where a slow image creation spends its time (t144 logs: single 192x64 creations of 0.4..3.6 s, no VRAM pressure) */
 static VImg *vimg_create_lv(u64 addr, u32 w, u32 h, u32 d, VkFormat f, int is3d, int depth, int arrayed, u32 levels);
 static VImg *vimg_create(u64 addr, u32 w, u32 h, u32 d, VkFormat f, int is3d, int depth, int arrayed) { return vimg_create_lv(addr, w, h, d, f, is3d, depth, arrayed, 1); }
@@ -3286,6 +4401,9 @@ static VImg *vimg_create_lv_(u64 addr, u32 w, u32 h, u32 d, VkFormat f, int is3d
     VImg *m = &V.img[slot];
     h_memset(m, 0, sizeof *m);
     m->addr = addr; m->w = w; m->h = h; m->d = d ? d : 1; m->fmt = f; m->is3d = is3d; m->depth = depth; m->arrayed = arrayed && !is3d; m->levels = levels ? levels : 1;
+    m->lw = w; m->lh = h;
+    u32 cw_ = w, ch_ = h;
+    if (g_rs_mk && g_rs_on && !is3d && d <= 1 && !arrayed && m->levels == 1) { m->rs = 1; cw_ = rs_up(w); ch_ = rs_up(h); g_n_rs_img++; }   /* t196 */
     VkFormatFeatureFlags ff = fmt_features(f);
     VkImageUsageFlags us = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) us |= VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -3296,7 +4414,7 @@ static VImg *vimg_create_lv_(u64 addr, u32 w, u32 h, u32 d, VkFormat f, int is3d
     }
     u32 layers = (!is3d && d > 1) ? d : 1;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, 0, depth ? 0u : (u32)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, f,
-        {w, h, is3d ? m->d : 1}, m->levels, layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, us, VK_SHARING_MODE_EXCLUSIVE, 0, 0, VK_IMAGE_LAYOUT_UNDEFINED};
+        {cw_, ch_, is3d ? m->d : 1}, m->levels, layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, us, VK_SHARING_MODE_EXCLUSIVE, 0, 0, VK_IMAGE_LAYOUT_UNDEFINED};
     m->usage = us;
     tq = plat_ticks(); CRUMB(101, addr, 3); VkResult r = vkCreateImage(V.dev, &ci, 0, &m->img); IC_PH(1);
     if (r) { vl("  image create failed "); vl_x(addr); vl(" fmt "); vl_d(f); vl(" "); vl_d(w); vl("x"); vl_d(h); vl(" err "); vl_d(r); vl("\n"); return 0; }
@@ -3306,11 +4424,36 @@ static VImg *vimg_create_lv_(u64 addr, u32 w, u32 h, u32 d, VkFormat f, int is3d
     if (!V.img_budget) {
         VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(V.pd, &mp); u64 big = 0;
         for (u32 i = 0; i < mp.memoryHeapCount; i++) if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > big) big = mp.memoryHeaps[i].size;
+        if (g_sim_vram) big = g_sim_vram;   /* t196 (tests) */
         V.img_budget = big ? big / 2 : (4ull << 30);
+        if (g_ram_img_cap && g_ram_img_cap < V.img_budget) V.img_budget = g_ram_img_cap;   /* t194 */
+        if (g_vram_img_cap && g_vram_img_cap < V.img_budget) V.img_budget = g_vram_img_cap;   /* t196 */
         vl("  image memory budget "); vl_d((i64)(V.img_budget >> 20)); vl(" MB\n");
+        g_img_budget0 = V.img_budget;
     }
     m->last_use = V.frame; m->use_seq = g_sub_seq + 1;
-    g_evict_reason = 2; while (V.img_bytes + mr.size > V.img_budget) { if (vimg_evict() < 0) break; V.n_budget_evict++; } g_evict_reason = 0;
+    { u64 rq = __atomic_exchange_n(&g_img_budget_req, 0, __ATOMIC_ACQ_REL);   /* t194: the PC is short of memory */
+      if (rq && rq < V.img_budget) { static int nl; if (nl++ < 20) { vl("  PC short of memory: image budget "); vl_d((i64)(V.img_budget >> 20)); vl(" -> "); vl_d((i64)(rq >> 20)); vl(" MB (t194), frame "); vl_d((i64)V.frame); vl("\n"); } V.img_budget = rq; } }
+    { u64 up = __atomic_exchange_n(&g_img_budget_up, 0, __ATOMIC_ACQ_REL);   /* w2 */
+      if (up > V.img_budget && up <= g_img_budget0) { V.img_budget = up; g_n_budget_up++; } }
+    g_evict_reason = 2;
+    if (g_opt_img_budget_real && g_opt_real_evict_any) { int ne = 0; while (img_real_bytes() + img_mem_need(m->img, &mr) > V.img_budget && ne++ < 64) { if (vimg_evict() < 0) break; V.n_budget_evict++; g_n_real_evict++; } }   /* t196 (at most 64 per image: holes in the blocks may not add up to room for it) */
+    else if (g_opt_img_budget_real) {
+        /* w2: the t196 loop above ran for every new image while the allocated memory was over the budget - also when the
+           image fits in a block it adds nothing to, and evicting images out of half-used blocks gives no memory back. In
+           the cave with --sim-vram-gb 8 --vram-fit (budget lowered to 2,907 MB, 3,023 MB allocated, 1,542 MB of images
+           alive): 77,024 evictions in 14,000 frames, 75,711 of images used in the last 60 frames, 19,382 of GPU-written
+           images (their contents exist only there), 142,280 images made again within 60 frames. Now: only when this
+           image needs new memory, only images unused for 60+ frames, never GPU-written ones; and the bytes of the
+           images themselves stay under the budget as without the option. --real-evict-any: as t196. */
+        u64 need_ = img_mem_need(m->img, &mr); int ne = 0;
+        g_evict_min_idle = 60; g_evict_no_gw = 1;
+        while (need_ && img_real_bytes() + need_ > V.img_budget && ne++ < 64) { if (vimg_evict() < 0) break; V.n_budget_evict++; g_n_real_evict++; need_ = img_mem_need(m->img, &mr); }
+        g_evict_min_idle = 0; g_evict_no_gw = 0;
+        while (V.img_bytes + mr.size > V.img_budget) { if (vimg_evict() < 0) break; V.n_budget_evict++; }
+    }
+    else while (V.img_bytes + mr.size > V.img_budget) { if (vimg_evict() < 0) break; V.n_budget_evict++; }
+    g_evict_reason = 0;
     CRUMB(102, m->img, 3); m->plen = mr.size; IC_PH(2);
     if (!img_mem_alloc(m->img, &mr, &m->mem, &m->pool, &m->poff)) { vkDestroyImage(V.dev, m->img, 0); m->img = 0; vl("  image memory failed\n"); return 0; }   /* t134 */
     IC_PH(3);
@@ -3417,7 +4560,7 @@ static void mip_selfcheck(const u8 *stage, const VkBufferImageCopy *bic, const M
    texture into a freed target), the old image must not win any more. A sample of the memory is recorded each frame
    the GPU writes the target; a different sample now, or a logged copy-engine / shader write over it, means the
    memory is newer than the image. */
-static u64 rt_mem_bytes(const VImg *m) { u64 b = (u64)m->w * m->h * (m->bpe ? m->bpe : 32) / 8; return b; }
+static u64 rt_mem_bytes(const VImg *m) { u64 b = (u64)(m->lw ? m->lw : m->w) * (m->lh ? m->lh : m->h) * (m->bpe ? m->bpe : 32) / 8; return b; }   /* (t191: the surface's own size) */
 static u64 mem_sig(u64 a, u64 len) {
     if (len < 64 || !mem_ok(a, len)) return 0;
     u64 step = (len / 64) & ~7ull; if (step < 8) step = 8;
@@ -3446,25 +4589,273 @@ static int rt_stale(VImg *m) {
 }
 /* attachments the current draw writes (set by vkr_draw_body before its textures are bound) */
 static VImg *g_att[9]; static int g_natt; static u64 g_n_fb_copies;
+/* t193c: the depth target the current draw has bound but does not write (depth test only). Sampling that same image in
+   the draw gave wrong depths at times (7514: speckled highlights from the light passes; the driver keeps an attached
+   depth buffer in its own form) - right whenever the GPU was idle before the draw, as in a replay trace. Until t191 the
+   padded depth buffer was always sampled through its region copy; a view-sized one is sampled through a copy too,
+   refreshed only when the depth changed (as the region copy was). --depth-ro-direct: sampled as it is. */
+static VImg *g_dro; static int g_opt_depth_ro_direct; static u64 g_n_dro;
+static u32 g_w6_dc; static u64 g_n_fbz_hist[2][2][8];   /* w6_gpu: depth snapshots copied, by depth write / depth test / depth function of the draw */
+static VImg *g_zro_att;   /* w6_gpu: the depth target the current draw writes ONLY the stencil of (no depth write, no clear) */
 static int att_written(const VImg *m) { for (int i = 0; i < g_natt; i++) if (g_att[i] == m) return 1; return 0; }
+/* t174: which images get copied, and for which pixel shader (diagnostic counts; report "image copies by kind") */
+typedef struct { u64 addr, ps; u32 w, h, kind, n; } CpyNote;
+static CpyNote g_cpyn[512]; static int g_ncpyn;
+static const char *const g_cpy_kind[5] = {"snapshot of a target the draw writes", "depth <-> R32 sync", "newer image of another format", "depth region (padded)", "render-target region (padded)"};
+static void cpy_note(int kind, const VImg *src) {
+    u64 ps = (u64)g_shr[SH_PGM_LO_PS] << 8;
+    for (int i = 0; i < g_ncpyn; i++) { CpyNote *c = &g_cpyn[i]; if (c->kind == (u32)kind && c->addr == src->addr && c->w == src->w && c->h == src->h && c->ps == ps) { c->n++; return; } }
+    if (g_ncpyn < 512) { CpyNote *c = &g_cpyn[g_ncpyn++]; c->kind = (u32)kind; c->addr = src->addr; c->w = src->w; c->h = src->h; c->ps = ps; c->n = 1; }
+}
+/* ---------------------------------------------------------------- t191: view-sized targets
+   The game's registers give a render target's pitch and padded height (a 1920x1080 depth buffer is 2048x1152, a 240x135
+   target 256x192); the T# that later samples it gives the real size. Vulkan samples a whole image, so every such read
+   used to copy the w x h region into an exact-size image first (vk_texture): 150-200 copies per frame in the sanatorium,
+   each ending the render pass, with barriers. Now the size a surface is sampled with is remembered per (address, padded
+   size, format); from then on the target itself is created with that size, so the texture read takes it as it is.
+   Nothing is drawn outside it: targets whose draw wants more than the view (viewport and scissors, g_vt_ex / g_vt_ey),
+   linear targets written back to memory, and surfaces read with a larger view later go back to the padded size
+   (the image is recreated padded with its contents, and the surface is not shrunk again). --padded-targets: as before. */
+static int g_opt_padded_targets;
+static int g_opt_stale_copies; static u64 g_n_fb_region;   /* t193: --stale-copies = a region copy made for a draw that writes its source stays "current" (as before: the snow / haze bug) */
+typedef struct { u64 addr; u32 lw, lh, vw, vh; VkFormat fmt; u8 state; } VwEnt;   /* state 0 free, 1 learnt, 2 never shrink */
+enum { VW_N = 4096 };
+static VwEnt g_vw[VW_N]; static u64 g_n_vw_learn, g_n_vw_made, g_n_vw_carry, g_n_vw_regrow, g_n_vw_off, g_n_vw_nopitch, g_n_vw_use;
+static i32 g_vt_ex, g_vt_ey; static int g_vt_noshrink;   /* the draw's extent (viewport and scissors); a linear target */
+static VwEnt *vw_ent(u64 addr, u32 lw, u32 lh, VkFormat f, int add) {
+    u32 h = hix_h(addr ^ ((u64)lw << 44) ^ ((u64)lh << 30) ^ ((u64)f * 0x9E3779B1u)) & (VW_N - 1);
+    for (u32 n = 0; n < VW_N; n++, h = (h + 1) & (VW_N - 1)) { VwEnt *e = &g_vw[h];
+        if (!e->state) { if (!add) return 0; e->addr = addr; e->lw = lw; e->lh = lh; e->fmt = f; return e; }
+        if (e->addr == addr && e->lw == lw && e->lh == lh && e->fmt == f) return e; }
+    return 0;
+}
+/* a padded GPU-written surface was just sampled as w x h (pitch = the T#'s) */
+static void vw_learn(const VImg *best, u32 w, u32 h, u32 pitch) {
+    if (best->wb || best->is3d || best->arrayed || best->levels > 1) return;   /* (learnt with --padded-targets too: the replay trace hashes the viewed part) */
+    u32 lw = best->lw ? best->lw : best->w, lh = best->lh ? best->lh : best->h;
+    if (best->w != lw || best->h != lh) return;   /* already view-sized (a smaller second view: copied as before) */
+    if (pitch != lw) { g_n_vw_nopitch++; return; }
+    if (w > lw || h > lh || lw - w >= 256 || lh - h >= 128) return;   /* (not padding) */
+    VwEnt *e = vw_ent(best->addr, lw, lh, best->fmt, 1); if (!e || e->state == 2) return;
+    if (!e->state) { e->state = 1; e->vw = w; e->vh = h; g_n_vw_learn++; }
+    else { if (w > e->vw) e->vw = w; if (h > e->vh) e->vh = h; }
+}
+/* t196: copy the logical w x h region between two images of which at least one is scaled (called between the callers' own
+   barriers). Same scale: a plain copy of the physical region. Different scale: a blit (linear for filterable colour
+   formats - 2:1 is then the exact 2x2 average -, nearest for depth and integer formats: the representative pixel). */
+static int fmt_kind(VkFormat f);
+static void rs_copy(VImg *src, VImg *dst, VkImageAspectFlags sa, VkImageAspectFlags da, u32 dlayer, u32 w, u32 h) {
+    if (src->rs == dst->rs) {
+        VkImageCopy ic = {{sa, 0, 0, 1}, {0, 0, 0}, {da, 0, dlayer, 1}, {0, 0, 0}, {RSV(src, w), RSV(src, h), 1}};
+        vkCmdCopyImage(V.cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic); return; }
+    VkFormatFeatureFlags fs = fmt_features(src->fmt), fd = fmt_features(dst->fmt);
+    int dz = (sa & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+    if (sa != da || src->fmt != dst->fmt || !(fs & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fd & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+        if (g_n_rs_noblit++ < 20) { vl("  render scale: contents NOT carried between a scaled and an unscaled image (no blit for this pair): "); vl_x(src->addr); vl(" "); vl_d(src->w); vl("x"); vl_d(src->h);
+            vl(" vkformat "); vl_d(src->fmt); vl(src->rs ? " scaled -> " : " -> scaled "); vl_d(dst->fmt); vl(", frame "); vl_d((i64)V.frame); vl("\n"); }
+        return; }
+    VkImageBlit bl = {{sa, 0, 0, 1}, {{0, 0, 0}, {(i32)RSV(src, w), (i32)RSV(src, h), 1}}, {da, 0, dlayer, 1}, {{0, 0, 0}, {(i32)RSV(dst, w), (i32)RSV(dst, h), 1}}};
+    vkCmdBlitImage(V.cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+        !dz && fmt_kind(src->fmt) != 2 && (fs & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    g_n_rs_resample++;
+}
+static void vw_copy(VImg *src, VImg *dst) {   /* contents carried over when a surface changes size (rare) */
+    u32 w = src->w < dst->w ? src->w : dst->w, h = src->h < dst->h ? src->h : dst->h;
+    vk_begin_cb(); vk_end_rendering();
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+    VkImageAspectFlags a = src->depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | (src->stencil && dst->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageCopy ic = {{a, 0, 0, 1}, {0, 0, 0}, {a, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    if (src->rs || dst->rs) rs_copy(src, dst, a, a, 0, w, h);   /* t196 */
+    else
+    vkCmdCopyImage(V.cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+    vk_barrier();
+    src->last_use = dst->last_use = V.frame; src->use_seq = dst->use_seq = g_sub_seq + 1;
+    dst->gpu_written = 1; dst->wseq = src->wseq; dst->dseq = src->dseq; dst->bpe = src->bpe; dst->lay_tm = src->lay_tm; dst->lay_pitch = src->lay_pitch;
+    dst->msig = src->msig; dst->mgw = src->mgw; dst->msig_frame = src->msig_frame; dst->csig_frame = src->csig_frame; dst->cstale = src->cstale;
+    dst->w_ep = dst->wx_ep = V.bar_ep + 1; g_n_vw_carry++; g_img_gen++;
+}
+static void vw_retire(VImg *m) { m->gpu_written = 0; m->is_copy = 9; m->copy_seq = 0; g_img_gen++; }   /* inert until the table's LRU takes it (GPU work in flight may still read it) */
+/* the target image for a surface with a learnt view size: the view-sized image, made (and filled from the padded one) if needed */
+static VImg *vw_target(u64 addr, u32 w, u32 h, VkFormat f, u32 bpe, int depth, VwEnt *e) {
+    VImg *m = 0, *old = 0;
+    FOR_ADDR(i, addr) { VImg *q = &V.img[i];
+        if (!q->img || q->is_copy || q->addr != addr || q->fmt != f || q->is3d || q->arrayed || (q->depth != 0) != (depth != 0) || q->levels > 1) continue;
+        if (q->w == e->vw && q->h == e->vh) { if (!m || q->wseq > m->wseq) m = q; }
+        else if (q->w == w && q->h == h && q->gpu_written) { if (!old || q->wseq > old->wseq) old = q; } }
+    int made = 0; u64 old_img = old ? (u64)old->img : 0;
+    if (!m) { m = vimg_create(addr, e->vw, e->vh, 1, f, 0, depth, 0); if (!m) return 0; m->bpe = bpe; made = 1; g_n_vw_made++; }
+    if (old && (u64)old->img != old_img) old = 0;   /* (evicted by that creation) */
+    m->lw = w; m->lh = h;
+    if (old && (made || old->wseq > m->wseq)) vw_copy(old, m);
+    if (old) vw_retire(old);
+    g_n_vw_use++;
+    return m;
+}
+/* a view-sized image turns out too small (a larger view, a draw beyond it, a storage view with the padded width): back
+   to the padded size for good, contents kept */
+static VImg *vw_regrow(VImg *m) {
+    u64 addr = m->addr; u32 lw = m->lw, lh = m->lh; VkFormat f = m->fmt; int depth = m->depth; u64 mi = (u64)m->img;
+    VwEnt *e = vw_ent(addr, lw, lh, f, 1); if (e) { if (e->state != 2) g_n_vw_off++; e->state = 2; }
+    VImg *n = vimg_find(addr, lw, lh, f);
+    if (!n) { int mk_ = g_rs_mk; g_rs_mk = m->rs; n = vimg_create(addr, lw, lh, 1, f, 0, depth, 0); g_rs_mk = mk_; }   /* (t196: at the same scale) */
+    if (!n) return 0;
+    if ((u64)m->img == mi && m->addr == addr) { if (m->gpu_written) vw_copy(m, n); vw_retire(m); }
+    g_n_vw_regrow++;
+    static int nl; if (nl++ < 30) { vl("  view-sized target back to its padded size (t191): "); vl_x(addr); vl(" "); vl_d(lw); vl("x"); vl_d(lh); vl(" vkformat "); vl_d(f); vl(", frame "); vl_d((i64)V.frame); vl("\n"); }
+    return n;
+}
+/* t196: an image that has to be at the other scale (a captured or uploaded image that becomes a screen-sized target, a
+   scaled target bound together with one that is not): a new image at the wanted scale takes its place, contents resampled */
+static VImg *rs_conform(VImg *m, int want) {
+    if (m->is3d || m->arrayed || m->levels > 1 || m->is_copy || m->d > 1) return m;
+    u64 addr = m->addr; u32 w = m->w, h = m->h, lw = m->lw, lh = m->lh, bpe = m->bpe, ltm = m->lay_tm, lp = m->lay_pitch; VkFormat f = m->fmt; int depth = m->depth; u64 mi = (u64)m->img;
+    m->last_use = V.frame; m->use_seq = g_sub_seq + 1;
+    int mk_ = g_rs_mk; g_rs_mk = want; VImg *n = vimg_create(addr, w, h, 1, f, 0, depth, 0); g_rs_mk = mk_;
+    if (!n) return 0;
+    n->bpe = bpe; n->lw = lw; n->lh = lh; n->lay_tm = ltm; n->lay_pitch = lp;
+    if ((u64)m->img == mi && m->addr == addr && m != n) { vw_copy(m, n); vw_retire(m); }
+    if (g_n_rs_conv[want != 0]++ < 40) { vl(want ? "  render scale: image replaced by a scaled one: " : "  render scale: scaled image replaced by an unscaled one: "); vl_x(addr); vl(" "); vl_d(w); vl("x"); vl_d(h);
+        vl(" vkformat "); vl_d(f); vl(depth ? " depth" : ""); vl(", frame "); vl_d((i64)V.frame); vl("\n"); }
+    return n;
+}
+/* t196: a scaled image's contents at the game's size, in an image of its own (the replay's comparison with the captured
+   images and its pictures; inert for every lookup: is_copy 8, not "GPU-written"). 0: no blit for the format. */
+static VImg *rs_1x(VImg *m) {
+    if (!m || !m->rs) return m;
+    VImg *c = 0; u64 mi = (u64)m->img;
+    FOR_ADDR(i, m->addr) { VImg *q = &V.img[i]; if (q->img && q->is_copy == 8 && q->addr == m->addr && q->w == m->w && q->h == m->h && q->fmt == m->fmt && !q->rs) { c = q; break; } }
+    m->last_use = V.frame; m->use_seq = g_sub_seq + 1;
+    if (!c) { int mk_ = g_rs_mk; g_rs_mk = 0; c = vimg_create(m->addr, m->w, m->h, 1, m->fmt, 0, m->depth, 0); g_rs_mk = mk_; if (!c || (u64)m->img != mi || c == m) return 0; c->is_copy = 8; c->bpe = m->bpe; c->lw = m->lw; c->lh = m->lh; }
+    c->last_use = V.frame; c->use_seq = g_sub_seq + 1; c->wseq = m->wseq;
+    vk_begin_cb(); vk_end_rendering();
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+    VkImageAspectFlags a = m->depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | (m->stencil && c->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    u64 nb = g_n_rs_noblit; rs_copy(m, c, a, a, 0, m->w, m->h);
+    vk_barrier();
+    return g_n_rs_noblit == nb ? c : 0;
+}
+/* w5: reduction by a box filter with blits only. A bilinear blit that halves is an exact 2x2 box; any other ratio r (1 < r <= 4)
+   is first interpolated (never reduced) to k times the destination (k = 2 or 4, the first power of two >= r), then halved
+   log2(k) times: every destination pixel is the mean of a k x k block that covers exactly its own footprint in the source.
+   The intermediates are images of their own (fake address 0x7700, is_copy 11). 0: not possible (the caller blits as before). */
+static VkImage rs_dn_tmp(u32 w, u32 h, VkFormat f) {
+    VImg *c = 0;
+    FOR_ADDR(i, 0x7700) { VImg *q = &V.img[i]; if (q->img && q->is_copy == 11 && q->addr == 0x7700 && q->w == w && q->h == h && q->fmt == f) { c = q; break; } }
+    if (!c) { int mk_ = g_rs_mk; g_rs_mk = 0; c = vimg_create(0x7700, w, h, 1, f, 0, 0, 0); g_rs_mk = mk_; if (!c) return 0; c->is_copy = 11; }
+    c->last_use = V.frame; c->use_seq = g_sub_seq + 1;
+    return c->img;
+}
+static int rs_box_blit(VkImage simg, u32 sw, u32 sh, VkFormat f, VkImage dimg, VkImageLayout dlay, i32 dx, i32 dy, u32 dw, u32 dh) {
+    /* (measured, job_930: for ratios up to 2 one bilinear blit already reads every source pixel with nearly the area weights -
+       at 1.5 it is 0.75 / 0.25 against the ideal 0.67 / 0.33 - and the two-step path is visibly softer; so only above 2,
+       where a bilinear tap skips pixels. force_: --rs-down 2, the two-step path for every reduction, A/B) */
+    if (!dw || !dh || (sw <= dw && sh <= dh) || (sw == 2 * dw && sh == 2 * dh)) return 0;
+    if (g_opt_rs_down < 2 && sw <= 2 * dw && sh <= 2 * dh) return 0;
+    u32 k = 2; while (k * dw < sw || k * dh < sh) k *= 2;
+    if (k > 4 || k * dw > 16384 || k * dh > 16384) return 0;
+    VkFormatFeatureFlags ff = fmt_features(f);
+    if (!(ff & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(ff & VK_FORMAT_FEATURE_BLIT_DST_BIT) || !(ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) return 0;
+    VkImage t0 = rs_dn_tmp(k * dw, k * dh, f), t1 = k == 4 ? rs_dn_tmp(2 * dw, 2 * dh, f) : 0;
+    if (!t0 || (k == 4 && !t1)) return 0;
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+    VkImageSubresourceLayers L = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    VkImageBlit b0 = {L, {{0, 0, 0}, {(i32)sw, (i32)sh, 1}}, L, {{0, 0, 0}, {(i32)(k * dw), (i32)(k * dh), 1}}};
+    vkCmdBlitImage(V.cb, simg, VK_IMAGE_LAYOUT_GENERAL, t0, VK_IMAGE_LAYOUT_GENERAL, 1, &b0, VK_FILTER_LINEAR);
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+    if (k == 4) {
+        VkImageBlit b1 = {L, {{0, 0, 0}, {(i32)(4 * dw), (i32)(4 * dh), 1}}, L, {{0, 0, 0}, {(i32)(2 * dw), (i32)(2 * dh), 1}}};
+        vkCmdBlitImage(V.cb, t0, VK_IMAGE_LAYOUT_GENERAL, t1, VK_IMAGE_LAYOUT_GENERAL, 1, &b1, VK_FILTER_LINEAR);
+        vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+        t0 = t1; }
+    VkImageBlit b2 = {L, {{0, 0, 0}, {(i32)(2 * dw), (i32)(2 * dh), 1}}, L, {{dx, dy, 0}, {dx + (i32)dw, dy + (i32)dh, 1}}};
+    vkCmdBlitImage(V.cb, t0, VK_IMAGE_LAYOUT_GENERAL, dimg, dlay, 1, &b2, VK_FILTER_LINEAR);
+    g_n_rs_box_blit++;
+    return 1;
+}
+/* w5 (--rs-box): the scaled colour image m as the game's 1920x1080 picture (box-reduced), for a pass at a lower fixed resolution
+   that samples it with a linear filter; refreshed when m was written since (is_copy 12; inert for every lookup). 0: use m. */
+static VImg *rs_1x_box(VImg *m) {
+    if (!m || !m->rs || m->depth || m->is3d || m->arrayed || m->levels > 1) return 0;
+    VkFormatFeatureFlags ff = fmt_features(m->fmt);
+    if (fmt_kind(m->fmt) == 2 || !(ff & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(ff & VK_FORMAT_FEATURE_BLIT_DST_BIT) || !(ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) return 0;
+    VImg *c = 0; u64 mi = (u64)m->img;
+    FOR_ADDR(i, m->addr) { VImg *q = &V.img[i]; if (q->img && q->is_copy == 12 && q->addr == m->addr && q->w == m->w && q->h == m->h && q->fmt == m->fmt && !q->rs) { c = q; break; } }
+    m->last_use = V.frame; m->use_seq = g_sub_seq + 1;
+    if (!c) { int mk_ = g_rs_mk; g_rs_mk = 0; c = vimg_create(m->addr, m->w, m->h, 1, m->fmt, 0, 0, 0); g_rs_mk = mk_; if (!c || (u64)m->img != mi || c == m) return 0; c->is_copy = 12; c->bpe = m->bpe; c->lw = m->lw; c->lh = m->lh; }
+    c->last_use = V.frame; c->use_seq = g_sub_seq + 1; c->wseq = m->wseq;
+    if (c->copy_seq != m->wseq || c->copy_src != m->img) {
+        vk_begin_cb(); vk_end_rendering();
+        if (!rs_box_blit(m->img, rs_up(m->w), rs_up(m->h), m->fmt, c->img, VK_IMAGE_LAYOUT_GENERAL, 0, 0, m->w, m->h)) {   /* (exactly 2: one bilinear blit is the box) */
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+            vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+            rs_copy(m, c, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, m->w, m->h); }
+        vk_barrier();
+        c->copy_seq = m->wseq; c->copy_src = m->img; g_n_rs_box++;
+    }
+    return c;
+}
 /* A draw that samples a target it also renders to (decals and particles reading the G-buffer they modify, a pass
    rewriting depth from depth): on the PS4 the texture unit reads the bytes in memory, i.e. the target as it was
    before this draw. In Vulkan the same thing is a feedback loop with undefined results (blotches, noise that changes
    every frame). Such draws sample a snapshot of the target taken just before the draw, refreshed when it changed. */
+static void vk_region_copy_pre(const VImg *src, const VImg *dst); static void vk_region_copy_post(VImg *dst, VImg *src);
+static int g_opt_fb_depth_only; static u64 g_n_fb_ds[2];   /* w12_gpu: snapshots of depth + stencil targets: both planes copied / the depth plane only */
 static VImg *vk_feedback_copy(VImg *best) {
     VImg *c = 0;
-    FOR_ADDR(i, best->addr) { VImg *m = &V.img[i]; if (m->img && m->is_copy == 2 && m->addr == best->addr && m->w == best->w && m->h == best->h && m->fmt == best->fmt) { c = m; break; } }
-    if (!c) { c = vimg_create(best->addr, best->w, best->h, 1, best->fmt, 0, best->depth, 0); if (!c) return best; c->is_copy = 2; c->bpe = best->bpe; }
-    c->last_use = V.frame; c->use_seq = g_sub_seq + 1;
+    FOR_ADDR(i, best->addr) { VImg *m = &V.img[i]; if (m->img && m->is_copy == 2 && m->addr == best->addr && m->w == best->w && m->h == best->h && m->fmt == best->fmt && m->rs == best->rs) { c = m; break; } }
+    if (!c) { g_rs_mk = best->rs; c = vimg_create(best->addr, best->w, best->h, 1, best->fmt, 0, best->depth, 0); g_rs_mk = 0; if (!c) return best; c->is_copy = 2; c->bpe = best->bpe; }
+    c->last_use = V.frame; c->use_seq = g_sub_seq + 1; c->lw = best->lw; c->lh = best->lh;
+    /* w6_gpu (--fb-zseq): a draw that samples the depth buffer and writes only its STENCIL (the deferred lights' volumes:
+       stencil test + stencil write, depth write off) counted as writing the target, so every such draw took a new
+       1920x1080 snapshot although the depth it samples had not changed since the last one. The snapshot is sampled
+       through its depth aspect only: it is current when the depth contents are the ones it holds (zseq: not moved by
+       draws that cannot write depth). Nothing else changes: the snapshot's own sequence and the rectangle tracking stay
+       as they were, so the next draw that does need a copy copies everything written since (stencil included). */
+    u64 zid = best->zat == best->wseq ? best->zseq : best->wseq; int zro = best->depth && g_zro_att == best;
+    g_n_fb_kind[best->depth ? (zro ? 1 : 0) : 2] += (c->copy_seq != best->wseq || c->copy_src != best->img);
+    if (best->depth && (c->copy_seq != best->wseq || c->copy_src != best->img)) g_n_fbz_hist[(g_w6_dc >> 2) & 1][(g_w6_dc >> 1) & 1][(g_w6_dc >> 4) & 7]++;
+    if (zro && c->copy_src == best->img && c->copy_zid && c->copy_zid == zid && c->copy_seq != best->wseq) {
+        g_n_fbz_cand++;
+        if (g_opt_fb_zseq) { g_n_fbz_skip++; c->wseq = best->wseq; return c; } }
+    g_n_fbc_calls++;
+    if (g_opt_fb_cover && c->cov_id && c->cov_id == best->cv_prev && c->copy_src == best->img && c->copy_seq != best->wseq) {   /* w10_res: kept current by cov_after_draw: nothing to copy */
+        g_n_cov_hit++; g_n_cov_px += (u64)RSV(best, best->w) * RSV(best, best->h);
+        c->copy_seq = best->wseq; c->copy_zid = 0;
+        if (g_opt_fb_rect) { if (best->fb_last == best->wseq) { best->fb_base = best->wseq; best->fb_full = 0; best->fb_x0 = g_dsc_x0; best->fb_y0 = g_dsc_y0; best->fb_x1 = g_dsc_x1; best->fb_y1 = g_dsc_y1; } else best->fb_base = 0; } }
     if (c->copy_seq != best->wseq || c->copy_src != best->img) {
+        c->copy_zid = zro ? zid : 0;   /* (a draw that writes depth: the snapshot is the depth before it, an identity nothing else has) */
+        /* t196 (--fb-rect): the snapshot was the whole target when the target's sequence was fb_base, and every write
+           since then was a draw's (inside its scissor rectangle, gathered in vk_target): only that rectangle differs */
+        int part = g_opt_fb_rect && !best->rs && c->copy_seq && c->copy_src == best->img && best->fb_base == c->copy_seq && !best->fb_full && best->fb_last == best->wseq;
+        i32 px0 = 0, py0 = 0, px1 = (i32)best->w, py1 = (i32)best->h;
+        if (part) { if (best->fb_x0 > px0) px0 = best->fb_x0; if (best->fb_y0 > py0) py0 = best->fb_y0; if (best->fb_x1 < px1) px1 = best->fb_x1; if (best->fb_y1 < py1) py1 = best->fb_y1; }
+        g_n_fb_px_full += (u64)best->w * best->h;
+        if (part && (px1 <= px0 || py1 <= py0)) g_n_fb_none++;   /* nothing was written since */
+        else {
+        if (part) g_n_fb_part++;
+        g_n_fb_px += (u64)(px1 - px0) * (u64)(py1 - py0);
+        VkImageAspectFlags a = best->depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | (best->stencil && c->stencil && !g_opt_fb_depth_only ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;   /* w12_gpu (--fb-depth-only): a snapshot is only ever sampled, through its depth aspect (vimg_view) - its stencil plane is never read */
+        if (best->depth && best->stencil && c->stencil) g_n_fb_ds[g_opt_fb_depth_only ? 1 : 0]++;
+        VkImageCopy ic = {{a, 0, 0, 1}, {px0, py0, 0}, {a, 0, 0, 1}, {px0, py0, 0}, {RSV(best, (u32)(px1 - px0)), RSV(best, (u32)(py1 - py0)), 1}};   /* (t196: a scaled target whole, part == 0) */
+        if (g_opt_lazy_copies & 1) {   /* t196: as the region copies (t107b) */
+            vk_region_copy_pre(best, c);
+            vkCmdCopyImage(V.cb, best->img, VK_IMAGE_LAYOUT_GENERAL, c->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+            vk_region_copy_post(c, best); g_n_lc[0]++;
+        } else {
         vk_begin_cb(); vk_end_rendering();
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
         vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
-        VkImageAspectFlags a = best->depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | (best->stencil && c->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
-        VkImageCopy ic = {{a, 0, 0, 1}, {0, 0, 0}, {a, 0, 0, 1}, {0, 0, 0}, {best->w, best->h, 1}};
         vkCmdCopyImage(V.cb, best->img, VK_IMAGE_LAYOUT_GENERAL, c->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
         vk_barrier();
-        c->copy_seq = best->wseq; c->copy_src = best->img; g_n_fb_copies++;
+        } }
+        c->copy_seq = best->wseq; c->copy_src = best->img; g_n_fb_copies++; cpy_note(0, best);
+        if (g_opt_fb_rect) {   /* from here on: what the draws write (this one first) */
+            if (best->fb_last == best->wseq) { best->fb_base = best->wseq; best->fb_full = 0; best->fb_x0 = g_dsc_x0; best->fb_y0 = g_dsc_y0; best->fb_x1 = g_dsc_x1; best->fb_y1 = g_dsc_y1; }
+            else best->fb_base = 0; }   /* (its last write was not a draw's target write: not tracked) */
     }
     c->wseq = best->wseq;
     return c;
@@ -3475,7 +4866,7 @@ static VImg *vk_feedback_copy(VImg *best) {
    a depth image as a storage image, so those writes went to a separate R32F image the depth test never saw (and the
    compute shaders started from stale contents). The two images are now kept in step: whichever was written last is
    copied into the other (through the staging buffer) before the other one is used. */
-static u64 g_n_depth_sync;
+static u64 g_n_depth_sync; static int g_opt_depth_ro_writes;   /* t173 */
 /* t107f: the copy goes through a buffer in GPU memory (it went through the host staging buffer: twice across PCIe each
    way, ~33 MB per frame in the Hannah / Beth scene, +2-5 ms of GPU time). Created once, 64 MB; the copies are ordered
    by barriers, so they all use its start. */
@@ -3492,12 +4883,154 @@ static int dsc_ensure(u64 bytes) {
     vkBindBufferMemory(V.dev, g_dsc_buf, g_dsc_mem, 0); g_dsc_size = size;
     return 1;
 }
+/* ---- w12_gpu (--dsync-cs / --dsync-draw; first made by w8_gpu, whose source was lost): depth <-> R32 syncs as shader passes ----
+   The single image copy between a depth aspect and an R32 colour image (t194, maintenance8) costs about nine times a
+   plain copy per pixel in the driver (measured: 283 / 361 us per 1920x1080 copy, six a frame = 1.9 ms; 3.5 ms at 4K).
+   --dsync-cs: depth -> R32 by a compute pass (texel fetch of the depth aspect, image store; any bit pattern is moved as
+   it is). --dsync-draw: R32 -> depth by a full-screen triangle whose pixel shader writes the texel to gl_FragDepth
+   (depth test ALWAYS, depth write on, stencil untouched). A depth write keeps every value in [0, 1] as it is; a value
+   outside it (or NaN, -0, a denormal) could be changed on the way, which the copy would not do. The pixel shader counts
+   such texels in a small buffer the renderer reads: at the first one --dsync-draw turns itself off for the rest of the
+   run (the copy is used again) and the report says so - then that one frame was not exact. Neither option is on by
+   default. Both use full barriers around the pass (the copy's lazy barriers are not used). */
+#include "e6_dsync_spv.h"
+static int g_opt_dsync_cs, g_opt_dsync_draw;
+static struct { int init, cs_ok, draw_ok, tripped; VkDescriptorSetLayout dsl_cs, dsl_fs; VkPipelineLayout pl_cs, pl_fs; VkPipeline p_cs, p_d[2]; VkBuffer cbuf; VkDeviceMemory cmem; volatile u32 *cnt; u64 ms; } g_dsy;
+static u64 g_n_dsy_cs, g_n_dsy_draw, g_n_dsy_no[5], g_n_dsy_px;   /* no: 0 formats / kind of image, 1 usage, 2 pipelines not available, 3 turned off (texels a depth write could change), 4 a game occlusion query is open (the draw would be counted) */
+static VkShaderModule dsy_mod(const u32 *w, u64 nw) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, 0, 0, 4 * nw, w}; VkShaderModule m = 0; if (vkCreateShaderModule(V.dev, &ci, 0, &m)) m = 0; return m; }
+static void dsy_init(void) {
+    if (g_dsy.init) return;
+    g_dsy.init = 1; u64 t0 = plat_ticks();
+    VkPhysicalDeviceFeatures2 pf2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; vkGetPhysicalDeviceFeatures2(V.pd, &pf2); VkPhysicalDeviceFeatures pf = pf2.features;   /* (fragmentStoresAndAtomics is enabled when the device has it) */
+    VkShaderModule mv = dsy_mod(k_dsync_vs, sizeof k_dsync_vs / 4), mf = dsy_mod(k_dsync_fs, sizeof k_dsync_fs / 4), mc = dsy_mod(k_dsync_cs, sizeof k_dsync_cs / 4);
+    {   /* compute: binding 0 the depth aspect (sampled image), 1 the R32 storage image; push constants: width, height */
+        VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0}};
+        VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, 0, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 2, b};
+        VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        if (mc && !vkCreateDescriptorSetLayout(V.dev, &dci, 0, &g_dsy.dsl_cs)) {
+            VkPipelineLayoutCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 0, 0, 1, &g_dsy.dsl_cs, 1, &pcr};
+            if (!vkCreatePipelineLayout(V.dev, &pci, 0, &g_dsy.pl_cs)) {
+                VkComputePipelineCreateInfo cci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, 0, 0,
+                    {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_COMPUTE_BIT, mc, "main", 0}, g_dsy.pl_cs, 0, -1};
+                g_dsy.cs_ok = !vkCreateComputePipelines(V.dev, 0, 1, &cci, 0, &g_dsy.p_cs) && g_dsy.p_cs; } } }
+    if (mv && mf && pf.fragmentStoresAndAtomics) {   /* draw: binding 0 the R32 image (sampled image), 1 the counter buffer; one pipeline per depth format */
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
+        VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, 0}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, 0}};
+        VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, 0, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 2, b};
+        int ok = !vkCreateBuffer(V.dev, &bci, 0, &g_dsy.cbuf);
+        if (ok) { VkMemoryRequirements mr; vkGetBufferMemoryRequirements(V.dev, g_dsy.cbuf, &mr); void *map = 0;
+            VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+            ok = mai.memoryTypeIndex != 0xFFFFFFFFu && !vkAllocateMemory(V.dev, &mai, 0, &g_dsy.cmem) && !vkBindBufferMemory(V.dev, g_dsy.cbuf, g_dsy.cmem, 0) && !vkMapMemory(V.dev, g_dsy.cmem, 0, 256, 0, &map) && map;
+            if (ok) { g_dsy.cnt = (volatile u32 *)map; for (int i = 0; i < 64; i++) g_dsy.cnt[i] = 0; } }
+        ok = ok && !vkCreateDescriptorSetLayout(V.dev, &dci, 0, &g_dsy.dsl_fs);
+        if (ok) { VkPipelineLayoutCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 0, 0, 1, &g_dsy.dsl_fs, 0, 0}; ok = !vkCreatePipelineLayout(V.dev, &pci, 0, &g_dsy.pl_fs); }
+        for (int k = 0; ok && k < 2; k++) {   /* 0: D32_SFLOAT, 1: D32_SFLOAT_S8_UINT (the stencil attachment bound, never tested or written) */
+            VkFormat df = k ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
+            if (!(fmt_features(df) & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) continue;
+            VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_VERTEX_BIT, mv, "main", 0},
+                                                     {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, mf, "main", 0}};
+            VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, 0, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
+            VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, 0, 1, 0};
+            VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, 0, 0, 0, 0, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1.0f};
+            VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, 0, 0, VK_SAMPLE_COUNT_1_BIT};
+            VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, 0, 0, 1, 1, VK_COMPARE_OP_ALWAYS, 0, 0};
+            dss.maxDepthBounds = 1.0f;
+            VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, 0, 0, 0, VK_LOGIC_OP_COPY, 0, 0, {0, 0, 0, 0}};
+            VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dys = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, 0, 0, 2, dyn};
+            VkPipelineRenderingCreateInfo pri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, 0, 0, 0, 0, df, k ? df : VK_FORMAT_UNDEFINED};
+            VkGraphicsPipelineCreateInfo gci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pri, 0, 2, st, &vi, &ia, 0, &vps, &rs, &ms, &dss, &cbs, &dys, g_dsy.pl_fs, 0, 0, 0, -1};
+            if (vkCreateGraphicsPipelines(V.dev, 0, 1, &gci, 0, &g_dsy.p_d[k])) g_dsy.p_d[k] = 0; }
+        g_dsy.draw_ok = ok && (g_dsy.p_d[0] || g_dsy.p_d[1]); }
+    if (mv) vkDestroyShaderModule(V.dev, mv, 0);
+    if (mf) vkDestroyShaderModule(V.dev, mf, 0);
+    if (mc) vkDestroyShaderModule(V.dev, mc, 0);
+    { u64 f = plat_ticks_per_sec() / 1000; if (!f) f = 1; g_dsy.ms = (plat_ticks() - t0) / f; }
+    vl("  w12_gpu: depth <-> R32 sync pipelines made in "); vl_d((i64)g_dsy.ms); vl(" ms (compute "); vl(g_dsy.cs_ok ? "ok" : "NOT available"); vl(", draw D32 "); vl(g_dsy.p_d[0] ? "ok" : "NOT available"); vl(", D32S8 "); vl(g_dsy.p_d[1] ? "ok" : "NOT available");
+    vl(pf.fragmentStoresAndAtomics ? ")\n" : "; no fragmentStoresAndAtomics: --dsync-draw is not used)\n");
+}
+/* the sync src -> dst (w x h texels of the Vulkan images) as a shader pass; 0: not done (the caller copies as before).
+   Called with the batch open and no render pass. */
+static int dsy_pass(VImg *src, VImg *dst, u32 w, u32 h) {
+    int to_depth = dst->depth != 0;
+    if (!(to_depth ? g_opt_dsync_draw : g_opt_dsync_cs)) return 0;
+    VImg *dp = to_depth ? dst : src, *cl = to_depth ? src : dst;
+    if (!dp->depth || cl->depth || cl->fmt != VK_FORMAT_R32_SFLOAT || (dp->fmt != VK_FORMAT_D32_SFLOAT && dp->fmt != VK_FORMAT_D32_SFLOAT_S8_UINT) || (dp->stencil != 0) != (dp->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        || dp->is3d || cl->is3d || dp->arrayed || cl->arrayed || dp->levels > 1 || cl->levels > 1 || dp->d > 1 || cl->d > 1 || !dp->view || !cl->view) { g_n_dsy_no[0]++; return 0; }
+    if (!(cl->usage & (to_depth ? VK_IMAGE_USAGE_SAMPLED_BIT : VK_IMAGE_USAGE_STORAGE_BIT)) || !(dp->usage & (to_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_SAMPLED_BIT))) { g_n_dsy_no[1]++; return 0; }
+    dsy_init();
+    if (to_depth) {
+        if (g_dsy.cnt && !g_dsy.tripped && g_dsy.cnt[0]) {   /* texels a depth write could have changed were synced: back to the copy */
+            g_dsy.tripped = 1;
+            say("    *** --dsync-draw (w12_gpu): R32 texels outside what a depth write keeps exactly (not in 0..1, NaN, -0 or denormal) were synced to a depth buffer - turned off for the rest of the run (flip "); say_dec((i64)g_flips); say(", "); say_dec((i64)g_dsy.cnt[0]); say(" texels so far)\n"); }
+        if (g_dsy.tripped) { g_n_dsy_no[3]++; return 0; }
+        if (g_gq_active >= 0) { g_n_dsy_no[4]++; return 0; }
+        VkPipeline p = g_dsy.draw_ok ? g_dsy.p_d[dp->stencil ? 1 : 0] : 0;
+        if (!p) { g_n_dsy_no[2]++; return 0; }
+        vk_barrier();   /* what wrote the R32 image / used the depth buffer has finished */
+        VkRenderingAttachmentInfo da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 0, dp->view, VK_IMAGE_LAYOUT_GENERAL, 0, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {{{0, 0, 0, 0}}}};
+        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, 0, 0, {{0, 0}, {w, h}}, 1, 0, 0, 0, &da, dp->stencil ? &da : 0};
+        VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f}; VkRect2D sc = {{0, 0}, {w, h}};
+        VkDescriptorImageInfo ii = {0, cl->view, VK_IMAGE_LAYOUT_GENERAL}; VkDescriptorBufferInfo bi = {g_dsy.cbuf, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, 0, 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii, 0, 0},
+                                      {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, 0, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, &bi, 0}};
+        vkCmdBeginRendering(V.cb, &ri);
+        vkCmdBindPipeline(V.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+        vkCmdSetViewport(V.cb, 0, 1, &vp); vkCmdSetScissor(V.cb, 0, 1, &sc);
+        vkCmdPushDescriptorSetKHR(V.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsy.pl_fs, 0, 2, wr);
+        tl_key(0x200, 0x200, 3);
+        vkCmdDraw(V.cb, 3, 1, 0, 0);
+        vkCmdEndRendering(V.cb);
+        vk_barrier();
+        g_sf_cb_ep++; g_sf_pc_ep++;   /* the next draw binds its pipeline and sets its viewport, scissor, blend constants and push constants again */
+        g_n_dsy_draw++;
+    } else {
+        if (!g_dsy.cs_ok) { g_n_dsy_no[2]++; return 0; }
+        VkImageView sv = vimg_view(dp, dp->fmt, 0, 0, 1);   /* (the depth aspect only) */
+        if (!sv) { g_n_dsy_no[2]++; return 0; }
+        vk_barrier();
+        VkDescriptorImageInfo si = {0, sv, VK_IMAGE_LAYOUT_GENERAL}, di = {0, cl->view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, 0, 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &si, 0, 0},
+                                      {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, 0, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &di, 0, 0}};
+        u32 pc[2] = {w, h}, gx = (w + 7) / 8, gy = (h + 7) / 8;
+        vkCmdBindPipeline(V.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dsy.p_cs);
+        vkCmdPushDescriptorSetKHR(V.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dsy.pl_cs, 0, 2, wr);
+        vkCmdPushConstants(V.cb, g_dsy.pl_cs, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pc);
+        tl_key(0x100, 0, gx * gy); g_tl_stage = 'o';
+        vkCmdDispatch(V.cb, gx, gy, 1);
+        vk_barrier();
+        g_sf_pc_ep++;   /* (push constants are shared with the draws) */
+        g_n_dsy_cs++;
+    }
+    g_n_dsy_px += (u64)w * h;
+    return 1;
+}
 static void vk_depth_xfer(VImg *src, VImg *dst) {
     src->last_use = dst->last_use = V.frame; src->use_seq = dst->use_seq = g_sub_seq + 1;
     u32 w = src->w < dst->w ? src->w : dst->w, h = src->h < dst->h ? src->h : dst->h;
     u64 bytes = (u64)w * h * 4;
     if (!w || !h) return;
+    if (src->rs || dst->rs) {   /* t196: both scaled: the physical region; one of them only: not kept in step */
+        if (src->rs != dst->rs) { if (g_n_rs_noblit++ < 20) { vl("  render scale: depth / R32 pair at different scales, not kept in step: "); vl_x(src->addr); vl("\n"); } return; }
+        w = rs_up(w); h = rs_up(h); bytes = (u64)w * h * 4; }
     vk_begin_cb(); vk_end_rendering();
+    if ((g_opt_dsync_cs | g_opt_dsync_draw) && dsy_pass(src, dst, w, h)) { cpy_note(1, src); g_n_depth_sync++; return; }   /* w12_gpu */
+    if (g_has_m8) {   /* t194: one copy, depth aspect <-> colour */
+        VImg *dp = src->depth ? src : dst, *cl = src->depth ? dst : src;
+        if ((dp->fmt == VK_FORMAT_D32_SFLOAT || dp->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) && cl->fmt == VK_FORMAT_R32_SFLOAT) {
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+            VkImageCopy ic = {{src->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {dst->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+            if ((g_opt_lazy_copies & 4) && g_sync_lazy_ok) {   /* t196: as the region copies (t107b); dst is the target of the draw being set up */
+                vk_region_copy_pre(src, dst);
+                vkCmdCopyImage(V.cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+                vk_region_copy_post(dst, src); g_n_lc[2]++;
+            } else {
+            vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+            vkCmdCopyImage(V.cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+            vk_barrier(); }
+            cpy_note(1, src); g_n_depth_sync++; g_n_depth_sync8++;
+            return; } }
     if (dsc_ensure(bytes)) {   /* t107f */
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
         vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
@@ -3508,11 +5041,11 @@ static void vk_depth_xfer(VImg *src, VImg *dst) {
         VkBufferImageCopy b2 = {0, 0, 0, {dst->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
         vkCmdCopyBufferToImage(V.cb, g_dsc_buf, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &b2);
         vk_barrier();
-        if (g_n_depth_sync++ < 12) { vl("  depth sync: "); vl_x(src->addr); vl(" "); vl_d(src->w); vl("x"); vl_d(src->h); vl(src->depth ? " depth -> R32 " : " R32 -> depth ");
+        cpy_note(1, src); if (g_n_depth_sync++ < 12) { vl("  depth sync: "); vl_x(src->addr); vl(" "); vl_d(src->w); vl("x"); vl_d(src->h); vl(src->depth ? " depth -> R32 " : " R32 -> depth ");
             vl_d(dst->w); vl("x"); vl_d(dst->h); vl(" (copied "); vl_d(w); vl("x"); vl_d(h); vl(", tile "); vl_d((i64)src->lay_tm - 1); vl(" pitch "); vl_d(src->lay_pitch); vl(", in GPU memory)\n"); }
         return; }
     VkBuffer sb_ = V.stage; u64 so_;
-    if (bytes > V.stage_size / NSLOT) { if (!stage_tmp(bytes, &sb_, 0)) return; so_ = 0; }   /* t111: larger than a ring slot */
+    if (bytes > V.stage_size / (u64)g_nslot) { if (!stage_tmp(bytes, &sb_, 0)) return; so_ = 0; }   /* t111: larger than a ring slot */
     else { if (V.stage_used + bytes > V.stage_lim) { vk_barrier(); vk_next_slot(); vk_end_rendering(); } so_ = V.stage_used; sb_ = V.stage; }
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
     vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
@@ -3524,7 +5057,7 @@ static void vk_depth_xfer(VImg *src, VImg *dst) {
     vkCmdCopyBufferToImage(V.cb, sb_, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &b2);
     if (sb_ == V.stage) V.stage_used += (bytes + 255) & ~255ull;
     vk_barrier();
-    if (g_n_depth_sync++ < 12) { vl("  depth sync: "); vl_x(src->addr); vl(" "); vl_d(src->w); vl("x"); vl_d(src->h); vl(src->depth ? " depth -> R32 " : " R32 -> depth ");
+    cpy_note(1, src); if (g_n_depth_sync++ < 12) { vl("  depth sync: "); vl_x(src->addr); vl(" "); vl_d(src->w); vl("x"); vl_d(src->h); vl(src->depth ? " depth -> R32 " : " R32 -> depth ");
         vl_d(dst->w); vl("x"); vl_d(dst->h); vl(" (copied "); vl_d(w); vl("x"); vl_d(h); vl(", tile "); vl_d((i64)src->lay_tm - 1); vl(" pitch "); vl_d(src->lay_pitch); vl(")\n"); }
 }
 /* the most recently written image at addr that is (want_depth) a 32-bit depth target / (!want_depth) an R32F image */
@@ -3545,6 +5078,7 @@ static VImg *vk_depth_partner(u64 addr, int want_depth) {
    a target or storage image, the most recently written image over the same memory with the same texel size is copied
    into it when that one is newer. (Depth <-> R32 pairs only with --depth-sync, see g_opt_depthsync.) */
 static u64 g_n_alias_sync, g_n_depth_pair_skipped;
+static int g_opt_sync_pitch; static u64 g_n_sync_cls[3], g_n_sync_px[3], g_n_sync_skip;   /* w6_gpu: see vk_sync_newer */
 /* t107e: may a depth target and an R32 storage image over the same memory be kept in step? Only when they lay the
    memory out the same way (tile mode index and pitch), so that texel (x, y) of one is texel (x, y) of the other. The
    hair: the hair resolve (Hannah / Beth frame 7514, CS 0x24f363400) writes the hair's depth into the depth buffer as an
@@ -3575,13 +5109,27 @@ static void vk_sync_newer(VImg *m) {
     if (p->depth || m->depth) { if (p->bpe == 32 && m->bpe == 32 && (p->depth ? m->fmt == VK_FORMAT_R32_SFLOAT : p->fmt == VK_FORMAT_R32_SFLOAT)) vk_depth_xfer(p, m); return; }
     if ((p->fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && p->fmt <= VK_FORMAT_BC7_SRGB_BLOCK) || (m->fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && m->fmt <= VK_FORMAT_BC7_SRGB_BLOCK)) return;
     u32 w = p->w < m->w ? p->w : m->w, h = p->h < m->h ? p->h : m->h;
+    {   /* w6_gpu (--sync-pitch): two surfaces over the same memory with different pitches share no texel positions - byte
+           (x, y) of one is not byte (x, y) of the other - so copying the top-left region of the newer one into the
+           older one puts nothing there the PS4 would have had; the game cannot rely on it (it reuses the memory for
+           another target and draws all of it). Counted by class; with the option the copy is not made. */
+        u32 pp = p->lay_pitch ? p->lay_pitch : p->lw ? p->lw : p->w, pm = m->lay_pitch ? m->lay_pitch : m->lw ? m->lw : m->w; int cls = pp != pm ? 2 : (p->w == m->w && p->h == m->h) ? 0 : 1;
+        g_n_sync_cls[cls]++; g_n_sync_px[cls] += (u64)w * h;
+        if (cls == 2 && g_opt_sync_pitch) { g_n_sync_skip++; return; } }
+    VkImageCopy ic = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    if ((g_opt_lazy_copies & 2) && g_sync_lazy_ok && !p->rs && !m->rs) {   /* t196: as the region copies (t107b); m is the target of the draw being set up */
+        vk_region_copy_pre(p, m);
+        vkCmdCopyImage(V.cb, p->img, VK_IMAGE_LAYOUT_GENERAL, m->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+        vk_region_copy_post(m, p); g_n_lc[1]++;
+    } else {
     vk_begin_cb(); vk_end_rendering();
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
     vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
-    VkImageCopy ic = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    if (p->rs || m->rs) rs_copy(p, m, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, w, h);   /* t196 */
+    else
     vkCmdCopyImage(V.cb, p->img, VK_IMAGE_LAYOUT_GENERAL, m->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
-    vk_barrier();
-    g_n_alias_sync++;
+    vk_barrier(); }
+    g_n_alias_sync++; cpy_note(2, p);
 }
 /* STATUS 71: textures that resolve to a GPU-written image of another kind - a block-compressed T# (games never render
    into those) or another texel size (the "most recent image of any kind" fallback). Suspected source of the blue flashes:
@@ -3688,23 +5236,73 @@ static void tex_wait_log(const VImg *m, u64 lo, u64 len, u32 tm, u32 dfmt) {
    once per frame (no reset) and every texture in it is answered from that list; a chunk that cannot be listed (not one
    watched allocation, or too many written pages) falls back to the per-texture call. A write after the chunk was listed
    is seen next frame - the same as a write right after the old per-texture call. --tex-dirty-each: the old way. */
-enum { DCH_N = 512, DCH_SHIFT = 22 };
-typedef struct { u64 base, frame; int st; u64 bm[(1u << DCH_SHIFT) / 4096 / 64]; } TexDChunk;   /* st: 1 list valid, 2 not listable */
+enum { DCH_N = 4096, DCH_SHIFT = 22 };   /* w5_perf: 4096 slots (16 GB of addresses without two chunks in one slot; 512 before - chunks 2 GB apart listed each other out within a frame) */
+typedef struct { u64 base, frame, seen; int st; volatile u32 lk; u8 by; u64 bm[(1u << DCH_SHIFT) / 4096 / 64]; } TexDChunk;   /* st: 1 list valid, 2 not listable; lk / by / seen: --tex-dirty-ahead */
 static TexDChunk g_dch[DCH_N]; static int g_opt_tex_dirty_each; static u64 g_n_dch_lists, g_n_dch_fallback;
+/* w5_perf --tex-dirty-ahead. The texture checks ask Windows once a frame, per 4 MB chunk of texture memory in use, which
+   pages the CPU wrote (GetWriteWatch without reset: ~210 calls a frame in the Chapter 10 cave, 4 us each = 0.9 ms of
+   the renderer thread, 6 % of its samples in ntdll). A helper thread now makes those calls for the chunks the frame
+   before used, starting when the renderer starts a frame's first submit; the renderer takes a chunk's list when it is
+   there (same frame tag), waits a moment when the helper is in that call, and otherwise asks itself as before. What a
+   list says is what the renderer's own call would have said a little earlier in the same submit: a page written after
+   it is found by the next frame's list, exactly as a page written after the renderer's own call was. */
+static int g_opt_dch_ahead, g_dcp_on; static PMutex g_dcp_m; static PCond g_dcp_cv; static volatile u32 g_dcp_gen;
+enum { DCP_MAX = 2048 };
+static u64 g_dcp_cur[DCP_MAX], g_dcp_pub[DCP_MAX]; static u32 g_dcp_ncur, g_dcp_npub; static u64 g_dcp_pub_frame, g_dcp_kick_frame;
+static volatile u64 g_n_dcp_made; static u64 g_n_dcp_used, g_n_dcp_kicks, g_n_dcp_busy, g_n_dcp_gaveup;
+static void dch_fill(TexDChunk *d, u64 c, u64 F, void **pg, u32 npg, int own) {
+    d->base = c; d->frame = F; for (u32 k = 0; k < sizeof d->bm / 8; k++) d->bm[k] = 0;
+    i64 n = plat_dirty_list((void *)c, 1ull << DCH_SHIFT, pg, npg);
+    if (n < 0 || n >= (i64)npg) { d->st = 2; if (own) g_n_dch_fallback++; }
+    else { d->st = 1; if (own) g_n_dch_lists++; for (i64 q = 0; q < n; q++) { u64 p = ((u64)pg[q] - c) >> 12; if (p < (1u << DCH_SHIFT) / 4096) d->bm[p >> 6] |= 1ull << (p & 63); } }
+}
+static void dcp_thread(void *arg) {
+    (void)arg; static void *pg[(1u << DCH_SHIFT) / 4096]; static u64 L[DCP_MAX]; u32 last = 0;
+    for (;;) {
+        pm_lock(&g_dcp_m);
+        while (__atomic_load_n(&g_dcp_gen, __ATOMIC_ACQUIRE) == last) pc_wait(&g_dcp_cv, &g_dcp_m, 100000);
+        last = g_dcp_gen; u32 n = g_dcp_npub; u64 F = g_dcp_pub_frame; for (u32 k = 0; k < n; k++) L[k] = g_dcp_pub[k];
+        pm_unlock(&g_dcp_m);
+        for (u32 k = 0; k < n && __atomic_load_n(&g_dcp_gen, __ATOMIC_ACQUIRE) == last; k++) {
+            u64 c = L[k]; TexDChunk *d = &g_dch[(c >> DCH_SHIFT) & (DCH_N - 1)]; u32 z = 0;
+            if (!__atomic_compare_exchange_n(&d->lk, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) continue;   /* (the renderer is at this chunk) */
+            if (d->base != c || d->frame != F) { dch_fill(d, c, F, pg, sizeof pg / sizeof pg[0], 0); d->by = 1; __atomic_add_fetch(&g_n_dcp_made, 1, __ATOMIC_RELAXED); }
+            __atomic_store_n(&d->lk, 0, __ATOMIC_RELEASE);
+        }
+    }
+}
+static void dcp_kick(void) {   /* renderer, at the start of a submit */
+    if (!g_opt_dch_ahead || g_opt_tex_dirty_each) return;
+    if (!g_dcp_on) { pm_init(&g_dcp_m); pc_init(&g_dcp_cv); void *h = pt_create(dcp_thread, 0, 1u << 18); if (!h) { g_opt_dch_ahead = 0; return; } pt_set_priority_high(h); g_dcp_on = 1;
+        vl("  texture write checks: the chunk lists are made ahead by a helper thread (w5_perf --tex-dirty-ahead)\n"); }
+    if (g_dcp_kick_frame == V.frame + 1) return;   /* (a later submit of the same frame) */
+    g_dcp_kick_frame = V.frame + 1;
+    if (!g_dcp_ncur) return;
+    pm_lock(&g_dcp_m);
+    for (u32 k = 0; k < g_dcp_ncur; k++) g_dcp_pub[k] = g_dcp_cur[k];
+    g_dcp_npub = g_dcp_ncur; g_dcp_pub_frame = V.frame + 1; __atomic_store_n(&g_dcp_gen, g_dcp_gen + 1, __ATOMIC_RELEASE);
+    pc_broadcast(&g_dcp_cv); pm_unlock(&g_dcp_m);
+    g_dcp_ncur = 0; g_n_dcp_kicks++;
+}
 static i64 tex_any_dirty(u64 lo, u64 len) {
     if (g_opt_tex_dirty_each || !len || len > (64ull << 20)) return plat_any_dirty((void *)lo, len);
     static void *pg[(1u << DCH_SHIFT) / 4096];
     for (u64 c = lo & ~((1ull << DCH_SHIFT) - 1); c < lo + len; c += 1ull << DCH_SHIFT) {
         TexDChunk *d = &g_dch[(c >> DCH_SHIFT) & (DCH_N - 1)];
-        if (d->base != c || d->frame != V.frame + 1) {
-            d->base = c; d->frame = V.frame + 1; for (u32 k = 0; k < sizeof d->bm / 8; k++) d->bm[k] = 0;
-            i64 n = plat_dirty_list((void *)c, 1ull << DCH_SHIFT, pg, sizeof pg / sizeof pg[0]);
-            if (n < 0 || n >= (i64)(sizeof pg / sizeof pg[0])) { d->st = 2; g_n_dch_fallback++; }
-            else { d->st = 1; g_n_dch_lists++; for (i64 q = 0; q < n; q++) { u64 p = ((u64)pg[q] - c) >> 12; if (p < (1u << DCH_SHIFT) / 4096) d->bm[p >> 6] |= 1ull << (p & 63); } }
-        }
-        if (d->st != 1) return plat_any_dirty((void *)lo, len);   /* (the whole range the old way) */
-        u64 a = lo > c ? lo : c, b = lo + len < c + (1ull << DCH_SHIFT) ? lo + len : c + (1ull << DCH_SHIFT);
-        for (u64 p = (a - c) >> 12, e = (b - 1 - c) >> 12; p <= e; p++) if (d->bm[p >> 6] >> (p & 63) & 1) return 1;
+        if (g_dcp_on) { u32 z = 0, spins = 0;
+            while (!__atomic_compare_exchange_n(&d->lk, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) { z = 0; if (!spins) g_n_dcp_busy++;
+                if (++spins > 2000) { g_n_dcp_gaveup++; return plat_any_dirty((void *)lo, len); }   /* (the helper lost its processor inside the call: the range asked directly) */
+                __builtin_ia32_pause(); } }
+        if (d->base != c || d->frame != V.frame + 1) { dch_fill(d, c, V.frame + 1, pg, sizeof pg / sizeof pg[0], 1); d->by = 0; }
+        else if (d->by) { d->by = 0; g_n_dcp_used++; }
+        if (g_dcp_on && d->seen != V.frame + 1) { d->seen = V.frame + 1; if (g_dcp_ncur < DCP_MAX) g_dcp_cur[g_dcp_ncur++] = c; }
+        i64 r = 0;
+        if (d->st != 1) r = -2;
+        else { u64 a = lo > c ? lo : c, b = lo + len < c + (1ull << DCH_SHIFT) ? lo + len : c + (1ull << DCH_SHIFT);
+            for (u64 p = (a - c) >> 12, e = (b - 1 - c) >> 12; p <= e; p++) if (d->bm[p >> 6] >> (p & 63) & 1) { r = 1; break; } }
+        if (g_dcp_on) __atomic_store_n(&d->lk, 0, __ATOMIC_RELEASE);
+        if (r == -2) return plat_any_dirty((void *)lo, len);   /* (the whole range the old way) */
+        if (r) return 1;
     }
     return 0;
 }
@@ -3724,7 +5322,7 @@ static void vk_region_copy_pre(const VImg *src, const VImg *dst) {
 }
 static void vk_region_copy_post(VImg *dst, VImg *src) {
     if (g_opt_copy_barriers || !V.recording || g_nrd_img >= 60) { vk_barrier(); return; }   /* (the sampling draw's list of images must have room for it) */
-    dst->w_ep = V.bar_ep + 1; g_n_copy_post_deferred++;
+    dst->w_ep = dst->wx_ep = V.bar_ep + 1; g_n_copy_post_deferred++;
     if (src) src->r_ep = V.bar_ep + 1;   /* read by the copy: a later write to it as a target waits for the copy (the restart's hazard check) */
 }
 typedef struct { const G2SOut *o; G2SIn in; int path; } TrRec;
@@ -3825,13 +5423,21 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
        frame, so prefer the most recent one with the same texel size; fall back to the most recent of any kind. */
     *lbase = 0;
     VImg *best = 0, *any = 0; u32 want_bpe = fmt_bpe(dfmt);
+    for (int vwpass = 0; vwpass < 2; vwpass++) {
+    VImg *small = 0; best = 0; any = 0;
     FOR_ADDR(i, addr) { VImg *m = &V.img[i];
-        if (!m->img || m->addr != addr || !m->gpu_written || m->w < w || m->h < h) continue;
+        if (!m->img || m->addr != addr || !m->gpu_written) continue;
+        if (m->w < w || m->h < h) {   /* t191: a view-sized target read with a larger view (or, as a storage image, with its padded width) */
+            if (!m->is_copy && (m->lw > m->w || m->lh > m->h) && m->lw >= w && m->lh >= h && (!small || m->wseq > small->wseq)) small = m;
+            continue; }
         if (!storage && rt_stale(m)) {   /* the game has put new data in that memory since: the image becomes an ordinary texture of it */
+            if (m->rs) { if (!m->is_copy && !m->depth) vw_retire(m); continue; }   /* t196: a scaled image is never filled from memory: the texture gets its own image */
             if (!m->depth && m->levels <= 1) { m->gpu_written = 0; m->hash = 0; m->watched = 0; m->frame_uploaded = 0; m->copy_seq = 0; g_img_gen++; }
             continue; }
         if (!any || m->wseq > any->wseq) any = m;
         if (m->bpe == want_bpe && !m->depth && (!best || m->wseq > best->wseq)) best = m; }
+    if (small && !vwpass && (storage || !any || small->wseq > any->wseq)) { if (vw_regrow(small)) continue; }
+    break; }
     if (any && any->depth && (!best || any->wseq > best->wseq)) best = 0;   /* depth written last: use it as is */
     if (!best) best = any;
     if (best && !storage && (arrayed && !is3d && !best->arrayed && layers > 1)) best = 0;   /* a cube / array over per-layer targets: composed below */
@@ -3841,22 +5447,32 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
         best->last_use = V.frame; best->use_seq = g_sub_seq + 1;
         int direct = best->depth || best->bpe != want_bpe || (best->w == w && best->h == h) || is3d || arrayed || best->is3d || best->arrayed;
         if (direct && g_natt && !best->is3d && !best->arrayed && att_written(best)) best = vk_feedback_copy(best);
-        if (best->depth && (best->w != w || best->h != h) && want_bpe == (best->bpe ? best->bpe : 32u) && !is3d && !arrayed && !best->is3d && !best->arrayed && best->w >= w && best->h >= h && !g_opt_depth_whole) {
+        int dro_ = best == g_dro && best->depth && best->w == w && best->h == h && !g_opt_depth_ro_direct;
+        if (best->depth && ((best->w != w || best->h != h) || dro_) && want_bpe == (best->bpe ? best->bpe : 32u) && !is3d && !arrayed && !best->is3d && !best->arrayed && best->w >= w && best->h >= h && (!g_opt_depth_whole || dro_)) {
+            g_n_dro += (u64)dro_;
             /* a depth buffer allocated padded (2048x1152) sampled as a w x h texture (1920x1080): normalized coordinates
                must cover exactly the w x h region, as the PS4's texture unit does with the T#'s size. Before (STATUS 47),
                the whole padded image was sampled: a pass reading depth at (x / 1920) got the texel at x * 2048 / 1920, so
                everything right of x = 1800 and below y = 1012 (1920 * 1920 / 2048, 1080 * 1080 / 1152) read padding -
                the "box" where the right and bottom edges miss fog and other effects. */
             VImg *c = 0;
-            FOR_ADDR(i, addr) { VImg *m = &V.img[i]; if (m->img && m->is_copy == 3 && m->addr == addr && m->w == w && m->h == h && m->fmt == best->fmt) { c = m; break; } }
-            if (!c) { c = vimg_create(addr, w, h, 1, best->fmt, 0, 1, 0); if (!c) { *viewfmt = best->fmt; return best; } c->is_copy = 3; c->bpe = best->bpe; }
+            FOR_ADDR(i, addr) { VImg *m = &V.img[i]; if (m->img && m->is_copy == 3 && m->addr == addr && m->w == w && m->h == h && m->fmt == best->fmt && m->rs == best->rs) { c = m; break; } }
+            vw_learn(best, w, h, pitch);   /* t191: from now on the depth target is made w x h */
+            if (!c) { g_rs_mk = best->rs; c = vimg_create(addr, w, h, 1, best->fmt, 0, 1, 0); g_rs_mk = 0; if (!c) { *viewfmt = best->fmt; return best; } c->is_copy = 3; c->bpe = best->bpe; }
             c->last_use = V.frame; c->use_seq = g_sub_seq + 1;
-            if (c->copy_seq != best->wseq || c->copy_src != best->img) {
+            u64 bseq_ = g_opt_depth_ro_writes || best->is_copy ? best->wseq : best->dseq;   /* t173c: a snapshot's own sequence is its source's wseq */
+            /* t193 (STATUS 242): a draw that samples the surface through this copy AND writes the surface leaves the copy one
+               draw behind, with the sequence number of the surface as written - the next reader took the copy for
+               current and saw the surface without that draw (the half-resolution particle / fog composite onto the
+               lighting buffer: falling snow and haze missing whenever nothing else was drawn after it). Such a copy
+               is valid for that draw only. */
+            int fbw_ = g_natt && att_written(best) && !g_opt_stale_copies; u64 dno_ = g_draws + g_dispatches + 1;
+            if ((c->copy_seq != bseq_ || c->copy_src != best->img) && c->fb_at != dno_) {
                 vk_region_copy_pre(best, c);
-                VkImageCopy ic = {{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+                VkImageCopy ic = {{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {RSV(best, w), RSV(best, h), 1}};
                 vkCmdCopyImage(V.cb, best->img, VK_IMAGE_LAYOUT_GENERAL, c->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
                 vk_region_copy_post(c, best);
-                c->copy_seq = best->wseq; c->copy_src = best->img; g_n_depth_copies++;
+                c->copy_seq = fbw_ ? 0 : bseq_; c->copy_src = best->img; c->fb_at = fbw_ ? dno_ : 0; g_n_depth_copies++; cpy_note(3, best); g_n_fb_region += (u64)fbw_;
             }
             c->wseq = best->wseq;
             *viewfmt = c->fmt; return c;
@@ -3865,15 +5481,17 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
         if ((best->w == w && best->h == h) || is3d || arrayed || best->is3d || best->arrayed) return best;
         /* the shader samples a w x h texture but the target is padded (pitch/slice): copy exactly that region */
         VImg *c = 0;
-        FOR_ADDR(i, addr) { VImg *m = &V.img[i]; if (m->img && m->is_copy == 1 && m->addr == addr && m->w == w && m->h == h && m->bpe == want_bpe) { c = m; break; } }
-        if (!c) { c = vimg_create(addr, w, h, 1, f, 0, 0, 0); if (!c) return best; c->is_copy = 1; c->bpe = want_bpe; }
+        FOR_ADDR(i, addr) { VImg *m = &V.img[i]; if (m->img && m->is_copy == 1 && m->addr == addr && m->w == w && m->h == h && m->bpe == want_bpe && m->rs == best->rs) { c = m; break; } }
+        vw_learn(best, w, h, pitch);   /* t191 */
+        if (!c) { g_rs_mk = best->rs; c = vimg_create(addr, w, h, 1, f, 0, 0, 0); g_rs_mk = 0; if (!c) return best; c->is_copy = 1; c->bpe = want_bpe; }
         c->last_use = V.frame; c->use_seq = g_sub_seq + 1;
-        if (c->copy_seq != best->wseq || c->copy_src != best->img) {
+        int fbw_ = g_natt && att_written(best) && !g_opt_stale_copies; u64 dno_ = g_draws + g_dispatches + 1;   /* t193: see the depth copy above */
+        if ((c->copy_seq != best->wseq || c->copy_src != best->img) && c->fb_at != dno_) {
             vk_region_copy_pre(best, c);
-            VkImageCopy ic = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+            VkImageCopy ic = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {RSV(best, w), RSV(best, h), 1}};
             vkCmdCopyImage(V.cb, best->img, VK_IMAGE_LAYOUT_GENERAL, c->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
             vk_region_copy_post(c, best);
-            c->copy_seq = best->wseq; c->copy_src = best->img; V.n_rt_copies++;
+            c->copy_seq = fbw_ ? 0 : best->wseq; c->copy_src = best->img; c->fb_at = fbw_ ? dno_ : 0; V.n_rt_copies++; cpy_note(4, best); g_n_fb_region += (u64)fbw_;
         }
         return c;
     }
@@ -3904,14 +5522,16 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
                 o->watched = 0; o->frame_uploaded = 0; o->up_lo = lo_; o->up_len = len_; o->hash = mem_hash((const u8 *)lo_, len_) ^ ((u64)first_ << 56) ^ ((u64)nlev << 60);
                 g_n_tmove_reused++; g_n_tmove_bytes += len_; m = o;
                 static int nl; if (nl++ < 20) { vl("  moved texture reused (t118c): "); vl_d(w); vl("x"); vl_d(h); vl(" vkformat "); vl_d(f); vl(" now at "); vl_x(addr); vl(", frame "); vl_d((i64)V.frame); vl("\n"); } } } }
-    if (!m) { if (g_opt_phantom) phantom_check(addr, w, h, f, storage ? 1 : nlev, T); m = vimg_create_lv(addr, w, h, is3d ? d : layers, f, is3d, 0, arrayed, storage ? 1 : nlev); if (!m) return 0; m->bpe = fmt_bpe(dfmt); }
+    int rs_st_ = g_rs_on && storage && !is3d && !arrayed && layers <= 1 && tm != 8 && rs_elig(w, h);   /* t196: a screen-sized storage image is scaled like the targets */
+    if (!m) { if (g_opt_phantom) phantom_check(addr, w, h, f, storage ? 1 : nlev, T); g_rs_mk = rs_st_; m = vimg_create_lv(addr, w, h, is3d ? d : layers, f, is3d, 0, arrayed, storage ? 1 : nlev); g_rs_mk = 0; if (!m) return 0; m->bpe = fmt_bpe(dfmt); }
+    if (g_rs_on && storage && !is3d && !arrayed && (int)m->rs != rs_st_) { m = rs_conform(m, rs_st_); if (!m) return 0; }
     m->last_use = V.frame; m->use_seq = g_sub_seq + 1;
     if (storage) {
         if (!g_opt_copy_barriers && (m->w_ep == V.bar_ep + 1 || m->r_ep == V.bar_ep + 1)) vk_barrier();   /* t107b: an upload / copy into it (or a read of it) whose barrier after was left to a sampler */
         m->lay_tm = tm + 1; m->lay_pitch = pitch;   /* t107e: see depth_pair_ok */
         if (!is3d && !arrayed) vk_sync_newer(m);
         if (!m->gpu_written) g_img_gen++;   /* t156 */
-        m->gpu_written = 1; m->wseq = ++V.wseq; rt_mark(m);
+        m->gpu_written = 1; m->wseq = ++V.wseq; m->dseq = m->wseq; rt_mark(m);
         if (g_natt < 9) g_att[g_natt++] = m;   /* written by this draw / dispatch: a sampled read of it gets a snapshot (no in-place race) */
         if (tm == 8 && !is3d && !arrayed && !g_opt_nowb) wb_add(m, addr, pitch, w, h, fmt_bpe(dfmt));
         return m; }
@@ -3940,7 +5560,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
                     VImg *g = src[k]; if (!g) continue;
                     if (g->depth) {
                         u64 bytes = (u64)w * h * 4; VkBuffer sb_ = V.stage; u64 so_;
-                        if (bytes > V.stage_size / NSLOT) { if (!stage_tmp(bytes, &sb_, 0)) { cfail = 1; continue; } so_ = 0; }   /* t111: larger than a ring slot */
+                        if (bytes > V.stage_size / (u64)g_nslot) { if (!stage_tmp(bytes, &sb_, 0)) { cfail = 1; continue; } so_ = 0; }   /* t111: larger than a ring slot */
                         else { if (V.stage_used + bytes > V.stage_lim) { vk_barrier(); vk_next_slot(); vk_end_rendering(); } so_ = V.stage_used; sb_ = V.stage; }
                         VkBufferImageCopy b1 = {so_, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
                         vkCmdCopyImageToBuffer(V.cb, g->img, VK_IMAGE_LAYOUT_GENERAL, sb_, 1, &b1);
@@ -3983,7 +5603,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
         if (g_opt_defer_fill) {   /* t107f: see PendFill */
             u64 out = 0;
             for (u32 i = first; i < nlev; i++) out += ((u64)L[i].ew * L[i].eh * L[i].slices * bpe / 8 + 15) & ~15ull;
-            if (out + 256 <= V.stage_size / NSLOT) {
+            if (out + 256 <= V.stage_size / (u64)g_nslot) {
                 vk_submit_async(0, 0); vk_begin_cb(); vk_carry_uses();   /* the writers go to the GPU; this batch starts after them (vk_begin_cb's barrier) */
                 u64 need = g_sub_seq;
                 if (V.stage_used + out > V.stage_lim) vk_next_slot();
@@ -4047,7 +5667,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
     for (u32 i = first; i < nlev; i++) out += ((u64)L[i].ew * L[i].eh * L[i].slices * bpe / 8 + 15) & ~15ull;
     vk_begin_cb();
     VkBuffer sbuf = V.stage; u8 *smap = V.stage_map; u64 so0;
-    if (out > V.stage_size / NSLOT) {   /* t111: larger than a ring slot: a staging buffer of its own */
+    if (out > V.stage_size / (u64)g_nslot) {   /* t111: larger than a ring slot: a staging buffer of its own */
         if (!stage_tmp(out, &sbuf, &smap)) { vl("  texture: no memory for its staging buffer\n"); m->hash = 0; return m; }
         so0 = 0; }
     else { if (V.stage_used + out > V.stage_lim) vk_next_slot(); so0 = V.stage_used; sbuf = V.stage; smap = V.stage_map; }
@@ -4274,6 +5894,12 @@ static void *stage_sgs(VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *sgs,
     g_n_sgs_stages++; return sgs;
 }
 /* sig: [count, then (binding << 8 | type) ...], type 0 = combined image sampler, 1 = storage image */
+static void rs_gen_push(VkPipelineLayout pl) {   /* w7_prep: words 38..45 of a ratio-generic shader (gcn2spv.h G2S_RS_GEN) */
+    if (!g_opt_rs_gen) return;
+    union { float f; u32 u; } a_, b_, c_; a_.f = (float)g_rs_num / (float)g_rs_den; b_.f = (float)g_rs_den / (float)g_rs_num; c_.f = g2s_rs_shift(g_rs_den);
+    u32 w_[8] = {g_rs_num, g_rs_den, RS_E(g_rs_den), (u32)(0x100000000ull / (2ull * g_rs_num)) + 1u, (u32)(0x100000000ull / (2ull * g_rs_den)) + 1u, a_.u, b_.u, c_.u};
+    vkCmdPushConstants(V.cb, pl, VK_SHADER_STAGE_ALL, 152, 32, w_);
+}
 static VLayout *vk_layout(const u32 *sig) {
     for (int i = 0; i < V.nlay; i++) { int same = 1; for (u32 k = 0; k <= sig[0] && same; k++) same = V.lay[i].sig[k] == sig[k]; if (same) return &V.lay[i]; }
     if (V.nlay >= 1024) return 0;
@@ -4290,7 +5916,7 @@ static VLayout *vk_layout(const u32 *sig) {
     if (sig[0] + 1 > g_max_bindings_seen) g_max_bindings_seen = sig[0] + 1;
     VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, 0, nopush ? 0 : VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, sig[0] + 1, b};
     CRUMB(106, sig[0], 3); if (vkCreateDescriptorSetLayout(V.dev, &dci, 0, &L->dsl)) return 0;
-    VkPushConstantRange pcr = {VK_SHADER_STAGE_ALL, 0, 128};
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_ALL, 0, g_rs_on ? (g_opt_rs_gen ? 184u : 152u) : 128u};   /* t196: six more words with a render scale */
     VkPipelineLayoutCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 0, 0, 1, &L->dsl, 1, &pcr};
     if (vkCreatePipelineLayout(V.dev, &pci, 0, &L->pl)) return 0;
     if (nopush) { g_dsp_pl[g_dsp_n] = L->pl; g_dsp_dsl[g_dsp_n] = L->dsl; g_dsp_n++; }   /* t168 */
@@ -4398,8 +6024,10 @@ static void kd_note(const G2SIn *in, const G2SOut *out) {
 /* t161: the translator inputs that depend on the GPU (its features and limits) - the renderer's own translations and the
    shipped pipeline manifest's (recorded on another PC: these are set again here, so a first start makes the SPIR-V this
    PC's renderer will ask for) */
+static u64 rs_code_hash(u64 a); static u64 rs_code_hash_fwd(u64 a) { return rs_code_hash(a); }
 static void vk_tr_device(G2SIn *in) {
-    in->no_tex_offsets = g_opt_no_tex_offsets || !g_gather_ext_ok;
+    in->no_tex_offsets = g_opt_no_tex_offsets || !g_gather_ext_ok ? 1 : g_opt_sample_offsets || (g_rs_on && g_opt_rs_aa) ? 2 : 0;   /* w5: 2 = IMAGE_SAMPLE*_O offsets too */
+    if (g_rs_on && g_opt_rs_aa >= 2 && in->stage == G2S_PS && !in->native && rs_code_hash_fwd(in->code_addr) == 0x1328db08206257e5ull) in->no_tex_offsets |= 4;   /* w5: RS_PS_TAA, see gcn2spv.c rs_map_load */
     in->fp_ctl = 0;
     if (g_opt_float_controls) {   /* STATUS 88: the shader's own FLOAT_MODE (RSRC1 bits 19:12), declared where the device can honour it */
         u32 fm = (in->rsrc1 >> 12) & 0xFF, rnd = fm & 3, den = (fm >> 4) & 3;
@@ -4409,65 +6037,77 @@ static void vk_tr_device(G2SIn *in) {
     }
     in->max_shared = g_opt_force_borrow ? 1 : g_dev.max_shared;   /* t104: wave-vote slots must fit the device's shared memory */
     if (in->tess_mode == 3) in->tess_shared_max = g_opt_no_tess_shared ? 0 : g_max_shared;
+    if (g_rs_on) in->diag_salt = G2S_RS_TAG | RS_SALT_ND() | (g_opt_rs_sub && in->stage == G2S_CS ? 0x8000u : 0u);   /* t196: shaders that know about scaled images (their own translation keys, modules and pipelines) */
 }
-static int vk_tr(int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 base, int fixz, G2SOut *out) {
-    G2SIn in; h_memset(&in, 0, sizeof in);
-    in.stage = stage; in.code_addr = (u64)lo << 8; in.rsrc1 = rsrc1; in.rsrc2 = rsrc2; in.fix_z = fixz; in.tex_binding_base = base;
-    if (g_tr_dbg && stage == G2S_PS) { in.dbg_pc = g_rdbg_pc + 1; in.dbg_regs = g_rdbg_regs; }   /* t168b */
-    in.n_user = (rsrc2 >> 1) & 0x1F; for (u32 i = 0; i < 16 && i < in.n_user; i++) in.user_data[i] = ud[i];   /* t155: only the words the shader gets (g2s_translate zeroed the rest, copying G2SIn to do it) */
-    in.ps_input_ena = g_ctx[CTX_SPI_PS_INPUT_ENA]; in.ps_input_addr = g_ctx[CTX_SPI_PS_INPUT_ADDR]; in.ps_in_control = g_ctx[CTX_SPI_PS_IN_CONTROL];
-    for (int i = 0; i < 32; i++) in.ps_input_cntl[i] = g_ctx[CTX_SPI_PS_INPUT_CNTL_0 + i];
-    for (int i = 0; i < 3; i++) in.cs_threads[i] = g_shr[SH_COMPUTE_NUM_THREAD_X + i] & 0xFFFF;
+/* t181: the translator's inputs for a stage from register values - the renderer's (ren 1: also its tessellation /
+   geometry pass state and diagnostics) or the look-ahead thread's own copy of the registers (ren 0) */
+static void vk_tr_build(G2SIn *in, int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 base, int fixz, const u32 *ctx, const u32 *shr, int ren) {
+    h_memset(in, 0, sizeof *in);
+    in->stage = stage; in->code_addr = (u64)lo << 8; in->rsrc1 = rsrc1; in->rsrc2 = rsrc2; in->fix_z = fixz; in->tex_binding_base = base;
+    if (ren && g_tr_dbg && stage == G2S_PS) { in->dbg_pc = g_rdbg_pc + 1; in->dbg_regs = g_rdbg_regs; }   /* t168b */
+    in->n_user = (rsrc2 >> 1) & 0x1F; for (u32 i = 0; i < 16 && i < in->n_user; i++) in->user_data[i] = ud[i];   /* t155: only the words the shader gets (g2s_translate zeroed the rest, copying G2SIn to do it) */
+    in->ps_input_ena = ctx[CTX_SPI_PS_INPUT_ENA]; in->ps_input_addr = ctx[CTX_SPI_PS_INPUT_ADDR]; in->ps_in_control = ctx[CTX_SPI_PS_IN_CONTROL];
+    for (int i = 0; i < 32; i++) in->ps_input_cntl[i] = ctx[CTX_SPI_PS_INPUT_CNTL_0 + i];
+    for (int i = 0; i < 3; i++) in->cs_threads[i] = shr[SH_COMPUTE_NUM_THREAD_X + i] & 0xFFFF;
     /* t155: inputs the translation of this stage never reads are left 0, so they do not split one program into several
        translation keys, memo entries, shader modules and pipelines: the pixel-shader input registers for other stages (a
        vertex shader got a key per pixel shader it was drawn with), the compute thread counts for vertex / pixel shaders
        (they held the last dispatch's), PS_INPUT_ADDR and PS_IN_CONTROL for every stage. Checked over the shader corpus:
        the SPIR-V is the same word for word (so the driver's pipeline cache still matches). --keep-unused-inputs: as before. */
     if (!g_opt_keep_unused_in) {
-        if (stage != G2S_PS) { in.ps_input_ena = 0; for (int i = 0; i < 32; i++) in.ps_input_cntl[i] = 0; }
-        in.ps_input_addr = 0; in.ps_in_control = 0;
-        if (stage != G2S_CS) { in.cs_threads[0] = 0; in.cs_threads[1] = 0; in.cs_threads[2] = 0; }
+        if (stage != G2S_PS) { in->ps_input_ena = 0; for (int i = 0; i < 32; i++) in->ps_input_cntl[i] = 0; }
+        in->ps_input_addr = 0; in->ps_in_control = 0;
+        if (stage != G2S_CS) { in->cs_threads[0] = 0; in->cs_threads[1] = 0; in->cs_threads[2] = 0; }
     }
-    in.read = lw_rd; in.gpu_written = g2s_gpu_written;   /* (t107g: g2s_reader, noting what a translation read) */
-    if (!g_opt_nofold) in.sdata_binding = stage == G2S_PS ? 101 : 100;
-    if (g_tess.mode) {
-        in.tess_mode = g_tess.mode; in.tess_stride = g_tess.stride; in.tess_ppt = g_tess.ppt; in.tess_cp = g_tess.cp; in.tess_base = G2S_TESS_BASE;
-        if (g_tess.mode == 1) { in.cs_threads[0] = g_tess.ppt * g_tess.cp; in.cs_threads[1] = 1; in.cs_threads[2] = 1; }
-        if (g_tess.mode == 3) { in.tess_ocp = g_tess.ocp; in.tess_tf_bytes = g_tess.tfb; in.tess_shared_max = g_opt_no_tess_shared ? 0 : g_max_shared; in.cs_threads[0] = g_tess.ppt * g_tess.ocp; in.cs_threads[1] = 1; in.cs_threads[2] = 1; }
+    in->read = lw_rd; in->gpu_written = g2s_gpu_written;   /* (t107g: g2s_reader, noting what a translation read) */
+    if (!g_opt_nofold) in->sdata_binding = stage == G2S_PS ? 101 : 100;
+    if (ren && g_tess.mode) {
+        in->tess_mode = g_tess.mode; in->tess_stride = g_tess.stride; in->tess_ppt = g_tess.ppt; in->tess_cp = g_tess.cp; in->tess_base = G2S_TESS_BASE;
+        if (g_tess.mode == 1) { in->cs_threads[0] = g_tess.ppt * g_tess.cp; in->cs_threads[1] = 1; in->cs_threads[2] = 1; }
+        if (g_tess.mode == 3) { in->tess_ocp = g_tess.ocp; in->tess_tf_bytes = g_tess.tfb; in->tess_shared_max = g_opt_no_tess_shared ? 0 : g_max_shared; in->cs_threads[0] = g_tess.ppt * g_tess.ocp; in->cs_threads[1] = 1; in->cs_threads[2] = 1; }
     }
-    if (g_gs.mode) {
-        in.gs_mode = g_gs.mode; in.gs_vpp = g_gs.vpp; in.gs_esgs_itemsize = g_gs.esgs; in.gs_maxv = g_gs.maxv; in.gs_out_prim = g_gs.op;
-        in.gs_wave_bytes = g_gs.wave_bytes; in.gs_base = G2S_GS_BASE;
-        if (g_gs.mode != 3) { in.cs_threads[0] = 64; in.cs_threads[1] = 1; in.cs_threads[2] = 1; }
+    if (ren && g_gs.mode) {
+        in->gs_mode = g_gs.mode; in->gs_vpp = g_gs.vpp; in->gs_esgs_itemsize = g_gs.esgs; in->gs_maxv = g_gs.maxv; in->gs_out_prim = g_gs.op;
+        in->gs_wave_bytes = g_gs.wave_bytes; in->gs_base = G2S_GS_BASE;
+        if (g_gs.mode != 3) { in->cs_threads[0] = 64; in->cs_threads[1] = 1; in->cs_threads[2] = 1; }
     }
-    if (g_opt_nexp && exp_is(in.code_addr)) in.exp_flags = g_exp_force ? g_exp_force_flags : g_exp_flags[exp_var()];
+    if (g_opt_nexp && exp_is(in->code_addr)) in->exp_flags = g_exp_force ? g_exp_force_flags : g_exp_flags[exp_var()];
     if (stage == G2S_PS) {   /* the game's depth-unit setting: test depth before the shader runs (EARLY_Z_THEN_LATE_Z / EARLY_Z_THEN_RE_Z) */
-        u32 dsc = g_ctx[CTX_DB_SHADER_CONTROL], zo = (dsc >> 4) & 3, kill = (dsc >> 6) & 1, zexp = dsc & 1, zw = (g_ctx[CTX_DB_DEPTH_CONTROL] >> 2) & 1;
-        in.ps_early_z = (zo == 1 || zo == 3) && !zexp && !(kill && zw);
+        u32 dsc = ctx[CTX_DB_SHADER_CONTROL], zo = (dsc >> 4) & 3, kill = (dsc >> 6) & 1, zexp = dsc & 1, zw = (ctx[CTX_DB_DEPTH_CONTROL] >> 2) & 1;
+        in->ps_early_z = (zo == 1 || zo == 3) && !zexp && !(kill && zw);
+        if (g2s_mip_fb > 1 && !zexp && !kill) in->ps_early_z = 1;   /* popin (--mip-stats gpuz): a shader that neither discards nor writes depth gives the same picture tested early, and then only visible pixels are counted */
     }
-    vk_tr_device(&in);   /* (t161: the inputs that depend on this GPU, also for the pipeline manifest's translations) */
-    in.exact_mad = g_opt_exact_mad;
-    in.quad_branch_all = g_opt_quad_branch_all > 0;
-    in.ps_helpers_on = g_opt_ps_helpers_on;
-    in.helpers_auto = g_opt_helpers_auto;   /* t106: live-mask EXEC only where a pixel shader can observe it */
-    in.mem_slow_count = g_opt_mem_slow;
-    in.no_structure = g_opt_nostructure; in.allow_append = g_opt_append; in.no_bounds = g_opt_nobounds; in.no_wave_sync = g_opt_nowavesync; for (int q = 0; q < g_nnows; q++) if (g_nows_at[q] == in.code_addr) in.no_wave_sync = 1; in.probe = g_opt_probe && in.code_addr == g_opt_probe; in.nan_probe = g_opt_nan_probe && in.code_addr == g_opt_nan_probe;
-    if (g_diag_mode == 9) in.diag_salt = 9;   /* t137: every shader translated afresh, nothing else different */
-    if (g_diag_mode == 0 && (stage == G2S_VS || stage == G2S_PS)) { int q = stage == G2S_PS; if (g_xs_on[q] && in.code_addr == g_xs_addr[q]) in.diag_salt = 0x7138; }   /* t138 NaN hunt: this shader translated afresh */
+    vk_tr_device(in);   /* (t161: the inputs that depend on this GPU, also for the pipeline manifest's translations) */
+    in->exact_mad = g_opt_exact_mad;
+    in->quad_branch_all = g_opt_quad_branch_all > 0;
+    in->ps_helpers_on = g_opt_ps_helpers_on;
+    in->helpers_auto = g_opt_helpers_auto;   /* t106: live-mask EXEC only where a pixel shader can observe it */
+    in->mem_slow_count = g_opt_mem_slow;
+    in->no_structure = g_opt_nostructure; in->allow_append = g_opt_append; in->no_bounds = g_opt_nobounds; in->no_wave_sync = g_opt_nowavesync; for (int q = 0; q < g_nnows; q++) if (g_nows_at[q] == in->code_addr) in->no_wave_sync = 1; in->probe = g_opt_probe && in->code_addr == g_opt_probe; in->nan_probe = g_opt_nan_probe && in->code_addr == g_opt_nan_probe;
+    if (g_diag_mode == 9) in->diag_salt = 9;   /* t137: every shader translated afresh, nothing else different */
+    if (g_diag_mode == 0 && (stage == G2S_VS || stage == G2S_PS)) { int q = stage == G2S_PS; if (g_xs_on[q] && in->code_addr == g_xs_addr[q]) in->diag_salt = 0x7138; }   /* t138 NaN hunt: this shader translated afresh */
     if (g_diag_mode >= 1 && g_diag_mode <= 5) {   /* t105 diagnostic modes */
-        in.diag_salt = (u32)g_diag_mode;
-        if (g_diag_mode == 1) in.zero_regs = 1;
-        if (g_diag_mode == 2) in.ps_helpers_on = 1;
-        if (g_diag_mode == 3) in.quad_branch_all = 0;
-        if (g_diag_mode == 4) in.sdata_binding = 0;
+        in->diag_salt = (u32)g_diag_mode;
+        if (g_diag_mode == 1) in->zero_regs = 1;
+        if (g_diag_mode == 2) in->ps_helpers_on = 1;
+        if (g_diag_mode == 3) in->quad_branch_all = 0;
+        if (g_diag_mode == 4) in->sdata_binding = 0;
     }
+    if (g_rs_on) in->diag_salt = G2S_RS_TAG | RS_SALT_ND() | (g_opt_rs_sub && in->stage == G2S_CS ? 0x8000u : 0u);   /* t196 (the diagnostic salts above are not kept with a render scale) */
+}
+static int spec_take(const G2SIn *in, G2SOut *out); static void spec_after(void);   /* t181 (e6_spec.c) */
+static int g_opt_smrd_log; static void smrd_lit_note(int stage, u64 code_addr, u32 pc, u32 lit, int cnt, int sbuf, u64 base, int base_known, u32 vs1, u32 vs2);   /* w5_smrd */
+static int vk_tr(int stage, u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 base, int fixz, G2SOut *out) {
+    G2SIn in; vk_tr_build(&in, stage, lo, rsrc1, rsrc2, ud, base, fixz, g_ctx, g_shr, 1);
     if (!in.code_addr || !mem_ok(in.code_addr, 4)) { vk_skip("shader address not in game memory"); return 0; }
+    if (g_opt_smrd_log && !g2s_smrd_lit_hook) g2s_smrd_lit_hook = smrd_lit_note;   /* w5_smrd */
     if (!g2s_memo_bad_hook) g2s_memo_bad_hook = memo_bad_note;
     u64 trh0 = 0, trm0, trc0; if (g_trc_f) g2s_memo_stats(&trh0, &trm0, &trc0);
     u64 lwh0 = 0, lwm0 = 0, lwc0; if (lw_init()) { g2s_memo_stats(&lwh0, &lwm0, &lwc0); g_lw_ntmp = 0; }
     u64 ph0 = 0, pm0 = 0, pc0, pr0 = 0, px_; if (g_opt_phantom) { g2s_memo_stats(&ph0, &pm0, &pc0); g2s_memo_reloc_stats(&pr0, &px_, &px_, &px_, &px_, &px_, &px_, &px_, &px_); }
     g2s_kp_fresh = 0;
-    T0(); int ok = g2s_translate(&in, out); TADD1(g_t_tr);
+    T0(); int ok = spec_take(&in, out) || g2s_translate(&in, out); TADD1(g_t_tr);   /* t181: a result made ahead of time, when it is still valid */
+    spec_after();   /* t181c */
     if (ok) prep_tnote(&in, out);   /* t160: translation records for the pipeline manifest (new SPIR-V only) */
     if (ok && g_hunt_state == 1 && (u32)V.frame == g_hunt_frame && (stage == G2S_VS || stage == G2S_PS)) { int q_ = stage == G2S_PS;
         g_hlast_in[q_] = in; g_hlast_out[q_] = *out; g_hlast_kind[q_] = g2s_memo_last_kind; g_hlast_born[q_] = g2s_memo_last_born;   /* t141 */
@@ -4542,7 +6182,7 @@ static int vkr_write_data(u64 a, const u32 *src, u32 n) {
     mem_copy(g_ovbuf + g_ovpos, src, n);
     if (cl) pm_unlock(&g_coh_m);
     vk_barrier();
-    gw_log(a, a + n);
+    g_gw_wd_next = 1; gw_log(a, a + n); g_gw_wd_next = 0;   /* w2 */
     g_ov[g_nov].a = a; g_ov[g_nov].n = n; g_ov[g_nov].off = g_ovpos; g_ov[g_nov].seq = g_sub_seq + 1;   /* the batch being recorded */
     if (a < g_ov_lo) g_ov_lo = a; if (a + n > g_ov_hi) g_ov_hi = a + n;
     g_nov++; g_ovpos += (n + 15) & ~15u;
@@ -4571,6 +6211,7 @@ static void vkr_sync_point(int kind /* 0 cache sync, 1 flush event, 2 wait on a 
        barrier from the lazy hazard check (STATUS 57, which came after these sync points), copies and transfers place their
        own; only memory written by shaders (storage, atomics, append) needs this barrier. --sync-points-all: always (before). */
     if (kind == 0 && !V.drew_mem && !g_opt_sync_points_all) { g_n_sync_points_lazy++; return; }
+    if (kind && !V.drew_mem && ((g_opt_lazy_sync >> (kind - 1)) & 1)) { g_n_sync_lazy2[kind]++; return; }   /* t196: the same for flush events / waits */
     vk_barrier(); g_n_sync_points[kind]++;
 }
 /* ---------------------------------------------------------------- CP DMA in GPU order (--gpu-dma)
@@ -4726,6 +6367,31 @@ static u64 fold_need(const G2SOut *o) { return o->fold_dw ? ((4ull * o->fold_dw 
 /* copy the folded scalar values (read now, from game memory) and bind them */
 static u32 *g_csck_fold;
 static VImg *g_csck_img[G2S_MAX_TEX]; static VkFormat g_csck_vf[G2S_MAX_TEX]; static u32 g_csck_lb[G2S_MAX_TEX];
+static int rsl_on(void);
+static u64 rs_code_hash(u64 a) { u64 h = 0; if (a && mem_ok(a, 256)) { const u8 *q = (const u8 *)a; h = 0xcbf29ce484222325ull; for (int i = 0; i < 256; i++) h = (h ^ q[i]) * 0x100000001b3ull; } return h; }
+static u64 rs_ps_hash(void) {   /* w5: the bound pixel shader's identity (first 256 bytes), looked up once per address and frame */
+    static u64 la_, lh_; static u32 lf_ = 0xFFFFFFFFu; u64 a = (u64)g_shr[SH_PGM_LO_PS] << 8;
+    if (a == la_ && lf_ == V.frame) return lh_;
+    u64 h = 0; if (a && mem_ok(a, 256)) { const u8 *q = (const u8 *)a; h = 0xcbf29ce484222325ull; for (int i = 0; i < 256; i++) h = (h ^ q[i]) * 0x100000001b3ull; }
+    la_ = a; lf_ = V.frame; lh_ = h; return h;
+}
+static void rs_fold_fix(u32 *d, u32 n, u32 binding) {
+    if (g_opt_rs_constlog && rsl_on()) { vl("rsl K "); vl(binding == 101 ? "PS " : "VS/CS "); vl_x((u64)(binding == 101 ? g_shr[SH_PGM_LO_PS] : g_shr[SH_PGM_LO_VS]) << 8); if (binding != 101) { vl(" / "); vl_x((u64)g_shr[SH_COMPUTE_PGM_LO] << 8); }
+        vl(g_rs_draw_scaled ? (g_rs_phys ? " phys" : " scaled") : " plain"); vl(" words "); vl_d(n); vl(":"); for (u32 i = 0; i < n && i < 160; i++) { vl(" "); vl_x(d[i]); } vl("\n"); }
+    if (binding != 101 || !g_opt_rs_aa || !g_rs_draw_scaled || g_rs_phys) return;
+    { u64 h_ = rs_ps_hash(); if (h_ != RS_PS_FXAA && !(g_opt_rs_aa >= 2 && h_ == RS_PS_SHARP)) return; }
+    for (u32 i = 0; i + 1 < n; i++) { float x = as_f(d[i]) * 1920.0f, y = as_f(d[i + 1]) * 1080.0f;   /* (1 / 1920, 1 / 1080): the size of a pixel */
+        if (x > 0.999f && x < 1.001f && y > 0.999f && y < 1.001f) { float k_ = (float)g_rs_den / (float)g_rs_num, fx = as_f(d[i]) * k_, fy = as_f(d[i + 1]) * k_;
+            *(float *)&d[i] = fx; *(float *)&d[i + 1] = fy; g_n_rs_aa++; i++; } }
+}
+static struct { u64 a; u32 n, draw, v[16]; u8 infl; } *g_fpr; static u32 g_fpr_n; enum { FPR_N = 32768 };   /* w3 diagnostic --gw-probe: folded loads from pages the GPU has written */
+static void fpr_note(u64 a, u32 c, const u32 *v) {
+    if (!g_gwp_pg || a < G2S_PT_BASE || a >= G2S_PT_BASE + G2S_PT_SIZE || !g_gwp_pg[(a - G2S_PT_BASE) >> 16]) return;
+    if (!g_fpr) { g_fpr = calloc(FPR_N, sizeof *g_fpr); if (!g_fpr) return; }
+    if (g_fpr_n >= FPR_N) return;
+    u32 q = g_fpr_n++; g_fpr[q].a = a; g_fpr[q].n = c > 16 ? 16 : c; g_fpr[q].draw = (u32)(g_draws + g_dispatches); for (u32 k = 0; k < g_fpr[q].n; k++) g_fpr[q].v[k] = v[k];
+    g_fpr[q].infl = (u8)gw_inflight(a, a + 4ull * c);
+}
 static void vk_bind_fold(VBind *B, const G2SOut *o, u32 binding) {
     if (!o->fold_dw || B->nb >= 2) return;
     u64 off; u32 *d = (u32 *)ring_alloc(4ull * o->fold_dw, &off), k = 0;
@@ -4733,9 +6399,10 @@ static void vk_bind_fold(VBind *B, const G2SOut *o, u32 binding) {
     for (u32 i = 0; i < o->nfold; i++) {
         u32 c = o->fold_cnt[i];
         if (o->fold_addr[i] & G2S_FOLD_PC) { u64 v = o->fold_addr[i] & ~G2S_FOLD_PC; d[k] = (u32)v; if (c > 1) d[k + 1] = (u32)(v >> 32); }   /* t143: the shader's PC (S_GETPC_B64), not memory */
-        else if (mem_ok(o->fold_addr[i], 4ull * c)) { mem_copy(d + k, (const void *)o->fold_addr[i], 4ull * c); ov_apply(o->fold_addr[i], d + k, 4ull * c); if (g_lw) lw_fold(o->fold_addr[i], c, d + k, g_memrep_cur); } else h_memset(d + k, 0, 4ull * c);
+        else if (mem_ok(o->fold_addr[i], 4ull * c)) { mem_copy(d + k, (const void *)o->fold_addr[i], 4ull * c); ov_apply(o->fold_addr[i], d + k, 4ull * c); if (g_opt_gw_probe) fpr_note(o->fold_addr[i], c, d + k); if (g_lw) lw_fold(o->fold_addr[i], c, d + k, g_memrep_cur); } else h_memset(d + k, 0, 4ull * c);
         k += c;
     }
+    if (g_rs_on) rs_fold_fix(d, k, binding);   /* w5 */
     u32 n = B->sig[0];
     B->bi[B->nb] = (VkDescriptorBufferInfo){V.qbuf, off, 4ull * o->fold_dw};
     B->wr[1 + n] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, 0, binding, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, &B->bi[B->nb], 0};
@@ -4781,6 +6448,7 @@ static int vk_bind_stage(VBind *B, const G2SOut *o, u32 base) {
     for (int t = 0; t < o->ntex; t++) {
         const G2STex *x = &o->tex[t];
         VkFormat vf = VK_FORMAT_UNDEFINED; u32 lb = 0;
+        if ((g_opt_mipstats > 1 || g_opt_stream_log || g_mipfb_map) && !x->storage) ms_seen(x->tsharp[0]);   /* popin: sampled by a draw (mip statistics) */
         if (tb_on && !x->storage) {   /* t156 */
             TBEnt *c = &g_tb[tb_slot(x->tsharp)]; VImg *cm = c->m;
             if (cm && c->gen == g_img_gen && tb_same(c->T, x->tsharp) && cm->img && !cm->gpu_written && cm->frame_uploaded == V.frame + 1) {
@@ -4829,14 +6497,32 @@ static int vk_bind_stage(VBind *B, const G2SOut *o, u32 base) {
             view = m->view;
         } else {
             u32 swz = x->tsharp[3] & 0xFFF; if (swz == 0xFAC) swz = 0;
+            if (g_rs_on && g_opt_rs_box && m->rs && base == 33 && !g_rs_draw_scaled && m->gpu_written && !m->depth && !m->is_copy && (x->ssharp[2] & (3u << 20)) && (x->ssharp[2] & (3u << 22)) && g_draw_tgt_w <= 1024) {   /* w5: see g_opt_rs_box */
+                VImg *c_ = rs_1x_box(m); if (c_) { m = c_; if (g_nrd_img < 64) g_rd_img[g_nrd_img++] = m; view = vimg_view(m, vf, swz, lb, 1); goto rs_boxed_; } }
             view = vimg_view(m, vf, swz, lb, m->gpu_written);
+        rs_boxed_:;
             u32 tty_ = x->tsharp[3] >> 28;
             if (tb_on && !m->gpu_written && m->frame_uploaded == V.frame + 1 && tty_ != 11 && tty_ != 12 && tty_ != 13 && tty_ != 15) {   /* t156: kept for the next bindings of this T# (not cubes / arrays: their layers may be composed from render targets again) */
                 TBEnt *c = &g_tb[tb_slot(x->tsharp)]; for (int q = 0; q < 8; q++) c->T[q] = x->tsharp[q];
                 c->m = m; c->view = view; c->gen = g_img_gen; c->vf = vf; c->lb = lb; g_n_tb_put++; }
         }
-        if (!x->storage) smp = vk_sampler(x->ssharp);
+        if (g_pshot_auto > 0 && !x->storage && base == 33 && m && m->gpu_written && RS_UI_ADDR(m->addr) && m->w >= 1000 && g_draw_tgt_w >= 1900 && g_draw_tgt_w < 16384 && (!g_pshot_auto_last || g_flips >= g_pshot_auto_last + 300) && g_flips > 60) {
+            g_pshot_auto--; g_pshot_auto_last = g_flips; for (u64 k_ = 0; k_ < 2; k_++) { if (g_npshot < 64) g_pshot[g_npshot++] = g_flips + k_; if (g_nshot_more < 64) g_shot_more[g_nshot_more++] = g_flips + k_; }   /* (this frame's flip: the current count or the next) */
+            say("    present check (w3): interface bitmap "); say_dec(m->w); say("x"); say_dec(m->h); say(m->rs ? " (scaled)" : ""); say(" put on the screen at flip "); say_dec((i64)g_flips); say(RS_UI_ADDR((u64)g_shr[SH_PGM_LO_PS] << 8) ? " by Scaleform" : " by the engine (a movie rendered to a texture)"); say(": picture saved\n"); }
+        if (!x->storage) {
+            if (g_rs_draw_ui && g_rs_draw_scaled && base == 33 && m && (!m->rs || g_rs_draw_ui == 4) && m->gpu_written && !m->depth && RS_UI_ADDR(m->addr) && !(x->ssharp[2] & (3u << 20)) && fmt_kind(m->fmt) != 2) {   /* w3: see g_opt_rs_ui */
+                u32 S_[4] = {x->ssharp[0], x->ssharp[1], x->ssharp[2] | (1u << 20) | (1u << 22), x->ssharp[3]}; smp = vk_sampler(S_); g_n_rs_ui_lin++; }
+            else if (g_opt_rs_movie && g_rs_draw_scaled && base == 33 && m && !m->rs && !m->gpu_written && m->fmt == VK_FORMAT_R8_UNORM && (m->addr >> 28) == 0x80 && m->w >= 256 && !(x->ssharp[2] & (3u << 20))) {
+                /* w3: a Bink movie frame (Y 1920x1088, Cb / Cr 960x544 planes in the Bink pool at 0x80_xxxxxxx, read with a point sampler by the
+                   YUV shader 0x24f27cc00) on a scaled screen: filtered, not enlarged by nearest neighbour */
+                u32 S_[4] = {x->ssharp[0], x->ssharp[1], x->ssharp[2] | (1u << 20) | (1u << 22), x->ssharp[3]}; smp = vk_sampler(S_); g_n_rs_movie++; }
+            else smp = vk_sampler(x->ssharp); }
     bound:;
+        if (g_rs_on && m && m->rs && t < 32) { g_rs_tm[base == 33] |= 1u << t; if (x->storage) g_rs_nst++; }   /* t196 */
+        if (g_rsl_flip >= 0 && rsl_on() && g_rsl_nt < 48) { __typeof__(g_rsl_t[0]) *q_ = &g_rsl_t[g_rsl_nt++];   /* w3 */
+            q_->addr = m ? m->addr : 0; q_->w = m ? m->w : 0; q_->h = m ? m->h : 0; q_->tw = (x->tsharp[2] & 0x3FFF) + 1; q_->th = ((x->tsharp[2] >> 14) & 0x3FFF) + 1;
+            q_->fl = (m && m->rs ? 1u : 0) | (m && m->gpu_written ? 2u : 0) | (x->storage ? 4u : 0) | (m && m->depth ? 8u : 0) | (base == 33 ? 16u : 0) | (m && m->is_copy ? 32u : 0) | ((u32)t << 8) | ((u32)(m ? m->fmt : 0) << 16);
+            q_->smp = x->storage ? 0 : ((x->ssharp[2] >> 20) & 3) | (((x->ssharp[2] >> 22) & 3) << 2) | (((x->ssharp[2] >> 26) & 3) << 4); }
         if (g_csck_on && t < G2S_MAX_TEX) { g_csck_img[t] = m; g_csck_vf[t] = vf; g_csck_lb[t] = lb; }   /* t105 compute check */
         u32 k = B->n++;
         B->ii[k] = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
@@ -4847,6 +6533,14 @@ static int vk_bind_stage(VBind *B, const G2SOut *o, u32 base) {
     B->sig[0] = B->n;
     return 1;
 }
+static int rsl_on(void) { return g_rsl_flip >= 0 && (g_rp_running ? 1 : (i64)g_flips == g_rsl_flip); }
+static void rsl_tex(void) {
+    for (int i = 0; i < g_rsl_nt; i++) { __typeof__(g_rsl_t[0]) *q = &g_rsl_t[i];
+        vl(" | "); vl(q->fl & 16 ? "p" : "v"); vl_d((q->fl >> 8) & 0xFF); vl(q->fl & 4 ? " ST " : " "); vl_x(q->addr); vl(" "); vl_d(q->tw); vl("x"); vl_d(q->th); vl(" img "); vl_d(q->w); vl("x"); vl_d(q->h);
+        vl(" f"); vl_d(q->fl >> 16); vl(q->fl & 1 ? " SCALED" : ""); vl(q->fl & 2 ? " gpu" : " mem"); vl(q->fl & 8 ? " depth" : ""); vl(q->fl & 32 ? " copy" : "");
+        if (!(q->fl & 4)) { vl(" mag"); vl_d(q->smp & 3); vl(" min"); vl_d((q->smp >> 2) & 3); vl(" mip"); vl_d((q->smp >> 4) & 3); } }
+    g_rsl_nt = 0;
+}
 static u32 vk_nwrites(const VBind *B) { return B->sig[0]; }
 static void vk_push_binds(VBind *B, VkPipelineBindPoint bp, VkPipelineLayout pl) {
     static VkDescriptorBufferInfo ubi;
@@ -4856,14 +6550,43 @@ static void vk_push_binds(VBind *B, VkPipelineBindPoint bp, VkPipelineLayout pl)
 }
 
 /* ---------------------------------------------------------------- render targets */
+/* t173: a depth target bound only for testing (no depth write, no stencil write, no clear) is not written by the draw:
+   its write sequence stays, so the copies made of it (the 1920x1080 region of the padded 2048x1152 depth buffer that
+   shaders sample, snapshots) stay valid. Before, every draw that bound the depth buffer counted as writing it - soft
+   particles and decals that test against depth and sample it made a fresh 8 MB copy per draw (~190 per frame in 6125).
+   Only the copies' validity looks at it (dseq, the sequence of the last real write); everything else still sees the
+   target as written by the draw (wseq), as before. --depth-ro-writes: the old way. */
+static int g_vt_ro, g_vt_zro, g_vt_synced, g_opt_depth_ro_writes; static u64 g_n_vt_ro;
 static VImg *vk_target(u64 addr, u32 w, u32 h, VkFormat f, u32 bpe, int depth, u32 lay_tm) {
-    VImg *m = vimg_find(addr, w, h, f);
+    VImg *m = 0;
+    if (g_rs_on) g_rs_mk = g_rs_tgt;   /* t196: images this target needs are created at the draw's scale */
+    if (!g_opt_padded_targets) {   /* t191 */
+        VwEnt *e = vw_ent(addr, w, h, f, 0);
+        if (e && e->state == 1 && (e->vw < w || e->vh < h)) {
+            if (g_vt_noshrink || g_vt_ex > (i32)e->vw || g_vt_ey > (i32)e->vh) {   /* this draw needs the padded surface */
+                VImg *sm = 0; FOR_ADDR(i, addr) { VImg *q = &V.img[i]; if (q->img && !q->is_copy && q->addr == addr && q->fmt == f && q->lw == w && q->lh == h && (q->w < w || q->h < h)) { sm = q; break; } }
+                if (sm) m = vw_regrow(sm); else { e->state = 2; g_n_vw_off++; } }
+            else m = vw_target(addr, w, h, f, bpe, depth, e); } }
+    if (!m) m = vimg_find(addr, w, h, f);
     if (!m && !depth) m = vimg_alias(addr, w, h, f);
-    if (!m) { m = vimg_create(addr, w, h, 1, f, 0, depth, 0); if (!m) return 0; m->bpe = bpe; }
+    if (!m) { m = vimg_create(addr, w, h, 1, f, 0, depth, 0); if (!m) { g_rs_mk = 0; return 0; } m->bpe = bpe; }
+    if (g_rs_on) { g_rs_mk = 0; if ((int)m->rs != g_rs_tgt) { m = rs_conform(m, g_rs_tgt); if (!m) return 0; } }   /* t196 */
     if (lay_tm) { m->lay_tm = lay_tm; m->lay_pitch = w; }   /* t107e: the surface's tile mode index + 1 (w is its pitch) */
-    vk_sync_newer(m);   /* another image over this memory (compute storage / other format) was written later */
+    { u64 n0 = g_n_alias_sync + g_n_depth_sync; g_sync_lazy_ok = 1; vk_sync_newer(m); g_sync_lazy_ok = 0; g_vt_synced = g_n_alias_sync + g_n_depth_sync != n0; }   /* another image over this memory (compute storage / other format) was written later (t173: noted) */
     if (!m->gpu_written) g_img_gen++;   /* t156 */
+    if (m->fb_base) {   /* t196 (--fb-rect): this draw writes inside its scissor rectangle; anything else since the snapshot: all of it */
+        if (m->fb_last != m->wseq || !m->gpu_written || g_vt_synced) m->fb_full = 1;
+        else if (g_dsc_x1 > g_dsc_x0 && g_dsc_y1 > g_dsc_y0) {
+            if (m->fb_x1 <= m->fb_x0 || m->fb_y1 <= m->fb_y0) { m->fb_x0 = g_dsc_x0; m->fb_y0 = g_dsc_y0; m->fb_x1 = g_dsc_x1; m->fb_y1 = g_dsc_y1; }
+            else { if (g_dsc_x0 < m->fb_x0) m->fb_x0 = g_dsc_x0; if (g_dsc_y0 < m->fb_y0) m->fb_y0 = g_dsc_y0; if (g_dsc_x1 > m->fb_x1) m->fb_x1 = g_dsc_x1; if (g_dsc_y1 > m->fb_y1) m->fb_y1 = g_dsc_y1; } } }
+    int ro = g_vt_ro && m->gpu_written && !g_vt_synced;
+    int zro_ = g_vt_zro && m->gpu_written && !g_vt_synced; u64 zid_ = m->zat == m->wseq ? m->zseq : m->wseq;   /* w6_gpu */
+    u64 cvp_ = (m->fb_last == m->wseq && m->gpu_written && !g_vt_synced) ? m->cv_id : 0;   /* w10_res: the contents identity before this draw (0: something other than a draw wrote it since) */
     m->gpu_written = 1; m->wseq = ++V.wseq; m->last_use = V.frame; m->use_seq = g_sub_seq + 1; rt_mark(m);
+    m->zseq = zro_ ? zid_ : m->wseq; m->zat = m->wseq;   /* w6_gpu: a draw that cannot write depth leaves the depth identity */
+    m->fb_last = m->wseq;   /* t196 */
+    m->cv_prev = cvp_; m->cv_id = (ro && cvp_) ? cvp_ : m->wseq;   /* w10_res: a draw that cannot write the surface leaves its identity */
+    if (!ro) m->dseq = m->wseq; else g_n_vt_ro++;   /* t173 */
     return m;
 }
 
@@ -4876,10 +6599,12 @@ static VImg *vk_target(u64 addr, u32 w, u32 h, VkFormat f, u32 bpe, int depth, u
 static int g_opt_target_barriers; static u64 g_n_lazy_bar, g_n_lazy_skip;
 static VImg *g_tgt_img[9]; static int g_ntgt_img;
 static void vk_draw_hazards(int restart) {
-    u64 cur = V.bar_ep + 1; int need = 0;
+    u64 cur = V.bar_ep + 1; int need = 0, waw = 0;
     for (int i = 0; i < g_nrd_img && !need; i++) if (g_rd_img[i]->w_ep == cur) need = 1;
-    if (restart) for (int i = 0; i < g_ntgt_img && !need; i++) if (g_tgt_img[i]->w_ep == cur || g_tgt_img[i]->r_ep == cur) need = 1;
-    if (need) { vk_barrier(); g_n_lazy_bar++; } else if (restart) g_n_lazy_skip++;
+    if (restart) for (int i = 0; i < g_ntgt_img && !need; i++) { const VImg *t = g_tgt_img[i];
+        if (t->r_ep == cur) need = 2;
+        else if (t->w_ep == cur) { if (g_opt_lazy_waw && t->wx_ep != cur) waw = 1; else need = 3; } }   /* t196 (--lazy-waw): written only as a render target */
+    if (need) { vk_barrier(); g_n_lazy_bar++; g_n_lazy_why[need - 1]++; } else if (restart) { g_n_lazy_skip++; g_n_lazy_waw_skip += (u64)waw; }
     for (int i = 0; i < g_nrd_img; i++) g_rd_img[i]->r_ep = V.bar_ep + 1;
 }
 static int vk_targets_restart(u32 ncol, const VkImageView *cv, VkImageView dv, u32 rw, u32 rh) {
@@ -4963,7 +6688,10 @@ static int vk_tess_pass(u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 ntg, co
     vk_shadow_for(&cs);
     vk_begin_cb(); vk_end_rendering();
     static VBind B; B.n = 0; B.nb = 0;
-    if (!vk_bind_stage(&B, &cs, 1)) return 0;
+    u32 rs_sv_[3] = {g_rs_tm[0], g_rs_tm[1], g_rs_nst}; g_rs_tm[0] = 0;   /* t196: this pass's own scaled bindings (the draw's are kept) */
+    int rs_bok_ = vk_bind_stage(&B, &cs, 1); u32 rs_blk_[6] = {0, g_rs_tm[0], 0, 0, 0, 0};
+    g_rs_tm[0] = rs_sv_[0]; g_rs_tm[1] = rs_sv_[1]; g_rs_nst = rs_sv_[2];
+    if (!rs_bok_) return 0;
     vk_bind_hazards();   /* t107b */
     ring_reserve(fold_need(&cs)); vk_end_rendering();
     vk_bind_fold(&B, &cs, 100);
@@ -4993,10 +6721,12 @@ static int vk_tess_pass(u32 lo, u32 rsrc1, u32 rsrc2, const u32 *ud, u32 ntg, co
     vk_push_binds(&B, VK_PIPELINE_BIND_POINT_COMPUTE, L->pl);
     vkCmdPushConstants(V.cb, L->pl, VK_SHADER_STAGE_ALL, 0, 64, ud);
     vkCmdPushConstants(V.cb, L->pl, VK_SHADER_STAGE_ALL, 64, 64, pc);
+    if (g_rs_on) { vkCmdPushConstants(V.cb, L->pl, VK_SHADER_STAGE_ALL, 128, 24, rs_blk_); rs_gen_push(L->pl); }   /* t196 */
+    tl_key((u64)lo << 8, 0, ntg); g_tl_stage = (u8)what[0];   /* t172; w12_gpu: LS / HS / ES / GS */
     int tsq = V.qp && g_opt_gpu_times > 0 && V.qn + 2 <= QPS - 2;
     if (tsq) { vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, V.qp, V.qbase + V.qn); V.qkey_a[(V.qbase + V.qn) / 2] = (u64)lo << 8; V.qkey_b[(V.qbase + V.qn) / 2] = 0; g_qverts[(V.qbase + V.qn) / 2] = ntg; }
     ck_mark(3, (u64)lo << 8, 0, ntg);
-    vkCmdDispatch(V.cb, ntg, 1, 1);
+    vkCmdDispatch(V.cb, ntg, 1, 1);   /* (w3: a pass of a draw - the draw's own command ends the set-up, gw_setup_done) */
     if (tsq) { vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, V.qp, V.qbase + V.qn + 1); V.qn += 2; }
     vk_barrier();
     return 1;
@@ -5088,6 +6818,51 @@ static int vk_gs_passes(u32 count, int indexed, u32 first_index, u32 *nverts_out
     g_n_gs_draws++; g_n_gs_prims += nprims; g_n_gs_verts += nv;
     return 1;
 }
+/* t184 / t185 --nan-vb (diagnostic): the first 64 bytes of every range a draw's vertex shader reads (vertex buffers,
+   bone palettes, constant buffers not folded) are checked at the draw for canonical NaNs (0xffc00000, the x86 result
+   of an invalid operation, or 0x7fc00000; at least 4 of the 16 floats - t184 counted any NaN bit pattern and was
+   flooded by packed colours 0xffffffff). Each (VS, range slot) is logged when it turns NaN and when it turns finite
+   again (flip, draw, addresses, bytes). The watched VS (--nan-vb-vs, default 0x24fe24d00: a piece of the stranger's
+   clothing in Chapter 5 whose whole vertex buffer is NaN when his waist is missing) also prints the frame times of
+   the 12 flips before and, with --fp-trap-full, makes the FP-exception hits of the 15 flips before it print. */
+static u64 g_nanvb_draws, g_nanvb_win, g_nanvb_lines, g_nanvb_watch = 0x24fe24d00ull; static volatile u64 g_nanvb_onset;
+static struct { u64 key; int nan; } g_nanvb_k[4096]; static int g_nanvb_nk;
+static void nanvb_check(const G2SOut *o) {
+    u64 vsa = (u64)g_shr[SH_PGM_LO_VS] << 8; int any = 0;
+    for (u32 k = 0; k < o->nrd && k < 16; k++) {
+        u64 lo = o->rd_lo[k], hi = o->rd_hi[k]; if (hi < lo + 16) continue;
+        u64 n = hi - lo; if (n > 64) n = 64; n &= ~3ull;
+        if (!mem_ok(lo, n)) continue;
+        const u32 *p = (const u32 *)lo; int nn = 0;
+        for (u32 i = 0; i < n / 4; i++) { u32 v = p[i]; if (v == 0xFFC00000u || v == 0x7FC00000u) nn++; }
+        int isnan_ = nn >= 4;
+        u64 key = vsa * 31 + k + 1; int q = -1;
+        for (int i = 0; i < g_nanvb_nk; i++) if (g_nanvb_k[i].key == key) { q = i; break; }
+        if (q < 0) { if (!isnan_ || g_nanvb_nk >= 4096) continue; q = g_nanvb_nk++; g_nanvb_k[q].key = key; g_nanvb_k[q].nan = 0; }
+        if (isnan_) any = 1;
+        if (g_nanvb_k[q].nan == isnan_) continue;
+        g_nanvb_k[q].nan = isnan_;
+        if (g_nanvb_lines++ < 600) {
+            char l[420]; Sb t = {l, 0, sizeof l};
+            sb_s(&t, isnan_ ? "    NaN in a vertex shader input (t185): turned NaN at flip " : "    NaN in a vertex shader input (t185): finite again at flip "); sb_d(&t, (i64)g_flips); sb_s(&t, ", draw "); sb_d(&t, (i64)V.n_draws);
+            sb_s(&t, ", VS "); sb_x(&t, vsa); sb_s(&t, " PS "); sb_x(&t, (u64)g_shr[SH_PGM_LO_PS] << 8); sb_s(&t, ", range "); sb_d(&t, (i64)k); sb_s(&t, " "); sb_x(&t, lo); sb_s(&t, "-"); sb_x(&t, hi);
+            sb_s(&t, ", NaN "); sb_d(&t, nn); sb_s(&t, "/"); sb_d(&t, (i64)(n / 4)); sb_s(&t, ":");
+            for (u32 i = 0; i < 8 && i < n / 4; i++) { sb_s(&t, " "); sb_x(&t, p[i]); }
+            sb_s(&t, "\n"); say(l); }
+        if (isnan_ && vsa == g_nanvb_watch && !g_nanvb_onset) {
+            g_nanvb_onset = g_flips ? g_flips : 1;
+            say("    (t185) the watched vertex shader's input turned NaN - frame times (ms) of the flips before:");
+            for (int j = 12; j >= 1; j--) if (g_flips >= (u64)j) { say(" "); say_dec((i64)g_frames[(g_flips - (u64)j) % MAX_FRAMES].ms); }
+            say("\n");
+        }
+    }
+    if (any) { g_nanvb_draws++; g_nanvb_win++; }
+}
+static void nanvb_window(void) {   /* every 600 flips (perf window) */
+    if (!g_opt_nan_vb) return;
+    static u64 l; if (g_flips < l + 600) return; l = g_flips;
+    say("    NaN in vertex shader inputs (t184): "); say_dec((i64)g_nanvb_win); say(" draws in the last 600 flips, "); say_dec((i64)g_nanvb_draws); say(" in all\n"); g_nanvb_win = 0;
+}
 static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_index);
 /* the GPU starts on the first part of a frame while the rest is still being translated (like a driver flushing its
    command buffer): every CHUNK draws / dispatches the batch so far is submitted */
@@ -5144,6 +6919,13 @@ static void oq_finish(void) {
     plat_close(f);
 }
 /* the pixels a draw can touch: viewport rectangle intersected with the generic / viewport / screen scissors */
+static u32 rs_first(u32 l) { return (u32)((2ull * g_rs_num * l + g_rs_den - 1 + RS_E(g_rs_den)) / (2ull * g_rs_den)); }   /* F(l) of gcn2spv.c: the first physical pixel of logical pixel l */
+static void rs_rect(VkRect2D *r, u32 pw, u32 ph) {   /* t196: a rectangle in the game's pixels -> the physical pixels of its logical ones (w2: exactly those, F(l)) */
+    u32 x0 = rs_first((u32)(r->offset.x < 0 ? 0 : r->offset.x)), y0 = rs_first((u32)(r->offset.y < 0 ? 0 : r->offset.y));
+    u32 x1 = rs_first((u32)(r->offset.x < 0 ? 0 : r->offset.x) + r->extent.width), y1 = rs_first((u32)(r->offset.y < 0 ? 0 : r->offset.y) + r->extent.height);
+    if (x1 > pw) x1 = pw; if (y1 > ph) y1 = ph; if (x0 > x1) x0 = x1; if (y0 > y1) y0 = y1;
+    r->offset.x = (i32)x0; r->offset.y = (i32)y0; r->extent.width = x1 - x0; r->extent.height = y1 - y0;
+}
 static int draw_clip_rect(u32 rw, u32 rh, VkRect2D *out) {
     const u32 *vp = &g_ctx[CTX_PA_CL_VPORT_XSCALE];
     float xs = as_f(vp[0]), xo = as_f(vp[1]), ys = as_f(vp[2]), yo = as_f(vp[3]);
@@ -5183,11 +6965,257 @@ static void sf_bind_ib(VkBuffer b, u64 off, VkIndexType t) {   /* t117 (the stat
     vkCmdBindIndexBuffer(V.cb, b, off, t); g_sf.ib = b; g_sf.ioff = off; g_sf.itype = (u32)t; g_sf.ib_ok = 1;
 }
 static u64 g_n_region_clears;
+/* ---------------------------------------------------------------- w10_res (--fb-cover N): snapshots kept current by coverage
+   A draw that samples a target it also writes reads a snapshot of it (vk_feedback_copy). The game makes runs of such draws
+   (decals reading the G-buffer they modify: ~20 a frame on one target in the cave; ~26 depth-writing draws that sample
+   the depth buffer), and every one of them took a new copy of the WHOLE target: 62 full-size copies a frame, 1.5 ms of
+   GPU time at 1080p, 2.3 ms at 1440p, 4.4 ms at 2160p (the copies run at the memory bandwidth: only fewer pixels help).
+   The scissor never limits them (--fb-rect), so the CPU cannot know the pixels a draw wrote - but the GPU does: after
+   such a draw its geometry is drawn once more, with the same vertex shader, viewport and scissor, into the snapshot,
+   by a pixel shader that only fetches the target's texel under the fragment. No culling, no depth or stencil test and
+   conservative rasterisation (overestimate): every pixel the draw could have written is brought up to date from the
+   target itself, the others are unchanged in both - the snapshot equals the target again, and the next draw of the run
+   needs no copy. N > 1: up to N - 1 draws in a row that write the target WITHOUT sampling it are covered too (a run
+   interleaved with other draws). Not done (the snapshot is then copied whole at its next use, as before): tessellated /
+   geometry-shader draws, points and lines, a vertex shader that writes memory or samples a snapshot, inside a game
+   occlusion query, formats whose texels a float fetch + store does not reproduce bit for bit (integer, signed
+   normalised, sRGB, 16-bit depth). The depth of a depth target is written through gl_FragDepth over a 0..1 viewport;
+   a snapshot's stencil is not kept (snapshots are sampled through a depth-only view). The pipelines (the draw's vertex
+   shader + the copy shader) are recorded for the shader preparation (t203: made before play at the next start) and,
+   when not in the pipeline cache, compiled on a background thread while the draws take the copy (cov_pipe). */
+typedef struct { u64 h1, h2; VkPipeline p; volatile long st; } CovPipe; static CovPipe g_covp[4096]; static int g_ncovp; static HIdx g_covp_ix;   /* st (t203): 0 not made yet, 1 compiling on the background thread, 2 made (p), 3 failed */
+typedef struct { u64 key; VkShaderModule m; } CovMod; static CovMod g_covm[256]; static int g_ncovm;
+static int cov_fmt_ok(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return 1;
+    default: return 0; }
+}
+/* the copy shader: out[j] = texelFetch(sampler at bind[j], ivec2(gl_FragCoord.xy), 0); dbind >= 0: gl_FragDepth = the same fetch's .r */
+static u32 cov_spv(u32 *w, int nc, const u32 *bind, int dbind) {
+    u32 n = 0; int nt = nc + (dbind >= 0);
+#define E(x) (w[n++] = (u32)(x))
+#define OP(op, cnt) E(((u32)(cnt) << 16) | (u32)(op))
+    E(0x07230203); E(0x00010000); E(0); E(32 + 8 * 9); E(0);
+    OP(17, 2); E(1);
+    OP(14, 3); E(0); E(1);
+    OP(15, 6 + nc + (dbind >= 0)); E(4); E(16); E(0x6E69616D); E(0); E(15); for (int j = 0; j < nc; j++) E(32 + 8 * j + 1); if (dbind >= 0) E(21);
+    OP(16, 3); E(16); E(7);
+    if (dbind >= 0) { OP(16, 3); E(16); E(12); }
+    OP(71, 4); E(15); E(11); E(15);
+    if (dbind >= 0) { OP(71, 4); E(21); E(11); E(22); }
+    for (int j = 0; j < nt; j++) { u32 b = j < nc ? bind[j] : (u32)dbind; OP(71, 4); E(32 + 8 * j); E(34); E(0); OP(71, 4); E(32 + 8 * j); E(33); E(b); if (j < nc) { OP(71, 4); E(32 + 8 * j + 1); E(30); E(j); } }
+    OP(19, 2); E(1); OP(33, 3); E(2); E(1); OP(22, 3); E(3); E(32);
+    OP(23, 4); E(4); E(3); E(4); OP(23, 4); E(5); E(3); E(2);
+    OP(21, 4); E(6); E(32); E(1); OP(23, 4); E(7); E(6); E(2);
+    OP(25, 9); E(8); E(3); E(1); E(0); E(0); E(0); E(1); E(0);
+    OP(27, 3); E(9); E(8);
+    OP(32, 4); E(10); E(0); E(9); OP(32, 4); E(11); E(1); E(4); OP(32, 4); E(12); E(3); E(4); OP(32, 4); E(13); E(3); E(3);
+    OP(43, 4); E(6); E(14); E(0);
+    OP(59, 4); E(11); E(15); E(1);
+    if (dbind >= 0) { OP(59, 4); E(13); E(21); E(3); }
+    for (int j = 0; j < nt; j++) { OP(59, 4); E(10); E(32 + 8 * j); E(0); if (j < nc) { OP(59, 4); E(12); E(32 + 8 * j + 1); E(3); } }
+    OP(54, 5); E(1); E(16); E(0); E(2); OP(248, 2); E(17);
+    OP(61, 4); E(4); E(18); E(15);
+    OP(79, 7); E(5); E(19); E(18); E(18); E(0); E(1);
+    OP(110, 4); E(7); E(20); E(19);
+    for (int j = 0; j < nt; j++) { u32 b = 32 + 8 * (u32)j; OP(61, 4); E(9); E(b + 2); E(b); OP(100, 4); E(8); E(b + 3); E(b + 2); OP(95, 7); E(4); E(b + 4); E(b + 3); E(20); E(2); E(14);
+        if (j < nc) { OP(62, 3); E(b + 1); E(b + 4); } else { OP(81, 5); E(3); E(b + 5); E(b + 4); E(0); OP(62, 3); E(21); E(b + 5); } }
+    OP(253, 1); OP(56, 1);
+#undef E
+#undef OP
+    return n;
+}
+#ifndef COV_HOST_TEST
+static VkShaderModule cov_module(int nc, const u32 *bind, int dbind) {
+    u64 key = 0x636f76ull ^ ((u64)nc << 56); for (int j = 0; j < nc; j++) key = hmix(key, bind[j] + 1); key = hmix(key, (u64)(dbind + 1) << 16);
+    for (int i = 0; i < g_ncovm; i++) if (g_covm[i].key == key) return g_covm[i].m;
+    if (g_ncovm >= 256) return 0;
+    static u32 w[640]; u32 n = cov_spv(w, nc, bind, dbind);
+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, 0, 0, 4ull * n, w}; VkShaderModule m = 0;
+    if (vkCreateShaderModule(V.dev, &ci, 0, &m)) m = 0;
+    g_covm[g_ncovm].key = key; g_covm[g_ncovm].m = m; g_ncovm++;
+    return m;
+}
+/* t203: the create info of a coverage pipeline, pointing into the job (cov_pipe; the same as e6_prep.c's prep_worker
+   makes from the record prep_note_cov writes, so the preparation and play meet in the pipeline cache) */
+static void cov_fill(PJob *j, VkPipelineRasterizationConservativeStateCreateInfoEXT *crs, VkShaderModule vm, int vm_x, VkShaderModule pm, VLayout *L, VkPrimitiveTopology topo, int restart, int zclamp, int nc, const VkFormat *cf, VkFormat dfmt, int dbind) {
+    h_memset(j, 0, sizeof *j);
+    *crs = (VkPipelineRasterizationConservativeStateCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT, 0, 0, VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT, 0.0f};
+    j->st[0] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, stage_sgs(&j->sgs[0], vm_x, VK_SHADER_STAGE_VERTEX_BIT), 0, VK_SHADER_STAGE_VERTEX_BIT, vm, "main", 0};
+    j->st[1] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, pm, "main", 0};
+    j->vi = (VkPipelineVertexInputStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    j->ia = (VkPipelineInputAssemblyStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, 0, 0, topo, (VkBool32)restart};
+    j->vps = (VkPipelineViewportStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, 0, 1, 0};
+    j->rs = (VkPipelineRasterizationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, 0, 0, 0, 0, VK_POLYGON_MODE_FILL,
+        VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1.0f};
+    j->rs.depthClampEnable = (VkBool32)zclamp;   /* (the draw's own clipping: same primitives) */
+    j->ms = (VkPipelineMultisampleStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, 0, 0, VK_SAMPLE_COUNT_1_BIT};
+    j->dss = (VkPipelineDepthStencilStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, 0, 0, (VkBool32)(dbind >= 0), (VkBool32)(dbind >= 0), VK_COMPARE_OP_ALWAYS, 0, 0};
+    j->dss.maxDepthBounds = 1.0f;
+    for (int k = 0; k < 8; k++) j->ba[k] = (VkPipelineColorBlendAttachmentState){0, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, 0xF};
+    j->cbs = (VkPipelineColorBlendStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, 0, 0, 0, VK_LOGIC_OP_COPY, (u32)nc, 0, {0, 0, 0, 0}};
+    j->dyn[0] = VK_DYNAMIC_STATE_VIEWPORT; j->dyn[1] = VK_DYNAMIC_STATE_SCISSOR; j->dyn[2] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
+    j->dys = (VkPipelineDynamicStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, 0, 0, 3, 0};
+    for (int k = 0; k < 8; k++) j->cf[k] = k < nc ? cf[k] : VK_FORMAT_UNDEFINED;
+    j->pri = (VkPipelineRenderingCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, 0, 0, (u32)nc, 0, dfmt, VK_FORMAT_UNDEFINED};
+    j->gci = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, L->pl, 0, 0, 0, -1};
+    pj_fix(j);   /* (pointers into the job; --pipeline-salt / --cold-pipelines: the same specialization entry as every other pipeline) */
+    j->rs.pNext = crs;
+    j->ncol = (u32)nc; j->topo = (u32)topo; j->depth = dbind >= 0;
+}
+/* t203: coverage pipelines that are not in the pipeline cache are compiled on one background thread (below normal
+   priority) while play goes on; until one is ready its draws take the whole snapshot copy as before (exact either way:
+   the copy is the path without --fb-cover). --fb-cover-sync: compiled where first needed, on this thread (w10_res).
+   Replays: always on this thread (deterministic). */
+typedef struct { PJob j; VkPipelineRasterizationConservativeStateCreateInfoEXT crs; u32 *w; u32 n; int ci; } CovJob;
+enum { COVQ_N = 64 };
+static CovJob g_covq[COVQ_N]; static volatile long long g_covq_head, g_covq_tail; static PMutex g_covq_m; static PCond g_covq_cv; static void *g_cov_th;
+static volatile long g_cov_busy, g_cov_stop; static int g_opt_fb_cover_sync, g_cov_th_failed, g_cov_pend;   /* (g_cov_pend: cov_pipe gave 0 because the pipeline is not compiled yet) */
+static volatile long long g_n_cov_bg, g_n_cov_bgfail, g_t_cov_bg; static u64 g_n_cov_cachehit, g_n_cov_queued;
+static void prep_note_cov(const PJob *j, const u32 *pw, u32 pn);   /* (e6_prep.c) */
+static u32 WINAPI cov_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pm_lock(&g_covq_m);
+        while (g_covq_tail == g_covq_head && !g_cov_stop) pc_wait(&g_covq_cv, &g_covq_m, -1);
+        if (g_cov_stop) { pm_unlock(&g_covq_m); break; }
+        CovJob *c = &g_covq[g_covq_tail % COVQ_N]; __atomic_store_n(&g_cov_busy, 1, __ATOMIC_RELEASE);
+        pm_unlock(&g_covq_m);
+        u64 t0 = plat_ticks(); VkShaderModule m = 0; VkPipeline p = 0; VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+        VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, 0, 0, 4ull * c->n, c->w};   /* (its own vertex-shader module: the renderer may release its module meanwhile, t114) */
+        if (c->w && !vkCreateShaderModule(V.dev, &ci, 0, &m) && m) { c->j.st[0].module = m; r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &c->j.gci, 0, &p); vkDestroyShaderModule(V.dev, m, 0); }
+        free(c->w); c->w = 0;
+        if (r) p = 0;
+        CovPipe *C = &g_covp[c->ci]; C->p = p; __atomic_store_n(&C->st, p ? 2 : 3, __ATOMIC_RELEASE);
+        __atomic_add_fetch(p ? &g_n_cov_bg : &g_n_cov_bgfail, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_t_cov_bg, (long long)(plat_ticks() - t0), __ATOMIC_RELAXED);
+        pm_lock(&g_covq_m); g_covq_tail++; __atomic_store_n(&g_cov_busy, 0, __ATOMIC_RELEASE); pc_broadcast(&g_covq_cv); pm_unlock(&g_covq_m);
+    }
+    return 0;
+}
+/* at exit (vk_save_pcache): the thread takes nothing more; a compile still inside the driver gets 2 s, else the process
+   ends without unloading the driver under it (w13_prep's hard exit) */
+static void cov_bg_stop(void) {
+    if (!g_cov_th) return;
+    pm_lock(&g_covq_m); g_cov_stop = 1; long long left = g_covq_head - g_covq_tail; pc_broadcast(&g_covq_cv); pm_unlock(&g_covq_m);
+    u64 t0 = plat_ticks(), f = plat_ticks_per_sec();
+    while (__atomic_load_n(&g_cov_busy, __ATOMIC_ACQUIRE) && (plat_ticks() - t0) * 1000 / f < 2000) plat_sleep_ms(10);
+    if (__atomic_load_n(&g_cov_busy, __ATOMIC_ACQUIRE)) { g_plat_hard_exit = 1; say("    --fb-cover (t203): a copy pipeline still compiling at the exit - the process ends without it\n"); }
+    if (left > 1) { say("    --fb-cover (t203): "); say_dec(left - 1); say(" copy pipelines not compiled before the exit (recorded: the next preparation makes them)\n"); }
+}
+static VkPipeline cov_pipe(G2SOut *vs, VLayout *L, VkPrimitiveTopology topo, int restart, int zclamp, int nc, const VkFormat *cf, VkFormat dfmt, const u32 *bind, int dbind) {
+    u64 h1 = 0x636f7631ull, h2 = 0x9E3779B97F4A7C15ull;
+    u64 parts[24] = {vs->key, (u64)topo, (u64)restart, (u64)zclamp, (u64)nc, (u64)dfmt, (u64)L->pl, (u64)(dbind + 1)};
+    for (int j = 0; j < 8; j++) { parts[8 + j] = j < nc ? (u64)cf[j] : 0; parts[16 + j] = j < nc ? bind[j] : 0; }
+    for (u32 i = 0; i < 24; i++) { h1 = hmix(h1, parts[i]); h2 = hmix(h2 ^ (i * 0x100000001b3ull), parts[i]); }
+    hix_init(&g_covp_ix, 16384);
+    CovPipe *C = 0;
+    { int q = hix_get(&g_covp_ix, h1); if (q >= 0 && g_covp[q].h2 == h2) C = &g_covp[q];
+      if (!C && q >= 0) for (int i = 0; i < g_ncovp; i++) if (g_covp[i].h1 == h1 && g_covp[i].h2 == h2) { C = &g_covp[i]; break; } }
+    if (C) { long st = __atomic_load_n(&C->st, __ATOMIC_ACQUIRE);
+        if (st == 2) return C->p;
+        if (st == 1) { g_cov_pend = 1; return 0; }   /* (still compiling: the copy) */
+        if (st == 3) return 0; }
+    else {
+        if (g_ncovp >= 4096) return 0;
+        C = &g_covp[g_ncovp]; C->h1 = h1; C->h2 = h2; C->p = 0; C->st = 0; hix_put(&g_covp_ix, h1, g_ncovp); g_ncovp++;
+    }
+    VkShaderModule vm = vk_module(vs->key, vs->spv, vs->n); int vm_x = g_mod_xlane_last;
+    VkShaderModule pm = vm ? cov_module(nc, bind, dbind) : 0;
+    if (!vm || !pm) { C->st = 3; return 0; }
+    static u32 cw[640]; u32 cn = cov_spv(cw, nc, bind, dbind);
+    static PJob jl; static VkPipelineRasterizationConservativeStateCreateInfoEXT crl;
+    cov_fill(&jl, &crl, vm, vm_x, pm, L, topo, restart, zclamp, nc, cf, dfmt, dbind);
+    jl.vs_key = vs->key; jl.vs_addr = (u64)g_shr[SH_PGM_LO_VS] << 8;
+    if (C->st == 0) prep_note_cov(&jl, cw, cn);   /* t203: recorded: the next start's preparation makes it */
+    int bg = !g_opt_fb_cover_sync && !g_prep_in_replay && !g_cov_th_failed;
+    u64 t0 = plat_ticks(); VkPipeline p = 0; VkResult r;
+    if (bg && prep_pcc && !g_opt_cold_pipes) {   /* in the pipeline cache already (prepared at the start, or made in an earlier session)? */
+        jl.gci.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT; r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &jl.gci, 0, &p); jl.gci.flags = 0;
+        if (r == VK_SUCCESS && p) { C->p = p; __atomic_store_n(&C->st, 2, __ATOMIC_RELEASE); g_n_cov_cachehit++; g_t_cov_pipes += plat_ticks() - t0; g_n_cov_pipes++; return p; }
+        p = 0;
+    }
+    if (bg && !g_cov_th) { pm_init(&g_covq_m); pc_init(&g_covq_cv); g_cov_th = CreateThread(0, 1u << 20, (void *)cov_worker, 0, 0, 0);
+        if (g_cov_th) plat_thread_priority(g_cov_th, -1 /* THREAD_PRIORITY_BELOW_NORMAL */); else g_cov_th_failed = 1, bg = 0; }
+    if (bg) {
+        if (g_covq_head - g_covq_tail >= COVQ_N) { g_cov_pend = 1; return 0; }   /* (queue full: asked again at its next use) */
+        CovJob *c = &g_covq[g_covq_head % COVQ_N];
+        c->w = (u32 *)malloc(4ull * vs->n); if (!c->w || !vs->spv) { free(c->w); c->w = 0; C->st = 3; return 0; }
+        h_memcpy(c->w, vs->spv, 4ull * vs->n); c->n = vs->n; c->ci = (int)(C - g_covp);
+        cov_fill(&c->j, &c->crs, 0, vm_x, pm, L, topo, restart, zclamp, nc, cf, dfmt, dbind);
+        C->st = 1; g_n_cov_queued++;
+        pm_lock(&g_covq_m); g_covq_head++; pc_broadcast(&g_covq_cv); pm_unlock(&g_covq_m);
+        if (g_n_cov_queued <= 400) { vl("  --fb-cover pipeline queued for the background (t203): VS "); vl_x((u64)g_shr[SH_PGM_LO_VS] << 8); vl(" colour targets "); vl_d(nc); vl(dbind >= 0 ? " +depth" : ""); vl(", flip "); vl_d((i64)g_flips); vl("\n"); }
+        g_cov_pend = 1; return 0;
+    }
+    r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &jl.gci, 0, &p);
+    u64 dt = plat_ticks() - t0; g_t_cov_pipes += dt; g_n_cov_pipes++;
+    if (r) { p = 0; vl("  --fb-cover: pipeline failed, VS "); vl_x((u64)g_shr[SH_PGM_LO_VS] << 8); vl(" err "); vl_d(r); vl("\n"); }
+    else if (g_n_cov_pipes <= 400) { vl("  --fb-cover pipeline "); vl_d((i64)g_n_cov_pipes); vl(": VS "); vl_x((u64)g_shr[SH_PGM_LO_VS] << 8); vl(" colour targets "); vl_d(nc); vl(dbind >= 0 ? " +depth, " : ", "); vl_d((i64)(dt * 1000 / plat_ticks_per_sec())); vl(" ms, flip "); vl_d((i64)g_flips); vl("\n"); }
+    C->p = p; __atomic_store_n(&C->st, p ? 2 : 3, __ATOMIC_RELEASE);
+    return p;
+}
+/* reasons a draw (or one of its targets) was not covered: 0 special draw (tessellation / GS / VS samples a snapshot / no targets), 1 points or lines,
+   2 vertex shader writes memory, 3 game occlusion query open, 4 format, 5 no pixel-shader sampler binding free, 6 pipeline failed, 7 a second depth target, 8 usage */
+static void cov_after_draw(G2SOut *vs, VBind *B, VLayout *L, VkPrimitiveTopology topo, int restart, int zclamp, int special, int kind, u32 n, u32 first, u32 prw, u32 prh, const VkViewport *vp) {
+    VImg *T[9], *S[9]; int bl[9], nt = 0, nd = 0;
+    for (int i = 0; i < g_natt; i++) { VImg *t = g_att[i]; int tg = 0;
+        for (int k = 0; k < g_ntgt_img; k++) if (g_tgt_img[k] == t) tg = 1;
+        if (!tg || t->is3d || t->arrayed || nt >= 9) continue;
+        VImg *s = 0;
+        FOR_ADDR(q, t->addr) { VImg *m = &V.img[q]; if (m->img && m->is_copy == 2 && m->addr == t->addr && m->w == t->w && m->h == t->h && m->fmt == t->fmt && m->rs == t->rs) { s = m; break; } }
+        if (!s || s->copy_src != t->img) continue;
+        int cur = s->copy_seq == t->wseq;   /* this draw sampled it: it is the target as it was before the draw */
+        int blind = !cur && s->cov_id && s->cov_id == t->cv_prev && s->cov_blind + 1 < (u32)g_opt_fb_cover;
+        if (!cur && !blind) continue;
+        if (t->depth) { if (nd) { g_n_cov_no[7]++; continue; } if (t->fmt != VK_FORMAT_D32_SFLOAT && t->fmt != VK_FORMAT_D32_SFLOAT_S8_UINT) { g_n_cov_no[4]++; continue; }
+            if (!(s->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) || !(t->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) { g_n_cov_no[8]++; continue; } nd++; }
+        else { if (!cov_fmt_ok(t->fmt)) { g_n_cov_no[4]++; continue; } if (!(s->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || !(t->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) { g_n_cov_no[8]++; continue; } }
+        T[nt] = t; S[nt] = s; bl[nt] = blind; nt++; }
+    if (!nt) return;
+    if (special) { g_n_cov_no[0]++; return; }
+    if (topo != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && topo != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP && topo != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) { g_n_cov_no[1]++; return; }
+    if (vs->writes_mem) { g_n_cov_no[2]++; return; }
+    if (g_gq_active >= 0 || !V.recording) { g_n_cov_no[3]++; return; }
+    /* colours first, the depth target last; one pixel-shader sampler binding of the draw's layout for each */
+    int ord[9], no = 0; for (int i = 0; i < nt; i++) if (!T[i]->depth && no < 8) ord[no++] = i;
+    int nc = no; int di = -1; for (int i = 0; i < nt; i++) if (T[i]->depth) di = i;
+    if (di >= 0) ord[no++] = di;
+    u32 bind[9]; int bk[9], nb = 0;
+    for (u32 k = 0; k < B->n && nb < no; k++) { u32 sg = B->sig[1 + k]; if ((sg & 0xFF) == 0 && (sg >> 8) >= 33 && B->wr[1 + k].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && B->wr[1 + k].pImageInfo == &B->ii[k]) { bind[nb] = sg >> 8; bk[nb] = (int)k; nb++; } }
+    if (nb < no) { g_n_cov_no[5]++; return; }
+    VkFormat cf[8]; VkImageView cv[8]; for (int j = 0; j < 8; j++) { cf[j] = VK_FORMAT_UNDEFINED; cv[j] = 0; }
+    for (int j = 0; j < nc; j++) { cf[j] = S[ord[j]]->fmt; cv[j] = S[ord[j]]->view; }
+    VkFormat dfmt = di >= 0 ? S[di]->fmt : VK_FORMAT_UNDEFINED; VkImageView dv = di >= 0 ? S[di]->view : 0;
+    if (di >= 0) ord[nc] = di;
+    g_cov_pend = 0;
+    VkPipeline p = cov_pipe(vs, L, topo, restart, zclamp, nc, cf, dfmt, bind, di >= 0 ? (int)bind[nc] : -1);
+    if (!p) { g_n_cov_no[g_cov_pend ? 9 : 6]++; return; }
+    vk_barrier();   /* the draw's writes are finished before the copy shader reads the targets (ends its rendering) */
+    { int dvs_ = g_dv_stencil; g_dv_stencil = 0; vk_targets((u32)nc, cv, dv, prw, prh); g_dv_stencil = dvs_; }
+    vkCmdBindPipeline(V.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); g_sf.P = 0;
+    if (di >= 0 && (vp->minDepth != 0.0f || vp->maxDepth != 1.0f)) { VkViewport v2 = *vp; v2.minDepth = 0.0f; v2.maxDepth = 1.0f; vkCmdSetViewport(V.cb, 0, 1, &v2); g_sf.vp_ok = 0; }
+    VkImageView old[9];
+    for (int j = 0; j < no; j++) { VImg *t = T[ord[j]]; old[j] = B->ii[bk[j]].imageView; B->ii[bk[j]].imageView = vimg_view(t, t->fmt, 0, 0, 1); }
+    vk_push_binds(B, VK_PIPELINE_BIND_POINT_GRAPHICS, L->pl);
+    for (int j = 0; j < no; j++) B->ii[bk[j]].imageView = old[j];
+    if (kind == 0) vkCmdDraw(V.cb, n, g_num_instances, 0, 0);
+    else vkCmdDrawIndexed(V.cb, n, g_num_instances, kind == 1 ? first : 0, 0, 0);
+    V.drew = 1; g_n_cov_draws++;
+    for (int j = 0; j < no; j++) { VImg *t = T[ord[j]], *s = S[ord[j]];
+        s->w_ep = V.bar_ep + 1; t->r_ep = V.bar_ep + 1;   /* lazy barriers: the snapshot was written, the target read, in this epoch */
+        s->last_use = V.frame; s->use_seq = g_sub_seq + 1;
+        s->cov_id = t->cv_id; s->cov_blind = bl[ord[j]] ? s->cov_blind + 1 : 0; g_n_cov_imgs++; g_n_cov_blind += (u64)bl[ord[j]]; }
+}
+#endif
 static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_index) {
     g_chain[0] = g_chain[1] = 0;   /* t116 */
     (void)kind; g_rw_kind = 0;
     V.n_draws++;
-    g_natt = 0; g_nrd_img = 0; g_ntgt_img = 0;
+    g_natt = 0; g_dro = 0; g_zro_att = 0; g_nrd_img = 0; g_ntgt_img = 0;
+    g_rs_tm[0] = g_rs_tm[1] = 0; g_rs_nst = 0; g_rs_tgt = 0;   /* t196 */ g_rs_draw_ui = 0; g_rs_draw_scaled = 0;
     if (!count) { vk_skip("indirect / zero-count draw"); return; }
     u32 cc = g_ctx[CTX_CB_COLOR_CONTROL], cmode = (cc >> 4) & 7;
     if (cmode >= 2) { vk_skip("CB decompress / fast-clear-eliminate pass (not needed)"); return; }
@@ -5199,6 +7227,51 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     for (int rt = 0; rt < 8; rt++) { cf[rt] = VK_FORMAT_UNDEFINED; cv[rt] = 0; }
     int rdbg = g_rp_running && g_rdbg_step && g_rp_step + 1 == g_rdbg_step;   /* t168b */
     if (rdbg) tmask |= 0xF;
+    {   /* t191: how far this draw can reach (viewport and scissors, before the targets' sizes) */
+        const u32 *vp_ = &g_ctx[CTX_PA_CL_VPORT_XSCALE]; float xs_ = as_f(vp_[0]), ys_ = as_f(vp_[2]); if (xs_ < 0) xs_ = -xs_; if (ys_ < 0) ys_ = -ys_;
+        float fx = as_f(vp_[1]) + xs_, fy = as_f(vp_[3]) + ys_;
+        g_rs_phys = 0;
+        if (g_rs_on && g_opt_rs_ui >= 3) { float pw_ = (float)rs_up(1920), ph_ = (float)rs_up(1080);
+            if (2 * xs_ > pw_ - 1 && 2 * xs_ < pw_ + 1 && 2 * ys_ > ph_ - 1 && 2 * ys_ < ph_ + 1) g_rs_phys = 1; }
+        if (g_rs_on && g_opt_rs_ui == 4) {   /* a movie rendered to a texture, its viewport at the physical size too (the texture is then scaled) */
+            const u32 *c_ = &g_ctx[CTX_CB_COLOR0_BASE];
+            if ((tmask & 0xF) && c_[0] && RS_UI_ADDR((u64)c_[0] << 8)) { u32 p_ = ((c_[1] & 0x7FF) + 1) * 8, h_ = (u32)((((u64)(c_[2] & 0x3FFFFF) + 1) * 64) / p_); float pw_ = (float)rs_up(p_), ph_ = (float)rs_up(h_);
+                if (2 * xs_ > pw_ - 1.5f && 2 * xs_ < pw_ + 1.5f && 2 * ys_ > ph_ - 1.5f && 2 * ys_ < ph_ + 1.5f) g_rs_phys = 2; } }
+
+        i32 ex = fx >= 16384.f || !(fx == fx) ? 16384 : fx <= 0 ? 0 : (i32)(fx + 0.999f), ey = fy >= 16384.f || !(fy == fy) ? 16384 : fy <= 0 ? 0 : (i32)(fy + 0.999f);
+        u32 br_ = g_ctx[CTX_PA_SC_GENERIC_SCISSOR_BR], sbr_ = g_ctx[CTX_PA_SC_SCREEN_SCISSOR_BR], vbr_ = g_ctx[CTX_PA_SC_VPORT_SCISSOR_0_BR];
+        if (br_ & 0x7FFF7FFF) { if ((i32)(br_ & 0x7FFF) < ex) ex = (i32)(br_ & 0x7FFF); if ((i32)((br_ >> 16) & 0x7FFF) < ey) ey = (i32)((br_ >> 16) & 0x7FFF); }
+        if (vbr_ & 0x7FFF7FFF) { if ((i32)(vbr_ & 0x7FFF) < ex) ex = (i32)(vbr_ & 0x7FFF); if ((i32)((vbr_ >> 16) & 0x7FFF) < ey) ey = (i32)((vbr_ >> 16) & 0x7FFF); }
+        if (sbr_) { if ((i32)(sbr_ & 0xFFFF) < ex) ex = (i32)(sbr_ & 0xFFFF); if ((i32)(sbr_ >> 16) < ey) ey = (i32)(sbr_ >> 16); }
+        if (g_rs_phys) { ex = (i32)((u64)ex * g_rs_den / g_rs_num); ey = (i32)((u64)ey * g_rs_den / g_rs_num); }   /* (w3: in the game's pixels) */
+        g_vt_ex = ex; g_vt_ey = ey; }
+    {   /* t196 (--fb-rect): the scissors alone, as the draw's VkRect2D below (before the targets' sizes) */
+        i32 x0 = 0, y0 = 0, x1 = 16384, y1 = 16384;
+        u32 tl = g_ctx[CTX_PA_SC_GENERIC_SCISSOR_TL], br = g_ctx[CTX_PA_SC_GENERIC_SCISSOR_BR], stl = g_ctx[CTX_PA_SC_SCREEN_SCISSOR_TL], sbr = g_ctx[CTX_PA_SC_SCREEN_SCISSOR_BR];
+        u32 vtl = g_ctx[CTX_PA_SC_VPORT_SCISSOR_0_TL], vbr = g_ctx[CTX_PA_SC_VPORT_SCISSOR_0_BR];
+        #define CLAMPLO(a, v) if ((i32)(v) > a) a = (i32)(v)
+        #define CLAMPHI(a, v) if ((i32)(v) < a) a = (i32)(v)
+        if (br & 0x7FFF7FFF) { CLAMPLO(x0, tl & 0x7FFF); CLAMPLO(y0, (tl >> 16) & 0x7FFF); CLAMPHI(x1, br & 0x7FFF); CLAMPHI(y1, (br >> 16) & 0x7FFF); }
+        if (vbr & 0x7FFF7FFF) { CLAMPLO(x0, vtl & 0x7FFF); CLAMPLO(y0, (vtl >> 16) & 0x7FFF); CLAMPHI(x1, vbr & 0x7FFF); CLAMPHI(y1, (vbr >> 16) & 0x7FFF); }
+        if (sbr) { CLAMPLO(x0, stl & 0xFFFF); CLAMPLO(y0, stl >> 16); CLAMPHI(x1, sbr & 0xFFFF); CLAMPHI(y1, sbr >> 16); }
+        #undef CLAMPLO
+        #undef CLAMPHI
+        if (rdbg) { x0 = 0; y0 = 0; x1 = 16384; y1 = 16384; }
+        g_dsc_x0 = x0; g_dsc_y0 = y0; g_dsc_x1 = x1; g_dsc_y1 = y1; }
+    int drs = 0;
+    if (g_rs_on) {   /* t196: this draw's targets are scaled when every one of them is the size of the screen (and none is a linear target written back to memory) */
+        int nt_ = 0, ok_ = !rdbg, ui_ = g_opt_rs_ui, uit_ = 0;   /* (w3: a render target in the 0x10_xxxxxxxx heap is one of the interface's) */
+        if (cmode == 1) for (int rt = 0; rt < 8; rt++) {
+            if (!((tmask >> (4 * rt)) & 0xF)) continue;
+            const u32 *c = &g_ctx[CTX_CB_COLOR0_BASE + rt * 15];
+            if (!((c[4] >> 2) & 0x1F) || !c[0]) continue;
+            u32 pitch = ((c[1] & 0x7FF) + 1) * 8, h = (u32)((((u64)(c[2] & 0x3FFFFF) + 1) * 64) / pitch);
+            nt_++; if ((c[5] & 0x1F) == 8 || !(rs_elig(pitch, h) || ((ui_ == 2 || g_rs_phys == 2) && RS_UI_ADDR((u64)c[0] << 8) && ++uit_))) ok_ = 0; }
+        { u32 zi_ = g_ctx[CTX_DB_Z_INFO], zf_ = zi_ & 3;
+          if (zf_ == 1 || zf_ == 3 || (zf_ == 0 && (g_ctx[CTX_DB_STENCIL_INFO] & 1) && (g_ctx[CTX_DB_DEPTH_CONTROL] & 1))) {
+              u32 ds_ = g_ctx[CTX_DB_DEPTH_SIZE], w = ((ds_ & 0x7FF) + 1) * 8, h = (((ds_ >> 11) & 0x3FFFFF & 0x7FF) + 1) * 8;
+              nt_++; if (!(rs_elig(w, h) || ((ui_ == 2 || g_rs_phys == 2) && (uit_ || RS_UI_ADDR((u64)(zf_ ? g_ctx[CTX_DB_Z_WRITE_BASE] : g_ctx[0x015]) << 8))))) ok_ = 0; } }
+        drs = nt_ && ok_; g_rs_tgt = drs; g_rs_draw_ui = ui_; g_rs_draw_scaled = drs; if (!drs) g_rs_phys = 0; else if (g_rs_phys) { g_n_rs_phys++; g_rs_draw_ui = 0; } if (RS_UI_ADDR((u64)g_shr[SH_PGM_LO_PS] << 8)) g_n_rs_ui_draws++; if (drs && uit_) g_n_rs_ui_tgt++; }
     if (cmode == 1) for (int rt = 0; rt < 8; rt++) {
         if (!((tmask >> (4 * rt)) & 0xF)) continue;
         const u32 *c = &g_ctx[CTX_CB_COLOR0_BASE + rt * 15];
@@ -5212,7 +7285,9 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         }
         if (view == VK_FORMAT_UNDEFINED || !(fmt_features(view) & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) { vk_skip("render target format not supported"); return; }
         if (rdbg && rt == 0) { base = view = VK_FORMAT_R32G32B32A32_SFLOAT; }   /* t168b */
+        g_vt_noshrink = (c[5] & 0x1F) == 8 || rdbg;   /* t191: linear targets (written back to memory with their pitch) keep their size */
         VImg *m = rdbg && rt == 0 ? vk_target(G_RDBG_ADDR, pitch, h, VK_FORMAT_R32G32B32A32_SFLOAT, 128, 0, 0) : vk_target((u64)c[0] << 8, pitch, h, base, fmt_bpe(fmt), 0, 0);
+        g_vt_noshrink = 0;
         if (!m) { vk_skip("render target image failed"); return; }
         cf[rt] = view; cv[rt] = vimg_view(m, view, 0, 0, 1); ncol = (u32)rt + 1;
         if (g_natt < 9) g_att[g_natt++] = m;   /* (only targets with a non-zero write mask get here) */
@@ -5230,21 +7305,35 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         u32 ds = g_ctx[CTX_DB_DEPTH_SIZE], w = ((ds & 0x7FF) + 1) * 8, h = (((ds >> 11) & 0x3FFFFF & 0x7FF) + 1) * 8;
         dfmt = zf == 1 ? VK_FORMAT_D16_UNORM : V.ds_fmt ? V.ds_fmt : VK_FORMAT_D32_SFLOAT;
         u64 za = (u64)(zf ? g_ctx[CTX_DB_Z_WRITE_BASE] : g_ctx[0x015]) << 8;   /* DB_STENCIL_WRITE_BASE for a stencil-only target */
+        {   /* t173: can this draw write the depth / stencil surface? */
+            u32 dcx = zf == 0 ? (dc & ~6u) : dc;
+            int sw = (dcx & 1) && sfmt && ((((g_ctx[0x10C] >> 16) & 0xFF) != 0) || ((dcx & 0x80) && ((g_ctx[0x10D] >> 16) & 0xFF) != 0));
+            g_vt_ro = !g_opt_depth_ro_writes && !(dcx & 4) && !sw && !(rc & 3);
+            { u32 zfn = (dcx >> 4) & 7;   /* w6_gpu: depth itself cannot change (stencil may): no depth write, no depth test (no write without it), or a test that never passes / passes only where the stored depth equals the fragment's */
+              g_vt_zro = !g_opt_depth_ro_writes && (!(dcx & 4) || !(dcx & 2) || zfn == 0 || zfn == 2) && !(rc & 3); g_w6_dc = dcx; } }
         VImg *m = vk_target(za, w, h, dfmt, zf == 1 ? 16 : 32, 1, ((zi >> 20) & 7) + 1);
+        int zro_d = g_vt_zro; g_vt_ro = 0; g_vt_zro = 0;
         if (m) { dv = m->view; dstencil = m->stencil; if (m->w < rw) rw = m->w; if (m->h < rh) rh = m->h; if (g_ntgt_img < 9) g_tgt_img[g_ntgt_img++] = m; } else dfmt = VK_FORMAT_UNDEFINED;
         if (m && ((dc & 4) || ((dc & 1) && dstencil && ((g_ctx[0x10C] >> 16) & 0xFF))) && g_natt < 9) g_att[g_natt++] = m;   /* depth or stencil written */
+        else if (m) g_dro = m;   /* t193c */
+        if (m && zro_d && att_written(m)) g_zro_att = m;   /* w6_gpu: written, but only its stencil */
         if (zf == 0) dc &= ~6u;   /* no depth surface: no depth test or write */
     }
     if ((dc & 1) && sfmt && !dstencil) V.n_stencil_lost++;
     g_dv_stencil = dstencil;
+    u32 prw = rw, prh = rh;   /* t196: the render area in the images' own pixels */ g_draw_tgt_w = rw;
+    if (g_rs_on) {
+        g_rs_tgt = 0;
+        for (int i = 0; i < g_ntgt_img; i++) if ((int)g_tgt_img[i]->rs != drs) { g_n_rs_mixed++; vk_skip("render scale: a target could not be brought to the draw's scale"); return; }
+        if (drs) { prw = rs_up(rw); prh = rs_up(rh); } }
     /* no colour target and no depth: the draw only has side effects (pixel shaders writing storage images / buffers,
        e.g. the volumetric lighting grid). Skipped before; now rendered with no attachments over the viewport. */
     int noatt = !ncol && !dv;
 
     /* fast depth clear draws: clear the attachment directly (no shaders needed) */
     if (dv && (rc & 3) && ((rc & 1) || dstencil)) {   /* DEPTH_CLEAR_ENABLE / STENCIL_CLEAR_ENABLE */
-        vk_draw_hazards(vk_targets_restart(ncol, cv, dv, rw, rh));
-        vk_targets(ncol, cv, dv, rw, rh);
+        vk_draw_hazards(vk_targets_restart(ncol, cv, dv, prw, prh));
+        vk_targets(ncol, cv, dv, prw, prh);
         for (int i = 0; i < g_ntgt_img; i++) g_tgt_img[i]->w_ep = V.bar_ep + 1;   /* the clear writes the depth target */
         union { u32 u; float f; } z; z.u = g_ctx[0x00B];   /* DB_DEPTH_CLEAR */
         VkClearAttachment ca = {((rc & 1) && zf ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | ((rc & 2) && dstencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0), 0, {{{0, 0, 0, 0}}}};
@@ -5253,8 +7342,9 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         /* only the draw's rectangle: the shadow atlas (4096x3072) is cleared one 1024x1024 light tile at a time - clearing
            the whole attachment wiped the shadows of the lights rendered before (lights flickering as their order changed) */
         VkClearRect cr = {{{0, 0}, {rw, rh}}, 0, 1};
-        if (!draw_clip_rect(rw, rh, &cr.rect)) { V.n_draws_ok++; return; }
-        if (cr.rect.extent.width != rw || cr.rect.extent.height != rh) g_n_region_clears++;
+        if (!draw_clip_rect(g_rs_phys ? prw : rw, g_rs_phys ? prh : rh, &cr.rect)) { V.n_draws_ok++; return; }
+        if (cr.rect.extent.width != (g_rs_phys ? prw : rw) || cr.rect.extent.height != (g_rs_phys ? prh : rh)) g_n_region_clears++;
+        if (drs && !g_rs_phys) rs_rect(&cr.rect, prw, prh);   /* t196 */
         vkCmdClearAttachments(V.cb, 1, &ca, 1, &cr);
         V.n_draws_ok++;
         return;
@@ -5294,6 +7384,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     int vok = vk_tr(G2S_VS, g_shr[SH_PGM_LO_VS], g_shr[SH_RSRC1_VS], g_shr[SH_RSRC1_VS + 1], &g_shr[SH_USER_DATA_VS], 1, fixz, &vs);
     g_tess.mode = 0; g_gs.mode = 0;
     if (!vok) return;
+    if (g_opt_nan_vb && !g_rp_running) nanvb_check(&vs);   /* t184 diagnostic */
     g_tr_dbg = rdbg; int psok = vk_tr(G2S_PS, g_shr[SH_PGM_LO_PS], g_shr[SH_RSRC1_PS], g_shr[SH_RSRC1_PS + 1], &g_shr[SH_USER_DATA_PS], 33, 0, &ps); g_tr_dbg = 0;
     if (!psok) return;
     if (g_opt_halloween && hh_stage_outline(ps.ntex)) { if (!g_hh_outline_skips++) vl("  Halloween screen (t167c): its stage outline left out (the yellow edge line; not shown on the PS4)\n"); return; }
@@ -5305,7 +7396,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         float axs = as_f(vq[0]), axo = as_f(vq[1]), ays = as_f(vq[2]), ayo = as_f(vq[3]);
         if (axs < 0) axs = -axs; if (ays < 0) ays = -ays;
         float fw = axo + axs, fh = ayo + ays;
-        rw = fw >= 1 && fw < 16384 ? (u32)(fw + 0.999f) : 16384; rh = fh >= 1 && fh < 16384 ? (u32)(fh + 0.999f) : 16384;
+        rw = fw >= 1 && fw < 16384 ? (u32)(fw + 0.999f) : 16384; rh = fh >= 1 && fh < 16384 ? (u32)(fh + 0.999f) : 16384; prw = rw; prh = rh;   /* (t196: no targets, nothing scaled) */
         V.n_noatt_draws++;
     }
     vk_shadow_for(&vs); vk_shadow_for(&ps);
@@ -5313,7 +7404,9 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     /* textures (may record uploads, so before rendering starts) */
     vk_begin_cb();
     static VBind B; B.n = 0; B.nb = 0;
-    if (!vk_bind_stage(&B, &vs, 1) || !vk_bind_stage(&B, &ps, 33)) return;
+    u64 fbc0_ = g_n_fbc_calls; if (!vk_bind_stage(&B, &vs, 1)) return;
+    int vs_fb_ = g_n_fbc_calls != fbc0_;   /* w10_res: the vertex shader samples a snapshot */
+    if (!vk_bind_stage(&B, &ps, 33)) return;
     u64 qoff = 0; u32 qcount = 0, nq = quads ? count / 4 : 0;
     u64 qneed = quads ? (((u64)nq * 24 + 255) & ~255ull) : 0;
     if (quads && !nq) { vk_skip("empty quad list"); return; }
@@ -5325,7 +7418,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         ib_ok = rm_locate(g_index_base, ixlen, &ib, &ioff) || vk_locate(g_index_base, ixlen, &ib, &ioff);
         if (!ib_ok && ixlen <= (1u << 20) && mem_ok(g_index_base, ixlen)) ixneed = (ixlen + 255) & ~255ull;
     }
-    if (qneed + ixneed + fold_need(&vs) + fold_need(&ps) > V.qsize / NSLOT / 2) { vk_skip("quad list too large"); return; }
+    if (qneed + ixneed + fold_need(&vs) + fold_need(&ps) > V.qsize / (u64)g_nslot / 2) { vk_skip("quad list too large"); return; }
     ring_reserve(qneed + ixneed + fold_need(&vs) + fold_need(&ps));
     if (ixneed) { u64 xo; ring_alloc(ixlen, &xo); if (ix_assemble(g_index_base, ixlen, xo)) { ib = V.qbuf; ioff = xo; ib_ok = 1; } }
     vk_bind_fold(&B, &vs, 100); vk_bind_fold(&B, &ps, 101);
@@ -5352,6 +7445,15 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     u32 blend[8]; for (int rt = 0; rt < 8; rt++) blend[rt] = cv[rt] ? g_ctx[CTX_CB_BLEND0_CONTROL + rt] : 0;
     if (rdbg) { blend[0] = 0; say("    replay debug (t168b): step "); say_dec((i64)g_rdbg_step); say(": PS "); say_hex((u64)g_shr[SH_PGM_LO_PS] << 8); say(" VGPRs after pc "); say_hex(g_rdbg_pc); say(" -> MRT0 at "); say_hex(G_RDBG_ADDR); say("\n"); }
     u32 su = g_ctx[CTX_PA_SU_SC_MODE_CNTL];
+    /* t183: PA_CL_CLIP_CNTL ZCLIP_NEAR_DISABLE (bit 26) / ZCLIP_FAR_DISABLE (bit 27): the PS4 does not clip such a draw
+       against the near / far plane; its depth is clamped to the viewport's range instead. The game draws the far
+       backdrops seen through distant windows and doors this way (beyond the far plane): Vulkan clipped them away, the
+       G-buffer kept its clear there and the lighting made it a bright blue-white patch (the "blue light" in the chapel
+       door window, the morgue, the round window; the boiler-room window, whose brightness also drove the lens ghosts).
+       Vulkan's depth clamp does both (it also leaves near-plane clipping out when only the far one is disabled).
+       --no-zclamp: as before. */
+    int zclamp = g_zclamp_ok && !g_opt_no_zclamp && (g_ctx[CTX_PA_CL_CLIP_CNTL] & (3u << 26));
+    if (zclamp) g_n_zclamp_draws++;
     VkCullModeFlags cullm = g_opt_nocull ? VK_CULL_MODE_NONE : (VkCullModeFlags)(((su & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((su & 2) ? VK_CULL_MODE_BACK_BIT : 0));
     /* stencil: DB_STENCIL_CONTROL (ops), DB_STENCILREFMASK / _BF (reference, masks), functions in DB_DEPTH_CONTROL */
     int sten = dstencil && (dc & 1);
@@ -5360,6 +7462,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     u64 parts[] = {vs.key, ps.key, (u64)topo, (u64)cullm | ((u64)(su & 4) << 8), ncol, dfmt, dc & 0x7F, tmask, (u64)L->pl, (u64)(indexed && strip), skey, (u64)dstencil,
                    cf[0], cf[1], cf[2], cf[3], cf[4], cf[5], cf[6], cf[7], blend[0], blend[1], blend[2], blend[3], blend[4], blend[5], blend[6], blend[7]};
     for (u32 i = 0; i < sizeof parts / sizeof parts[0]; i++) { h1 = hmix(h1, parts[i]); h2 = hmix(h2 ^ (i * 0x100000001b3ull), parts[i]); }
+    if (zclamp) { h1 = hmix(h1, 0x2C1A3D0F); h2 = hmix(h2, 0x2C1A3D0F); }   /* t183 (only then: the other pipelines keep their keys) */
     if (g_xs_pipe && ((u64)g_shr[SH_PGM_LO_PS] << 8) == g_xs_addr[1] && ((u64)g_shr[SH_PGM_LO_VS] << 8) == g_xs_addr[0]) { h1 = hmix(h1, 0x7139 + (u64)g_xs_pipe); h2 = hmix(h2, 0x7139 + (u64)g_xs_pipe); }   /* t139 NaN hunt: this draw's pipeline made again (t140: 2 = also with a new module object for its PS) */
     VPipe *P = 0;
     hix_init(&V.pipe_ix, 262144);
@@ -5411,6 +7514,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
             j->vps = (VkPipelineViewportStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, 0, 1, 0};
             j->rs = (VkPipelineRasterizationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, 0, 0, 0, 0, VK_POLYGON_MODE_FILL,
                 cullm, (su & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1.0f};
+            j->rs.depthClampEnable = (VkBool32)zclamp;   /* t183 */
             j->ms = (VkPipelineMultisampleStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, 0, 0, VK_SAMPLE_COUNT_1_BIT};
             j->dss = (VkPipelineDepthStencilStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, 0, 0,
                 (VkBool32)(dv && (dc & 2)), (VkBool32)(dv && (dc & 4)), (VkCompareOp)((dc >> 4) & 7), 0, 0};
@@ -5473,8 +7577,8 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         oq_finish(); V.oq_flip = g_frame_no_for_files + 1; V.oq_n = 0;
         vk_begin_cb(); vk_end_rendering(); vkCmdResetQueryPool(V.cb, V.oqp, 0, 8192);
     }
-    vk_draw_hazards(vk_targets_restart(ncol, cv, dv, rw, rh));
-    vk_targets(ncol, cv, dv, rw, rh);
+    vk_draw_hazards(vk_targets_restart(ncol, cv, dv, prw, prh));
+    vk_targets(ncol, cv, dv, prw, prh);
 
     /* viewport / scissor */
     const u32 *vp = &g_ctx[CTX_PA_CL_VPORT_XSCALE];
@@ -5483,10 +7587,17 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     VkViewport vpt = {xo - xs, yo - ys, 2 * xs, 2 * ys, fixz ? zo - zs : zo, zo + zs};
     if (vpt.minDepth < 0) vpt.minDepth = 0; if (vpt.minDepth > 1) vpt.minDepth = 1; if (vpt.maxDepth < 0) vpt.maxDepth = 0; if (vpt.maxDepth > 1) vpt.maxDepth = 1;
     if (vpt.width == 0 || vpt.height == 0) { vk_skip("empty viewport"); return; }
-    i32 x0 = 0, y0 = 0, x1 = (i32)rw, y1 = (i32)rh;
+    if (drs && !g_rs_phys) { float k_ = (float)g_rs_num / (float)g_rs_den, sh_ = g2s_rs_shift(g_rs_den);   /* t196; w2: + the shift of even denominators (gcn2spv.c RS_E) */
+        vpt.x = vpt.x * k_ + sh_; vpt.y = vpt.y * k_ + sh_; vpt.width *= k_; vpt.height *= k_; }
+    i32 x0 = 0, y0 = 0, x1 = (i32)(g_rs_phys ? prw : rw), y1 = (i32)(g_rs_phys ? prh : rh);
     /* a scissor whose bottom-right is 0 was never set (the driver's default-state routine is not replayed): treat it as unlimited */
     u32 tl = g_ctx[CTX_PA_SC_GENERIC_SCISSOR_TL], br = g_ctx[CTX_PA_SC_GENERIC_SCISSOR_BR], stl = g_ctx[CTX_PA_SC_SCREEN_SCISSOR_TL], sbr = g_ctx[CTX_PA_SC_SCREEN_SCISSOR_BR];
     u32 vtl = g_ctx[CTX_PA_SC_VPORT_SCISSOR_0_TL], vbr = g_ctx[CTX_PA_SC_VPORT_SCISSOR_0_BR];
+    if (g_rs_phys) {   /* w3: a scissor that is exactly the game's whole target (set by the engine, not by Scaleform for its viewport) does not limit a draw in physical coordinates */
+        #define WHOLE_(t, b) (!(t) && ((b) & 0x7FFF) == rw && ((((b) >> 16) & 0x7FFF) == rh || (((b) >> 16) & 0x7FFF) == 1080 || (((b) >> 16) & 0x7FFF) == 1088))
+        if (WHOLE_(tl, br)) { br = 0; g_n_rs_phys_sc++; } if (WHOLE_(vtl, vbr)) { vbr = 0; g_n_rs_phys_sc++; } if (WHOLE_(stl, sbr)) { sbr = 0; g_n_rs_phys_sc++; }
+        #undef WHOLE_
+    }
     #define CLAMPLO(a, v) if ((i32)(v) > a) a = (i32)(v)
     #define CLAMPHI(a, v) if ((i32)(v) < a) a = (i32)(v)
     if (br & 0x7FFF7FFF) { CLAMPLO(x0, tl & 0x7FFF); CLAMPLO(y0, (tl >> 16) & 0x7FFF); CLAMPHI(x1, br & 0x7FFF); CLAMPHI(y1, (br >> 16) & 0x7FFF); }
@@ -5496,6 +7607,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     #undef CLAMPHI
     if (x1 <= x0 || y1 <= y0) { vk_skip("empty scissor"); return; }
     VkRect2D sc = {{x0, y0}, {(u32)(x1 - x0), (u32)(y1 - y0)}};
+    if (drs && !g_rs_phys) rs_rect(&sc, prw, prh);   /* t196 */
     {   /* t116: a tessellated / GS draw also depends on its first compute pass (and the GS pass) */
         VPipe *cg0 = (tess || gsd) ? g_chain[0] : 0, *cg1 = gsd ? g_chain[1] : 0;
         if (vk_guard_failed(cg0) || vk_guard_failed(cg1)) { vk_skip("tessellation / geometry pass pipeline failed"); return; }
@@ -5519,6 +7631,18 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         for (int k = 0; k < 2; k++) { const u32 *u = &g_shr[k ? SH_USER_DATA_PS : SH_USER_DATA_VS];
             if (!g_opt_no_sf && g_sf.pc_ok[k] && rd_eq(g_sf.pc[k], u, 64)) { g_sf_skip[4 + k]++; continue; }
             vkCmdPushConstants(V.cb, L->pl, VK_SHADER_STAGE_ALL, 64u * (u32)k, 64, u); mem_copy(g_sf.pc[k], u, 64); g_sf.pc_ok[k] = 1; } }
+    if (g_opt_rs_uilog && RS_UI_ADDR((u64)g_ctx[CTX_CB_COLOR0_BASE] << 8)) { static int n_; static u64 la_; static u32 lw_; u64 a_ = (u64)g_ctx[CTX_CB_COLOR0_BASE] << 8;   /* w5 */
+        if (n_ < 400 && (a_ != la_ || lw_ != (u32)vpt.width)) { n_++; la_ = a_; lw_ = (u32)vpt.width;
+            say("    interface target (w5) flip "); say_dec((i64)g_flips); say(": "); say_hex(a_); say(" "); say_dec(rw); say("x"); say_dec(rh); say(drs ? (g_rs_phys ? " scaled-phys" : " scaled") : " plain");
+            say(" viewport "); say_dec((i64)vpt.x); say(","); say_dec((i64)vpt.y); say(" "); say_dec((i64)vpt.width); say("x"); say_dec((i64)vpt.height); say(" scissor "); say_dec(sc.offset.x); say(","); say_dec(sc.offset.y); say(" "); say_dec(sc.extent.width); say("x"); say_dec(sc.extent.height);
+            say(" PS "); say_hex((u64)g_shr[SH_PGM_LO_PS] << 8); say("\n"); } }
+    if (g_rs_on) { u32 rsb_[6] = {(u32)drs, g_rs_tm[0], g_rs_tm[1], 0, 0, 0}; vkCmdPushConstants(V.cb, L->pl, VK_SHADER_STAGE_ALL, 128, 24, rsb_); rs_gen_push(L->pl); g_n_rs_draws += (u64)drs; }   /* t196 */
+    if (rsl_on()) {   /* w3 */
+        vl("rsl D "); vl_d((i64)g_rsl_seq++); vl(" step "); vl_d((i64)g_rp_step + 1); vl(drs ? (g_rs_phys ? " SCALED-PHYS" : " SCALED") : " plain"); vl(" vp "); vl_d((i64)vpt.x); vl(","); vl_d((i64)vpt.y); vl(" "); vl_d((i64)vpt.width); vl("x"); vl_d((i64)vpt.height);
+        vl(" sc "); vl_d(sc.extent.width); vl("x"); vl_d(sc.extent.height); vl(" PS "); vl_x((u64)g_shr[SH_PGM_LO_PS] << 8); if (ps.nwr || ps.wr_unknown) { vl(" MEMW"); vl_d((i64)ps.nwr); } if (ps.nrd) { vl(" MEMR"); vl_d((i64)ps.nrd); }   /* (w5: a pixel shader that writes / reads buffers on the GPU: per-pixel lists) */
+        for (int i = 0; i < g_ntgt_img; i++) { VImg *q = g_tgt_img[i]; vl(" | T "); vl_x(q->addr); vl(" "); vl_d(q->w); vl("x"); vl_d(q->h); vl(" f"); vl_d(q->fmt); vl(q->rs ? " SCALED" : ""); vl(q->depth ? " depth" : ""); }
+        rsl_tex(); vl("\n"); }
+    tl_key((u64)g_shr[SH_PGM_LO_VS] << 8, (u64)g_shr[SH_PGM_LO_PS] << 8, count * g_num_instances);   /* t172 */
     int tsq = V.qp && g_opt_gpu_times > 0 && V.qn + 2 <= QPS - 2;
     if (tsq) { vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, V.qp, V.qbase + V.qn); V.qkey_a[(V.qbase + V.qn) / 2] = (u64)g_shr[SH_PGM_LO_VS] << 8; V.qkey_b[(V.qbase + V.qn) / 2] = (u64)g_shr[SH_PGM_LO_PS] << 8; g_qverts[(V.qbase + V.qn) / 2] = count * g_num_instances;
            if (g_opt_nexp && (exp_is((u64)g_shr[SH_PGM_LO_VS] << 8) || exp_is((u64)g_shr[SH_PGM_LO_PS] << 8))) V.qkey_b[(V.qbase + V.qn) / 2] |= (u64)(exp_var() + 1) << 56; }
@@ -5550,12 +7674,15 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         rd_ib(ib, ioff, g_index_type ? 1 : 0); sf_bind_ib(ib, ioff, g_index_type ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
         vkCmdDrawIndexed(V.cb, count, g_num_instances, first_index, 0, 0);
     } else vkCmdDraw(V.cb, count, g_num_instances, 0, 0);
-    pred_end(pc_on);
+    pred_end(pc_on); gw_setup_done();
     if (oq >= 0) vkCmdEndQuery(V.cb, V.oqp, (u32)oq);
     if (g_diag_mode == 6 && g_gq_active < 0) vk_barrier();   /* t105 diagnostic: nothing overlaps on the GPU (not inside a game occlusion query) */
     if (tsq) { vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, V.qp, V.qbase + V.qn + 1); V.qn += 2; }
     V.drew = 1; if (vs.writes_mem || ps.writes_mem) V.drew_mem = 1;
-    for (int i = 0; i < g_natt; i++) g_att[i]->w_ep = V.bar_ep + 1;   /* written in this epoch (lazy barriers) */
+    for (int i = 0; i < g_natt; i++) { g_att[i]->w_ep = V.bar_ep + 1;   /* written in this epoch (lazy barriers) */
+        int tg = 0; for (int k = 0; k < g_ntgt_img; k++) if (g_tgt_img[k] == g_att[i]) tg = 1;
+        if (!tg) g_att[i]->wx_ep = V.bar_ep + 1; }   /* t196: a storage image the shaders write (not an attachment) */
+    if (g_opt_fb_cover && g_has_consraster) cov_after_draw(&vs, &B, L, topo, indexed && strip, zclamp, gsd || tess || vs_fb_ || noatt || rdbg, quads ? 2 : indexed ? 1 : 0, quads ? qcount : count, first_index, prw, prh, &vpt);
     V.n_draws_ok++;
 }
 
@@ -5572,6 +7699,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
 typedef struct { u32 n; u64 h; } CodeSig;
 static const CodeSig k_cs_copy = {12, 0x9e7c4b6c7eda7041ull}, k_cs_fill = {27, 0xa55a26d3b5a7ba20ull}, k_cs_fill_pat = {18, 0x8ff4a5ff123dd4f8ull};
 static u64 g_n_dma_copy, g_n_dma_fill, g_dma_bytes, g_n_rt_fill_clears, g_n_rt_fill_skipped;
+static u64 g_n_dmac[3], g_dmac_bytes[2]; static int gw_inflight(u64 lo, u64 hi);   /* w12_gpu: see vk_dma_fastpath */
 /* A fill of game memory that covers the whole memory of a render target / storage image: on the PS4 the image IS that
    memory, so it is filled too. Before, only the memory changed and the Vulkan image kept its old contents (e.g. the
    UI choice cards in Dr Hill's office drawn over the phone screen that was there before, overlapping texts). Zero
@@ -5624,7 +7752,7 @@ static void rt_fill(u64 lo, u64 hi, u32 val) {
             vkCmdClearColorImage(V.cb, m->img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
         }
         vk_barrier();
-        m->wseq = ++V.wseq; m->last_use = V.frame; m->use_seq = g_sub_seq + 1;
+        m->wseq = ++V.wseq; m->dseq = m->wseq; m->last_use = V.frame; m->use_seq = g_sub_seq + 1;
         m->msig_frame = 0; rt_mark(m);
         g_n_rt_fill_clears++;
     }
@@ -5679,6 +7807,14 @@ static int vk_dma_fastpath(u32 x, u32 y, u32 z) {
         vk_begin_cb(); vk_barrier();   /* earlier draws / dispatches may still read or write it */
         VkBufferCopy bc = {os_, od, bytes};
         vkCmdCopyBuffer(V.cb, bs, bd, 1, &bc);
+        if (g_opt_wbg && bytes >= (1u << 20)) { static struct { u64 s, d, n, c; } big[8]; static int nbig; int q = 0; while (q < nbig && !(big[q].s == sa && big[q].d == da)) q++;   /* w5_fast: where the big compute copies come from */
+            if (q == nbig && q < 8) { big[q].s = sa; big[q].d = da; big[q].n = bytes; nbig++; say("  label guard (w5_fast): compute copy over 1 MB "); say_hex(sa); say(" -> "); say_hex(da); say(" +"); say_dec((i64)bytes); say(" flip "); say_dec((i64)g_flips); say(", source in a VRAM copy "); say_dec(shadow_overlaps(sa, bytes)); say(" (GPU-written "); say_dec(shadow_overlaps_rw(sa, bytes)); say("), destination "); say_dec(shadow_overlaps(da, bytes)); say("\n"); } }
+        if (bytes >= 65536 && g_opt_gpu_tl) {   /* w12_gpu (counters only, with --gpu-pass-log / --gpu-timeline): the pass log's bcopy row at this line is the GPU-busy spike of streaming moments - how often could it be a CPU copy provably? */
+            static u32 run; if (g_chunk_n <= 1) run = 0;
+            int only = g_chunk_n == run + 1; if (only) run = g_chunk_n;
+            g_n_dmac[0]++; g_dmac_bytes[0] += bytes;
+            { u64 keep = g_n_fold_inflight; if (gw_inflight(sa, sa + bytes)) g_n_dmac[1]++; g_n_fold_inflight = keep; }   /* (not one of the fold candidates that counter is about) */
+            if (only && __atomic_load_n(&g_done_seq, __ATOMIC_ACQUIRE) == __atomic_load_n(&g_sub_seq, __ATOMIC_ACQUIRE)) { g_n_dmac[2]++; g_dmac_bytes[1] += bytes; } }
         gw_note(da, da + bytes);
         vk_barrier();
         g_n_dma_copy++; g_dma_bytes += bytes;
@@ -5874,7 +8010,8 @@ static void csck_post(const G2SOut *cs) {
 static void vkr_dispatch_body(u32 x, u32 y, u32 z);
 static void vkr_dispatch(u32 x, u32 y, u32 z) { if (rp_skipped()) return; RSTEP("dispatch", (u64)g_shr[SH_COMPUTE_PGM_LO] << 8, 0); T0(); vkr_dispatch_body(x, y, z); TADD(g_t_disp); g_rstep = "between draws"; }
 static void vkr_dispatch_body(u32 x, u32 y, u32 z) {
-    g_natt = 0; g_csck_on = 0; g_rw_kind = 1;
+    g_natt = 0; g_dro = 0; g_zro_att = 0; g_csck_on = 0; g_rw_kind = 1;
+    g_rs_tm[0] = g_rs_tm[1] = 0; g_rs_nst = 0; g_rs_tgt = 0;   /* t196 */ g_rs_draw_ui = 0; g_rs_draw_scaled = 0;
     if (g_vk_on) vk_chunk();
     if (!g_vk_on) return;
     if (!x || !y || !z) return;
@@ -5911,11 +8048,41 @@ static void vkr_dispatch_body(u32 x, u32 y, u32 z) {
     dfr_bind_guarded(VK_PIPELINE_BIND_POINT_COMPUTE, P, 0, 0); g_rd_epoch++; sf_compute_push();   /* (push constants shared with draws) */
     vk_push_binds(&B, VK_PIPELINE_BIND_POINT_COMPUTE, L->pl);
     vkCmdPushConstants(V.cb, L->pl, VK_SHADER_STAGE_ALL, 0, 64, &g_shr[SH_COMPUTE_USER_DATA]);
+    u32 dgx = x, dgy = y; int rs_sub_ = 0;
+    if (g_rs_on) {
+        /* t196: a dispatch that writes scaled images runs once per physical pixel (the group counts grow; the program still
+           sees the game's thread ids) - but only a program without side effects per thread besides those images: no
+           buffer writes, no LDS. Any other dispatch runs as the game issued it: it reads scaled images at the
+           representative pixel and writes every physical texel of a logical one with the same value (logged: what such a
+           pass writes has the game's resolution). */
+        u32 tx_ = g_shr[SH_COMPUTE_NUM_THREAD_X] & 0xFFFF, ty_ = g_shr[SH_COMPUTE_NUM_THREAD_X + 1] & 0xFFFF; if (!tx_) tx_ = 1; if (!ty_) ty_ = 1;
+        int sd_ = g_rs_nst && z == 1 && !cs.nwr && !cs.wr_unknown && !cs.uses_lds && (u64)x * tx_ <= 16384 && (u64)y * ty_ <= 16384;
+        u32 rsb_[6] = {(u32)sd_, g_rs_tm[0], 0, x * tx_, y * ty_, 0};
+        if (sd_) { dgx = (rs_up(x * tx_) + tx_ - 1) / tx_; dgy = (rs_up(y * ty_) + ty_ - 1) / ty_; g_n_rs_disp++; }
+        rs_sub_ = !sd_ && g_rs_nst && g_opt_rs_sub && z == 1 && !cs.nwr && !cs.wr_unknown && cs.uses_lds && rs_elig(x * tx_, y * ty_);
+        if (sd_) {} else if (rs_sub_) g_n_rs_sub++;
+        else if (g_rs_nst) { if (g_n_rs_disp1++ < 40) { vl("  render scale: dispatch writes a scaled image at the game's resolution (buffer writes / LDS / 3D groups): CS "); vl_x((u64)g_shr[SH_COMPUTE_PGM_LO] << 8);
+            vl(" groups "); vl_d(x); vl("x"); vl_d(y); vl("x"); vl_d(z); vl(" buffer writes "); vl_d(cs.nwr); vl(cs.wr_unknown ? "+unknown" : ""); vl(cs.uses_lds ? " LDS" : ""); vl(", frame "); vl_d((i64)V.frame); vl("\n"); } }
+        vkCmdPushConstants(V.cb, L->pl, VK_SHADER_STAGE_ALL, 128, 24, rsb_); rs_gen_push(L->pl);
+        if (rsl_on()) { vl("rsl C "); vl_d((i64)g_rsl_seq++); vl(" step "); vl_d((i64)g_rp_step + 1); vl(sd_ ? " per-physical-pixel" : rs_sub_ ? " SUB-PIXEL-RUNS" : g_rs_nst ? " GAME-RES-WRITER" : " plain"); vl(" groups "); vl_d(x); vl("x"); vl_d(y); vl("x"); vl_d(z);
+            vl(" threads "); vl_d(tx_); vl("x"); vl_d(ty_); vl(" CS "); vl_x((u64)g_shr[SH_COMPUTE_PGM_LO] << 8); rsl_tex(); vl("\n"); } }
+    tl_key((u64)g_shr[SH_COMPUTE_PGM_LO] << 8, 0, x * y * z); g_tl_stage = 'C';   /* t172 */
     int tsq = V.qp && g_opt_gpu_times > 0 && V.qn + 2 <= QPS - 2;
     if (tsq) { vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, V.qp, V.qbase + V.qn); V.qkey_a[(V.qbase + V.qn) / 2] = (u64)g_shr[SH_COMPUTE_PGM_LO] << 8; V.qkey_b[(V.qbase + V.qn) / 2] = 0; g_qverts[(V.qbase + V.qn) / 2] = x * y * z;
            if (g_opt_nexp && exp_is((u64)g_shr[SH_COMPUTE_PGM_LO] << 8)) V.qkey_a[(V.qbase + V.qn) / 2] |= (u64)(exp_var() + 1) << 56; }
     ck_mark(2, (u64)g_shr[SH_COMPUTE_PGM_LO] << 8, 0, x * y * z);
-    { int pd_on = pred_begin(1); vkCmdDispatch(V.cb, x, y, z); pred_end(pd_on); }
+    if (rs_sub_) {   /* w3: one run per position inside a logical pixel's block of physical pixels (see rs_sub in gcn2spv.c) */
+        u32 k_ = (g_rs_num + g_rs_den - 1) / g_rs_den, tx_ = g_shr[SH_COMPUTE_NUM_THREAD_X] & 0xFFFF, ty_ = g_shr[SH_COMPUTE_NUM_THREAD_X + 1] & 0xFFFF; if (!tx_) tx_ = 1; if (!ty_) ty_ = 1;
+        int pd_on = pred_begin(1);
+        for (u32 j = 0; j < k_; j++) for (u32 i = 0; i < k_; i++) {
+            u32 rsb_[6] = {0, g_rs_tm[0], 0, x * tx_, y * ty_, 0x10000u | i | (j << 8)};
+            vkCmdPushConstants(V.cb, L->pl, VK_SHADER_STAGE_ALL, 128, 24, rsb_);
+            vkCmdDispatch(V.cb, dgx, dgy, z);
+            if (i + 1 < k_ || j + 1 < k_) { VkMemoryBarrier mb_ = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+                vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_, 0, 0, 0, 0); } }
+        pred_end(pd_on); gw_setup_done();
+    } else
+    { int pd_on = pred_begin(1); vkCmdDispatch(V.cb, dgx, dgy, z); pred_end(pd_on); gw_setup_done(); }
     if (tsq) { vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, V.qp, V.qbase + V.qn + 1); V.qn += 2; }
     vk_barrier();
     wb_flush();
@@ -5955,13 +8122,19 @@ static void vk_cpu_wrote_sync(void) {
         for (u64 p = lo & ~0xFFFull; p < hi && p < (lo & ~0xFFFull) + (256ull << 20); p += 4096) { if (!(p & 0xFFFF) || p == (lo & ~0xFFFull)) rm_note_cpu_write(p); sh_note_cpu_write(p); g_n_cw_pages++; }
     }
 }
-static void vkr_begin_submit(void) { RSTEP("start of a submit (memory syncs)", 0, 0); if (!g_main_tid) g_main_tid = GetCurrentThreadId(); g2s_memo_epoch(); if (g_trc_f) trc_event('E', 0, 0); T0();
+static void vkr_begin_submit(void) { RSTEP("start of a submit (memory syncs)", 0, 0); if (!g_main_tid) g_main_tid = GetCurrentThreadId(); g2s_memo_epoch(); dcp_kick(); if (g_trc_f) trc_event('E', 0, 0); T0();
     g_ww_mode = g_opt_ww_probe == 2 ? (int)(g_ww_nsub & 1) : g_opt_ww_probe; g_ww_nsub++; g_n_wwm[g_ww_mode == 3 ? 1 : g_ww_mode]++;   /* t117 (every other game submit) */
     u64 ta = plat_ticks(); if (g_vk_on) vk_cpu_wrote_sync(); u64 tb = plat_ticks(); g_t_ww[0] += tb - ta;
+    int psw = g_ps_done; g_ps_done = 0;   /* t182: a scan ahead ran before this submit */
+    if (g_ps_nrm && g_nsh) for (u32 i = 0; i < g_ps_nrm; i++) if (shadow_of(g_ps_rm[i], 1)) {   /* (t182: a VRAM copy made over a page since the scan ahead) */
+        if (!coh_on() && ps_grow(&g_ps_sh, g_ps_nsh, &g_ps_shcap, 1)) g_ps_sh[g_ps_nsh++] = g_ps_rm[i]; else sh_note_cpu_write(g_ps_rm[i]); }   /* (t183: with coherence in the copies' own list, which the completion thread sees) */
     if (g_vk_on && g_nsh) vk_shadow_sync(); g_t_ww[1] += plat_ticks() - tb;
+    g_ps_nsh = 0;   /* (t182: copied by vk_shadow_sync, or no copies left: RAM is read there) */
     if (g_vk_on) rm_submit_sync();
+    g_ps_nrm = 0;   /* (t182: used by the mirror's sync, or the mirror is off: those pages are read from RAM) */
+    { u64 tt = plat_ticks() - ta; g_t_bsub_ps[psw] += tt; g_n_bsub_ps[psw]++; }
     TADD(g_t_bsub); }
-static void vkr_end_submit(void) { if (g_vk_on && V.recording) { V.n_flush++; if (g_opt_gpu_sync || g_diag_mode == 6) vk_submit_wait(); else vk_submit_async(0, 0); } }
+static void vkr_end_submit(void) { if (g_vk_on && V.recording) { V.n_flush++; if (g_opt_gpu_sync || g_diag_mode == 6) vk_submit_wait(); else { g_lbl_end_submit = 1; vk_submit_async(0, 0); g_lbl_end_submit = 0; } } }
 /* an end-of-pipe write / interrupt: queued behind the GPU work recorded or in flight (returns 0: nothing outstanding, apply now) */
 static int vkr_defer(u64 addr, const void *src, u32 n, int irq) {
     if (!g_vk_on) return 0;
@@ -5978,6 +8151,7 @@ static int vkr_busy(void) { return g_vk_on && V.recording; }
 
 /* ---------------------------------------------------------------- present */
 static void vk_shot(VImg *m, u32 w, u32 h) {
+    if (m->rs) { w = rs_up(w); h = rs_up(h); }   /* t196: the screenshot has the scaled picture's own pixels */
     if (m->bpe != 32 || (u64)w * h * 4 > V.stage_size) return;
     vk_submit_wait(); vk_begin_cb(); vk_end_rendering(); V.stage_used = 0;
     VkBufferImageCopy bic = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
@@ -6020,7 +8194,7 @@ static void flb_record(VImg *src, u32 sw, u32 sh) {
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_fb_img[k], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, g_fb_init[k] ? 0 : 1, &ib);
     g_fb_init[k] = 1;
-    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(i32)sw, (i32)sh, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {FB_W, FB_H, 1}}};
+    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(i32)RSV(src, sw), (i32)RSV(src, sh), 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {FB_W, FB_H, 1}}};
     vkCmdBlitImage(V.cb, src->img, VK_IMAGE_LAYOUT_GENERAL, g_fb_img[k], VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
     VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb2, 0, 0, 0, 0);
@@ -6216,16 +8390,17 @@ static void vk_replay_snap(u64 step) {
             say(" wseq "); say_dec((i64)m->wseq); if (m->is_copy) { say(" copy_seq "); say_dec((i64)m->copy_seq); }
             say(" last_use "); say_dec(m->last_use);
             u32 tb = m->depth ? ((m->fmt == VK_FORMAT_D16_UNORM || m->fmt == VK_FORMAT_D16_UNORM_S8_UINT) ? 2 : 4) : (m->bpe ? m->bpe : 32) / 8;
-            u64 sz = (u64)m->w * m->h * tb;
+            u32 sw_ = RSV(m, m->w), sh_ = RSV(m, m->h);   /* w2: a scaled image is saved in its own pixels (the file name has that size) */
+            u64 sz = (u64)sw_ * sh_ * tb;
             if (m->d > 1 || sz > V.stage_size) { say(" (not saved: layered or too large)\n"); continue; }
             vk_submit_wait(); vk_begin_cb(); vk_end_rendering(); stage_dev(); V.stage_used = 0;
             VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
             vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, 0, 0, 0);
-            VkBufferImageCopy bic = {0, 0, 0, {m->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {m->w, m->h, 1}};
+            VkBufferImageCopy bic = {0, 0, 0, {m->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {sw_, sh_, 1}};
             vkCmdCopyImageToBuffer(V.cb, m->img, VK_IMAGE_LAYOUT_GENERAL, V.stage, 1, &bic);
             vk_submit_wait();
             char nm[160]; Sb sn = {nm, 0, sizeof nm};
-            sb_s(&sn, "replay_snap"); sb_d(&sn, (i64)step); sb_s(&sn, "_"); sb_x(&sn, m->addr); sb_s(&sn, "_"); sb_d(&sn, m->w); sb_s(&sn, "x"); sb_d(&sn, m->h); sb_s(&sn, "_f"); sb_d(&sn, m->fmt);
+            sb_s(&sn, "replay_snap"); sb_d(&sn, (i64)step); sb_s(&sn, "_"); sb_x(&sn, m->addr); sb_s(&sn, "_"); sb_d(&sn, sw_); sb_s(&sn, "x"); sb_d(&sn, sh_); sb_s(&sn, "_f"); sb_d(&sn, m->fmt);
             sb_s(&sn, "_img"); sb_d(&sn, i); sb_s(&sn, m->is_copy ? "_copy" : ""); sb_s(&sn, ".bin");
             void *f = cap_open(nm); if (f) { plat_write_bin(f, V.stage_map, sz); plat_close(f); }
             say(" -> "); say(nm); say("\n");
@@ -6619,7 +8794,7 @@ static void hunt_step(void) {
 static void vkr_snap(u32 n) {
     if (g_vk_on && g_hunt_state == 1) hunt_step();   /* t135 */
     if (g_vk_on && (g_nrw || g_rw_w)) rwatch_step();
-    if (g_vk_on && g_rp_running && (g_nrsnap || g_nrsm || g_nrdt || g_nrskip)) { ++g_rp_step; if (g_nrsnap) vk_replay_snap(g_rp_step); if (g_nrsm) vk_replay_snapmem(g_rp_step); if (g_nrdte) vk_replay_dumptex(g_rp_step); }
+    if (g_vk_on && g_rp_running && (g_nrsnap || g_nrsm || g_nrdt || g_nrskip || g_rtl_hi)) { ++g_rp_step; if (g_nrsnap) vk_replay_snap(g_rp_step); if (g_nrsm) vk_replay_snapmem(g_rp_step); if (g_nrdte) vk_replay_dumptex(g_rp_step); }
     if (g_vk_on && g_rc_trace) rc_trace_step();
     else if (g_vk_on && g_rc_nsync) { u64 k = ++g_rcs_step; for (int i = 0; i < g_rc_nsync; i++) if (k >= g_rc_sync[i][0] && k <= g_rc_sync[i][1]) { vk_submit_wait(); break; } }
     if (g_vk_on && n && g_ntrace) vk_trace_after(n);
@@ -6651,13 +8826,17 @@ static void vk_mem_report(void) {
     if (!g_vk_on || !V.dev) return;
     u64 nimg = 0; for (int i = 0; i < V.nimg; i++) if (V.img[i].img) nimg++;
     say("      renderer: images "); say_dec((i64)(V.img_bytes >> 20)); say(" MB in "); say_dec((i64)nimg); say(" (peak "); say_dec((i64)(V.img_bytes_peak >> 20));
-    say(", budget "); say_dec((i64)(V.img_budget >> 20)); say("; t134 pool: "); say_dec(g_nimb); say(" blocks of "); say_dec(IMP_BLOCK_MB); say(" MB holding "); say_dec((i64)(g_imp_bytes_pooled >> 20)); say(" MB, images pooled "); say_dec((i64)g_imp_n_pooled); say(", dedicated "); say_dec((i64)g_imp_n_dedicated); if (g_imp_n_block_fail) { say(", block allocations failed "); say_dec((i64)g_imp_n_block_fail); }
+    say(", budget "); say_dec((i64)(V.img_budget >> 20)); say("; t134 pool: "); say_dec(g_imp_live); say(" blocks of "); say_dec(IMP_BLOCK_MB); say(" MB holding "); say_dec((i64)(g_imp_bytes_pooled >> 20)); say(" MB, images pooled "); say_dec((i64)g_imp_n_pooled); say(", dedicated "); say_dec((i64)g_imp_n_dedicated); if (g_imp_n_block_fail) { say(", block allocations failed "); say_dec((i64)g_imp_n_block_fail); }
     say("), VRAM copies "); say_dec((i64)(g_sh_bytes >> 20)); say(" MB in "); say_dec(g_nsh); say(" (budget "); say_dec((i64)(g_sh_budget >> 20)); say(")");
     say(", read mirror "); say_dec((i64)((u64)g_rm_nblk * RM_BLK >> 20)); say(" MB ("); say_dec((i64)(g_rm_npages >> 4)); say(" MB used, budget "); say_dec((i64)(g_rm_budget >> 20)); say("), staging "); say_dec((i64)(V.stage_size >> 20));
     say(" MB, index ring "); say_dec((i64)(V.qsize >> 20)); say(" MB; game memory imported in "); say_dec(V.nreg); say(" regions\n");
-    say("      staging per batch: peak "); say_dec((i64)(g_stage_peak >> 20)); say(" MB of "); say_dec((i64)(V.stage_size / NSLOT >> 20)); say(", over 16 MB "); say_dec((i64)g_stage_n16);
+    say("      image memory (t196): really allocated "); say_dec((i64)(img_real_bytes() >> 20)); say(" MB (pool blocks in use "); say_dec(g_imp_live); say(", given back "); say_dec((i64)g_imp_blocks_freed);
+    say("), memory textures freed by age "); say_dec((i64)g_n_age_evict); say(" ("); say_dec((i64)(g_age_evict_bytes >> 20)); say(" MB; --image-max-age "); say_dec((i64)g_img_max_age);
+    say("), evictions for the real budget "); say_dec((i64)g_n_real_evict); say(g_opt_img_budget_real ? " (on)" : " (off)"); say(", budget lowered because the card was full "); say_dec((i64)g_n_vram_pressure); say(", raised again "); say_dec((i64)g_n_budget_up); say("; w2: table headroom "); say_dec(g_opt_img_headroom); say(", freed between frames for it "); say_dec((i64)g_n_headroom_evict);
+    if (g_sim_vram) { say("; --sim-vram-gb "); say_dec((i64)(g_sim_vram >> 30)); } if (g_opt_vram_fit) say("; --vram-fit"); say("\n");
+    say("      staging per batch: peak "); say_dec((i64)(g_stage_peak >> 20)); say(" MB of "); say_dec((i64)(V.stage_size / (u64)g_nslot >> 20)); say(", over 16 MB "); say_dec((i64)g_stage_n16);
     say(", over 32 MB "); say_dec((i64)g_stage_n32); say(" of "); say_dec((i64)g_stage_nb); say(" batches; index ring per batch: peak "); say_dec((i64)(g_ring_peak >> 10)); say(" KB of ");
-    say_dec((i64)(V.qsize / NSLOT >> 10)); say(" KB; staging at "); say_hex((u64)V.stage_map); say(", ring at "); say_hex((u64)V.qmap);
+    say_dec((i64)(V.qsize / (u64)g_nslot >> 10)); say(" KB; staging at "); say_hex((u64)V.stage_map); say(", ring at "); say_hex((u64)V.qmap);
     say("; t111: own staging buffers for large uploads "); say_dec((i64)g_n_stage_tmp); say(" ("); say_dec((i64)(g_stage_tmp_bytes >> 20)); say(" MB, at most ");
     say_dec((i64)(g_stage_tmp_peak >> 20)); say(" MB at once, failed "); say_dec((i64)g_n_stage_tmp_fail); say(")"); if (g_stage_dev_on) say("; developer tools switched it to 512 MB"); say("\n");
     { u64 mu, mb, sn, sb, ma; g2s_mem_stats(&mu, &mb, &sn, &sb, &ma); if (ma) mem_name((const void *)ma, "translator: memo table");
@@ -6672,7 +8851,8 @@ static void vk_mem_report(void) {
         say("; t114: alive "); say_dec(g_mod_live); say(" (most at once "); say_dec(g_mod_live_peak); say("), destroyed "); say_dec((i64)g_mod_destroyed); say(", made again ");
         say_dec((i64)g_mod_remade); say(" ("); say_dec((i64)(g_mod_remade_ticks * 1000 / plat_ticks_per_sec())); say(" ms in all)");
         if (g_mod_remade_fail) { say(", could not be made again "); say_dec((i64)g_mod_remade_fail); }
-        say("; SPIR-V kept compressed for "); say_dec((i64)zn); say(" modules: "); say_dec((i64)(zb >> 20)); say(" MB (from "); say_dec((i64)(zr >> 20)); say(" MB)"); }
+        say("; SPIR-V kept compressed for "); say_dec((i64)zn); say(" modules: "); say_dec((i64)(zb >> 20)); say(" MB (from "); say_dec((i64)(zr >> 20)); say(" MB)");
+        if (g2s_spv_compress_lazy) { u64 lq, lp, ld; g2s_spv_lazy_stats(&lq, &lp, &ld); say("; w2: compressed between frames "); say_dec((i64)ld); say(", waiting "); say_dec((i64)lq); say(" (most "); say_dec((i64)lp); say(")"); } }
     say("), graphics pipelines ");
     say_dec(V.npipe); say(", compute pipelines "); say_dec(g_ncpipe); say(", samplers "); say_dec(V.nsamp); say(", images "); { int ni = 0; for (int i = 0; i < V.nimg; i++) if (V.img[i].img) ni++; say_dec(ni); } say("\n");
     if (g_has_mem_budget && !g_memrep_crash) {
@@ -6686,6 +8866,17 @@ static void vk_mem_report(void) {
         }
         say("\n");
     }
+}
+static void spec_play_line(void);   /* t181 (e6_spec.c) */
+/* t183: --ab-period N (a multiple of 60): every N flips the t182 parts (presents on the back-end, scans ahead of the
+   submit) are switched off / on, so one play session measures both ways in the same places; each perf line says which
+   way its 60 flips ran. Renderer thread (the flip). */
+static int g_opt_ab_period, g_ab_off;
+static void vkr_ab_flip(u64 flips) {
+    nanvb_window();
+    if (g_opt_ab_period <= 0 || flips % (u64)g_opt_ab_period) return;
+    g_ab_off = (int)((flips / (u64)g_opt_ab_period) & 1);
+    g_opt_bk_present = !g_ab_off; g_opt_prescan = !g_ab_off;
 }
 static void vkr_perf_window(u64 flips, u64 window_ticks, u64 draws_total) {
     static u64 l_sub, l_draw, l_tr, l_tex, l_pipe, l_wait, l_pres, l_pace, l_busy, l_draws, l_bar, l_batches, l_disp, l_bsub, l_wbk, l_ndisp; static int primed;
@@ -6704,6 +8895,7 @@ static void vkr_perf_window(u64 flips, u64 window_ticks, u64 draws_total) {
     if (g_n_aq_items) game = frame > aqw ? frame - aqw : 0;   /* t107g: asynchronous submits: the game thread's time is the frame minus its waits for the renderer */
     if (!window_ticks) goto take;
 #define MS(v) do { say_dec((i64)((v) / 100)); say("."); say_dec((i64)((v) / 10 % 10)); } while (0)
+    if (g_opt_ab_period > 0) say(g_ab_off ? "    [A/B: t182 parts off] " : "    [A/B: t182 parts on] ");
     say("    perf per frame (ms, last 60 flips): frame "); MS(frame); say(" = game "); MS(game); say(" + E6 submit "); MS(sub);
     say(" (draw recording "); MS(drw); say(": shaders "); MS(tr); say(", textures "); MS(tex); say(", pipelines "); MS(pip); say(", GPU waits "); MS(wt);
     say(") + present "); MS(pres); say(" + pacing "); MS(pace); say("; GPU busy "); MS(busy);
@@ -6711,6 +8903,8 @@ static void vkr_perf_window(u64 flips, u64 window_ticks, u64 draws_total) {
     say("; draws "); say_dec((i64)nd); say(", barriers "); say_dec((i64)nb); say(", batches "); say_dec((i64)nbt); say("\n");
     if (g_n_aq_items) { say("    asynchronous submits (t107g, ms per frame): the game waited for the renderer "); MS(aqw); say(", the renderer waited for the game "); MS(aqi);
         say(aqw > aqi ? " (the renderer sets the pace)\n" : " (the game sets the pace)\n"); }
+    spec_play_line();   /* t181 */
+    tl_window(n, 0);   /* w6_gpu */
     {   /* t107: the rest of the submit time (compute dispatches, the memory syncs at each submit, write-backs after batches) */
         u64 known = drw + dsp + bsb + wbk, oth = sub > known ? sub - known : 0;
         say("    perf detail (ms per frame): dispatches "); MS(dsp); say(" ("); say_dec((i64)((g_dispatches - l_ndisp) / n)); say(" per frame), submit memory syncs "); MS(bsb);
@@ -6730,6 +8924,12 @@ static void vkr_perf_window(u64 flips, u64 window_ticks, u64 draws_total) {
             if (g_opt_ww_probe == 3) { static u64 lvr, lvf, lvp; say("; verify: unwritten ranges "); say_dec((i64)(g_ww_vfy_ranges - lvr)); say(", of them the reset found written ");
                 say_dec((i64)(g_ww_vfy_found - lvf)); say(" ("); say_dec((i64)(g_ww_vfy_pages - lvp)); say(" pages)"); lvr = g_ww_vfy_ranges; lvf = g_ww_vfy_found; lvp = g_ww_vfy_pages; }
             for (int m = 0; m < 2; m++) { u64 nn = g_n_wwm[m] - lnm[m]; if (!nn) continue; say(m ? "; write-tracking calls per submit with the probe " : "; write-tracking calls per submit without the probe "); MS((g_t_wwm[m] - lm[m]) / f100c / nn); }
+            {   /* t182: the scans ahead of the submits, and the submit's memory sync with / without one before it */
+                static u64 lps, lpst, lpsr, lpss, lb0[2], ln0[2];
+                if (g_opt_prescan) { say("; scans ahead (t182) "); say_dec((i64)(g_n_ps - lps)); say(", "); MS((g_t_ps - lpst) / f100c / 60); say(" ms per frame, pages found: mirror ");
+                    say_dec((i64)((g_n_ps_rm - lpsr) / 60)); say(", VRAM copies "); say_dec((i64)((g_n_ps_sh - lpss) / 60)); }
+                for (int m = 1; m >= 0; m--) { u64 nn = g_n_bsub_ps[m] - ln0[m]; if (!nn) continue; say(m ? "; submit memory sync after a scan ahead " : "; submit memory sync without one "); MS((g_t_bsub_ps[m] - lb0[m]) / f100c / nn); say(" ms ("); say_dec((i64)nn); say(")"); }
+                lps = g_n_ps; lpst = g_t_ps; lpsr = g_n_ps_rm; lpss = g_n_ps_sh; for (int m = 0; m < 2; m++) { lb0[m] = g_t_bsub_ps[m]; ln0[m] = g_n_bsub_ps[m]; } }
             lpr = g_ww_probes;
             for (int k = 0; k < 5; k++) lw[k] = g_t_ww[k]; lc = g_ww_calls; lb = g_ww_bytes; ld = g_ww_dirty; ls = g_ww_skipped;
             for (int m = 0; m < 2; m++) { lm[m] = g_t_wwm[m]; lnm[m] = g_n_wwm[m]; } }
@@ -6875,16 +9075,51 @@ static void vk_present_slow(int timed_out) {
         g_pm_fallback = 1; g_pm_fallback_flip = V.frame;
         say("    present: frames are taking very long to reach the display (3 times within 600 flips) - switching to FIFO (t121)\n");
         vl("flip "); vl_d(V.frame); vl(": slow presents - swapchain recreated with FIFO\n");
-        { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } if (!vk_make_swapchain()) vl("  (swapchain not recreated now: the window has no size; FIFO is used when it is)\n");
+        { bk_flush(); qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } if (!vk_make_swapchain()) vl("  (swapchain not recreated now: the window has no size; FIFO is used when it is)\n");
     }
 }
 
 /* (g_pc_busy: declared before vimg_create, t145) */
+/* t198 --lum-log: the game's own 32x8 luminance target (written back to game memory every frame) as a flicker detector:
+   per 600 flips its mean, range and the number of frame-to-frame jumps over 8% (a light switching on and off, an
+   exposure flipping between two states). One frame behind the picture. A page guarded by label policy 4 is read when
+   the guard opens it (wbg_done). */
+static struct { double lo, hi, sum, prev, big; u32 n, jumps, late; } g_lum; static volatile int g_lum_pending;
+static int lum_guarded(void) {
+    u32 px = g_lum_bpe / 8; u64 bytes = (u64)g_lum_pitch * 7 * px + 32 * px;
+    for (u64 p = g_lum_addr & ~0xFFFull; p < g_lum_addr + bytes; p += 4096) { WbgEnt *e = wbg_find(p); if (e && e->prot == 1) return 1; }
+    return 0;
+}
+static void lum_sample(void) {
+    u32 px = g_lum_bpe / 8; u64 bytes = (u64)g_lum_pitch * 7 * px + 32 * px;
+    if (!g_lum_addr || !px || !mem_ok(g_lum_addr, bytes)) return;
+    double m = 0;
+    for (u32 y = 0; y < 8; y++) for (u32 x = 0; x < 32; x++) { const u8 *q = (const u8 *)(g_lum_addr + ((u64)y * g_lum_pitch + x) * px);
+        if (px == 4) { float f; mem_copy(&f, q, 4); if (f == f && f > -1e30f && f < 1e30f) m += f; }
+        else if (px == 2 || px == 8) { u32 h = q[0] | ((u32)q[1] << 8), ex = (h >> 10) & 31, mt = h & 1023; double v = ex == 0 ? mt / 1024.0 / 16384.0 : ex == 31 ? 0 : (1.0 + mt / 1024.0) * (double)(1u << ex) / 32768.0; m += (h & 0x8000) ? -v : v; }
+        else m += q[0]; }
+    m /= 256.0;
+    if (!g_lum.n || m < g_lum.lo) g_lum.lo = m; if (!g_lum.n || m > g_lum.hi) g_lum.hi = m; g_lum.sum += m;
+    if (g_lum.n && g_lum.prev != 0) { double d = (m - g_lum.prev) / g_lum.prev; if (d < 0) d = -d; if (d > 0.08) g_lum.jumps++; if (d > g_lum.big) g_lum.big = d; }
+    g_lum.prev = m; g_lum.n++;
+}
+static void lum_log(void) {
+    if (!g_lum_addr) return;
+    if (!g_wbg_init) lum_sample();
+    else { pm_lock(&g_wbg_m); if (lum_guarded()) { g_lum_pending = 1; g_lum.late++; } else lum_sample(); pm_unlock(&g_wbg_m); }
+    if (V.frame % 600 == 599 && g_lum.n) {
+        say("    lum (t198, 32x8 target at "); say_hex(g_lum_addr); say(", "); say_dec(g_lum_bpe); say(" bits): frames "); say_dec(g_lum.n); say(", mean x1e6 "); say_dec((i64)(g_lum.sum / g_lum.n * 1e6)); say(", min "); say_dec((i64)(g_lum.lo * 1e6)); say(", max "); say_dec((i64)(g_lum.hi * 1e6));
+        say(", jumps over 8% "); say_dec(g_lum.jumps); say(" (largest "); say_dec((i64)(g_lum.big * 100)); say("%), read when the guard opened "); say_dec(g_lum.late); say("\n");
+        g_lum.n = 0; g_lum.jumps = 0; g_lum.late = 0; g_lum.sum = 0; g_lum.big = 0; }
+}
 static void vkr_flip_body(u64 addr, u32 w, u32 h) {
     pm_lock(&g_gpu_lock);
+    if (g_opt_gpu_tl && g_tl_from && g_flips == g_tl_from && !g_tl_from_frame) { pm_lock(&g_slock); g_nprof = 0; tl_reset(); pm_unlock(&g_slock); g_tl_from_frame = V.frame ? V.frame : 1; }
+    if (g_opt_lumlog) lum_log();
+    fr_flip_check();   /* w16_rel rc2 */
     /* a frame that took over 0.4 s: say where the renderer's time went (the game stutters or looks frozen during these) */
-    { static u64 lt, ltr, ltex, lwait, lpipe, ldraw, lpres, lsub, lqs, lsw, laqw, laqi, llzf, lmr, lion, liob, liot, lvc, lvct, lve, lvet, lpwn, lpwt; u64 now = plat_ticks(), f = plat_ticks_per_sec() / 1000;
-      if (lt && now - lt > plat_ticks_per_sec() / 4) {   /* t147: 250 ms (was 400) - t146 run 1 had 285-377 ms frames with no detail */
+    { static u64 lt, ltr, ltex, lwait, lpipe, ldraw, lpres, lsub, lqs, lsw, laqw, laqi, llzf, lmr, lion, liob, liot, lvc, lvct, lve, lvet, lpwn, lpwt, lfull, lupl, ldrw; u64 now = plat_ticks(), f = plat_ticks_per_sec() / 1000;
+      if (lt && now - lt > plat_ticks_per_sec() * g_long_frame_ms / 1000) {   /* t147: 250 ms (was 400) - t146 run 1 had 285-377 ms frames with no detail; t196: --long-frame-ms */
           say("    long frame "); say_dec((i64)V.frame); say(": "); say_dec((i64)((now - lt) / f)); say(" ms - renderer: shader translation "); say_dec((i64)((g_t_tr - ltr) / f));
           say(", textures "); say_dec((i64)((g_t_tex - ltex) / f)); say(", GPU wait "); say_dec((i64)((g_t_wait - lwait) / f)); say(", pipelines "); say_dec((i64)((g_t_pipe - lpipe) / f));
           say(", all draws "); say_dec((i64)((g_t_draw - ldraw) / f)); say(", present "); say_dec((i64)((g_t_present - lpres) / f)); say(" ms\n");
@@ -6892,21 +9127,27 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
           say("      (t143) game's submit calls "); say_dec((i64)((g_t_submit - lsub) / f)); say(" ms (vkQueueSubmit "); say_dec((i64)((g_t_qsub - lqs) / f)); say(", batch-slot waits "); say_dec((i64)((g_t_slotw - lsw) / f));
           say("), the game waited for the renderer "); say_dec((i64)((g_t_aqwait - laqw) / f)); say(" ms, the renderer waited for the game "); say_dec((i64)((g_t_aqidle - laqi) / f));
           say(" ms, lazy-memory first touches "); say_dec((i64)(g_lz_faults - llzf)); say(", pipeline-cache save running "); say(__atomic_load_n(&g_pc_busy, __ATOMIC_ACQUIRE) ? "yes" : "no");
-          say(", module rebuilds "); say_dec((i64)(g_mod_remade - lmr)); say("\n");
+          say(", module rebuilds "); say_dec((i64)(g_mod_remade - lmr));
+          { u64 fu = g2s_memo_full(); say("; (t196) shaders translated in full "); say_dec((i64)(fu - lfull)); say(", texture uploads "); say_dec((i64)(V.n_uploads - lupl)); say(", draws "); say_dec((i64)(V.n_draws - ldrw)); }
+          say("\n");
           say("      (t144) game file reads "); say_dec((i64)(g_io_n - lion)); say(" ("); say_dec((i64)((g_io_bytes - liob) >> 20)); say(" MB, "); say_dec((i64)((g_io_ticks - liot) / f)); say(" ms in all on the game's threads, longest one ");
           say_dec((i64)(g_io_max / f)); say(" ms); images created "); say_dec((i64)(g_n_vcreate - lvc)); say(" ("); say_dec((i64)((g_t_vcreate - lvct) / f)); say(" ms), evicted "); say_dec((i64)(g_n_vevict - lve)); say(" ("); say_dec((i64)((g_t_vevict - lvet) / f)); say(" ms)");
           say("; (t145b) log writes over 20 ms "); say_dec((i64)(g_pw_slow_n - lpwn)); say(" ("); say_dec((i64)((g_pw_slow_ticks - lpwt) / f)); say(" ms, longest so far "); say_dec((i64)(g_pw_slow_max / f)); say(" ms)\n");
       }
       lt = now; ltr = g_t_tr; ltex = g_t_tex; lwait = g_t_wait; lpipe = g_t_pipe; ldraw = g_t_draw; lpres = g_t_present;
       lsub = g_t_submit; lqs = g_t_qsub; lsw = g_t_slotw; laqw = g_t_aqwait; laqi = g_t_aqidle; llzf = g_lz_faults; lmr = g_mod_remade;
-      lpwn = g_pw_slow_n; lpwt = g_pw_slow_ticks; lion = g_io_n; liob = g_io_bytes; liot = g_io_ticks; g_io_max = 0; lvc = g_n_vcreate; lvct = g_t_vcreate; lve = g_n_vevict; lvet = g_t_vevict; }
+      lpwn = g_pw_slow_n; lpwt = g_pw_slow_ticks; lion = g_io_n; liob = g_io_bytes; liot = g_io_ticks; g_io_max = 0; lvc = g_n_vcreate; lvct = g_t_vcreate; lve = g_n_vevict; lvet = g_t_vevict; lfull = g2s_memo_full(); lupl = V.n_uploads; ldrw = V.n_draws; }
     if (V.n_pipes >= g_pc_saved_at + 1000 || g_prep_new_bytes > (128ull << 20)) vk_save_pcache_bg();   /* (t159: also when the new modules of the preparation records add up) */
     if (g_pcs_report && !__atomic_load_n(&g_pc_busy, __ATOMIC_ACQUIRE)) { u64 fm = plat_ticks_per_sec() / 1000; if (!fm) fm = 1; g_pcs_report = 0;   /* t145 */
         say("    (t145) background pipeline-cache save: frames "); say_dec((i64)g_pcs_frame0); say(" to "); say_dec((i64)V.frame); say(", "); say_dec((i64)(g_pcs_bytes >> 20));
-        say(" MB, reading it from the driver "); say_dec((i64)(g_pcs_get / fm)); say(" ms, writing the file "); say_dec((i64)(g_pcs_write / fm)); say(" ms\n"); }
+        say(" MB, reading it from the driver "); say_dec((i64)(g_pcs_get / fm)); say(" ms, writing the file "); say_dec((i64)(g_pcs_write / fm)); say(g_pc_low_saves ? " ms (w3: with background I/O priority)" : " ms");
+        if (g_pc_quiet) { say("; --pc-save-quiet: writes skipped so far (cache hardly grown) "); say_dec((i64)g_pc_skips); say(", waited for pauses in the game's file reads "); say_dec((i64)g_pc_quiet_wait_ms); say(" ms"); } say("\n"); }
     if (V.oq_n && !g_frame_file) oq_finish();
     /* t107 translation trace: start / flip marks / stop */
     vk_lz_trap_check();   /* t111 */
+    if (g2s_spv_compress_lazy) {   /* w2: the compression left out of the draws (g2s_spv_release), about 0.7 ms of it per flip */
+        u64 t0_ = plat_ticks(), lim_ = plat_ticks_per_sec() * 7 / 10000;
+        while (g2s_spv_compress_step(1) > 0 && plat_ticks() - t0_ < lim_) ; }
     g2s_spv_flush(0);   /* t112: SPIR-V words of modules made since the last flush (64 at a time) */
     vk_module_evict();   /* t114 */
     if (g_trc_f) { trc_event('F', g_flips, 0); if (g_flips >= g_trc_until) trc_stop(); }
@@ -6994,7 +9235,7 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
     static int nolog;
     if (!src && nolog++ < 5) { vl("flip "); vl_d(V.frame); vl(": no rendered image at display buffer "); vl_x(addr); vl("\n"); }
     if (src && g_opt_catch_flash) vk_catch_flash(src, w < src->w ? w : src->w, h < src->h ? h : src->h);
-    if (src && shot_due(g_flips)) vk_shot(src, w < src->w ? w : src->w, h < src->h ? h : src->h);
+    if (src && (shot_due(g_flips) || (g_rp_running && g_npshot))) vk_shot(src, w < src->w ? w : src->w, h < src->h ? h : src->h);
     if (src && g_dev_mode && src->bpe == 32 && !src->depth) flb_record(src, w < src->w ? w : src->w, h < src->h ? h : src->h);   /* t107f: flashback */
     if (g_fb_req) { g_fb_req = 0; flb_save(); }
     if (g_skip_blank) {   /* a movie was skipped: its paused last frame stays in the display buffer; show black until it changes */
@@ -7012,9 +9253,10 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
             break; } }
     VSlot *PS = &g_slot[g_slot_cur];
     u64 t_acq0 = plat_ticks();
+    bk_wait_presents();   /* t182: the back-end's last present is made (acquire and present never at the same time) */
     VkResult r = vkAcquireNextImageKHR(V.dev, V.sw, g_acq_timeout_ns, PS->acq, 0, &idx);
     u64 t_acq = plat_ticks() - t_acq0;
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); V.frame++; pm_unlock(&g_gpu_lock); return; }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { { bk_flush(); qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); V.frame++; pm_unlock(&g_gpu_lock); return; }
     if (r < 0) { vk_fail("vkAcquireNextImageKHR", r); V.frame++; pm_unlock(&g_gpu_lock); return; }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {   /* t121: no image was acquired (and its semaphore will not be signalled): skip this frame's present */
         g_n_acq_timeout++;
@@ -7037,16 +9279,41 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
         if (dh > V.ext.height) { dh = V.ext.height; dw = (u32)((u64)V.ext.height * sw / sh); }
         i32 ox = (i32)(V.ext.width - dw) / 2, oy = (i32)(V.ext.height - dh) / 2;
         VkClearColorValue black = {{0, 0, 0, 1}};
+        int lean_ = g_opt_present_lean && ox == 0 && oy == 0 && dw == V.ext.width && dh == V.ext.height;   /* w10_res (--present-lean): the picture covers the whole window: no clear (and no barrier between clear and blit) */
+        if (lean_) g_n_present_lean++; else {
         vkCmdClearColorImage(V.cb, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &b.subresourceRange);
         /* Clear and blit overlap in the destination. Submission order, even within one transfer stage, does not
            order these writes: without a memory dependency the black clear can overwrite the copied frame. */
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, &b);
-        VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(i32)sw, (i32)sh, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{ox, oy, 0}, {ox + (i32)dw, oy + (i32)dh, 1}}};
+        vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, &b); }
+        VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(i32)RSV(src, sw), (i32)RSV(src, sh), 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{ox, oy, 0}, {ox + (i32)dw, oy + (i32)dh, 1}}};   /* (t196: the scaled picture's own pixels) */
+        int boxed_ = g_opt_rs_down && g_rs_on && rs_box_blit(src->img, RSV(src, sw), RSV(src, sh), src->fmt, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, ox, oy, dw, dh);   /* w5 */
+        if (boxed_) g_n_rs_down++; else
         vkCmdBlitImage(V.cb, src->img, VK_IMAGE_LAYOUT_GENERAL, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+        for (int k_ = 0; k_ < g_disp_tog_n; k_++) if (g_disp.on && g_flips == g_disp_tog_at[k_]) g_disp.toggle_req = 1;   /* tests: --display-toggle-at */
+        { static u32 lw_, lh_; if (g_disp.on && (lw_ != V.ext.width || lh_ != V.ext.height)) { lw_ = V.ext.width; lh_ = V.ext.height;   /* w6_disp: at the start and whenever the window changes */
+            say("    display: the picture "); say_dec(RSV(src, sw)); say("x"); say_dec(RSV(src, sh)); say(" is shown in "); say_dec(dw); say("x"); say_dec(dh); say(" at "); say_dec(ox); say(","); say_dec(oy); say(" of the "); say_dec(V.ext.width); say("x"); say_dec(V.ext.height);
+            say(g_disp.borderless ? " borderless window" : " window"); say(RSV(src, sw) == dw && RSV(src, sh) == dh ? ": pixel for pixel" : RSV(src, sw) > dw ? ": filtered down" : ": enlarged (linear)"); say(ox ? ", pillarbox" : oy ? ", letterbox" : ""); say(", flip "); say_dec((i64)g_flips); say("\n"); } }
+        if (rsl_on()) { vl("rsl FLIP source "); vl_x(src->addr); vl(" "); vl_d(src->w); vl("x"); vl_d(src->h); vl(" f"); vl_d(src->fmt); vl(src->rs ? " SCALED" : " plain"); vl(" -> "); vl_d(dw); vl("x"); vl_d(dh); vl("\n"); }
         src->r_ep = V.bar_ep + 1; src->use_seq = g_sub_seq + 1; src->last_use = V.frame;
+        { static int once_; if (g_rs_on && !once_) { once_ = 1; say("    render scale: the picture "); say_dec(RSV(src, sw)); say("x"); say_dec(RSV(src, sh)); say(" is shown in "); say_dec(dw); say("x"); say_dec(dh);
+            say(" of a "); say_dec(V.ext.width); say("x"); say_dec(V.ext.height); say(RSV(src, sw) == dw && RSV(src, sh) == dh ? " window: pixel for pixel" : boxed_ ? " window: reduced by a box filter (w5, --rs-down 1)" : " window: filtered (linear)"); say("; monitor "); say_dec(g_win_rs_mon_w); say("x"); say_dec(g_win_rs_mon_h); say("\n"); } }
         skp_overlay(V.simg[idx], ox, oy, dw, dh);
+        if (g_pshot_usage_ok && pshot_due(g_flips)) {   /* w3: read the swapchain image back */
+            static VkBuffer pb_; static VkDeviceMemory pm_; static u64 psz_; u64 need_ = (u64)V.ext.width * V.ext.height * 4;
+            if (psz_ < need_) { psz_ = 0; if (stage_make((need_ + 0xFFFFF) & ~0xFFFFFull, &pb_, &pm_, &g_pshot_map)) psz_ = need_; }
+            if (psz_) {
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, &b);
+                VkBufferImageCopy bic_ = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {V.ext.width, V.ext.height, 1}};
+                vkCmdCopyImageToBuffer(V.cb, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pb_, 1, &bic_);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                vkCmdPipelineBarrier(V.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, &b);
+                g_pshot_pend = 1; g_pshot_w = V.ext.width; g_pshot_h = V.ext.height; g_pshot_bgr = V.sfmt == VK_FORMAT_B8G8R8A8_UNORM || V.sfmt == VK_FORMAT_B8G8R8A8_SRGB;
+                say("    present check (w3) flip "); say_dec((i64)g_flips); say(": source image "); say_dec(RSV(src, sw)); say("x"); say_dec(RSV(src, sh)); say(" (game "); say_dec(sw); say("x"); say_dec(sh); say(src->rs ? ", scaled" : ", not scaled");
+                say(", vkformat "); say_dec(src->fmt); say(") -> blit, linear filter, to "); say_dec(dw); say("x"); say_dec(dh); say(" at "); say_dec(ox); say(","); say_dec(oy); say(" of the swapchain "); say_dec(V.ext.width); say("x"); say_dec(V.ext.height);
+                say(RSV(src, sw) == dw && RSV(src, sh) == dh ? " (1:1)" : boxed_ ? " (reduced by a box filter)" : " (resampled)"); say("; "); plat_win_report(); say("\n"); } }
     } else {
         VkClearColorValue c = {{0.05f, 0.0f, 0.1f, 1}};
         if (g_skip_blank) c.float32[0] = c.float32[2] = 0;
@@ -7059,20 +9326,34 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
     if (!img_done[idx]) { VkSemaphoreCreateInfo semi = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; vkCreateSemaphore(V.dev, &semi, 0, &img_done[idx]); }
     vk_submit_async(PS->acq, img_done[idx]);
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, 0, 1, &img_done[idx], 1, &V.sw, &idx, 0};
-    u64 t_pr0 = plat_ticks();
-    qm_lock(); r = vkQueuePresentKHR(V.q, &pi); qm_unlock();
-    u64 t_pr = plat_ticks() - t_pr0;
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { { qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); }
+    u64 t_pr0 = plat_ticks(), bk_slow = 0;
+    if (bk_present(V.sw, img_done[idx], idx)) {   /* t182: the back-end presents it after the batch (no wait here) */
+        r = bk_present_result(&bk_slow);   /* (the earlier presents' outcome: out of date / suboptimal is handled now) */
+    } else {
+        bk_flush();   /* t180: the batch that signals img_done is on the queue before the present */
+        qm_lock(); r = vkQueuePresentKHR(V.q, &pi); qm_unlock();
+    }
+    u64 t_pr = plat_ticks() - t_pr0; if (bk_slow > t_pr) t_pr = bk_slow;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { { bk_flush(); qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock(); } vk_make_swapchain(); }
     else if (t_acq + t_pr > plat_ticks_per_sec() / 10 || (g_opt_slow_present_test && V.frame > 300 && V.frame % 200 == 0)) vk_present_slow(0);   /* t121: getting an image and presenting it took over 100 ms */
-    V.n_presents++; V.gds_reset = 1;
+    if (g_pshot_pend) {   /* w3: the frame is on the screen; wait for the GPU and save what was presented */
+        g_pshot_pend = 0; bk_flush(); qm_lock(); vkDeviceWaitIdle(V.dev); qm_unlock();
+        u8 *p_ = g_pshot_map; u64 n_ = (u64)g_pshot_w * g_pshot_h;
+        if (g_pshot_bgr) for (u64 i = 0; i < n_; i++) { u8 t = p_[i * 4]; p_[i * 4] = p_[i * 4 + 2]; p_[i * 4 + 2] = t; }
+        char nm[64]; Sb s_ = {nm, 0, sizeof nm}; sb_s(&s_, "e6_present_"); sb_d(&s_, (i64)g_flips); sb_s(&s_, ".bmp");
+        bmp_write(nm, p_, g_pshot_w, g_pshot_h); say("    saved the presented image "); say(g_cap_dir); say("/"); say(nm); say("\n"); }
+    V.n_presents++; V.gds_reset = 1; g_mipfb_turn = 1; g_gw_fidx++; g_gw_fseq[g_gw_fidx & 7] = g_gw_seq;   /* w3_perf: --gw-sticky */
     if (V.frame < 5 || V.frame % 300 == 0) { vl("flip "); vl_d(V.frame); vl(src ? ": presented " : ": nothing rendered at "); vl_x(addr);
         vl("  draws ok "); vl_d(V.n_draws_ok); vl("/"); vl_d(V.n_draws); vl(", dispatches ok "); vl_d(V.n_dispatch_ok); vl(", uploads "); vl_d(V.n_uploads); vl(", images "); vl_d(V.nimg); vl("\n");
         for (int k = 0; k < g_nskips; k++) { vl("      skipped so far: "); vl_d((i64)g_skips[k].n); vl(" "); vl(g_skips[k].why); vl("\n"); }
         vl("      mip check so far (good/unclear/bad): 2D "); vl_d(g_mipchk_ok[0]); vl("/"); vl_d(g_mipchk_mid[0]); vl("/"); vl_d(g_mipchk_bad[0]); vl(", 1D "); vl_d(g_mipchk_ok[1]); vl("/"); vl_d(g_mipchk_mid[1]); vl("/"); vl_d(g_mipchk_bad[1]);
         vl(", image memory "); vl_d((i64)(V.img_bytes >> 20)); vl(" MB\n"); }
+    vimg_trim_tick();   /* t196 */
+    vimg_headroom_tick();   /* w2 */
     V.frame++;
     pm_unlock(&g_gpu_lock);
 }
+#include "e6_spec.c"   /* t181: shader-setup lookups made ahead of time on a second thread */
 #include "e6_prep.c"   /* t159: shader preparation (records of the pipelines made; prepared at start-up) */
 /* the pipeline cache is written at the end of a run, every 300 new pipelines, and when the game crashes, so a crash
    does not throw away the compile work (a rerun then skips most of the first-time stall) */
@@ -7081,7 +9362,7 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
    ("present" in the long-frame lines). Now the periodic saves run on a background thread; only the save at exit waits. */
 static u64 g_pc_bg_saves;   /* (g_pc_busy: declared before vkr_flip_body, t143) */
 static void vk_save_pcache_now(void);
-static u32 WINAPI pc_saver(void *arg) { (void)arg; vk_save_pcache_now(); g_pc_bg_saves++; g_pcs_report = 1; __atomic_store_n(&g_pc_busy, 0, __ATOMIC_RELEASE); return 0; }
+static u32 WINAPI pc_saver(void *arg) { (void)arg; g_pc_saver_tid = GetCurrentThreadId(); vk_save_pcache_now(); g_pc_bg_saves++; g_pcs_report = 1; __atomic_store_n(&g_pc_busy, 0, __ATOMIC_RELEASE); return 0; }
 static void vk_save_pcache_bg(void) {
     g_pc_saved_at = V.n_pipes;
     if (__atomic_exchange_n(&g_pc_busy, 1, __ATOMIC_ACQ_REL)) return;   /* one save at a time */
@@ -7091,19 +9372,44 @@ static void vk_save_pcache_bg(void) {
 static void prep_bg_stop(void);
 static void vk_save_pcache(void) {   /* at exit: wait for a background save, then save once more */
     prep_bg_stop();   /* t164: a background shader preparation stops first */
+    cov_bg_stop();    /* t203: the --fb-cover background compile thread too */
+    __atomic_store_n(&g_pc_quit, 1, __ATOMIC_RELEASE);   /* w11_load: a background save that is still waiting for a quiet moment gives way */
     while (__atomic_load_n(&g_pc_busy, __ATOMIC_ACQUIRE)) plat_sleep_ms(10);
     vk_save_pcache_now();
 }
 static void vk_save_pcache_now(void) {
     if (!V.pcache || g_opt_cold_pipes) return;
+    int bg_ = __atomic_load_n(&g_pc_busy, __ATOMIC_ACQUIRE) && g_pc_saver_tid == GetCurrentThreadId(), quiet_ = g_pc_quiet && bg_;
+    if (quiet_) {   /* w11_load: not while the game is loading (its last file read under 3 s ago), for 3 minutes at most */
+        u64 f_ = plat_ticks_per_sec(), w0_ = plat_ticks();
+        while (!__atomic_load_n(&g_pc_quit, __ATOMIC_ACQUIRE) && plat_ticks() - w0_ < 180 * f_ && g_io_last && plat_ticks() - g_io_last < 3 * f_) plat_sleep_ms(200);
+        g_pc_quiet_wait_ms += (plat_ticks() - w0_) * 1000 / f_;
+        if (__atomic_load_n(&g_pc_quit, __ATOMIC_ACQUIRE)) return;   /* (the save at exit writes everything) */
+        SetThreadPriority(GetCurrentThread(), 0x00010000 /* THREAD_MODE_BACKGROUND_BEGIN */);
+    }
     prep_save();   /* t159: new pipeline records and their modules first */
+    if (quiet_) SetThreadPriority(GetCurrentThread(), 0x00020000 /* THREAD_MODE_BACKGROUND_END */);
     u64 n = 0, t0 = plat_ticks(), t1 = t0;
+    if (quiet_ && !vkGetPipelineCacheData(V.dev, V.pcache, &n, 0) && n) {   /* w11_load: hardly grown since the last write - not written again now */
+        u64 min_ = g_pc_saved_bytes / 16; if (min_ < (32ull << 20)) min_ = 32ull << 20;
+        if (g_pc_saved_bytes && n < g_pc_saved_bytes + min_) { g_pc_skips++; g_pcs_get = plat_ticks() - t0; g_pcs_write = 0; g_pcs_bytes = 0; g_pc_saved_at = V.n_pipes; return; }
+    }
+    n = 0;
     if (!vkGetPipelineCacheData(V.dev, V.pcache, &n, 0) && n) {
         void *buf = malloc(n);
         if (buf && !vkGetPipelineCacheData(V.dev, V.pcache, &n, buf)) {
             t1 = plat_ticks();
+            /* w3 (--pc-save-normal-io: as t198): a background save writes the file (700+ MB after a shader preparation that
+               compiled pipelines) with Windows' background I/O priority. Session 60_03: that write ran for 23 s over the
+               first 1200 frames on the disk the game streams from; the game's reads took ~40 ms each, the saved
+               chapter's lighting set (masteribls) was only read when the write had ended, and Chapter 5 opened without
+               sky / ambient light for ~190 frames. The driver read above stays at normal priority (it holds the
+               pipeline cache). */
+            int low_ = g_pc_low_io && __atomic_load_n(&g_pc_busy, __ATOMIC_ACQUIRE) && g_pc_saver_tid == GetCurrentThreadId();
+            if (low_) low_ = SetThreadPriority(GetCurrentThread(), 0x00010000 /* THREAD_MODE_BACKGROUND_BEGIN */) != 0;
             void *f = plat_open_write(g_pcache_tmp);
-            if (f) { plat_write_bin(f, buf, n); plat_close(f); plat_replace_file(g_pcache_tmp, g_pcache_path); }
+            if (f) { plat_write_bin(f, buf, n); plat_close(f); plat_replace_file(g_pcache_tmp, g_pcache_path); g_pc_saved_bytes = n; }
+            if (low_) { SetThreadPriority(GetCurrentThread(), 0x00020000 /* THREAD_MODE_BACKGROUND_END */); g_pc_low_saves++; }
         }
         free(buf);
     }
@@ -7168,30 +9474,78 @@ static void vkr_crash_note(void *f) {
         sb_s(&u, ": VS "); sb_x(&u, j->vs_addr); sb_s(&u, " PS "); sb_x(&u, j->ps_addr); sb_s(&u, " targets "); sb_d(&u, j->ncol); sb_s(&u, " topology "); sb_d(&u, j->topo); sb_s(&u, "\n"); plat_write(f, b); }
 }
 static void vkr_on_fatal(void) {
+    if (g_fr_crash_fn && (!g_normal_exit || g_coh_fatal_hit || g_dev_lost_hit || g_fixed_fatal)) g_fr_crash_fn(0);   /* w16_rel rc2 (once per run); rc3: not at a normal stop (window closed / frame limit) */
     if (!g_vk_on) return;
     vk_save_pcache();
     say("    renderer: draws ok "); say_dec((i64)V.n_draws_ok); say(" of "); say_dec((i64)V.n_draws); say("; pipeline cache saved\n");
     for (int i = 0; i < g_nskips; i++) { say("    skipped "); say_dec((i64)g_skips[i].n); say(": "); say(g_skips[i].why); say("\n"); }
 }
+/* w5_smrd (--smrd-log): the literal-offset SMRD loads (s_load_dword / s_buffer_load_dword with a 32-bit literal offset, which
+   is in DWORDS on this GPU - gcn2spv.c SMRD_LIT_OFF) the shader set-up met: per shader address and load (first use, and first use whose two readings differ), what the
+   load reads with the literal taken as dwords and as bytes (the translator before t199c). Diagnostic only: nothing is
+   changed. Called from the renderer and from the look-ahead thread, hence the lock. */
+typedef struct { u64 code, base, uses, ndiff, nunk, step, flip, dflip; u32 pc, lit, vs1, vs2, dw[16], by[16]; u8 stage, cnt, sbuf, known, okd, okb, hasd; } SmrdLog;
+static SmrdLog g_sml[256]; static int g_nsml; static u64 g_sml_over; static volatile u32 g_sml_lock;
+static void smrd_lit_note(int stage, u64 code_addr, u32 pc, u32 lit, int cnt, int sbuf, u64 base, int base_known, u32 vs1, u32 vs2) {
+    SmrdLog e; h_memset(&e, 0, sizeof e); e.code = code_addr; e.base = base_known ? base : 0; e.pc = pc; e.lit = lit; e.vs1 = vs1; e.vs2 = vs2;
+    e.stage = (u8)stage; e.cnt = (u8)(cnt > 16 ? 16 : cnt); e.sbuf = (u8)sbuf; e.known = (u8)base_known; e.step = g_rp_step; e.flip = g_flips;
+    int df = 0;
+    if (base_known) {
+        u64 ad = base + (u64)lit * 4, ab = base + (u64)lit;
+        if (mem_ok(ad, 4ull * e.cnt)) { e.okd = 1; for (int i = 0; i < e.cnt; i++) e.dw[i] = *(volatile u32 *)(ad + 4ull * i); }
+        if (mem_ok(ab, 4ull * e.cnt)) { e.okb = 1; for (int i = 0; i < e.cnt; i++) e.by[i] = *(volatile u32 *)(ab + 4ull * i); }
+        for (int i = 0; i < e.cnt; i++) if (e.dw[i] != e.by[i]) df = 1;
+    }
+    while (__atomic_exchange_n(&g_sml_lock, 1, __ATOMIC_ACQUIRE)) { }
+    int k;
+    for (k = 0; k < g_nsml; k++) if (g_sml[k].code == e.code && g_sml[k].pc == e.pc) break;   /* one line per shader address and load: the first use, and the first use whose two readings differ */
+    if (k == g_nsml) { if (g_nsml < 256) g_sml[g_nsml++] = e; else { g_sml_over++; k = -1; } }
+    if (k >= 0) { SmrdLog *o = &g_sml[k]; o->uses++; if (!base_known) o->nunk++;
+        if (df) { o->ndiff++; if (!o->hasd) { u64 u = o->uses, nd = o->ndiff, nu = o->nunk, f0 = o->flip; *o = e; o->uses = u; o->ndiff = nd; o->nunk = nu; o->flip = f0; o->dflip = e.flip; o->hasd = 1; } } }
+    __atomic_store_n(&g_sml_lock, 0, __ATOMIC_RELEASE);
+}
+static void smrd_lit_report(void) {
+    if (!g_opt_smrd_log) return;
+    say("\n    literal-offset SMRD loads (w5_smrd --smrd-log): "); say_dec(g_nsml); say(" (shader address, load)"); if (g_sml_over) { say(", "); say_dec((i64)g_sml_over); say(" more not kept"); }
+    for (int k = 0; k < g_nsml; k++) { SmrdLog *o = &g_sml[k];
+        say("\n      smrdlit stage "); say_dec(o->stage); say(" code "); say_hex(o->code); say(" pc "); say_hex(o->pc); say(" lit "); say_dec(o->lit); say(" x"); say_dec(o->cnt);
+        say(o->sbuf ? " buf " : " ptr "); say_hex(o->base); say(" vs1 "); say_hex(o->vs1); say(" vs2 "); say_hex(o->vs2); say(" uses "); say_dec((i64)o->uses); say(" unknown-base "); say_dec((i64)o->nunk);
+        say(" differ-uses "); say_dec((i64)o->ndiff); say(" first-flip "); say_dec((i64)o->flip); say(" first-differ-flip "); say_dec((i64)o->dflip); say(" step "); say_dec((i64)o->step);
+        say(" dw"); for (int i = 0; i < o->cnt; i++) { say(" "); say_hex(o->dw[i]); }
+        say(" by"); for (int i = 0; i < o->cnt; i++) { say(" "); say_hex(o->by[i]); } }
+    say("\n");
+}
 static void vkr_report(void) {
     if (!g_vk_on && !V.dev) return;
+    smrd_lit_report();
     say("\n  Vulkan renderer (E6):\n    draws executed "); say_dec((i64)V.n_draws_ok); say(" of "); say_dec((i64)V.n_draws);
     say(", dispatches executed "); say_dec((i64)V.n_dispatch_ok); say(", frames presented "); say_dec((i64)V.n_presents);
     say(" (t121: present mode "); say(g_pm_cur >= 0 ? pm_name(g_pm_cur) : "-"); say(", swapchain images not ready within "); say_dec((i64)(g_acq_timeout_ns / 1000000)); say(" ms "); say_dec((i64)g_n_acq_timeout);
     say(", presents over 100 ms "); say_dec((i64)g_n_slow_present); if (g_pm_fallback) { say(", switched to FIFO at flip "); say_dec((i64)g_pm_fallback_flip); } say(")");
-    { u64 fq = plat_ticks_per_sec() / 1000; if (!fq) fq = 1; say("\n    de-tiling on helper threads (t128): levels "); say_dec((i64)g_n_par_lv); say(" in "); say_dec((i64)g_n_par_parts); say(" parts on "); say_dec(g_par_n); say(" helpers + the renderer, "); say_dec((i64)(g_t_par / fq)); say(" ms in all; texture uploads "); say_dec((i64)V.n_uploads); say(" in "); say_dec((i64)(g_t_tx[3] / fq)); say(" ms (t129: full hashes "); say_dec((i64)(g_t_tx[4] / fq)); say(" ms, de-tiling "); say_dec((i64)(g_t_tx[5] / fq)); say(" ms, image creation "); say_dec((i64)(g_t_vcreate / fq)); say(" ms; hashes on helpers "); say_dec((i64)g_n_ph); say(" in "); say_dec((i64)(g_t_ph / fq)); say(" ms, lookup hashes reused by the upload "); say_dec((i64)g_n_fh_reused); say(")"); }
-    say("\n    pipelines "); say_dec((i64)V.n_pipes); say(", images "); say_dec(V.nimg); say(", texture uploads "); say_dec((i64)V.n_uploads); say(" (unchanged by write tracking "); say_dec((i64)V.n_tex_clean); say(")"); say(", images recycled "); say_dec((i64)V.n_evicted); say(", render-target region copies "); say_dec((i64)V.n_rt_copies); say(", depth region copies "); say_dec((i64)g_n_depth_copies); say(", GPU syncs "); say_dec((i64)V.n_flush); say("\n");
+    if (g_par_contended || g_par_nested) { say("\n    BUG (w2 guard): helper-thread jobs started by two threads at once "); say_dec((i64)g_par_contended); say(" (made to wait), from inside a job "); say_dec((i64)g_par_nested); }
+    { u64 fq = plat_ticks_per_sec() / 1000; if (!fq) fq = 1; say("\n    de-tiling on helper threads (t128): levels "); say_dec((i64)g_n_par_lv); say(" in "); say_dec((i64)g_n_par_parts); say(" parts on "); say_dec(g_par_n); say(" helpers + the renderer, "); say_dec((i64)(g_t_par / fq)); say(" ms in all (t196: "); say_dec((i64)g_n_par_ref); say(g_detile_ref_rows ? " of them levels without a fast path, by rows" : " without a fast path - --no-detile-ref-rows"); say("); texture uploads "); say_dec((i64)V.n_uploads); say(" in "); say_dec((i64)(g_t_tx[3] / fq)); say(" ms (t129: full hashes "); say_dec((i64)(g_t_tx[4] / fq)); say(" ms, de-tiling "); say_dec((i64)(g_t_tx[5] / fq)); say(" ms, image creation "); say_dec((i64)(g_t_vcreate / fq)); say(" ms; hashes on helpers "); say_dec((i64)g_n_ph); say(" in "); say_dec((i64)(g_t_ph / fq)); say(" ms, lookup hashes reused by the upload "); say_dec((i64)g_n_fh_reused); say(")"); }
+    say("\n    pipelines "); say_dec((i64)V.n_pipes); say(", images "); say_dec(V.nimg); say(", texture uploads "); say_dec((i64)V.n_uploads); say(" (unchanged by write tracking "); say_dec((i64)V.n_tex_clean); say(")"); say(", images recycled "); say_dec((i64)V.n_evicted); say(", render-target region copies "); say_dec((i64)V.n_rt_copies); say(", depth region copies "); say_dec((i64)g_n_depth_copies); say(", depth bound read-only (t173) "); say_dec((i64)g_n_vt_ro); say(", GPU syncs "); say_dec((i64)V.n_flush); say("\n");
+    fr_exit_summary();   /* w16_rel rc2 */
+    wbg_report();
+    if (g_opt_early_labels) { say("    label policy "); say_dec(g_opt_early_labels); say(" (t194, experimental): label writes made at the hand-over "); say_dec((i64)g_n_early_labels); say(", moved to the batch of the last copy from game memory "); say_dec((i64)g_n_moved_labels); say("\n"); }
+    say("    depth <-> R32 syncs as single image copies (t194, VK_KHR_maintenance8"); say(g_has_m8 ? "): " : ", not available): "); say_dec((i64)g_n_depth_sync8);
+    say("; w12_gpu: as shader passes: depth -> R32 by compute (--dsync-cs "); say(g_opt_dsync_cs ? "on) " : "off) "); say_dec((i64)g_n_dsy_cs); say(", R32 -> depth by a draw (--dsync-draw "); say(g_opt_dsync_draw ? "on) " : "off) "); say_dec((i64)g_n_dsy_draw);
+    if (g_opt_dsync_cs || g_opt_dsync_draw) { say(" ("); say_dec((i64)(g_n_dsy_px >> 20)); say(" Mpx; pipelines made in "); say_dec((i64)g_dsy.ms); say(" ms; left to the copy: image kinds "); say_dec((i64)g_n_dsy_no[0]); say(", usage "); say_dec((i64)g_n_dsy_no[1]); say(", no pipeline "); say_dec((i64)g_n_dsy_no[2]);
+        say(", open occlusion query "); say_dec((i64)g_n_dsy_no[4]); say(", after turning itself off "); say_dec((i64)g_n_dsy_no[3]); say("; R32 texels a depth write could change (must be 0): "); say_dec(g_dsy.cnt ? (i64)g_dsy.cnt[0] : 0); say(g_dsy.tripped ? " - TURNED OFF during the run)" : ")"); }
+    say("\n    w12_gpu: snapshots of depth + stencil targets: both planes "); say_dec((i64)g_n_fb_ds[0]); say(", depth plane only (--fb-depth-only "); say(g_opt_fb_depth_only ? "on) " : "off) "); say_dec((i64)g_n_fb_ds[1]); say("\n");
+    if (g_ram_img_cap || g_n_pressure) { say("    memory budgets (t194): RAM "); say_dec((i64)(ram_total() >> 20)); say(" MB"); if (g_sim_ram) say(" (--sim-ram-gb)"); say(", image budget held to "); say_dec((i64)(g_ram_img_cap >> 20)); say(" MB, lowered under memory pressure "); say_dec((i64)g_n_pressure); say(" times\n"); }
     say("    image memory peak "); say_dec((i64)(V.img_bytes_peak >> 20)); say(" MB of budget "); say_dec((i64)(V.img_budget >> 20)); say(" MB, freed to stay in budget "); say_dec((i64)V.n_budget_evict); say(", pipelines "); say_dec(V.npipe); say("/65536, compute "); say_dec(g_ncpipe); say("/16384, shader modules "); say_dec(V.nmod); say("/65536, views "); say_dec(V.nview); say("/32768, samplers "); say_dec(V.nsamp); say(" (recycled "); say_dec((i64)V.n_samp_recycled); say(")\n");
     say("    cube/array textures composed from render targets: "); say_dec((i64)V.n_layer_compose); say(", render targets replaced by newer data in their memory: "); say_dec((i64)g_rt_stale); say(", image frees that waited for the GPU: "); say_dec((i64)g_n_evict_waits); say(", targets cleared by a memory fill: "); say_dec((i64)g_n_rt_fill_clears); say(" (non-zero fills not applied: "); say_dec((i64)g_n_rt_fill_skipped); say(")"); say(", draws with no attachments (shader writes only): "); say_dec((i64)V.n_noatt_draws);
-    say("\n    scalar loads not folded because the GPU work writing them was in flight: "); say_dec((i64)g_n_fold_inflight); say(", texture uploads that waited for the GPU writing them: "); say_dec((i64)g_n_tex_inflight_waits);
+    say("\n    GPU writes logged before their batch (w3, "); say(g_opt_gw_late ? "handled" : "--no-gw-late: as t198"); say("): batches handed over during a draw's set-up "); say_dec((i64)g_n_gw_late); say(" (log entries held back for the next batch "); say_dec((i64)g_n_gw_late_ent); say("), write-back ranges kept for the writer's batch "); say_dec((i64)g_n_gw_late_wb); say(", repeated writes logged again because the earlier entry belonged to an older batch "); say_dec((i64)g_n_gw_redup);
+    say("\n    scalar loads not folded because the GPU work writing them was in flight: "); say_dec((i64)g_n_fold_inflight); say(" (w2: answers \"in flight, RAM still old\" "); say_dec((i64)g_n_inflight2); say(", \"in flight, WRITE_DATA\" "); say_dec((i64)g_n_inflight3); say("; later loads of those shaders left to the GPU "); say_dec((i64)g2s_n_taint_unfold_get()); say("; waits for the GPU before such a load "); say_dec((i64)g_n_inflight_waits); say(" ("); say_dec((i64)(g_t_inflight_wait * 1000 / (plat_ticks_per_sec() ? plat_ticks_per_sec() : 1))); say(g_opt_inflight_wait ? " ms))" : " ms; --no-inflight-wait))"); say(", texture uploads that waited for the GPU writing them: "); say_dec((i64)g_n_tex_inflight_waits);
     { u64 fq = plat_ticks_per_sec() / 1000; if (!fq) fq = 1; say("; filled when their batch was handed over (t107f): "); say_dec((i64)g_n_pf); say(", of them waited "); say_dec((i64)g_n_pf_waited); say(" ("); say_dec((i64)(g_t_pfwait / fq)); say(" ms)"); }
     say("\n");
     say("    game occlusion queries: "); say_dec((i64)g_n_gq_begin); say(" begun, "); say_dec((i64)g_n_gq_end); say(" measured, nested "); say_dec((i64)g_n_gq_nested);
     say(", split by a submit "); say_dec((i64)g_n_gq_split); say(", end without begin "); say_dec((i64)g_n_gq_unmatched); say("; predication set "); say_dec((i64)g_n_pred_set);
     say(" (never-measured "); say_dec((i64)g_n_pred_fresh); say("), off "); say_dec((i64)g_n_pred_off); say(", other modes "); say_dec((i64)g_n_pred_other);
     say("; predicated draws "); say_dec((i64)g_n_pred_draws); say(" (draw-if-not-visible "); say_dec((i64)g_n_pred_inv_draws); say("), dispatches "); say_dec((i64)g_n_pred_disp); say("\n");
-    say("    stencil: "); say_dec((i64)V.n_stencil_draws); say(" draws with the stencil test, "); say_dec((i64)V.n_stencil_approx); say(" approximated ops, "); say_dec((i64)V.n_stencil_lost); say(" draws whose target has no stencil\n");
-    say("    texture write checks (t107b): 4 MB chunks listed "); say_dec((i64)g_n_dch_lists); say(", not listable (per-texture calls) "); say_dec((i64)g_n_dch_fallback); say(g_opt_tex_dirty_each ? " (off: --tex-dirty-each)\n" : "\n");
+    say("    draws with near / far clipping off (t183): "); say_dec((i64)g_n_zclamp_draws); say(g_opt_no_zclamp ? " (clipped: --no-zclamp)\n" : g_zclamp_ok ? " (depth clamped, as on the PS4)\n" : " (clipped: the GPU has no depth clamp)\n"); say("    stencil: "); say_dec((i64)V.n_stencil_draws); say(" draws with the stencil test, "); say_dec((i64)V.n_stencil_approx); say(" approximated ops, "); say_dec((i64)V.n_stencil_lost); say(" draws whose target has no stencil\n");
+    say("    texture write checks (t107b): 4 MB chunks listed "); say_dec((i64)g_n_dch_lists); if (g_dcp_on) { say(" by the renderer, "); say_dec((i64)g_n_dcp_made); say(" ahead by the helper thread (--tex-dirty-ahead: "); say_dec((i64)g_n_dcp_used); say(" of them used, frames "); say_dec((i64)g_n_dcp_kicks); say(", renderer waited at a chunk "); say_dec((i64)g_n_dcp_busy); say(", gave up waiting "); say_dec((i64)g_n_dcp_gaveup); say(")"); } say(", not listable (per-texture calls) "); say_dec((i64)g_n_dch_fallback); say(g_opt_tex_dirty_each ? " (off: --tex-dirty-each)\n" : "\n");
     say("    texture uploads after a barrier (earlier draws finished first): "); say_dec((i64)V.n_upload_barriers); say(", without one (nothing used the image since the last barrier, t107b): "); say_dec((i64)g_n_upload_pre_skipped); say("\n");
     say("    game synchronisation requests turned into barriers: cache syncs (ACQUIRE_MEM / SURFACE_SYNC) "); say_dec((i64)g_n_sync_points[0]);
     say(", flush events "); say_dec((i64)g_n_sync_points[1]); say(", waits for earlier work (WAIT_REG_MEM) "); say_dec((i64)g_n_sync_points[2]);
@@ -7225,7 +9579,45 @@ static void vkr_report(void) {
         say("; write-tracked runs at the last submit: "); say_dec((i64)g_rm_runs_last); say("; budget full: "); say_dec((i64)g_rm_full); say("; pages without write tracking: "); say_dec((i64)g_rm_nowatch);
         say("; draws / dispatches storing through unknown descriptors: "); say_dec((i64)g_rm_wr_unknown); say("\n"); }
     else say(g_opt_no_rm ? "    read mirror in VRAM: off (--no-vram-mirror)\n" : "    read mirror in VRAM: not used\n");
+    say("    t196 lazy-barrier causes: a sampled image was written "); say_dec((i64)g_n_lazy_why[0]); say(", a new target was sampled / read by a copy "); say_dec((i64)g_n_lazy_why[1]); say(", a new target was written "); say_dec((i64)g_n_lazy_why[2]);
+    say("; --bar-dedupe "); say(g_opt_bar_dedupe ? "on" : "off"); say(": barriers not repeated "); say_dec((i64)g_n_bar_dedup);
+    say("; --lazy-sync "); say_dec(g_opt_lazy_sync); say(": flush events left lazy "); say_dec((i64)g_n_sync_lazy2[1]); say(", waits "); say_dec((i64)g_n_sync_lazy2[2]);
+    say("; --lazy-waw "); say(g_opt_lazy_waw ? "on" : "off"); say(": target changes without a barrier because of it "); say_dec((i64)g_n_lazy_waw_skip);
+    say("; --lazy-copies "); say_dec(g_opt_lazy_copies); say(": snapshots "); say_dec((i64)g_n_lc[0]); say(", format syncs "); say_dec((i64)g_n_lc[1]); say(", depth syncs "); say_dec((i64)g_n_lc[2]);
+    say("; --fb-rect "); say(g_opt_fb_rect ? "on" : "off"); say(": snapshots copied in part "); say_dec((i64)g_n_fb_part); say(", not needed "); say_dec((i64)g_n_fb_none);
+    say(", pixels copied "); say_dec((i64)g_n_fb_px); say(" of "); say_dec((i64)g_n_fb_px_full); say("; multi-dword loads with one page-table lookup (--ld-group) "); say(g2s_ld_group ? "on\n" : "off\n");
+    say("    w6_gpu: snapshots copied for a draw that writes depth "); say_dec((i64)g_n_fb_kind[0]); say(", that cannot change the depth of the depth target it samples (stencil only, no depth test, test EQUAL / NEVER) "); say_dec((i64)g_n_fb_kind[1]); say(", a colour target "); say_dec((i64)g_n_fb_kind[2]);
+    say("; copies from a newer image over the same memory: same size (another format) "); say_dec((i64)g_n_sync_cls[0]); say(" ("); say_dec((i64)(g_n_sync_px[0] >> 20)); say(" Mpx), same pitch, another height "); say_dec((i64)g_n_sync_cls[1]); say(" ("); say_dec((i64)(g_n_sync_px[1] >> 20));
+    say(" Mpx), another pitch "); say_dec((i64)g_n_sync_cls[2]); say(" ("); say_dec((i64)(g_n_sync_px[2] >> 20)); say(" Mpx; --sync-pitch "); say(g_opt_sync_pitch ? "on" : "off"); say(": not copied "); say_dec((i64)g_n_sync_skip); say(")");
+    say("; --fb-zseq "); say(g_opt_fb_zseq ? "on" : "off"); say(": depth unchanged since the snapshot "); say_dec((i64)g_n_fbz_cand); say(", not copied "); say_dec((i64)g_n_fbz_skip); say("\n");
+    say("    w10_res: --fb-cover "); say_dec(g_opt_fb_cover); say(g_has_consraster ? "" : " (not available)"); say(": snapshot copies avoided "); say_dec((i64)g_n_cov_hit); say(" ("); say_dec((i64)(g_n_cov_px >> 20)); say(" Mpx) of "); say_dec((i64)(g_n_cov_hit + g_n_fb_copies));
+    say(" wanted; coverage draws "); say_dec((i64)g_n_cov_draws); say(" updating "); say_dec((i64)g_n_cov_imgs); say(" snapshots, of those for a draw that did not sample "); say_dec((i64)g_n_cov_blind); say("; pipelines made "); say_dec((i64)g_n_cov_pipes); say(" in "); say_dec((i64)(g_t_cov_pipes * 1000 / plat_ticks_per_sec())); say(" ms; not covered:");
+    { static const char *why_[10] = {" special draw ", ", points / lines ", ", VS writes memory ", ", occlusion query ", ", format ", ", no sampler binding ", ", pipeline failed ", ", second depth ", ", usage ", ", pipeline still compiling (t203) "}; for (int i = 0; i < 10; i++) { say(why_[i]); say_dec((i64)g_n_cov_no[i]); } }
+    say("; --present-lean "); say(g_opt_present_lean ? "on" : "off"); say(": presents without the clear "); say_dec((i64)g_n_present_lean); say("\n");
+    if (g_opt_fb_cover) { say("    t203: --fb-cover copy pipelines on this thread "); say_dec((i64)g_n_cov_pipes); say(" (of those found in the pipeline cache "); say_dec((i64)g_n_cov_cachehit);
+        say("), queued for the background thread "); say_dec((i64)g_n_cov_queued); say(", compiled there "); say_dec((i64)__atomic_load_n(&g_n_cov_bg, __ATOMIC_ACQUIRE)); say(" (failed "); say_dec((i64)__atomic_load_n(&g_n_cov_bgfail, __ATOMIC_ACQUIRE));
+        say(") in "); say_dec((i64)((u64)__atomic_load_n(&g_t_cov_bg, __ATOMIC_ACQUIRE) * 1000 / plat_ticks_per_sec())); say(" ms; recorded new for the preparation "); say_dec((i64)g_prep_n_cov_rec); say(g_opt_fb_cover_sync ? "; --fb-cover-sync\n" : "\n"); }
+    say("    w6_gpu: depth snapshots wanted, by the draw's depth state (write/test/function 0 never 1 less 2 equal 3 lequal 4 greater 5 notequal 6 gequal 7 always: count):");
+    for (int a = 0; a < 2; a++) for (int b = 0; b < 2; b++) for (int f = 0; f < 8; f++) if (g_n_fbz_hist[a][b][f]) { say(" w"); say_dec(a); say("t"); say_dec(b); say("f"); say_dec(f); say(": "); say_dec((i64)g_n_fbz_hist[a][b][f]); }
+    say("\n");
     say("    render-target changes: barrier needed "); say_dec((i64)g_n_lazy_bar); say(", no barrier needed "); say_dec((i64)g_n_lazy_skip); say(g_opt_target_barriers ? " (--target-barriers: a barrier at every change anyway)\n" : "\n");
+    {   /* t174: image copies by kind, source image and pixel shader (top 6 of each kind) */
+        { char b_[512]; Sb t_ = {b_, 0, sizeof b_}; sb_s(&t_, "    view-sized targets (t191"); sb_s(&t_, g_opt_padded_targets ? ", OFF" : ""); sb_s(&t_, "; region copies made for a draw that writes their source (t193"); sb_s(&t_, g_opt_stale_copies ? ", kept as current: --stale-copies" : ""); sb_s(&t_, ") "); sb_d(&t_, (i64)g_n_fb_region); sb_s(&t_, ", depth targets bound for testing only and sampled (t193c) "); sb_d(&t_, (i64)g_n_dro); sb_s(&t_, "): surfaces learnt "); sb_d(&t_, (i64)g_n_vw_learn); sb_s(&t_, ", images made "); sb_d(&t_, (i64)g_n_vw_made);
+          sb_s(&t_, ", contents carried over "); sb_d(&t_, (i64)g_n_vw_carry); sb_s(&t_, ", target uses "); sb_d(&t_, (i64)g_n_vw_use); sb_s(&t_, "; back to padded "); sb_d(&t_, (i64)g_n_vw_regrow); sb_s(&t_, ", surfaces never shrunk "); sb_d(&t_, (i64)g_n_vw_off);
+          sb_s(&t_, ", views with another pitch "); sb_d(&t_, (i64)g_n_vw_nopitch); sb_s(&t_, "\n"); say(b_); }
+        if (g_gfx_mem_report_fn) g_gfx_mem_report_fn();
+        if (g_rs_on) { say("    render scale (w5): anti-aliasing pass given the physical pixel size "); say_dec((i64)g_n_rs_aa); say(" times (--rs-aa "); say_dec(g_opt_rs_aa); say("), 1920x1080 box copies for lower-resolution passes "); say_dec((i64)g_n_rs_box);
+            say(" (--rs-box "); say_dec(g_opt_rs_box); say("), box reductions by blits "); say_dec((i64)g_n_rs_box_blit); say(", of those for the window "); say_dec((i64)g_n_rs_down); say(" (--rs-down "); say_dec(g_opt_rs_down); say(")\n"); }
+        if (g_rs_on) { say("    render scale (t196) "); say_dec(g_rs_num); say("/"); say_dec(g_rs_den); say(": scaled images made "); say_dec((i64)g_n_rs_img); say(", draws on scaled targets "); say_dec((i64)g_n_rs_draws); say(", LDS dispatches run per sub-pixel position (w3) "); say_dec((i64)g_n_rs_sub); say("; interface (w3, --rs-ui "); say_dec(g_opt_rs_ui); say("): draws "); say_dec((i64)g_n_rs_ui_draws); say(", on its own scaled targets "); say_dec((i64)g_n_rs_ui_tgt); say(", point-sampled copies filtered "); say_dec((i64)g_n_rs_ui_lin); say(", draws in physical coordinates "); say_dec((i64)g_n_rs_phys); say(" (whole-target scissors ignored "); say_dec((i64)g_n_rs_phys_sc); say(")"); say(", movie planes filtered "); say_dec((i64)g_n_rs_movie);
+            say(", dispatches run per physical pixel "); say_dec((i64)g_n_rs_disp); say(", dispatches writing scaled images at the game's resolution "); say_dec((i64)g_n_rs_disp1);
+            say(", images replaced by scaled / unscaled ones "); say_dec((i64)g_n_rs_conv[1]); say(" / "); say_dec((i64)g_n_rs_conv[0]); say(", resampling copies "); say_dec((i64)g_n_rs_resample);
+            say(", contents not carried (no blit) "); say_dec((i64)g_n_rs_noblit); say(", draws skipped (targets at different scales) "); say_dec((i64)g_n_rs_mixed); say("\n"); }
+        say("    image copies by kind (t174; source image, the pixel shader of the draw that needed it, count):\n");
+        for (int k = 0; k < 5; k++) { u8 shown[512]; for (int i = 0; i < 512; i++) shown[i] = 0; u64 tot = 0; for (int i = 0; i < g_ncpyn; i++) if (g_cpyn[i].kind == (u32)k) tot += g_cpyn[i].n;
+            if (!tot) continue;
+            say("      "); say(g_cpy_kind[k]); say(": "); say_dec((i64)tot); say("\n");
+            for (int r = 0; r < (g_opt_gpu_tl ? 24 : 6); r++) { int b = -1; for (int i = 0; i < g_ncpyn; i++) if (g_cpyn[i].kind == (u32)k && !shown[i] && (b < 0 || g_cpyn[i].n > g_cpyn[b].n)) b = i;
+                if (b < 0) break; shown[b] = 1; say("        "); say_hex(g_cpyn[b].addr); say(" "); say_dec(g_cpyn[b].w); say("x"); say_dec(g_cpyn[b].h); say(" PS "); say_hex(g_cpyn[b].ps); say(": "); say_dec(g_cpyn[b].n); say("\n"); } } }
     {   /* where the full barriers came from (e6_vk.c line: count) */
         say("    full barriers by e6_vk.c line:"); u32 shown[8]; int ns = 0;
         for (int k = 0; k < 8; k++) { int best = -1; for (int l = 1; l < 8192; l++) { int dup = 0; for (int j = 0; j < ns; j++) if ((int)shown[j] == l) dup = 1; if (!dup && g_bar_line[l] && (best < 0 || g_bar_line[l] > g_bar_line[best])) best = l; }
@@ -7262,6 +9654,8 @@ static void vkr_report(void) {
     if (g_n_gs_draws || g_n_gs_fail) { say("    geometry-shader draws: "); say_dec((i64)g_n_gs_draws); say(" ("); say_dec((i64)g_n_gs_prims); say(" primitives, "); say_dec((i64)g_n_gs_verts); say(" output vertices); not run "); say_dec((i64)g_n_gs_fail); say(g_opt_no_gs ? " (--no-gs)\n" : "\n"); }
     if (V.n_tess_draws) { say("    tessellated draws: "); say_dec((i64)V.n_tess_draws); say(" ("); say_dec((i64)V.n_tess_patches); say(" patches, drawn at tess factor 1); hull-shader passes run "); say_dec((i64)g_n_hs_pass); say(", not run "); say_dec((i64)g_n_hs_fail); say("\n"); }
     say("    copy-engine fast paths: "); say_dec((i64)g_n_dma_copy); say(" copies, "); say_dec((i64)g_n_dma_fill); say(" fills, "); say_dec((i64)(g_dma_bytes >> 20)); say(" MB\n");
+    say("    w12_gpu: game buffer copies of 64 KB or more made by the GPU copy engine (the pass log's bcopy row at vk_dma_fastpath): "); say_dec((i64)g_n_dmac[0]); say(", "); say_dec((i64)(g_dmac_bytes[0] >> 20)); say(" MB; source still being written by GPU work in flight (chained) "); say_dec((i64)g_n_dmac[1]);
+    say("; made while no batch was in flight and the batch being recorded held only such copies "); say_dec((i64)g_n_dmac[2]); say(" ("); say_dec((i64)(g_dmac_bytes[1] >> 20)); say(" MB)\n");
     if (!g_opt_keep_modules) { say("    shader modules (t114): made "); say_dec(V.nmod); say(", alive "); say_dec(g_mod_live); say(" (most at once "); say_dec(g_mod_live_peak); say("), destroyed ");
         say_dec((i64)g_mod_destroyed); say(", made again "); say_dec((i64)g_mod_remade); say(" ("); say_dec((i64)(g_mod_remade_ticks * 1000 / plat_ticks_per_sec())); say(" ms)");
         if (g_mod_remade_fail) { say(", could not be made again "); say_dec((i64)g_mod_remade_fail); } if (g_opt_module_stress) say(", --module-stress"); say("\n"); }
@@ -7283,6 +9677,9 @@ static void vkr_report(void) {
         RDP("), index buffer ", g_rd_ib, g_rd_nib); sb_s(&q, " of "); sb_d(&q, (i64)g_rd_nib); sb_s(&q, "\n");
         #undef RDP
         say(t);
+        say("    scans ahead of the submits (t182): "); if (!g_opt_prescan) say("off (--no-prescan)\n");
+        else { say(g_opt_prescan == 2 ? "before every other submit (--prescan-ab)" : "on"); say("; "); say_dec((i64)g_n_ps); say(" scans, "); say_dec((i64)(g_t_ps / (plat_ticks_per_sec() / 1000 ? plat_ticks_per_sec() / 1000 : 1))); say(" ms; pages found: mirror ");
+            say_dec((i64)g_n_ps_rm); say(" (copied at the submit "); say_dec((i64)g_n_ps_rm_used); say("), VRAM copies "); say_dec((i64)g_n_ps_sh); say("; stopped for lack of room "); say_dec((i64)g_n_ps_full); say(", stopped early for a submit "); say_dec((i64)g_n_ps_stopped); say(", mirror only (GPU coherence on) "); say_dec((i64)g_n_ps_coh); say("\n"); }
         say("    memory checks (t118): "); say(g_opt_ww_probe == 0 ? "the old way (--no-ww-probe)" : g_opt_ww_probe == 2 ? "probe at every other submit" : g_opt_ww_probe == 3 ? "probe verified" : "probe first");
     say("; probes "); say_dec((i64)g_ww_probes); say(", ranges found unwritten "); say_dec((i64)g_ww_skipped);
     if (g_opt_ww_probe == 3) { say("; verify: of "); say_dec((i64)g_ww_vfy_ranges); say(" unwritten ranges the reset found written "); say_dec((i64)g_ww_vfy_found); say(" ("); say_dec((i64)g_ww_vfy_pages); say(" pages)"); }
@@ -7328,8 +9725,33 @@ static void vkr_report(void) {
           if (g2s_memo_verify) { u64 vv, vb, vr; g2s_memo_verify_stats2(&vv, &vb, &vr); say("    memo self-check: "); say_dec((i64)vv); say(" reused results re-translated, "); say_dec((i64)vb); say(" differed ("); say_dec((i64)vr); say(" of them relocated reuses); "); say_dec((i64)g2s_memo_verify_racy()); say(" differed only because a GPU-written answer changed during the check (not counted)\n"); } }
         say("    totals (ms): translation "); say_dec((i64)(g_t_tr / f)); say(", textures "); say_dec((i64)(g_t_tex / f)); say(", GPU wait "); say_dec((i64)(g_t_wait / f));
         say(", pipelines "); say_dec((i64)(g_t_pipe / f)); say(", draws "); say_dec((i64)(g_t_draw / f)); say(", present "); say_dec((i64)(g_t_present / f)); say("\n"); }
+    bk_report();   /* t180 */
+    spec_report();   /* t181 */
     say("    GPU busy (batch timestamps): "); say_dec((i64)(g_gpu_busy_ns / 1000000)); say(" ms over "); say_dec((i64)g_gpu_batches); say(" batches");
     say(g_opt_gpu_times > 0 ? "; per-draw timestamps on\n" : "; per-draw timestamps off (--gpu-times turns them on)\n");
+    if (g_opt_gpu_tl) {   /* t172 */
+        double tot = 0; for (int i = 1; i < TL_N; i++) tot += g_tl_ms[i];
+        say("    GPU timeline (t172, --gpu-timeline; "); say_dec((i64)g_tl_batches); say(" batches"); if (g_prof_reps) { say(", last "); say_dec(g_prof_reps); say(" repeats"); }
+        say("; commands without a timestamp slot "); say_dec((i64)g_tl_over); say("): ms in all / count / largest single ms\n");
+        for (int i = 1; i < TL_N; i++) if (g_tl_n[i] || g_tl_ms[i] > 0) {
+            char b[160]; Sb t = {b, 0, sizeof b}; sb_s(&t, "      "); sb_s(&t, g_tl_name[i]); sb_s(&t, ": ");
+            sb_d(&t, (i64)(g_tl_ms[i] * 10 + 0.5) / 10); sb_s(&t, "."); sb_d(&t, (i64)(g_tl_ms[i] * 10 + 0.5) % 10); sb_s(&t, " ms / "); sb_d(&t, (i64)g_tl_n[i]);
+            sb_s(&t, " / "); sb_d(&t, (i64)(g_tl_max[i] * 100 + 0.5) / 100); sb_s(&t, "."); { i64 c = (i64)(g_tl_max[i] * 100 + 0.5) % 100; if (c < 10) sb_s(&t, "0"); sb_d(&t, c); }
+            sb_s(&t, "\n"); say(b); }
+        { char b[80]; Sb t = {b, 0, sizeof b}; sb_s(&t, "      total "); sb_d(&t, (i64)(tot + 0.5)); sb_s(&t, " ms\n"); say(b); }
+        { u64 nf = g_tl_from_frame ? (V.frame > g_tl_from_frame ? V.frame - g_tl_from_frame : 1) : g_prof_reps ? (u64)g_prof_reps : (V.frame ? V.frame : 1); tl_window(nf, 1); }   /* w6_gpu */
+        if (g_tl_from_frame) {   /* t198 (--gpu-timeline-from F): per frame since flip F, and the shaders with the most GPU time */
+            u64 nf = V.frame > g_tl_from_frame ? V.frame - g_tl_from_frame : 1;
+            say("      since flip "); say_dec((i64)g_tl_from); say(" ("); say_dec((i64)nf); say(" frames), us per frame:");
+            for (int i = 1; i < TL_N; i++) if (g_tl_n[i]) { say(" "); say(g_tl_name[i]); say(" "); say_dec((i64)(g_tl_ms[i] * 1000.0 / (double)nf)); say(" (x"); say_dec((i64)(g_tl_n[i] / nf)); say(")"); }
+            say("; total "); say_dec((i64)(tot * 1000.0 / (double)nf)); say("\n");
+            u8 used[64]; int nu = 0;
+            for (int r = 0; r < 24 && r < g_nprof; r++) { int best = -1; for (int i = 0; i < g_nprof; i++) { int u = 0; for (int k = 0; k < nu; k++) if (used[k] == (u8)0 && 0) u = 1; if (g_prof[i].ms < 0) continue; if (best < 0 || g_prof[i].ms > g_prof[best].ms) { (void)u; best = i; } }
+                if (best < 0 || g_prof[best].ms <= 0) break;
+                VProf *P = &g_prof[best]; u64 a = P->a & 0xFFFFFFFFFFFFull, b = P->b & 0xFFFFFFFFFFFFull;
+                say("        "); say(b ? "VS " : "CS "); say_hex(a); if (b) { say(" PS "); say_hex(b); } say(": "); say_dec((i64)(P->ms * 1000.0 / (double)nf)); say(" us per frame, "); say_dec((i64)(P->n / nf)); say(" calls per frame, "); say_dec((i64)(P->ms * 1000.0 / (double)(P->n ? P->n : 1))); say(" us each\n");
+                P->ms = -P->ms - 1e-9; }
+            for (int i = 0; i < g_nprof; i++) if (g_prof[i].ms < 0) g_prof[i].ms = -g_prof[i].ms; } }
     {   /* GPU time by shader */
         double tot = 0; for (int i = 0; i < g_nprof; i++) tot += g_prof[i].ms;
         vl("\nGPU time by shader (sum of per-draw timestamps");
@@ -7359,7 +9781,7 @@ static void vkr_report(void) {
             vl("  "); vl_d((i64)P->ms); vl(" ms  "); vl_d((i64)P->n); vl(P->b ? " draws  VS " : " dispatches  CS "); vl_x(P->a); if (P->b) { vl(" PS "); vl_x(P->b); }
             vl("  (shader #"); vl_d(shader_index_of(P->a)); if (P->b) { vl(" / #"); vl_d(shader_index_of(P->b)); } vl(")  ");
             vl_d((i64)(P->verts / (P->n ? P->n : 1))); vl(P->b ? " vertices per draw\n" : " groups per dispatch\n");
-            if (k < 6) { say("      "); say_dec((i64)P->ms); say(" ms over "); say_dec((i64)P->n); say(P->b ? " draws: VS #" : " dispatches: CS #"); say_dec(shader_index_of(P->a));
+            if (k < 12) { say("      "); say_dec((i64)(P->ms * 1000.0)); say(" us over "); say_dec((i64)P->n); say(P->b ? " draws: VS #" : " dispatches: CS #"); say_dec(shader_index_of(P->a));
                          if (P->b) { say(" + PS #"); say_dec(shader_index_of(P->b)); } say("\n"); }
             P->ms = -1;
         }
@@ -7532,7 +9954,7 @@ static void coh_selftest2(VShadow *S) {
     if (ct_sel(14)) {
         u64 P = big ? big : S->lo; ct_wd(14, 30);
         ct_fill(P, 0x1000, 0x14141414u); vk_submit_wait();
-        ct_backlog(NSLOT, 120);   /* every slot busy for a while */
+        ct_backlog(g_nslot, 120);   /* every slot busy for a while */
         pm_lock(&g_coh_m); coh_patch_add(P + 0x800, 64); pm_unlock(&g_coh_m);
         u64 t0 = plat_ticks();
         coh_apply_patches();   /* (what vk_shadow_sync does first at a submit, with no batch being recorded) */
@@ -7597,7 +10019,7 @@ static void coh_selftest2(VShadow *S) {
         u64 r0 = g_coh_rb_retry; __atomic_store_n(&g_ct_inj_rb, 6, __ATOMIC_RELEASE);
         T.a = P; T.done = 0; pt_create(ct_reader1, &T, 1u << 20); ct_wait_done_s(&T, 1, 30);
         ct_result(17, "GPU read-back failing 6 times in a row: retried, the reader gets the GPU's bytes", (T.done == 1 && (u32)T.sink == 0x17171717u && g_coh_rb_retry - r0 >= 6) ? 0 : 1, 1);
-        ct_fill(P + 0x1000, 0x1000, 0x17171718u); vk_submit_wait(); ct_backlog(NSLOT, 120);
+        ct_fill(P + 0x1000, 0x1000, 0x17171718u); vk_submit_wait(); ct_backlog(g_nslot, 120);
         u64 f0 = g_coh_fence_late; __atomic_store_n(&g_ct_inj_fence, 1, __ATOMIC_RELEASE);
         T.a = P + 0x1000; T.done = 0; pt_create(ct_reader1, &T, 1u << 20); ct_wait_done_s(&T, 1, 60);
         vk_submit_wait();

@@ -43,6 +43,7 @@ static void check_all(const char *when, int np) {
     }
 }
 int main(int argc, char **argv) {
+    if (getenv("SPVREL_INLINE")) g2s_spv_compress_lazy = 0;   /* w2: the --spv-compress-inline path */
     int np = 0;
     for (int a = 1; a < argc && np < 4096; a++) {
         FILE *f = fopen(argv[a], "rb"); if (!f) continue;
@@ -109,6 +110,13 @@ int main(int argc, char **argv) {
         u32 n0 = 0; const u32 *w0 = g2s_spv_get(g_key[i], &n0);
         CHECK(w0 && n0 == g_n[i] && !memcmp(w0, g_words[i], 4ull * n0), "program %d: g2s_spv_get before release", i);
         g2s_spv_release(g_key[i]); g_rel[i] = 2; nz++; }
+    if (g2s_spv_compress_lazy) {   /* w2: the release only queued them - a flush now frees nothing and the words are still held */
+        u64 r0, b0, f0, r1, b1, f1; g2s_spv_stats(&r0, &b0, &f0); g2s_spv_flush(1); g2s_spv_stats(&r1, &b1, &f1);
+        CHECK(r1 == r0, "lazy compression: a flush before the compression step freed %llu", (unsigned long long)(r1 - r0));
+        for (int i = 0; i < np; i++) if (g_key[i] && g_rel[i] == 2) { u32 n0 = 0; const u32 *w0 = g2s_spv_get(g_key[i], &n0); CHECK(w0 && n0 == g_n[i] && !memcmp(w0, g_words[i], 4ull * n0), "program %d: words not held while queued", i); }
+        int left = g2s_spv_compress_step(3), steps = 1; while (left > 0) { int l2 = g2s_spv_compress_step(3); CHECK(l2 < left, "compression step made no progress"); left = l2; steps++; }
+        u64 q, pk, dn; g2s_spv_lazy_stats(&q, &pk, &dn); CHECK(q == 0 && (int)dn == nz && (int)pk == nz, "lazy compression: queued %llu, peak %llu, done %llu of %d", (unsigned long long)q, (unsigned long long)pk, (unsigned long long)dn, nz);
+        printf("spvrel: lazy compression (w2): %d entries in %d steps\n", nz, steps); }
     g2s_spv_flush(1);
     check_all("after compressed release", np);
     int got = 0;
