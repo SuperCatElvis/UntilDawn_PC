@@ -3490,6 +3490,7 @@ static int ud_player_start(int *pargc, char ***pargv) {
     if (!g_uds.shader_prep) av[n++] = "--no-prep";   /* t159 */
     if (g_uds.shader_prep == 2) av[n++] = "--prep-background";   /* t164 */
     if (g_uds.disp_auto) av[n++] = "--rs-generic";   /* w16_rel: the display system's scaled shaders (as every v0.4.0 test: play_dev D) */
+    g_gpuopt_req = g_uds.gpu_opt;   /* w17_mem: for the memory log line only */
     g_fr_req = g_uds.fast_render; g_fr_src = g_uds.seen_fast && !g_uds.fresh ? 1 : 0;   /* (rc3: a file written at this start holds the defaults) */   /* w16_rel rc2: Optimised Rendering (Fast Mode) requested (applied after the options: --no-fast-rendering / --fast-rendering win); never by GPU vendor */
     g_fps_src = g_uds.seen_fps && !g_uds.fresh ? 1 : 0;
     if (g_uds.gpu_opt) { static char *const k_gpu_opt[] = {"--ce-ahead", "--par-ce-gate", "--gw-pred", "--memo-reloc-any", "--memo-rd-dups", "--tex-dirty-ahead", "--par-fastcheck",
@@ -3731,6 +3732,10 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--image-budget-real")) g_opt_img_budget_real = 1;   /* t196 */
         else if (str_eq(argv[i], "--vram-fit")) g_opt_vram_fit = 1;   /* t196 */
         else if (str_eq(argv[i], "--sim-vram-gb") && i + 1 < argc) g_sim_vram = str_to_u64(argv[++i]) << 30;   /* t196 (tests) */
+        else if (str_eq(argv[i], "--low-sys-mem")) g_opt_lowsys = 1;   /* w17_mem: low system memory mode whatever the driver's budget */
+        else if (str_eq(argv[i], "--no-low-sys-mem")) g_opt_lowsys = -1;   /* w17_mem: never */
+        else if (str_eq(argv[i], "--sim-sys-budget") && i + 1 < argc) g_sim_sys_budget = str_to_u64(argv[++i]) << 20;   /* w17_mem (tests): the driver's system-memory budget as if it were N MB */
+        else if (str_eq(argv[i], "--sys-heap-log")) g_opt_sysheap_log = 1;   /* w17_mem: system memory for the GPU every 10 s */
         else if (str_eq(argv[i], "--no-image-pool-trim")) g_opt_no_pool_trim = 1;   /* t196 */
         else if (str_eq(argv[i], "--mem-saver")) { g_img_max_age = 1800; g_opt_vram_fit = 1; g_stage_small_req = 1; }   /* t196 */
         else if (str_eq(argv[i], "--no-maintenance8")) g_opt_no_m8 = 1;   /* t194 (A/B): depth <-> R32 syncs through a buffer, as before */
@@ -3739,7 +3744,8 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--label-guard-big")) g_opt_wbg_big = 1;   /* w3_perf */
         else if (str_eq(argv[i], "--no-fast-rendering") || str_eq(argv[i], "--no-optimised-rendering")) { g_fr_req = 0; g_fr_src = 2; }   /* w16_rel: Optimised Rendering (Fast Mode) off (= optimised_rendering = 0) */
         else if (str_eq(argv[i], "--fast-rendering") || str_eq(argv[i], "--optimised-rendering")) { g_fr_req = 1; g_fr_src = 2; }   /* w16_rel: on (= --label-policy 4 --label-trailing --label-read-guard 2 --label-guard-big) */
-        else if (str_eq(argv[i], "--no-gpu-optimisations")) { g_opt_ce_ahead = 0; g_opt_spec_cegate = 0; g2s_gw_pred = 0; g2s_reloc_any = 0; g2s_rd_dups = 0; g_opt_dch_ahead = 0; g_opt_spec_fast = 0; g_opt_spec_pcores = 0; g_opt_sync_pitch = 0; g_opt_dsync_cs = 0; g_opt_dsync_draw = 0; g_opt_fb_cover = 0; g_pc_early = 0; }   /* w16_rel: = gpu_optimisations = 0 */
+        else if (str_eq(argv[i], "--gpu-optimisations")) { g_opt_ce_ahead = 1; g_opt_spec_cegate = 1; g2s_gw_pred = 1; g2s_reloc_any = 1; g2s_rd_dups = 1; g_opt_dch_ahead = 1; g_opt_spec_fast = 1; g_opt_spec_pcores = 1; g_opt_sync_pitch = 1; g_opt_dsync_cs = 1; g_opt_dsync_draw = 1; g_opt_fb_cover = 1; g_pc_early = 1; g_gpuopt_req = 1; }   /* w17_mem (tests): = gpu_optimisations = 1 */
+        else if (str_eq(argv[i], "--no-gpu-optimisations")) { g_gpuopt_req = 0; g_opt_ce_ahead = 0; g_opt_spec_cegate = 0; g2s_gw_pred = 0; g2s_reloc_any = 0; g2s_rd_dups = 0; g_opt_dch_ahead = 0; g_opt_spec_fast = 0; g_opt_spec_pcores = 0; g_opt_sync_pitch = 0; g_opt_dsync_cs = 0; g_opt_dsync_draw = 0; g_opt_fb_cover = 0; g_pc_early = 0; }   /* w16_rel: = gpu_optimisations = 0 */
         else if (str_eq(argv[i], "--no-ce-ahead")) g_opt_ce_ahead = 0;   /* w16_rel: each v0.4.0 default can be turned off on its own (troubleshooting) */
         else if (str_eq(argv[i], "--no-par-ce-gate")) g_opt_spec_cegate = 0;
         else if (str_eq(argv[i], "--no-gw-pred")) g2s_gw_pred = 0;

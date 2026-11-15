@@ -1,4 +1,4 @@
-# Known issues — v0.4.0
+# Known issues — v0.4.1
 
 [← Back to README](../README.md)
 
@@ -73,6 +73,18 @@ GPUs, and the flickering menus may remain. Things to try:
 3. `present_mode = fifo` in `Config\settings.ini`.
 
 Please report what happened, with `Logs\UntilDawn.log`.
+
+## New in v0.4.1
+
+- **Some PCs with 16 GB of RAM can crash when loading demanding scenes**, for example the Chapter 6 chair scene or a
+  main menu that shows it: the game stops with a graphics "device lost" error
+  ([issue #6](https://github.com/SuperCatElvis/UntilDawn_PC/issues/6)). The graphics driver lets the program keep only
+  about half of the PC's RAM for the game's memory, and the game alone needs nearly all of that. v0.4.1 detects this,
+  uses a little less memory (low-memory mode) and writes a LOW MEMORY warning to `Logs\UntilDawn.log`, but this does
+  not fix the crash. v0.3.2 may work better on these PCs. A larger memory reduction is planned. Closing other programs
+  before playing can help.
+- In low-memory mode performance can be somewhat lower (in our test with a simulated small memory budget about 17.1 ms
+  per frame instead of about 14.7 ms).
 
 ## New in v0.4.0
 

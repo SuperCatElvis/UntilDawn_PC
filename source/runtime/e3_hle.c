@@ -1463,7 +1463,7 @@ static void mem_report(const char *why) {
     if (pm.sys_total) { say("; system: RAM free "); say_dec((i64)(pm.sys_avail >> 20)); say(" of "); say_dec((i64)(pm.sys_total >> 20)); say(" MB, commit free "); say_dec((i64)(pm.commit_avail >> 20)); say(" of "); say_dec((i64)(pm.commit_total >> 20)); say(" MB"); }
     say("\n");
     if (ok && g_mem_pressure_fn) g_mem_pressure_fn(pm.sys_avail, pm.commit_avail);   /* t194 */
-    if (pm.sys_total && pm.sys_avail < (1ull << 30)) { static int nlow; if (nlow++ < 20) say("    LOW MEMORY: less than 1 GB of RAM free on this PC (Windows may be paging; other programs closed would help)\n"); }
+    if (pm.sys_total && pm.sys_avail < (1ull << 30)) { static int nlow; if (nlow++ < 20) say("    LOW MEMORY: less than 1 GB of RAM free on this PC (Windows may be paging; close other programs such as the web browser and game launchers - PCs with 16 GB of RAM are at the limit for this game)\n"); }
     if (!detail) return;
     /* game memory by kind: arenas (reserved / committed / mapped by the game), pools, the rest (the game's large mappings) */
     u64 dm_live = 0, dm_arena = 0; int ndm = 0;

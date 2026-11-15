@@ -436,6 +436,7 @@ static void gw_setup_done(void);   /* the draw / dispatch command has been recor
 static void wbg_note_read(u32 pg, u64 lo, u64 hi); static int g_opt_rdg; static u64 g_wbg_after; static void wbg_note(u64 lo, u64 hi, int kind, int line); static void wbg_arm(const u64 *skip, int nskip, int first); static void wbg_done(u64 seq); static void wbg_label(u64 addr, u64 val, u32 n, int irq, int early); static int g_opt_wbg, g_wbg_audit;   /* t198: label policy 4 (see wbg_note) */
 /* w16_rel rc2: Optimised Rendering (Fast Mode) state - see fr_flip_check */
 static int g_fr_req = -1, g_fr_src;   /* requested 1 / 0 (-1: no setting or switch - a developer run with raw label options); source 0 default, 1 settings.ini, 2 command line */
+static int g_gpuopt_req = -1, g_gpuopt_src = -1;   /* w17_mem: GPU optimisations requested 1 / 0 (-1: raw options, not managed); source 0 default / auto, 1 settings.ini, 2 command line */
 static int g_fps_src = -1;            /* frame-rate limit: 0 default, 1 settings.ini, 2 command line (--fps), -1 the game's own rate */
 static volatile int g_fr_state;       /* 0 not decided yet, 1 active (logged at the first early release), 2 logged as NOT active */
 static u64 g_fr_active_flip; static volatile int g_fr_rdg_fail; static int g_fr_rdg_warned;
@@ -720,6 +721,133 @@ static int stage_tmp(u64 bytes, VkBuffer *pb, u8 **pmap);
 static void stage_dev(void);
 static u32 g_max_bindings_seen;   /* the most push descriptors any layout needed (run summary) */
 static u64 g_n_xlane_mods, g_n_sgs_stages;   /* modules with cross-lane shuffles; pipeline stages given a 32-lane requirement */
+/* ---------------------------------------------------------------- w17_mem: low system memory mode
+   Issue #6 (laptop, 16 GB RAM, RTX 5050 8 GB): the driver's budget for this program in system memory (VK_EXT_memory_budget,
+   the non-device-local heap) is about half the RAM, 7,189 MB there, and the program used 7,065 MB of it at the menu: the
+   game's memory imported for the GPU (6.2 GB: every mapping is imported, and an import keeps all its pages in RAM, zero
+   pages included), the 512 MB upload (staging) buffer, the 48 MB index ring and about 300 MB of the driver's own. Every
+   device loss in the player's logs (v0.3.2 and v0.4.0) happened with that heap at 97-100 % and less than 1 GB of RAM free.
+   When the budget is small for what the program will need (about: game memory mapped at start + 1.1 GB it maps later,
+   staging, ring, 300 MB of the driver's; more than 90 % of the budget), or with --low-sys-mem:
+   - the upload ring is 128 MB instead of 512 MB (the t111 ring: 16 MB per batch slot; a larger upload gets a buffer of
+     its own for its batch; replays and developer tools still switch to 512 MB) - unless --stage-mb / --stage-128 chose;
+   - with --vram-fit (cards under 12 GB) the image budget is lowered when less than 768 MB (not 384) of the driver's VRAM
+     budget is left, so the driver does not move video memory out to system memory (v0.3.2 Chapter 6: VRAM 7,441 of
+     7,142 MB with the system heap full);
+   - a start-up warning for the player; the system-memory figures every 10 s.
+   Pictures: the same (the ring size changes only where uploads are staged). The game memory itself cannot be reduced
+   here (importing only what the GPU uses is the t111 lazy machinery, off since STATUS 116).
+   --low-sys-mem: on whatever the budget; --no-low-sys-mem: never; --sim-sys-budget MB: as if the driver's budget for
+   system memory were MB (tests on a large PC; the decision, the warning and the figures use it); --sys-heap-log: the
+   10 s figures also when the mode is off. */
+static int g_opt_lowsys;            /* 1 --low-sys-mem, -1 --no-low-sys-mem, 0 automatic */
+static u64 g_sim_sys_budget;        /* --sim-sys-budget MB (bytes) */
+static int g_opt_sysheap_log;       /* --sys-heap-log */
+/* w17_mem build 2: the mode is decided on the driver's budgets (VK_EXT_memory_budget): the system heap first; a small VRAM budget
+   (under 7.5 GB, simulated with --sim-vram-gb) counts too when the system heap is within 1 GB of the 90 % line (what does not fit in
+   VRAM is moved to system memory by the driver). Installed RAM only when the driver gives no budget figures (under 20 GB).
+   Build 3: no fallback of Optimised Rendering / GPU optimisations (build 2 had one; the player's run with both off crashed
+   the same way, so it is not supported by evidence). */
+static int g_lowsys_vram_tight; static u64 g_lowsys_vbud, g_lowsys_vsize;
+static u64 g_sim_vram;   /* (t196 --sim-vram-gb, defined below; a tentative definition) */
+static int vramheap_query(u64 *use, u64 *bud, u64 *size) {
+    *use = *bud = *size = 0;
+    if (!g_has_mem_budget || !V.pd) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
+    vkGetPhysicalDeviceMemoryProperties2(V.pd, &p2);
+    u32 h = 0xFFFFFFFFu;
+    for (u32 i = 0; i < p2.memoryProperties.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++)
+        if ((p2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && (h == 0xFFFFFFFFu || p2.memoryProperties.memoryHeaps[i].size > p2.memoryProperties.memoryHeaps[h].size)) h = i;
+    if (h == 0xFFFFFFFFu) return 0;
+    *use = b.heapUsage[h]; *bud = b.heapBudget[h]; *size = p2.memoryProperties.memoryHeaps[h].size;
+    if (g_sim_vram && *size > g_sim_vram) { *bud = *bud > *size - g_sim_vram ? *bud - (*size - g_sim_vram) : 1; *size = g_sim_vram; }   /* (as mem_pressure_tick) */
+    return 1;
+}
+static int g_lowsys_on, g_lowsys_tight; static u64 g_lowsys_budget, g_lowsys_need, g_lowsys_need_low, g_lowsys_peak, g_lowsys_n90, g_lowsys_n100;
+static volatile u64 g_imp_bytes;    /* game memory imported (bytes) */
+/* the driver's figures for the largest system-memory heap (budget replaced by --sim-sys-budget when smaller); 0 = none */
+static int sysheap_query(u64 *use, u64 *bud, u64 *size) {
+    *use = *bud = *size = 0;
+    if (!g_has_mem_budget || !V.pd) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
+    vkGetPhysicalDeviceMemoryProperties2(V.pd, &p2);
+    u32 h = 0xFFFFFFFFu;
+    for (u32 i = 0; i < p2.memoryProperties.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++)
+        if (!(p2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && (h == 0xFFFFFFFFu || p2.memoryProperties.memoryHeaps[i].size > p2.memoryProperties.memoryHeaps[h].size)) h = i;
+    if (h == 0xFFFFFFFFu) return 0;
+    *use = b.heapUsage[h]; *bud = b.heapBudget[h]; *size = p2.memoryProperties.memoryHeaps[h].size;
+    if (g_sim_sys_budget && (!*bud || g_sim_sys_budget < *bud)) *bud = g_sim_sys_budget;
+    return 1;
+}
+static u64 game_mem_mapped(void) {
+    u64 t = 0; int n = (int)__atomic_load_n(&g_nmem, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) t += g_mem[i].hi - g_mem[i].lo;
+    return t;
+}
+/* render thread, at device creation, before the upload ring is made */
+static void vk_lowsys_decide(void) {
+    u64 use, bud, size; int have = sysheap_query(&use, &bud, &size);
+    u64 mapped = game_mem_mapped(), ring = (48ull << 20) * (u64)g_nslot / 8;
+    int stage_chosen = g_stage_big_req || g_stage_small_req || g_stage_mb_req;
+    u64 stage_now = g_stage_small_req && !g_stage_big_req ? (128ull << 20) : g_stage_mb_req && !g_stage_big_req ? g_stage_mb_req << 20 : (512ull << 20);
+    u64 base = mapped + (1100ull << 20) + ring + (300ull << 20) + use;   /* game memory now + what it maps later, ring, the driver's */
+    g_lowsys_budget = bud; g_lowsys_need = base + stage_now;
+    g_lowsys_tight = have && bud && g_lowsys_need * 10 > bud * 9;
+    { u64 vu, vb, vs; int vh = vramheap_query(&vu, &vb, &vs); g_lowsys_vbud = vb; g_lowsys_vsize = vs;
+      g_lowsys_vram_tight = vh && vb && vb < (7680ull << 20);
+      int sys_near = have && bud && (g_lowsys_need + (1024ull << 20)) * 10 > bud * 9;
+      int why_ram = !have && plat_phys_mem() && plat_phys_mem() < (20ull << 30);   /* (secondary: no budget figures from the driver) */
+      if (!g_lowsys_tight && ((g_lowsys_vram_tight && sys_near) || why_ram)) g_lowsys_tight = 2; }
+    g_lowsys_on = g_opt_lowsys > 0 || (g_opt_lowsys == 0 && g_lowsys_tight);
+    if (g_lowsys_on && !stage_chosen) g_stage_small_req = 1;
+    g_lowsys_need_low = base + (g_stage_small_req && !g_stage_big_req ? (128ull << 20) : stage_now);
+    vl("  w17_mem: system heap "); if (have) { vl_d((i64)(use >> 20)); vl(" MB used, budget "); vl_d((i64)(bud >> 20)); vl(" MB"); if (g_sim_sys_budget) vl(" (simulated)"); vl(", size "); vl_d((i64)(size >> 20)); }
+    else vl("figures not available (no VK_EXT_memory_budget)");
+    vl("; game memory mapped "); vl_d((i64)(mapped >> 20)); vl(" MB; needed about "); vl_d((i64)(g_lowsys_need >> 20)); vl(" MB, "); vl_d((i64)(g_lowsys_need_low >> 20)); vl(" MB in low mode; low mode "); vl(g_lowsys_on ? "on\n" : "off\n");
+    if (g_lowsys_on || g_sim_sys_budget || g_opt_lowsys) {
+        say("  low system memory mode (w17_mem): "); say(!g_lowsys_on ? "off" : g_opt_lowsys > 0 ? "on (--low-sys-mem)" : "on (automatic: the driver's budget is small)");
+        if (have) { say("; the driver's budget for this program in system memory "); say_dec((i64)(bud >> 20)); say(" MB"); if (g_sim_sys_budget) say(" (simulated: --sim-sys-budget)"); }
+        say("; needed about "); say_dec((i64)(g_lowsys_need >> 20)); say(" MB (game memory "); say_dec((i64)((mapped + (1100ull << 20)) >> 20)); say(" MB with what it maps later, upload buffer "); say_dec((i64)(stage_now >> 20));
+        say(" MB, index ring "); say_dec((i64)(ring >> 20)); say(" MB, driver about "); say_dec((i64)((use + (300ull << 20)) >> 20)); say(" MB)");
+        if (g_lowsys_on) {
+            say("; done: upload buffer "); if (stage_chosen) { say("as chosen on the command line ("); say_dec((i64)(stage_now >> 20)); say(" MB)"); } else say("512 -> 128 MB");
+            say(", video memory kept 768 MB under the driver's budget (with --vram-fit), system-memory figures every 10 s; expected about "); say_dec((i64)(g_lowsys_need_low >> 20)); say(" MB");
+            if (bud) { say(" = "); say_dec((i64)(g_lowsys_need_low * 100 / bud)); say(" % of the budget"); }
+            say(" (the game's own memory, imported for the GPU, is not reduced)"); }
+        say("\n");
+    }
+    if (g_lowsys_vbud || g_sim_vram) { vl("  w17_mem: VRAM budget "); vl_d((i64)(g_lowsys_vbud >> 20)); vl(" MB of "); vl_d((i64)(g_lowsys_vsize >> 20)); vl(g_sim_vram ? " (--sim-vram-gb)" : ""); vl(g_lowsys_vram_tight ? ", small\n" : "\n"); }
+    if (g_lowsys_on) {   /* w17_mem build 3: no fallback of Optimised Rendering / GPU optimisations (the player's log with both off crashed the same way) */
+        say("  low system memory mode (w17_mem): reason: "); say(g_opt_lowsys > 0 ? "--low-sys-mem" : g_lowsys_tight == 2 ? (have ? "small VRAM budget with the system heap near its limit" : "no budget figures from the driver and under 20 GB of RAM") : "the driver's system-memory budget is small");
+        if (g_lowsys_vbud) { say("; VRAM budget "); say_dec((i64)(g_lowsys_vbud >> 20)); say(" MB"); if (g_sim_vram) say(" (simulated card)"); }
+        say("; Optimised Rendering and GPU optimisations are left as set\n");
+    }
+    if (g_lowsys_tight) {
+        say("    LOW MEMORY: the graphics driver lets this program keep about "); say_dec((i64)(bud >> 20)); say(" MB in system memory (about half of the PC's RAM)");
+        if (g_sim_sys_budget) say(" [simulated]");
+        say(" and the game needs about "); say_dec((i64)(g_lowsys_need_low >> 20)); say(" MB of it. The game may stop with a graphics error (\"device lost\").\n");
+        say("    Close other programs before playing (web browser, game launchers, overlays, recording tools). PCs with 16 GB of RAM are at the limit for this game.\n");
+    }
+}
+/* every 10 s (housekeeping thread): system memory for the GPU, when the mode is on, a budget is simulated or --sys-heap-log */
+static void vk_lowsys_tick(void) {
+    if (!g_vk_on || !V.dev || !(g_lowsys_on || g_sim_sys_budget || g_opt_sysheap_log)) return;
+    u64 use, bud, size; if (!sysheap_query(&use, &bud, &size)) return;
+    if (use > g_lowsys_peak) g_lowsys_peak = use;
+    if (bud && use * 10 > bud * 9) g_lowsys_n90++;
+    if (bud && use >= bud) g_lowsys_n100++;
+    u64 imp = __atomic_load_n(&g_imp_bytes, __ATOMIC_RELAXED), own = imp + V.stage_size + V.qsize + g_stmp_live;
+    say("    system memory for the GPU (w17_mem, flip "); say_dec((i64)V.frame); say("): "); say_dec((i64)(use >> 20)); say(" of "); say_dec((i64)(bud >> 20)); say(" MB");
+    if (bud) { say(" ("); say_dec((i64)(use * 100 / bud)); say(" %)"); } if (g_sim_sys_budget) say(" simulated budget");
+    say("; game memory imported "); say_dec((i64)(imp >> 20)); say(" MB, upload buffer "); say_dec((i64)(V.stage_size >> 20)); say(" MB, index ring "); say_dec((i64)(V.qsize >> 20));
+    say(" MB, own upload buffers "); say_dec((i64)(g_stmp_live >> 20)); say(" MB, the rest (driver) "); say_dec((i64)(use > own ? (use - own) >> 20 : 0)); say(" MB; peak "); say_dec((i64)(g_lowsys_peak >> 20));
+    say(" MB; headroom "); say_dec((i64)(bud > use ? (bud - use) >> 20 : 0)); say(" MB");
+    { u64 vu, vb, vs; if (vramheap_query(&vu, &vb, &vs)) { say("; VRAM "); say_dec((i64)(vu >> 20)); say(" of "); say_dec((i64)(vb >> 20)); say(" MB"); if (vb) { say(" ("); say_dec((i64)(vu * 100 / vb)); say(" %)"); }
+        say(" headroom "); say_dec((i64)(vb > vu ? (vb - vu) >> 20 : 0)); say(" MB"); if (g_sim_vram) say(" simulated card"); } }
+    say("; low mode "); say(g_lowsys_on ? "on" : "off"); say(", Optimised Rendering "); say(g_fr_req == 1 ? "on" : g_fr_req == 0 ? "off" : "raw options"); say(", GPU optimisations "); say(g_gpuopt_req == 1 ? "on" : g_gpuopt_req == 0 ? "off" : "raw options"); say("\n");
+}
 /* ---------------------------------------------------------------- memory import */
 /* t109: the region of each 64 KB page of the page-table window (index + 1), so finding a region needs no search
    (arenas are now imported in pieces, so there are hundreds of regions) */
@@ -781,6 +909,7 @@ static int vk_import_one_(u64 lo, u64 hi, VkBuffer *pbuf, VkDeviceMemory *pmem, 
     vkBindBufferMemory(V.dev, buf, mem, 0);
     VkBufferDeviceAddressInfo bdai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, 0, buf};
     *pbuf = buf; *pmem = mem; *pdev = vkGetBufferDeviceAddress(V.dev, &bdai);
+    __atomic_add_fetch(&g_imp_bytes, size, __ATOMIC_RELAXED);   /* w17_mem: game memory imported (system memory the driver counts for the GPU) */
     return 1;
 }
 /* t107: new game memory is imported by the thread that maps it, before the game gets the address. Importing locks the
@@ -799,7 +928,7 @@ static int vk_preimport_r(u64 lo, u64 len) {   /* any thread; 1 imported, 0 the 
     pm_lock(&g_preimp_m);
     if (g_npreimp < 1024) { x.ok = 1; g_preimp[g_npreimp++] = x; __atomic_add_fetch(&g_n_preimp, 1, __ATOMIC_RELAXED); pm_unlock(&g_preimp_m); return 1; }
     pm_unlock(&g_preimp_m);
-    vkFreeMemory(V.dev, x.mem, 0); vkDestroyBuffer(V.dev, x.buf, 0);   /* (list full: imported later as before) */
+    vkFreeMemory(V.dev, x.mem, 0); vkDestroyBuffer(V.dev, x.buf, 0); __atomic_sub_fetch(&g_imp_bytes, hi - lo, __ATOMIC_RELAXED);   /* (list full: imported later as before) */
     return -1;
 }
 static void vk_preimport(u64 lo, u64 len) { (void)vk_preimport_r(lo, len); }
@@ -1187,6 +1316,7 @@ static void vkr_init(void) {
         VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
         vkAllocateMemory(V.dev, &mai, 0, &V.umem); vkBindBufferMemory(V.dev, V.ubuf, V.umem, 0);
         vkMapMemory(V.dev, V.umem, 0, mr.size, 0, (void **)&V.umap); mem_name(V.umap, "renderer: per-draw buffer");
+        vk_lowsys_decide();   /* w17_mem: may choose the 128 MB ring */
         /* t111: 128 MB (8 batch slots of 16 MB) - t112: 512 MB again by default (t110's behaviour; --stage-128 for the
            smaller ring, an experiment: see stage_tmp / stage_dev) */
         V.stage_size = g_stage_small_req && !g_stage_big_req ? (128ull << 20) : (512ull << 20);
@@ -2148,6 +2278,7 @@ static void vk_ram_budgets(void) {
     vl("  memory budgets for a PC with "); vl_d((i64)(ram >> 20)); vl(" MB of RAM (t194): images at most "); vl_d((i64)(img >> 20)); vl(" MB, VRAM copies "); vl_d((i64)(g_sh_budget >> 20)); vl(" MB, read mirror "); vl_d((i64)(g_rm_budget >> 20)); vl(" MB\n");
 }
 static void mem_pressure_tick(u64 sys_avail, u64 commit_avail) {   /* any thread (the housekeeping thread, every 10 s) */
+    vk_lowsys_tick();   /* w17_mem */
     if (g_opt_vram_fit && g_has_mem_budget && V.img_budget && V.pd) {   /* t196: the card is nearly full (other programs use it too) */
         VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
@@ -2157,7 +2288,7 @@ static void mem_pressure_tick(u64 sys_avail, u64 commit_avail) {   /* any thread
         if (hi != 0xFFFFFFFFu) {
             u64 size = p2.memoryProperties.memoryHeaps[hi].size, bud = b.heapBudget[hi], use = b.heapUsage[hi];
             if (g_sim_vram && size > g_sim_vram) bud = bud > size - g_sim_vram ? bud - (size - g_sim_vram) : 1;
-            if (bud && use + (384ull << 20) > bud) {
+            if (bud && use + (g_lowsys_on ? (768ull << 20) : (384ull << 20)) > bud) {   /* (w17_mem: 768 MB in low system memory mode) */
                 u64 real = img_real_bytes(), want = real - real / 8; if (want < (1536ull << 20)) want = 1536ull << 20;
                 if (want < V.img_budget) { __atomic_store_n(&g_img_budget_req, want, __ATOMIC_RELEASE); g_n_vram_pressure++; } }
             /* w2: the lowering was for good - one peak while a level loaded (cave, --sim-vram-gb 8: once, to 2,907 MB) held
@@ -8864,7 +8995,13 @@ static void vk_mem_report(void) {
             say(i ? "; " : " "); say((p2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? "VRAM " : "system ");
             say_dec((i64)(b.heapUsage[i] >> 20)); say(" / "); say_dec((i64)(b.heapBudget[i] >> 20)); say(" / "); say_dec((i64)(p2.memoryProperties.memoryHeaps[i].size >> 20));
         }
+        if (g_sim_sys_budget) { say(" (system budget simulated: "); say_dec((i64)(g_sim_sys_budget >> 20)); say(" MB)"); }
         say("\n");
+        { u64 imp = __atomic_load_n(&g_imp_bytes, __ATOMIC_RELAXED);   /* w17_mem */
+          say("      system memory for the GPU (w17_mem): game memory imported "); say_dec((i64)(imp >> 20)); say(" MB, upload buffer "); say_dec((i64)(V.stage_size >> 20)); say(" MB, index ring ");
+          say_dec((i64)(V.qsize >> 20)); say(" MB, own upload buffers "); say_dec((i64)(g_stmp_live >> 20)); say(" MB; low system memory mode "); say(g_lowsys_on ? (g_opt_lowsys > 0 ? "on (forced)" : "on") : "off");
+          if (g_lowsys_peak) { say("; peak use "); say_dec((i64)(g_lowsys_peak >> 20)); say(" MB, 10 s checks over 90 % "); say_dec((i64)g_lowsys_n90); say(", at or over the budget "); say_dec((i64)g_lowsys_n100); }
+          say("\n"); }
     }
 }
 static void spec_play_line(void);   /* t181 (e6_spec.c) */

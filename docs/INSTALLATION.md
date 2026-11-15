@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This guide covers v0.4.0 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
+This guide covers v0.4.1 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
 copy of the original PS4 game**. The download does not contain the game.
 
 ---
@@ -23,7 +23,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 
 ## 2. Download and extract the release
 
-1. Download `UntilDawn_0.4.0.zip` from the
+1. Download `UntilDawn_PC_v0.4.1.zip` from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder **you can write to**, for example `D:\Games\UntilDawn_WIP`.
    Don't use `C:\Program Files`: the program keeps its settings, logs, shader cache and saves in its own folder.
@@ -31,7 +31,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 After extracting you have:
 
 ```
-UntilDawn_0.4.0\
+UntilDawn_0.4.1\
   UntilDawn.exe                     the game
   pipelines.udm                     the shader list prepared on the first start (keep it here)
   Config\settings.ini               settings (see section 5)
@@ -43,7 +43,8 @@ UntilDawn_0.4.0\
     README_COMPAT.txt
   README.txt
   INSTALLATION.txt                  this guide
-  CHANGELOG_v0.4.0.md               what is new in this version
+  CHANGELOG_v0.4.1.md               what is new in this version
+  CHANGELOG_v0.4.0.md               what was new in v0.4.0
   Controls.txt
   KNOWN_ISSUES.txt
   LICENSE.txt
@@ -51,6 +52,10 @@ UntilDawn_0.4.0\
 ```
 
 ### Updating from an earlier release
+
+**From 0.4.0:** copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files into your old folder
+(`pipelines.udm` is unchanged). **Do not overwrite** `Config\settings.ini`, `savedata\` or `Game\`. There are no new
+settings. The first start shows the "Preparing shaders" screen once more.
 
 **From 0.3.2:** copy the new `UntilDawn.exe`, `compat\ud_compat.exe` and the text files into your old folder
 (`pipelines.udm` is the same as in 0.3.1 and 0.3.2). **Do not overwrite** `Config\settings.ini`, `savedata\` or
@@ -86,7 +91,7 @@ Circle skips it (the rest is then compiled during play, as before).
 **From 0.1.5 or earlier:**
 
 Copy the new `UntilDawn.exe`, `pipelines.udm`, `compat\ud_compat.exe` and the text files into your old folder. **Do not
-overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.4.0 to a
+overwrite** `Config\settings.ini`, `savedata\` or `Game\` (your settings, saves and game). Or extract 0.4.1 to a
 new folder and copy your `settings.ini`, `savedata` and game files over.
 
 - Saves and settings from earlier WIP releases work as they are. WIP 0.2.0 added four settings (`gpu`,
@@ -124,7 +129,7 @@ Choose **one** of these three ways:
 Copy the contents of your game folder into the release's `Game` folder, so that this file exists:
 
 ```
-UntilDawn_0.4.0\Game\eboot.bin
+UntilDawn_0.4.1\Game\eboot.bin
 ```
 
 ### Option B — point `settings.ini` at your game
@@ -242,6 +247,7 @@ and videos are scaled to match.
 | The game runs out of memory or Windows warns about low memory | Keep the page file on ("System managed"); close other large programs. 16 GB of RAM is recommended. |
 | The game crashed | Start it again (saves are kept), then [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.previous.log`. |
 | The game stops with a message about **GPU coherence** | It could not keep the game's memory consistent safely (for example because other software interfered) and stopped rather than go on with possibly wrong data. Set `gpu_coherence = 0` in `Config\settings.ini` (change the existing line or add it), start again, and [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.previous.log`. |
+| The game stops with a graphics "device lost" error, or `Logs\UntilDawn.log` shows **LOW MEMORY** (often PCs with 16 GB of RAM) | Since v0.4.1 the program detects this and uses a little less memory, but demanding scenes can still crash on these PCs. Close other programs (web browser, game launchers, overlays, recording tools) before playing; v0.3.2 may work better there. Please [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.log`. |
 | The game runs too slowly at your monitor's resolution | Set `render_resolution = 1080p` (or `1440p`) in `Config\settings.ini`; the picture is scaled to the monitor. A lower `frame_rate_limit` (for example `30`) also helps in heavy scenes. |
 | Something looks wrong, flickers or crashes since v0.4.0 | Try `optimised_rendering = 0`, then `gpu_optimisations = 0`, and [report](../README.md#reporting-bugs) which one made a difference, with `Logs\UntilDawn.log`. |
 | Something looks or runs worse in 0.3.x than in 0.2.1 | Try `gpu_coherence = 0` once to see whether GPU coherence is involved, and report both results with the logs. |

@@ -8,7 +8,7 @@ This project brings the original PlayStation 4 version of Until Dawn to PC using
 The game is playable from start to finish, although development is still ongoing. A complete playthrough was achieved with an earlier build, but the latest release has not yet been fully playtested.
 
 > [!WARNING]
-> **This is still a work-in-progress.** Expect occasional crashes, graphical issues, frame-rate drops and shader compilation stutters. Some demanding scenes still run below 30 FPS. Improvements to stability, performance and compatibility are ongoing.
+> **This is still a work-in-progress.** While stability, graphics and performance have improved significantly, occasional crashes, graphical issues and frame-rate drops may still occur. Performance will vary depending on your hardware, and some scenes may experience brief stutters while loading. Further improvements to stability, performance and compatibility are ongoing.
 
 > [!IMPORTANT]
 > **You must provide your own legally obtained copy of Until Dawn (2015) for PlayStation 4 (CUSA02636), with update 1.03 applied.**
@@ -23,13 +23,22 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release](https://github.com/SuperCatElvis/UntilDawn_PC/releases/latest)**
 
-**Current version: [v0.4.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.4.0)** — Release date: (to be filled in on release)
+**Current version: [v0.4.1](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.4.1)** — Release date: (to be filled in on release)
 
-Download `UntilDawn_0.4.0.zip` from the release's Assets section.
+Download `UntilDawn_PC_v0.4.1.zip` from the release's Assets section.
 
 The download includes the program, shader list, compatibility tester and documentation. Game files are not included.
 
-### What's new in v0.4.0
+### What's new in v0.4.1
+
+v0.4.1 is a small hotfix for PCs with little memory:
+
+- Automatic low-memory mode when the graphics driver gives the program only a small amount of system memory: a smaller upload buffer, more video memory kept free, and a LOW MEMORY warning in `Logs\UntilDawn.log`.
+- It does not yet fix the crash some 16 GB PCs see when loading demanding scenes (see Known Issues).
+
+See the [v0.4.1 changelog](docs/releases/v0.4.1.md) (also `CHANGELOG_v0.4.1.md` in the download).
+
+### Previously in v0.4.0
 
 - Native-resolution rendering with borderless full screen by default (1080p, 1440p, 4K and others; Alt+Enter switches to a window).
 - Better performance, especially at 1440p and 4K.
@@ -135,7 +144,7 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 
 The project has been tested on several different PCs. Results include both gameplay testing and hardware compatibility checks.
 
-A successful compatibility test does not guarantee that the game will run without issues. Most results are from earlier versions, and not all systems have been tested with v0.4.0.
+A successful compatibility test does not guarantee that the game will run without issues. Most results are from earlier versions, and not all systems have been tested with v0.4.1.
 
 | CPU | GPU | Driver | OS | RAM | Results |
 |---|---|---|---|---|---|
@@ -164,7 +173,7 @@ If you have different hardware, please consider submitting a [compatibility repo
 
 ### 1. Download the program
 
-Download `UntilDawn_0.4.0.zip` from the [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
+Download `UntilDawn_PC_v0.4.1.zip` from the [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 
 Extract the ZIP into a folder of your choice, such as:
 
@@ -216,7 +225,7 @@ For more details, see the [Installation Guide](docs/INSTALLATION.md).
 
 ### Updating from an earlier version
 
-If you're updating from v0.3.2 or an earlier release, replace the program files with the new versions.
+If you're updating from v0.4.0, v0.3.2 or an earlier release, replace the program files with the new versions.
 
 Make sure to update:
 
@@ -287,6 +296,7 @@ See the [Full Controls Guide](docs/CONTROLS.md) for more information.
 The project is still in development, and some issues remain.
 
 - Intermittent memory corruption can still cause crashes.
+- Some PCs with 16 GB of RAM can crash when loading demanding scenes (for example the Chapter 6 chair scene or a menu showing it). v0.3.2 may work better there; a larger memory reduction is planned.
 - The main-menu character's look-around moves too fast at high frame rates.
 - Brief dark lighting at the start of some scenes.
 - First-run shader preparation time depends on your CPU and on background programs.
