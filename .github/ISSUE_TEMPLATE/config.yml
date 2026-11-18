@@ -3,12 +3,4 @@ blank_issues_enabled: false
 contact_links:
   - name: "💡 Feature Request"
     url: https://github.com/SuperCatElvis/UntilDawn_PC/discussions/categories/feature-requests
-    about: "Suggest new features, gameplay improvements, accessibility options, and other enhancements to the Until Dawn PC Recomp."
-
-  - name: "💬 General Discussion"
-    url: https://github.com/SuperCatElvis/UntilDawn_PC/discussions/categories/general
-    about: "Ask questions, share feedback, and discuss the Until Dawn PC Recomp."
-
-  - name: "📖 Installation Guide"
-    url: https://github.com/SuperCatElvis/UntilDawn_PC/blob/main/docs/INSTALLATION.md
-    about: "How to set up the release and your own game files."
+    about: "Suggest new features, gameplay improvements, accessibility options, and other enhancements."
