@@ -182,16 +182,18 @@ Check logs for personal information before sharing them. **Do not upload or requ
 
 ## How it works
 
-The PS4 and modern Windows PCs use x86-64 processors, allowing the original game's CPU code to run directly rather than through console emulation.
+This project runs the original Until Dawn (2015) game code natively on Windows, using a custom-built runtime and Vulkan renderer.
 
-The project provides its own:
+The project includes:
 
-- **Loader** to start the original game code.
-- **Windows compatibility layer** for the PS4 system functions the game uses.
-- **Vulkan renderer** to translate the game's graphics commands and shaders.
-- **Shader cache** to avoid repeating compilation work.
+- **Native PC Runtime:** Runs the original game's x86-64 code directly on Windows.
+- **Custom Vulkan Renderer:** Handles the game's original graphics and shaders, with support for modern PC resolutions and hardware.
+- **Shader Caching:** Reduces compilation times and stuttering during gameplay.
+- **Modding and Development:** Provides access to the project's source code and technical documentation, allowing modders and developers to explore the game's systems, create modifications and contribute improvements.
 
-Original game assets come from your own copy of Until Dawn. See the [Technical Overview](docs/TECHNICAL_OVERVIEW.md) for more details.
+The original game files are provided by your own legally obtained PS4 copy of Until Dawn.
+
+For more technical information, including the game's architecture, memory, graphics and file formats, see the [Technical Overview](https://github.com/SuperCatElvis/UntilDawn_PC/blob/main/docs/TECHNICAL_OVERVIEW.md).
 
 ## Future development
 
