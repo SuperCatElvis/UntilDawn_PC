@@ -127,7 +127,7 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 | Operating system | Windows 10 or 11, 64-bit |
 | Processor | Intel Core 4th generation (Haswell) or newer, or AMD Ryzen or newer |
 | Memory | 16 GB RAM recommended |
-| Graphics card | Vulkan 1.3 compatible GPU with the required extensions |
+| Graphics card | 6GB VRAM minimum, Vulkan 1.3 compatible GPU with the required extensions |
 | Storage | Approximately 50 GB for the game, plus space for shader caching |
 | Game | Until Dawn PS4, CUSA02636, update 1.03 |
 
