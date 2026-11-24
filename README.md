@@ -61,34 +61,6 @@ See the [v0.4.1 changelog](docs/releases/v0.4.1.md).
 
 See the [v0.4.0 changelog](docs/releases/v0.4.0.md) for details (also `CHANGELOG_v0.4.0.md` in the download).
 
-### Previously in v0.3.2
-
-v0.3.2 is a hotfix for v0.3.1:
-
-- Fixed the black, flickering screen on AMD graphics cards ([issue #5](https://github.com/SuperCatElvis/UntilDawn_PC/issues/5)); fix contributed by [Pedro-Castro31](https://github.com/Pedro-Castro31).
-- Fixed the stranger's clothing disappearing in Chapter 5 (simulated cloth could break after a few seconds).
-
-See the [v0.3.2 changelog](docs/releases/v0.3.2.md) for details.
-
-### Previously in v0.3.1
-
-- Fixed see-through and depth-faded surfaces, including the black icicles, the solid liquid in the "strange skull" clue jar, the squares on the cable car windows in Chapter 1 and a pale glow along the edges of hair.
-- Fixed draws that were left out in parts of Chapters 5 and 6.
-- Expanded shader preparation to 6,797 recorded pipelines from a full playthrough of the game.
-
-See the [v0.3.1 changelog](docs/releases/v0.3.1.md) for the full list of changes.
-
-### Previously in v0.3.0
-
-- Added GPU memory coherence to fix stretched character geometry and disappearing lake water.
-- Fixed a crash when loading chapters.
-- Expanded shader preparation to 4,440 recorded pipelines, covering the opening of every chapter.
-- Fixed cinematic letterbox bars and some outdated textures.
-- Improved memory handling and stability.
-- Added the original Halloween Hunt 2015 event as an optional extra.
-
-See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes.
-
 ---
 
 ## Features
@@ -120,7 +92,25 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 - Xbox controllers and other XInput-compatible controllers.
 - Keyboard and mouse support, including mouse aiming.
 
-### Languages
+### Regional Compatibility and Languages
+
+| Game ID | Region | Voice acting and text | Text only | Status |
+|---|---|---|---|---|
+| CUSA02636 | Europe 2 | English, Spanish, Portuguese, Russian, Polish | Danish, Finnish, Norwegian, Swedish | **Supported** |
+| CUSA00194 | Europe 1 | English, French, German, Italian | Dutch, Turkish | **Supported** |
+| CUSA00359 | Americas | English, French, Latin American Spanish, Brazilian Portuguese (unverified) | To be confirmed | Experimental |
+| CUSA01913 | United Kingdom | English | To be confirmed | Experimental |
+| CUSA00902 | Japan | Japanese (unverified) | To be confirmed | Experimental |
+| CUSA01423 | Asia | English | Korean, Traditional Chinese, Simplified Chinese (voice acting unverified) | Experimental |
+
+**Compatibility status:**
+
+- **Supported:** Tested and confirmed compatible with update 1.03.
+- **Experimental:** Recognised but requires further compatibility and language testing.
+
+All editions require update **1.03**. The included Language Importer is designed to support all regional editions.
+
+See the [Regional Compatibility Guide](docs/COMPATIBILITY.md) and [Language Packs Guide](docs/LANGUAGE_PACKS.md) for more information.
 
 - All 20 of the game's languages can be chosen in `Config\settings.ini`, by name or code (`language = french` or `fr`).
 - Languages of your own edition work at once; languages from a second edition you own can be added once with the **Language Importer**. See the [Language Packs guide](docs/LANGUAGE_PACKS.md).
