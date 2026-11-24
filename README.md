@@ -32,6 +32,27 @@ This does **not** yet resolve all crashes on PCs with 16 GB RAM.
 
 See the [full v0.4.1 changelog](docs/releases/v0.4.1.md). Older changes are covered in the [v0.4.0](docs/releases/v0.4.0.md), [v0.3.2](docs/releases/v0.3.2.md), [v0.3.1](docs/releases/v0.3.1.md) and [v0.3.0](docs/releases/v0.3.0.md) changelogs.
 
+### v0.5.0 Currently In Progress
+
+Development of v0.5.0 is continuing, with a range of improvements and new features already implemented.
+
+**Completed Improvements**
+- **Language Pack Installer** – Added support for installing additional language packs.
+- **Additional Languages** – Expanded language support beyond the default English version.
+- **Automatic Updater** – Added automatic update functionality.
+- **Depth of Field Setting** – Added an option to control depth of field.
+- **Low-Memory Optimisations** – Introduced automatic optimisations for systems with limited memory.
+- **Memory Management** – Improved memory handling and resource management.
+- **Performance Improvements** – CPU optimisations and reduced processing bottlenecks.
+- **Improved Audio** – Fixed audio playback issues and clipping.
+- **Controller Improvements** – Further improvements to controller handling.
+- **Bug Fixes** – Fixed various issues, including the Dr. Hill book interaction.
+
+**Ongoing Development**
+- Further renderer and graphics pipeline optimisation.
+- Continued CPU and multithreading improvements.
+- Additional stability, performance and memory optimisations.
+
 ## Features
 
 - The original PS4 story, chapters and endings.
