@@ -11,7 +11,7 @@ The game is playable from start to finish, although development is still ongoing
 > **This is still a work-in-progress.** Expect occasional crashes, graphical issues, frame-rate drops and shader compilation stutters. Some demanding scenes still run below 30 FPS. Improvements to stability, performance and compatibility are ongoing.
 
 > [!IMPORTANT]
-> **You must provide your own legally obtained copy of Until Dawn (2015) for PlayStation 4 — CUSA02636 or CUSA00194 (Europe) — with update 1.03 applied.** Other editions: see `COMPATIBILITY.txt`.
+> **You must provide your own legally obtained copy of Until Dawn (2015) for PlayStation 4 — CUSA02636 or CUSA00194 (Europe) — with update 1.03 applied.** Other editions: see the [compatibility list](docs/COMPATIBILITY.md).
 >
 > No original game files are included with this project.
 
@@ -23,19 +23,21 @@ This is an unofficial fan project and is not affiliated with Sony Interactive En
 
 **[Download the latest release](https://github.com/SuperCatElvis/UntilDawn_PC/releases/latest)**
 
-**Current version: [v0.5.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.5.0)** — Release date: (to be filled in on release)
+**Current version: [v0.5.0](https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.5.0)** — Release date: 25 November 2026
 
 Download `UntilDawn_PC_v0.5.0.zip` from the release's Assets section.
 
-The download includes the program, shader list, Language Importer, updater, compatibility tester and documentation. Game files are not included.
+The download includes the program (with its built-in updater), shader list, Language Importer, compatibility tester and documentation. Game files are not included.
 
 ### What's new in v0.5.0
 
 - **Cleaner sound:** no more crackling and spikes (mostly heard at 4K); a limiter prevents clipping.
 - **More languages:** the new **Language Importer** (`UDLanguageImporter.exe`) adds the languages of a second PS4 edition you own, and `Config\settings.ini` lists all 20 languages with their codes. Changing language is one line: `language = french` (or `fr`).
-- **CUSA00194 (Europe 1) supported** as well as CUSA02636, with update 1.03.
+- **CUSA00194 (Europe 1) supported** as well as CUSA02636, with update 1.03. CUSA00359 (Americas) is experimental.
 - **Fixed:** Dr Hill's book pages, motion-control drift in "Don't Move" moments, thin bright lines above 1080p, the "TlsAlloc" start-up stop (issue #9), a rare cloth crash in Chapter 5.
-- **Automatic updater** built into `UntilDawn.exe` (on by default; `update_check = 0` turns it off), and a new `depth_of_field` setting in `settings.ini`.
+- **Automatic updater** built into `UntilDawn.exe` (on by default; `update_check = 0` turns it off).
+- **New settings:** `depth_of_field` (turns depth of field, bokeh and motion blur off) and `cpu_compat` (older processors).
+- **Less memory** handed to the graphics driver on PCs where it is tight, and fewer texture reloads on graphics cards under 12 GB.
 
 See the [v0.5.0 changelog](docs/releases/v0.5.0.md) (also `CHANGELOG_v0.5.0.md` in the download).
 
@@ -98,6 +100,7 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 - Save files are stored locally in `savedata\`.
 - Supports the original pre-order bonus chapter, **The Road Not Taken**, if you own the DLC.
 - Supports skipping certain intro videos, recaps and tutorials.
+- Works with **CUSA02636** and **CUSA00194** (Europe), update 1.03; other editions are checked at start and accepted as experimental when their program is the original 01.03 build.
 
 ### Graphics
 
@@ -117,10 +120,14 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 - Xbox controllers and other XInput-compatible controllers.
 - Keyboard and mouse support, including mouse aiming.
 
+### Languages
+
+- All 20 of the game's languages can be chosen in `Config\settings.ini`, by name or code (`language = french` or `fr`).
+- Languages of your own edition work at once; languages from a second edition you own can be added once with the **Language Importer**. See the [Language Packs guide](docs/LANGUAGE_PACKS.md).
+
 ### Extras
 
 - **Halloween Hunt 2015:** Restores the original Halloween screen and hidden pumpkins throughout the game. Disabled by default, but can be enabled anytime by setting `halloween_hunt = 1` in `Config\settings.ini`.
-- **Language Importer:** `UDLanguageImporter.exe` imports the languages of a second PS4 edition you own (for example French, German and Italian from CUSA00194 into a CUSA02636 game, or Spanish, Russian and others the other way round). Languages already in your game are recognised; no game files are included.
 - **Automatic updater:** built into `UntilDawn.exe` and on by default (`update_check = 1`): checks GitHub for a new release at start, asks before installing, verifies the download and keeps your game files, saves, settings and language packs untouched. The only network request is GitHub's "latest release" page; nothing about your PC is sent.
 
 ### Other
@@ -137,15 +144,15 @@ See the [v0.3.0 changelog](docs/releases/v0.3.0.md) for the full list of changes
 | Component | Requirement |
 |---|---|
 | Operating system | Windows 10 or 11, 64-bit |
-| Processor | Intel Core 4th generation (Haswell) or newer, or AMD Ryzen or newer |
+| Processor | Intel Core 4th generation (Haswell) or newer, or AMD Ryzen or newer (older CPUs: see `cpu_compat` below) |
 | Memory | 16 GB RAM recommended |
 | Graphics card | Vulkan 1.3 compatible GPU with the required extensions |
 | Storage | Approximately 50 GB for the game, plus space for shader caching |
-| Game | Until Dawn PS4, CUSA02636 or CUSA00194, update 1.03 (see `COMPATIBILITY.txt`) |
+| Game | Until Dawn PS4, CUSA02636 or CUSA00194, update 1.03 (see the [compatibility list](docs/COMPATIBILITY.md)) |
 
 **Important information:**
 
-- The CPU must support AVX, F16C, BMI1, LZCNT, POPCNT, MOVBE and SSE4.2.
+- The CPU must support AVX, POPCNT and SSE4.2. Processors without F16C, BMI1, LZCNT or MOVBE (for example Intel Sandy / Ivy Bridge or AMD FX) can use `cpu_compat = 1`; the program says when it is needed.
 - The graphics driver must support `VK_EXT_external_memory_host` and `VK_KHR_push_descriptor`, along with the Vulkan features checked at startup.
 - Keep the Windows page file enabled.
 - NVIDIA GPUs have received the most testing. AMD support has been tested in earlier builds, while Intel GPUs remain largely untested.
@@ -195,7 +202,7 @@ Avoid installing it inside `Program Files`, as the game stores its settings, sav
 
 ### 2. Add your game files
 
-You need a decrypted dump of the original Until Dawn PS4 game, **CUSA02636** or **CUSA00194**, with update **1.03** applied, from your own legally obtained copy. CUSA00359 (Americas) is experimental; see `COMPATIBILITY.txt` for every edition.
+You need a decrypted dump of the original Until Dawn PS4 game, **CUSA02636** or **CUSA00194**, with update **1.03** applied, from your own legally obtained copy. CUSA00359 (Americas) is experimental; see the [compatibility list](docs/COMPATIBILITY.md) for every edition.
 
 Copy the game files into the `Game` folder beside `UntilDawn.exe`.
 
@@ -237,7 +244,9 @@ For more details, see the [Installation Guide](docs/INSTALLATION.md).
 
 ### Updating from an earlier version
 
-If you're updating from v0.4.1 or an earlier release, replace the program files with the new versions.
+**From v0.5.0 on, updates are automatic:** the built-in updater checks for a new release when you start the game, asks before installing, and keeps your game files, saves, settings and language packs untouched. Set `update_check = 0` in `Config\settings.ini` to turn it off.
+
+If you're updating from v0.4.1 or an earlier release, replace the program files with the new versions once by hand.
 
 Make sure to update:
 
@@ -249,7 +258,7 @@ Make sure to update:
 
 **Do not overwrite your existing `Game\`, `savedata\` or `Config\settings.ini`.**
 
-Your game files, saves and settings will carry over. New settings are added to your `settings.ini` with their defaults on the first start, and its language notes are updated; your own values are kept. From v0.5.0 on, the built-in updater does this for you (`update_check = 1`, the default). As after every update, the first start prepares the shaders once more.
+Your game files, saves and settings will carry over. New settings are added to your `settings.ini` with their defaults on the first start, and its language notes are updated; your own values are kept. As after every update, the first start prepares the shaders once more.
 
 ---
 
@@ -268,9 +277,11 @@ Some useful options include:
 | `shader_preparation` | Controls shader preparation before gameplay. Enabled by default. |
 | `gpu_coherence` | Keeps CPU and GPU memory synchronised. Enabled by default; set to `0` to disable. |
 | `halloween_hunt` | Enables the original Halloween Hunt 2015 event when set to `1`. |
+| `depth_of_field` | `1` (default) as on the PS4; `0` turns depth of field, bokeh and motion blur off. |
 | `language` | `auto` (English) or any of the 20 languages by name or code, e.g. `french` or `fr`. The file lists them all, with the editions they come from. |
 | `rs_depth_max` | `auto` (default) fixes thin lines above 1080p. |
 | `low_driver_memory` | `auto` (default) hands less memory to the graphics driver on PCs where it is tight. |
+| `cpu_compat` | `1` = support for older processors (Intel Sandy / Ivy Bridge, AMD FX). Only needed if the program says so. |
 | `update_check` | `1` (default) = check GitHub for a new release at start and ask before installing; `0` = off. |
 | `renderer_thread` | Controls whether the renderer runs on a separate thread. |
 | `gpu` | Selects which graphics card the game uses. |
@@ -323,6 +334,9 @@ The project is still in development, and some issues remain.
 - Some graphical issues remain, including lighting problems, flickering UI elements and occasional character distortions.
 - Certain Chapter 10 graphical problems have not yet been fully re-tested.
 - Some laptops with integrated and dedicated GPUs may experience performance or display issues.
+- Brief graphical issues after a camera cut in the Chapter 5 stranger scene.
+- Compatibility issues on some AMD graphics cards are under investigation ([issue #15](https://github.com/SuperCatElvis/UntilDawn_PC/issues/15)).
+- Editions other than CUSA02636 and CUSA00194, and the languages that only they contain, are experimental.
 - PlayStation controller vibration and light-bar support are not yet available.
 - Keyboard controls cannot currently be remapped.
 - Online and PlayStation Network features are not supported.
@@ -425,6 +439,12 @@ Development is ongoing, with the main priorities being:
 - **Performance:** Improve frame rates and reduce stuttering.
 - **Compatibility:** Expand support for different graphics cards and hardware.
 
+Planned for **v0.5.1**:
+
+- **Exit to Desktop** in the main menu.
+- **Xbox and keyboard button prompts**, switching automatically with the device you use.
+- Further performance improvements.
+
 Other features I'd like to explore in the future include:
 
 - More consistent 60 FPS performance and possibly higher frame rates.
@@ -432,6 +452,7 @@ Other features I'd like to explore in the future include:
 - A proper in-game settings menu.
 - More language options and accessibility improvements.
 - Additional features such as freecam and first-person mode.
+- A fully native renderer for better performance and stability.
 - Better modding support and documentation.
 
 These are future goals and are not guaranteed features or confirmed release plans.
