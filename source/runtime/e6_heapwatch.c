@@ -319,9 +319,33 @@ static void hw_print_traps(void) {
         if (sus && g_hw_explain_fn) g_hw_explain_fn(T->addr - 0x400, T->addr + 0x40, say);
     }
 }
+static u64 g_hw_res_skipped;
+static void hw_forget(u64 lo, u64 hi) {   /* w34_mem --zero-decommit (under the zd lock): pages made fresh read as zero - the watch's last values 0, so it does not read them back into RAM */
+    for (int i = 0; i < g_nhwr; i++) { HwReg *R = &g_hwr[i]; if (R->skip || !R->last || hi <= R->lo || lo >= R->hi) continue;
+        u64 a = lo > R->lo ? lo : R->lo, b = hi < R->hi ? hi : R->hi;
+        for (u64 p = (a - R->lo + 0xFFF) >> 12; p < (b - R->lo) >> 12; p++) R->last[p] = 0; }
+}   /* w34_mem --watch-heap-resident: page reads left out (page not in RAM) */
+static int hw_res_mask(u64 lo, u32 n, u8 *in) {   /* w34_mem: in[k] = page k of [lo, lo + n pages) is in RAM; 0 when not available */
+    static int (WINAPI *qws)(void *, void *, u32); static int looked; static struct { u64 va, attr; } q[512];
+    if (!looked) { looked = 1; void *k = GetModuleHandleA("kernel32.dll"); if (k) qws = (int (WINAPI *)(void *, void *, u32))GetProcAddress(k, "K32QueryWorkingSetEx"); }
+    if (!qws || n > 512) return 0;
+    for (u32 j = 0; j < n; j++) { q[j].va = lo + ((u64)j << 12); q[j].attr = 0; }
+    if (!qws((void *)(i64)-1, q, n * 16)) return 0;
+    for (u32 j = 0; j < n; j++) in[j] = (u8)(q[j].attr & 1);
+    return 1;
+}
 static void hw_scan_region(HwReg *R) {
     u64 n = (R->hi - R->lo) >> 12;
+    static u8 in[512]; u64 in_base = ~0ull; int locked = 0;
     for (u64 k = 0; k < n; k++) {
+        if (g_opt_hw_res && (in_base == ~0ull || k >= in_base + 512)) {   /* w34_mem --watch-heap-resident: per batch of 512 pages */
+            if (locked) { zd_unlock(); locked = 0; }
+            in_base = k; u32 m = n - k < 512 ? (u32)(n - k) : 512;
+            if (g_opt_zero_decommit) { zd_lock(); locked = 1; }   /* (no page of the batch is decommitted while it is read) */
+            int anyzero = 0; for (u32 j = 0; j < m; j++) if (!R->last[k + j]) { anyzero = 1; break; }
+            if (!anyzero || !hw_res_mask(R->lo + (k << 12), m, in)) for (u32 j = 0; j < m; j++) in[j] = 1;
+        }
+        if (g_opt_hw_res && !R->last[k] && !in[k - in_base]) { g_hw_res_skipped++; continue; }   /* last seen zero and not in RAM: unchanged */
         if (coh_stale4k(R->lo + (k << 12))) continue;   /* t165: a GPU-held page (reading it would copy it back) */
 #ifdef HAVE_WBG_GUARDED
         if (g_wbg_guarded_fn && g_wbg_guarded_fn(R->lo + (k << 12))) continue;   /* w3_perf: guarded under label policy 4 (reading it would open it) */
@@ -348,6 +372,7 @@ static void hw_scan_region(HwReg *R) {
                 char b[160]; Sb t = {b, 0, sizeof b}; sb_s(&t, "    lump-repair: page start "); sb_x(&t, p); sb_s(&t, " set from eboot+"); sb_x(&t, v - (u64)g_eboot.base);
                 sb_s(&t, " to +0x10 by the scanner (flip "); sb_d(&t, (i64)g_plat_frame); sb_s(&t, ")\n"); if (g_lump_repaired_scan <= 40) say(b); } }
     }
+    if (locked) zd_unlock();
 }
 static void hw_thread(void *arg) {
     (void)arg;
@@ -365,7 +390,7 @@ static void hw_thread(void *arg) {
                 /* regions registered while the game runs (a new 64 MB lump arena, say) start from 0, as fresh memory does:
                    the first pass then classifies what was written before it saw the region (the two crashes of STATUS 46
                    were in arenas created a few flips earlier, and their bad values were taken in as the baseline) */
-                for (u64 k = 0; k < n; k++) R->last[k] = g_hw_scans || coh_stale4k(R->lo + (k << 12)) ? 0 : *(volatile const u64 *)(R->lo + (k << 12));
+                for (u64 k = 0; k < n; k++) { u64 v0 = 0; if (!(g_hw_scans || coh_stale4k(R->lo + (k << 12)))) { if (g_opt_hw_res) { u8 one = 1; if (g_opt_zero_decommit) zd_lock(); if (!hw_res_mask(R->lo + (k << 12), 1, &one) || one) v0 = *(volatile const u64 *)(R->lo + (k << 12)); if (g_opt_zero_decommit) zd_unlock(); } else v0 = *(volatile const u64 *)(R->lo + (k << 12)); } R->last[k] = v0; }   /* (w34_mem --watch-heap-resident: pages out of RAM read as 0, as never-used pages do) */
                 g_hw_pages += n; }
             g_nhwr++;
         }

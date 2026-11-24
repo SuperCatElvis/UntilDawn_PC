@@ -1,0 +1,14 @@
+LIBRARY winhttp.dll
+EXPORTS
+WinHttpOpen
+WinHttpSetTimeouts
+WinHttpConnect
+WinHttpOpenRequest
+WinHttpSendRequest
+WinHttpReceiveResponse
+WinHttpQueryHeaders
+WinHttpQueryDataAvailable
+WinHttpReadData
+WinHttpCloseHandle
+WinHttpSetOption
+WinHttpQueryOption

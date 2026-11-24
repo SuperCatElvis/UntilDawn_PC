@@ -8,7 +8,12 @@ typedef signed char i8;
 typedef int i32;
 typedef long long i64;
 #define SYSV __attribute__((sysv_abi))
-#define UD_VERSION "0.4.1"   /* the release this program is (log, file properties, compatibility test) */
+#define UD_VERSION "0.5.0"   /* the release this program is (log, file properties, compatibility test) */
+/* w28_int: build kind. 1 = a development build (not a release): the updater never checks for, installs over or restores
+   such a program (ud_update_main.h, ud_update_hook). A release sets 0 and a plain version number. UD_BUILD_KIND_MARK is
+   stored in the program file and searched for by ud_update.exe. */
+#define UD_DEV_BUILD 0
+#define UD_BUILD_KIND_MARK "UD-BUILD-KIND=" "release"
 
 static u64 g_main_va;
 
@@ -146,6 +151,7 @@ __declspec(dllimport) int WINAPI TerminateProcess(void *, u32);
 __declspec(dllimport) void *WINAPI AddVectoredExceptionHandler(u32, void *);
 __declspec(dllimport) u32 WINAPI TlsAlloc(void);
 __declspec(dllimport) int WINAPI TlsSetValue(u32, void *);
+__declspec(dllimport) int WINAPI TlsFree(u32);   /* issue #9 (ud_compat's slot check) */
 __declspec(dllimport) void *WINAPI CreateThread(void *, u64, void *, void *, u32, u32 *);
 __declspec(dllimport) u32 WINAPI WaitForSingleObject(void *, u32);
 __declspec(dllimport) void WINAPI Sleep(u32);
@@ -155,6 +161,86 @@ __declspec(dllimport) int WINAPI QueryPerformanceFrequency(i64 *);
 /* msvcrt */
 void *malloc(size_t); void free(void *); void *calloc(size_t, size_t); void *realloc(void *, size_t);
 void *_aligned_malloc(size_t, size_t); void _aligned_free(void *);
+/* w20_mem v0.5 --alloc-log (diagnostic, default off): our own C-heap allocations of 1 MB and more, by source place (file:line):
+   live bytes / count, peak, total made - long-lived tables, growth, leaks. Small allocations pass straight through (one branch).
+   The table and the lock are only touched when the option is on. */
+static volatile int g_opt_alloclog;
+typedef struct { const char *f; int l; u64 live, peak, nlive, n, bytes; } AlSite;
+enum { AL_SITES = 256, AL_BLK = 16384, AL_MIN = 1u << 20 };
+static AlSite g_als[AL_SITES]; static int g_nals; static volatile int g_al_spin;
+static struct { void *p; u64 n; u16 site; } g_alb[AL_BLK]; static u64 g_al_live, g_al_peak, g_al_dropped;
+static void al_lock(void) { while (__atomic_exchange_n(&g_al_spin, 1, __ATOMIC_ACQUIRE)) { while (__atomic_load_n(&g_al_spin, __ATOMIC_RELAXED)) __builtin_ia32_pause(); } }
+static void al_unlock(void) { __atomic_store_n(&g_al_spin, 0, __ATOMIC_RELEASE); }
+static u32 al_h(void *p) { return (u32)(((u64)p >> 12) * 0x9E3779B97F4A7C15ull >> 50) & (AL_BLK - 1); }
+static void al_add(void *p, u64 n, const char *f, int l) {   /* (lock held) */
+    int s = -1; for (int i = 0; i < g_nals; i++) if (g_als[i].l == l && g_als[i].f == f) { s = i; break; }
+    if (s < 0) { if (g_nals >= AL_SITES) { g_al_dropped++; return; } s = g_nals++; g_als[s].f = f; g_als[s].l = l; }
+    u32 h = al_h(p), k = 0; while (g_alb[h].p && k < AL_BLK) { h = (h + 1) & (AL_BLK - 1); k++; }
+    if (k == AL_BLK) { g_al_dropped++; return; }
+    g_alb[h].p = p; g_alb[h].n = n; g_alb[h].site = (u16)s;
+    AlSite *A = &g_als[s]; A->live += n; A->nlive++; A->n++; A->bytes += n; if (A->live > A->peak) A->peak = A->live;
+    g_al_live += n; if (g_al_live > g_al_peak) g_al_peak = g_al_live;
+}
+static void al_del(void *p) {   /* (lock held) linear probing with backward-shift deletion */
+    u32 i = al_h(p), k = 0;
+    while (g_alb[i].p != p) { if (!g_alb[i].p || ++k >= AL_BLK) return; i = (i + 1) & (AL_BLK - 1); }
+    AlSite *A = &g_als[g_alb[i].site]; A->live -= g_alb[i].n; A->nlive--; g_al_live -= g_alb[i].n;
+    u32 j = i;
+    for (;;) {
+        g_alb[i].p = 0;
+        for (;;) { j = (j + 1) & (AL_BLK - 1); if (!g_alb[j].p) return;
+            u32 h = al_h(g_alb[j].p);   /* move j back to i unless its home lies cyclically in (i, j] */
+            if (i <= j ? (i < h && h <= j) : (i < h || h <= j)) continue;
+            break; }
+        g_alb[i] = g_alb[j]; i = j;
+    }
+}
+static void *ud_malloc_t(size_t n, const char *f, int l) { void *p = malloc(n); if (p && g_opt_alloclog && n >= AL_MIN) { al_lock(); al_add(p, n, f, l); al_unlock(); } return p; }
+static void *ud_calloc_t(size_t a, size_t b, const char *f, int l) { void *p = calloc(a, b); if (p && g_opt_alloclog && a * b >= AL_MIN) { al_lock(); al_add(p, (u64)a * b, f, l); al_unlock(); } return p; }
+static void *ud_realloc_t(void *o, size_t n, const char *f, int l) {
+    if (!g_opt_alloclog) return realloc(o, n);
+    void *p = realloc(o, n);
+    if (p || !n) { al_lock(); if (o) al_del(o); if (p && n >= AL_MIN) al_add(p, n, f, l); al_unlock(); }
+    return p;
+}
+/* w20_mem v0.5 --lean-tables (default off): the renderer's flat per-64-KB-page tables over the 300 GB page-table window (coherence,
+   read guard, GPU-write prediction, read mirror, region / shadow indexes: ~0.3 GB of calloc'd, i.e. committed, memory of which only
+   the parts for addresses in use are ever touched) are only RESERVED; a 64 KB piece is committed (zero-filled) by the exception handler
+   the first time it is read or written (lean_fault). Less commit charge; RAM in use unchanged (untouched pages were never resident). */
+__declspec(dllimport) int WINAPI VirtualFree(void *, u64, u32);   /* (also declared below) */
+static int g_opt_lean_tables;
+typedef struct { u64 lo, hi; } LeanTab;
+enum { LEAN_MAX = 64 };
+static LeanTab g_lean[LEAN_MAX]; static volatile int g_nlean; static volatile u64 g_lean_commits, g_lean_bytes, g_lean_fail;
+static void *lean_calloc(u64 n, u64 sz) {
+    u64 b = n * sz;
+    if (!g_opt_lean_tables || b < (4u << 20)) return calloc(n, sz);
+    b = (b + 0xFFFF) & ~0xFFFFull;
+    int i = __atomic_fetch_add(&g_nlean, 1, __ATOMIC_ACQ_REL);
+    if (i >= LEAN_MAX) { __atomic_sub_fetch(&g_nlean, 1, __ATOMIC_ACQ_REL); return calloc(n, sz); }
+    void *p = VirtualAlloc(0, b, 0x2000, 0x04);   /* MEM_RESERVE (protection used when committed) */
+    if (!p) { g_lean[i].lo = g_lean[i].hi = 0; return calloc(n, sz); }
+    __atomic_add_fetch(&g_lean_bytes, b, __ATOMIC_RELAXED);
+    g_lean[i].lo = (u64)p; __atomic_store_n(&g_lean[i].hi, (u64)p + b, __ATOMIC_RELEASE);
+    return p;
+}
+static int lean_fault(u64 a) {   /* (exception handler, any thread) */
+    int n = __atomic_load_n(&g_nlean, __ATOMIC_ACQUIRE); if (n > LEAN_MAX) n = LEAN_MAX;
+    for (int i = 0; i < n; i++) { u64 hi = __atomic_load_n(&g_lean[i].hi, __ATOMIC_ACQUIRE);
+        if (a >= g_lean[i].lo && a < hi) {
+            u64 pg = a & ~0xFFFFull;
+            if (VirtualAlloc((void *)pg, 0x10000, 0x1000, 0x04) != (void *)pg) { __atomic_add_fetch(&g_lean_fail, 1, __ATOMIC_RELAXED); return 0; }
+            __atomic_add_fetch(&g_lean_commits, 1, __ATOMIC_RELAXED); return 1; } }
+    return 0;
+}
+static int lean_owns(void *p) { int n = __atomic_load_n(&g_nlean, __ATOMIC_ACQUIRE); if (n > LEAN_MAX) n = LEAN_MAX; for (int i = 0; i < n; i++) if ((u64)p == g_lean[i].lo && g_lean[i].hi) return i + 1; return 0; }
+static void ud_free_t(void *p) {
+    if (p && g_nlean) { int i = lean_owns(p); if (i) { g_lean[i - 1].hi = 0; VirtualFree(p, 0, 0x8000); return; } }
+    if (p && g_opt_alloclog) { al_lock(); al_del(p); al_unlock(); } free(p); }
+#define malloc(n) ud_malloc_t((n), __FILE__, __LINE__)
+#define calloc(a, b) ud_calloc_t((a), (b), __FILE__, __LINE__)
+#define realloc(p, n) ud_realloc_t((p), (n), __FILE__, __LINE__)
+#define free(p) ud_free_t(p)
 double sin(double), cos(double), tan(double), asin(double), acos(double), atan(double), atan2(double, double);
 double exp(double), log(double), log10(double), pow(double, double), fmod(double, double), sqrt(double);
 double floor(double), ceil(double), sinh(double), ldexp(double, int), modf(double, double *), hypot(double, double);
@@ -338,6 +424,13 @@ static u32 plat_query_span(u64 a, u64 *end) {
     if (VirtualQuery((const void *)a, &mi, sizeof mi) != sizeof mi || mi.state != 0x1000) { *end = a; return 0; }
     *end = mi.base + mi.size; return mi.prot;
 }
+/* w20_mem: what is at a (for the FIXED-mapping stop): allocation base, region base / size, state (0x1000 commit, 0x2000 reserve,
+   0x10000 free), type (0x20000 private, 0x40000 mapped, 0x1000000 image); 0 when the query fails */
+static int plat_query_info(u64 a, u64 *abase, u64 *base, u64 *size, u32 *state, u32 *type) {
+    struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
+    if (VirtualQuery((const void *)a, &mi, sizeof mi) != sizeof mi) return 0;
+    *abase = mi.abase; *base = mi.base; *size = mi.size; *state = mi.state; *type = mi.type; return 1;
+}
 /* t165w: the page's current protection (0: not committed / unknown) */
 static u32 plat_query_prot(u64 a) {
     struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
@@ -401,7 +494,7 @@ static void plat_guard_init(u64 lo, u64 hi) {
         else {   /* t163: something is already there: guard the free parts of the block around it */
             if (g_guard_busy < 4) g_guard_busy_at[g_guard_busy] = a;
             g_guard_busy++;
-            if (a < lo + (u64)GUARD_GAME_SLOTS * GUARD_BLOCK) { if (!g_guard_busy_low) g_guard_busy_low_at = a; g_guard_busy_low++; }   /* w16_rel rc4 */
+            if (a < 0x1200000000ull + (u64)GUARD_GAME_SLOTS * GUARD_BLOCK) { if (!g_guard_busy_low) g_guard_busy_low_at = a; g_guard_busy_low++; }   /* w16_rel rc4 (w20_mem: absolute, so --guard-fixed-maps' lower start adds the early fixed mappings to it) */
             for (u64 q = a; q < a + GUARD_BLOCK; ) {
                 struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
                 if (VirtualQuery((const void *)q, &mi, sizeof mi) != sizeof mi || !mi.size) break;
@@ -600,17 +693,49 @@ static i64 plat_any_dirty(void *base, u64 size) {
 }
 static volatile int g_plat_hard_exit;   /* w13_prep: shader-preparation workers are still inside the driver's compiler: the process ends without unloading the driver under them */
 __declspec(dllimport) void *WINAPI GetCurrentProcess(void);
+__declspec(dllimport) int WINAPI ReadProcessMemory(void *proc, const void *src, void *dst, u64 n, u64 *got);
+/* w20_mem: copy n bytes of this process's memory without faulting (a page made inaccessible meanwhile - Fast Mode guards,
+   coherence holds - makes it fail: 0) */
+static int plat_read_safe(void *dst, const void *src, u64 n) { u64 got = 0; return ReadProcessMemory(GetCurrentProcess(), src, dst, n, &got) && got == n; }
 static void plat_exit(int c) { plat_log_flush(0, 5000, 1); if (g_plat_hard_exit) TerminateProcess(GetCurrentProcess(), (u32)c); ExitProcess((u32)c); }   /* t146: the queued log text first */
 static void plat_sleep_ms(u32 ms) { Sleep(ms); }
-static u32 g_tls_idx;
-static u32 plat_tls_alloc_disp(void) {
-    g_tls_idx = TlsAlloc();
-    if (g_tls_idx >= 64) { plat_write(0, "TlsAlloc returned an index >= 64; gs:[TlsSlots] patch impossible\n"); plat_exit(2); }
-    return 0x1480 + 8 * g_tls_idx;   /* TEB.TlsSlots[idx] */
+/* ---- the game's thread pointer and one extra per-thread slot (issue #9, w24_compat) ----
+   The patched game code reads its thread pointer from a Windows TLS slot. Slots 0..63 live inside the TEB
+   (TEB.TlsSlots, gs:[0x1480 + 8*idx]): one instruction, as before. Programs that inject DLLs (overlays, hooks,
+   RGB / peripheral tools, the graphics driver itself) can use up those 64 before us; TlsAlloc then returns 64..1087,
+   whose values Windows keeps in TEB.TlsExpansionSlots (gs:[0x1780] -> array, entry idx-64; the same storage
+   TlsGetValue / TlsSetValue use, x64 TEB layout unchanged since Windows XP x64). Such a slot is read with two loads
+   (patched sites jump to small stubs, e3_loader.c patch_tls). Slot codes: < 0x80000000 = gs:[code] (inline slot);
+   0x80000000 | byte offset = expansion slot; TLS_SLOT_NONE = no slot.
+   Both indices are taken at the very start of the program (entry), before the display / Vulkan driver DLLs load.
+   --test-tls-burn N (test): N slots are taken first, so ours land at >= 64 on any PC. */
+#define TLS_SLOT_NONE 0xFFFFFFFFu
+static u32 g_tls_idx = TLS_SLOT_NONE, g_tls_extra_idx = TLS_SLOT_NONE, g_tls_burned;
+static u32 tls_code(u32 idx) { return idx < 64 ? 0x1480 + 8 * idx : idx < 64 + 1024 ? 0x80000000u | (8 * (idx - 64)) : TLS_SLOT_NONE; }
+static void plat_tls_reserve(int argc, char **argv) {
+    for (int i = 1; i + 1 < argc; i++) if (str_eq(argv[i], "--test-tls-burn")) {
+        u32 n = (u32)str_to_u64(argv[i + 1]); if (n > 1000) n = 1000;
+        for (u32 k = 0; k < n; k++) if (TlsAlloc() != TLS_SLOT_NONE) g_tls_burned++;
+    }
+    if (g_tls_idx == TLS_SLOT_NONE) g_tls_idx = TlsAlloc();
+    if (g_tls_extra_idx == TLS_SLOT_NONE) g_tls_extra_idx = TlsAlloc();
 }
-static void plat_set_thread_pointer(void *tp) { TlsSetValue(g_tls_idx, tp); }
-/* one more per-thread 8-byte slot the patched game code can address as gs:[disp] (0 = none) */
-static u32 plat_tls_extra_disp(void) { u32 i = TlsAlloc(); return i < 64 ? 0x1480 + 8 * i : 0; }
+static u32 plat_tls_alloc_disp(void) {
+    if (g_tls_idx == TLS_SLOT_NONE) g_tls_idx = TlsAlloc();
+    u32 c = g_tls_idx == TLS_SLOT_NONE ? TLS_SLOT_NONE : tls_code(g_tls_idx);
+    if (c == TLS_SLOT_NONE) { plat_write(0, "TlsAlloc found no free thread-local slot (all 1088 used by other programs' DLLs) - the game cannot start\n"); plat_exit(2); }
+    return c;
+}
+static void plat_set_thread_pointer(void *tp) {
+    TlsSetValue(g_tls_idx, tp);
+    if (g_tls_extra_idx != TLS_SLOT_NONE) TlsSetValue(g_tls_extra_idx, 0);   /* (also makes this thread's expansion array exist) */
+}
+/* one more per-thread 8-byte slot for patched game code (slot code as above; 0 = none) */
+static u32 plat_tls_extra_disp(void) {
+    if (g_tls_extra_idx == TLS_SLOT_NONE) g_tls_extra_idx = TlsAlloc();
+    u32 c = g_tls_extra_idx == TLS_SLOT_NONE ? TLS_SLOT_NONE : tls_code(g_tls_extra_idx);
+    return c == TLS_SLOT_NONE ? 0 : c;
+}
 __declspec(dllimport) void *WINAPI TlsGetValue(u32);
 static void *plat_get_thread_pointer(void) { return TlsGetValue(g_tls_idx); }
 
@@ -659,8 +784,10 @@ static int fp_quiet_patch(u8 *ip) {
     return fp_patch_byte(q, (u8)(imm ^ 0x10));   /* the same relation with the other signalling behaviour */
 }
 static int (*g_rsq_bp_fn)(u8 *ctx), (*g_rsq_ss_fn)(u8 *ctx);   /* t149 --rsqrt-trap (e5_gpu.c) */
+static u64 (*g_isa_trap_fn)(u64 rip);   /* w24_compat: a UD2 at a CPU-compatibility trap site -> its stub (e3_loader.c) */
 static WINAPI long plat_veh(ExcPtrs *ep) {
     u32 code = ep->rec->code;
+    if (code == 0xC0000005 && g_nlean && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && lean_fault(ep->rec->info[1])) return -1;   /* w20_mem v0.5 --lean-tables */
     if (code == 0xC0000005 && g_wbg_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_wbg_fault_fn(ep->rec->info[1], ep->rec->info[0] == 1, *(u64 *)(ep->ctx + CTX_RIP))) return -1;   /* t198 */
     if (code == 0xC0000005 && g_coh_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_coh_fault_fn(ep->rec->info[1], ep->rec->info[0] == 1, *(u64 *)(ep->ctx + CTX_RIP))) return -1;   /* t165 */
     if (code == 0xC0000005 && g_lz_fault_fn && ep->rec->nparams > 1 && ep->rec->info[0] != 8 && g_lz_fault_fn(ep->rec->info[1], ep->rec->info[0] == 1)) return -1;   /* read / write, not execute */
@@ -691,6 +818,7 @@ static WINAPI long plat_veh(ExcPtrs *ep) {
         u64 nr;
         if (try_emulate_extrq((u8 *)*rip, ep->ctx + CTX_XMM0, &nr)) { *rip = nr; return -1; }
         if (try_emulate_rdtsc((u8 *)*rip, (u64 *)(ep->ctx + 0x78), (u64 *)(ep->ctx + 0x88), &nr)) { *rip = nr; return -1; }
+        if (g_isa_trap_fn && (nr = g_isa_trap_fn(*rip)) != 0) { *rip = nr; return -1; }   /* w24_compat */
     }
     if (code == 0x80000003 && g_rsq_bp_fn && g_rsq_bp_fn(ep->ctx)) return -1;   /* t149 --rsqrt-trap */
     if (code == 0x80000003) { note_breakpoint(*rip); *rip += 1; return -1; }
@@ -1119,6 +1247,8 @@ static void plat_disp_moved(void *hw) {
     plat_mon_enum(); int mi = plat_mon_of_window(hw);
     if (rc[2] != g_disp.w || rc[3] != g_disp.h || wr[0] != g_disp.x || wr[1] != g_disp.y) { g_disp.w = rc[2]; g_disp.h = rc[3]; g_disp.cw_req = rc[2]; g_disp.ch_req = rc[3]; g_disp.x = wr[0]; g_disp.y = wr[1]; if (mi >= 0) g_disp.mon = mi; g_disp.changed = 1; }
 }
+__declspec(dllimport) void *WINAPI CreateIconFromResourceEx(const u8 *, u32, int, u32, int, int, u32);
+static void *g_win_icon_big, *g_win_icon_small;   /* w38_rel: set before the window exists (e3_icon.c) */
 static WINAPI u32 plat_window_thread(void *arg) {
     (void)arg;
     void *inst = GetModuleHandleA(0);
@@ -1126,6 +1256,7 @@ static WINAPI u32 plat_window_thread(void *arg) {
     { u8 *z = (u8 *)&wc; for (u64 i = 0; i < sizeof wc; i++) z[i] = 0; }
     wc.cb = sizeof wc; wc.style = 3; wc.proc = (void *)plat_wndproc; wc.inst = inst; wc.cursor = LoadCursorA(0, (const char *)32512); wc.cls = "UD_E5";
     wc.icon = LoadIconA(inst, (const char *)1); wc.sm = wc.icon;   /* the game icon embedded in the exe (resource 1), if present */
+    if (!wc.icon && g_win_icon_big) { wc.icon = g_win_icon_big; wc.sm = g_win_icon_small ? g_win_icon_small : g_win_icon_big; }   /* w38_rel: made from the player's own icon0.png (e3_icon.c) */
     RegisterClassExA(&wc);
     void *hw;
     if (g_win_rs_w) {   /* w2 (--render-scale): one window pixel = one monitor pixel (no DPI stretching by Windows), and a window as large as the
@@ -1192,39 +1323,73 @@ __declspec(dllimport) u32 WINAPI waveOutUnprepareHeader(void *, void *, u32);
 __declspec(dllimport) u32 WINAPI waveOutWrite(void *, void *, u32);
 __declspec(dllimport) u32 WINAPI waveOutReset(void *);
 __declspec(dllimport) u32 WINAPI waveOutClose(void *);
+__declspec(dllimport) u32 WINAPI waveOutGetPosition(void *, void *, u32);
 typedef struct { char *data; u32 len, rec; u64 user; volatile u32 flags; u32 loops; void *next; u64 res; } PlatWaveHdr;
-enum { PLAT_AUDIO_NBUF = 6 };
-typedef struct { void *wo; u32 frames, next; PlatWaveHdr hdr[PLAT_AUDIO_NBUF]; } PlatAudio;
+/* w27_audio: the number of waveOut buffers per port is a setting (--audio-dev-buffers N, 2..32; default 6 as before) */
+enum { PLAT_AUDIO_NBUF = 6, PLAT_AUDIO_NBUF_MAX = 32 };
+static u32 g_plat_audio_nbuf = PLAT_AUDIO_NBUF;
+typedef struct { void *wo; u32 frames, next, nbuf; u64 submitted; PlatWaveHdr hdr[PLAT_AUDIO_NBUF_MAX]; } PlatAudio;
+/* w27_audio (--audio-diag): what one plat_audio_write saw. queued_before: our buffers still queued when it was called (0 after
+   the first = the device had run dry: an underrun); level: samples submitted but not yet played (waveOutGetPosition), -1 unknown */
+typedef struct { u32 queued_before, sleeps, dropped, waited; u64 wait_ticks, max_sleep_ticks; i64 level; } PlatAudioStat;
 static PlatAudio *plat_audio_open(u32 freq, u32 frames) {
     struct __attribute__((packed)) { u16 tag, ch; u32 rate, bps; u16 align, bits, cb; } fmt = { 1, 2, freq, freq * 4, 4, 16, 0 };
-    PlatAudio *a = (PlatAudio *)VirtualAlloc(0, sizeof(PlatAudio) + (u64)PLAT_AUDIO_NBUF * frames * 4, 0x3000, 4);
+    u32 nb = g_plat_audio_nbuf < 2 ? 2 : g_plat_audio_nbuf > PLAT_AUDIO_NBUF_MAX ? PLAT_AUDIO_NBUF_MAX : g_plat_audio_nbuf;
+    PlatAudio *a = (PlatAudio *)VirtualAlloc(0, sizeof(PlatAudio) + (u64)nb * frames * 4, 0x3000, 4);
     if (!a) return 0;
     if (waveOutOpen(&a->wo, 0xFFFFFFFFu, &fmt, 0, 0, 0)) return 0;   /* WAVE_MAPPER, CALLBACK_NULL */
-    a->frames = frames;
+    a->frames = frames; a->nbuf = nb;
     char *buf = (char *)(a + 1);
-    for (int i = 0; i < PLAT_AUDIO_NBUF; i++) {
+    for (u32 i = 0; i < nb; i++) {
         a->hdr[i].data = buf + (u64)i * frames * 4; a->hdr[i].len = frames * 4;
         waveOutPrepareHeader(a->wo, &a->hdr[i], sizeof(PlatWaveHdr));
     }
     return a;
 }
-static void plat_audio_write(PlatAudio *a, const short *lr, u32 frames) {
+/* the blocking part of a write: wait (polling 1 ms sleeps, at most 500) until our next device buffer is free; st->waited = 1 */
+static void plat_audio_wait(PlatAudio *a, PlatAudioStat *st) {
+    PlatWaveHdr *h = &a->hdr[a->next];
+    u32 q = 0; for (u32 i = 0; i < a->nbuf; i++) if (a->hdr[i].flags & 0x10) q++;
+    st->queued_before = q; st->sleeps = 0; st->dropped = 0; st->wait_ticks = 0; st->max_sleep_ticks = 0; st->level = -1; st->waited = 1;
+    struct { u32 type, v, pad; } mt = { 2 /* TIME_SAMPLES */, 0, 0 };
+    if (!waveOutGetPosition(a->wo, &mt, 12) && mt.type == 2) st->level = (i64)(a->submitted - (u64)mt.v);   /* (32-bit sample count: wraps after 24 h) */
+    if (st->level < 0 && st->level != -1) st->level = 0;
+    u64 w0 = plat_ticks();
+    for (int w = 0; (h->flags & 0x10) && w < 500; w++) { u64 s0 = plat_ticks(); Sleep(1); u64 d = plat_ticks() - s0; if (d > st->max_sleep_ticks) st->max_sleep_ticks = d; st->sleeps++; }
+    st->wait_ticks = plat_ticks() - w0;
+}
+static void plat_audio_write2(PlatAudio *a, const short *lr, u32 frames, PlatAudioStat *st) {
     if (!a) return;
     PlatWaveHdr *h = &a->hdr[a->next];
-    for (int w = 0; (h->flags & 0x10) && w < 500; w++) Sleep(1);   /* WHDR_INQUEUE: still playing */
-    if (h->flags & 0x10) return;   /* the device stopped consuming: drop this buffer rather than block the game */
+    if (st) { if (!st->waited) plat_audio_wait(a, st); }
+    else
+        for (int w = 0; (h->flags & 0x10) && w < 500; w++) Sleep(1);   /* WHDR_INQUEUE: still playing */
+    if (h->flags & 0x10) { if (st) st->dropped = 1; return; }   /* the device stopped consuming: drop this buffer rather than block the game */
     if (frames > a->frames) frames = a->frames;
     short *d = (short *)h->data; for (u32 i = 0; i < frames * 2; i++) d[i] = lr[i];
     h->len = frames * 4;
     waveOutWrite(a->wo, h, sizeof(PlatWaveHdr));
-    a->next = (a->next + 1) % PLAT_AUDIO_NBUF;
+    a->submitted += frames;
+    a->next = (a->next + 1) % a->nbuf;
 }
+static void plat_audio_write(PlatAudio *a, const short *lr, u32 frames) { plat_audio_write2(a, lr, frames, 0); }
 static void plat_audio_close(PlatAudio *a) {
     if (!a) return;
     waveOutReset(a->wo);
-    for (int i = 0; i < PLAT_AUDIO_NBUF; i++) waveOutUnprepareHeader(a->wo, &a->hdr[i], sizeof(PlatWaveHdr));
+    for (u32 i = 0; i < a->nbuf; i++) waveOutUnprepareHeader(a->wo, &a->hdr[i], sizeof(PlatWaveHdr));
     waveOutClose(a->wo);
 }
+/* w27_audio (--audio-prio): the calling thread's Windows priority; mmcss = 1: also the "Pro Audio" multimedia class (avrt.dll) */
+__declspec(dllimport) void *WINAPI LoadLibraryA(const char *);
+__declspec(dllimport) int WINAPI GetThreadPriority(void *);
+__declspec(dllimport) void *WINAPI GetCurrentThread(void);
+static int plat_audio_thread_prio(int winprio, int mmcss) {
+    int ok = SetThreadPriority(GetCurrentThread(), winprio) != 0;
+    if (mmcss) { void *m = LoadLibraryA("avrt.dll"); void *(WINAPI *av)(const char *, u32 *) = m ? (void *(WINAPI *)(const char *, u32 *))GetProcAddress(m, "AvSetMmThreadCharacteristicsA") : 0;
+        u32 ix = 0; if (!av || !av("Pro Audio", &ix)) ok = 0; }
+    return ok;
+}
+static int plat_this_thread_prio(void) { return GetThreadPriority(GetCurrentThread()); }
 static int plat_mouse(u32 *x, u32 *y) {
     i32 pt[2], rc[4];
     if (!g_win.hwnd || !GetCursorPos(pt) || !ScreenToClient(g_win.hwnd, pt) || !GetClientRect(g_win.hwnd, rc) || rc[2] <= 0 || rc[3] <= 0) return 0;
@@ -1319,7 +1484,10 @@ static int plat_relaunch(int n, u64 addr) {
     return (int)code;
 }
 static int plat_test_occupy(u64 a) { return VirtualAlloc((void *)a, 0x10000, 0x2000, 0x01) == (void *)a; }   /* (tests: MEM_RESERVE, PAGE_NOACCESS) */
-static void plat_message_box(const char *title, const char *text) { MessageBoxA(0, text, title, 0x10 /* MB_ICONERROR */ | 0x10000 /* MB_SETFOREGROUND */); }
+__declspec(dllimport) u32 WINAPI GetEnvironmentVariableA(const char *, char *, u32);
+/* w38_rel: UD_TEST_NO_DIALOG=1 (unattended tests only) - the message goes to the console instead of a window that would wait */
+static void plat_message_box(const char *title, const char *text) { char e[4]; if (GetEnvironmentVariableA("UD_TEST_NO_DIALOG", e, sizeof e) == 1 && e[0] == '1') { plat_write(0, "[dialog suppressed for the test] "); plat_write(0, title); plat_write(0, "\n"); return; }
+    MessageBoxA(0, text, title, 0x10 /* MB_ICONERROR */ | 0x10000 /* MB_SETFOREGROUND */); }
 /* system facts for the log and the compatibility check (STATUS 88): physical memory, logical processors, Windows version */
 typedef struct { u32 len, load; u64 phys_total, phys_avail, page_total, page_avail, virt_total, virt_avail, virt_ext; } PlatMemStatus;
 __declspec(dllimport) int WINAPI GlobalMemoryStatusEx(PlatMemStatus *);
@@ -1330,7 +1498,7 @@ static u64 plat_phys_mem(void) { PlatMemStatus m; m.len = sizeof m; return Globa
 static u64 plat_commit_avail(void) { PlatMemStatus m; m.len = sizeof m; return GlobalMemoryStatusEx(&m) ? m.page_avail : 0; }
 /* t108: memory for the log - this process (private commit, working set, their peaks) and the system (free RAM, free commit) */
 __declspec(dllimport) void *WINAPI GetProcAddress(void *, const char *);
-typedef struct { u64 priv, priv_peak, ws, ws_peak, sys_avail, sys_total, commit_avail, commit_total; } PlatProcMem;
+typedef struct { u64 priv, priv_peak, ws, ws_peak, sys_avail, sys_total, commit_avail, commit_total, faults; } PlatProcMem;
 static int plat_proc_mem(PlatProcMem *o) {
     for (u32 i = 0; i < sizeof *o; i++) ((u8 *)o)[i] = 0;
     PlatMemStatus m; m.len = sizeof m; if (GlobalMemoryStatusEx(&m)) { o->sys_avail = m.phys_avail; o->sys_total = m.phys_total; o->commit_avail = m.page_avail; o->commit_total = m.page_total; }
@@ -1340,10 +1508,11 @@ static int plat_proc_mem(PlatProcMem *o) {
        QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage */
     struct { u32 cb, faults; u64 ws_peak, ws, qpp_peak, qpp, qnp_peak, qnp, pf, pf_peak, priv; } c = {0};
     c.cb = sizeof c;
-    if (gpmi && gpmi((void *)(i64)-1, &c, sizeof c)) { o->priv = c.priv; o->priv_peak = c.pf_peak; o->ws = c.ws; o->ws_peak = c.ws_peak; return 1; }
+    if (gpmi && gpmi((void *)(i64)-1, &c, sizeof c)) { o->priv = c.priv; o->priv_peak = c.pf_peak; o->ws = c.ws; o->ws_peak = c.ws_peak; o->faults = c.faults; return 1; }
     return 0;
 }
-static u32 plat_ncpu(void) { PlatSysInfo si; for (u32 i = 0; i < sizeof si; i++) ((u8 *)&si)[i] = 0; GetNativeSystemInfo(&si); return si.nproc >= 1 && si.nproc <= 4096 ? si.nproc : 1; }   /* (the current processor group: at most 64) */
+static u32 g_sim_ncpu;   /* w21_perf --sim-cpus N: the logical processor count our rules see (and the process kept on processors 0..N-1) */
+static u32 plat_ncpu(void) { if (g_sim_ncpu) return g_sim_ncpu; PlatSysInfo si; for (u32 i = 0; i < sizeof si; i++) ((u8 *)&si)[i] = 0; GetNativeSystemInfo(&si); return si.nproc >= 1 && si.nproc <= 4096 ? si.nproc : 1; }   /* (the current processor group: at most 64) */
 __declspec(dllimport) void *WINAPI GetProcAddress(void *, const char *);
 static int plat_os_version(u32 *major, u32 *minor, u32 *build) {   /* RtlGetVersion: the real version, not the compatibility-shimmed one */
     void *nt = GetModuleHandleA("ntdll.dll"); if (!nt) return 0;
@@ -1354,7 +1523,7 @@ static int plat_os_version(u32 *major, u32 *minor, u32 *build) {   /* RtlGetVers
 /* t107h: on a CPU with performance and efficiency cores (Intel 12th gen and later), keep a thread on the cores of the
    highest efficiency class (the performance cores). Windows 10+ (CPU sets), looked up at run time. Returns the number
    of logical processors the thread is kept on, 0 when nothing was changed (not a hybrid CPU, or no CPU-set support). */
-static int plat_thread_on_pcores(void *thread) {
+static int plat_thread_on_pcores(void *thread) { if (g_sim_ncpu) return 0;   /* w21_perf --sim-cpus: no hybrid-core placement (a 4-core / 8-thread CPU has none) */
     void *k = GetModuleHandleA("kernel32.dll"); if (!k || !thread) return 0;
     int (WINAPI *gi)(void *, u32, u32 *, void *, u32) = (int (WINAPI *)(void *, u32, u32 *, void *, u32))GetProcAddress(k, "GetSystemCpuSetInformation");
     int (WINAPI *ss)(void *, const u32 *, u32) = (int (WINAPI *)(void *, const u32 *, u32))GetProcAddress(k, "SetThreadSelectedCpuSets");
@@ -1373,7 +1542,7 @@ static int plat_thread_on_pcores(void *thread) {
     return n && ss(thread, ids, n) ? (int)n : 0;
 }
 /* t181f: the efficiency cores of a hybrid CPU (lowest efficiency class); 0 when not hybrid */
-static int plat_thread_on_ecores(void *thread) {
+static int plat_thread_on_ecores(void *thread) { if (g_sim_ncpu) return 0;   /* w21_perf --sim-cpus: no hybrid-core placement (a 4-core / 8-thread CPU has none) */
     void *k = GetModuleHandleA("kernel32.dll"); if (!k || !thread) return 0;
     int (WINAPI *gi)(void *, u32, u32 *, void *, u32) = (int (WINAPI *)(void *, u32, u32 *, void *, u32))GetProcAddress(k, "GetSystemCpuSetInformation");
     int (WINAPI *ss)(void *, const u32 *, u32) = (int (WINAPI *)(void *, const u32 *, u32))GetProcAddress(k, "SetThreadSelectedCpuSets");
@@ -1393,7 +1562,7 @@ static int plat_thread_on_ecores(void *thread) {
    performance cores on a hybrid CPU. 0 when the machine has fewer than 6 cores or the information is unavailable. */
 __declspec(dllimport) u64 WINAPI SetThreadAffinityMask(void *, u64);
 __declspec(dllimport) void *WINAPI GetCurrentThread(void);
-static u64 plat_six_core_mask(void) {
+static u64 plat_six_core_mask(void) { if (g_sim_ncpu) return 0;   /* w21_perf --sim-cpus: no hybrid-core placement (a 4-core / 8-thread CPU has none) */
     void *k = GetModuleHandleA("kernel32.dll"); if (!k) return 0;
     int (WINAPI *gi)(void *, u32, u32 *, void *, u32) = (int (WINAPI *)(void *, u32, u32 *, void *, u32))GetProcAddress(k, "GetSystemCpuSetInformation");
     if (!gi) return 0;
@@ -1406,6 +1575,12 @@ static u64 plat_six_core_mask(void) {
     for (u32 o = 0; o + 24 <= len && n < 6; ) { u32 sz = *(u32 *)(buf + o), ty = *(u32 *)(buf + o + 4); if (sz < 24) break;
         if (ty == 0 && buf[o + 18] == best && *(u16 *)(buf + o + 12) == 0) { u8 lp = buf[o + 14], core = buf[o + 15]; if (!seen[core] && lp < 64) { seen[core] = 1; mask |= 1ull << lp; n++; } } o += sz; }
     return n == 6 ? mask : 0;
+}
+static int plat_sim_cpus(u32 n) {   /* w21_perf --sim-cpus N: the whole process on logical processors 0..N-1 */
+    if (n < 1 || n > 63) return 0; g_sim_ncpu = n;
+    void *k = GetModuleHandleA("kernel32.dll"); if (!k) return 0;
+    int (WINAPI *spa)(void *, u64) = (int (WINAPI *)(void *, u64))GetProcAddress(k, "SetProcessAffinityMask");
+    return spa && spa(GetCurrentProcess(), (1ull << n) - 1) != 0;
 }
 static int plat_thread_affinity(void *h, u64 mask) { return h && mask && SetThreadAffinityMask(h, mask) != 0; }
 static int plat_thread_priority(void *h, int winprio) { return h && SetThreadPriority(h, winprio) != 0; }
@@ -1469,6 +1644,7 @@ void entry(void) {
     static char *argv[256]; int argc = 0;
     char *cl = GetCommandLineA(), *a;
     while (argc < 255 && (a = next_arg(&cl))) argv[argc++] = a;
+    plat_tls_reserve(argc, argv);   /* issue #9: our TLS slots first, before any display / driver / overlay DLL takes them */
     plat_exit(e3_main(argc, argv));
 }
 #else
@@ -1510,9 +1686,11 @@ static void plat_chdir(const char *p) { if (chdir(p)) {} }
 static void plat_message_box(const char *title, const char *text) { fprintf(stderr, "[%s]\n%s\n", title, text); }
 static u64 plat_phys_mem(void) { long pages = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGESIZE); return pages > 0 && ps > 0 ? (u64)pages * (u64)ps : 0; }
 static u64 plat_commit_avail(void) { return plat_phys_mem(); }
-typedef struct { u64 priv, priv_peak, ws, ws_peak, sys_avail, sys_total, commit_avail, commit_total; } PlatProcMem;
+typedef struct { u64 priv, priv_peak, ws, ws_peak, sys_avail, sys_total, commit_avail, commit_total, faults; } PlatProcMem;
 static int plat_proc_mem(PlatProcMem *o) { for (u32 i = 0; i < sizeof *o; i++) ((u8 *)o)[i] = 0; o->sys_total = plat_phys_mem(); return 0; }
-static u32 plat_ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (u32)n : 1; }
+static u32 g_sim_ncpu;
+static u32 plat_ncpu(void) { if (g_sim_ncpu) return g_sim_ncpu; long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (u32)n : 1; }
+static int plat_sim_cpus(u32 n) { g_sim_ncpu = n; return 0; }
 static int plat_thread_on_ecores(void *thread) { (void)thread; return 0; }
 static int plat_thread_on_pcores(void *thread) { (void)thread; return 0; }
 static int plat_os_version(u32 *major, u32 *minor, u32 *build) { *major = 0; *minor = 0; *build = 0; return 0; }
@@ -1539,9 +1717,11 @@ static void *plat_reserve_any(u64 n) { void *p = mmap(0, n, 0, MAP_PRIVATE | MAP
 static void plat_release_rw(void *p, u64 n) { munmap(p, n); }
 static int plat_commit_rw(void *a, u64 n) { return mprotect(a, n, 3) == 0; }
 static u32 plat_query_prot(u64 a) { (void)a; return 0x04; }
+static int plat_query_info(u64 a, u64 *abase, u64 *base, u64 *size, u32 *state, u32 *type) { (void)a; *abase = *base = *size = 0; *state = *type = 0; return 0; }
 static u32 plat_query_span(u64 a, u64 *end) { *end = a + 0x10000; return 0x04; }
 static void plat_stop_lock(void) {} static void plat_stop_unlock(void) {}
 static void *plat_alloc_rwx(u64 n) { void *p = mmap(0, n, 7, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0); return p == MAP_FAILED ? 0 : p; }
+static int plat_read_safe(void *dst, const void *src, u64 n) { (void)dst; (void)src; (void)n; return 0; }   /* w20_mem (Linux test builds: no scan) */
 static int plat_readable(u64 a, u64 n) { (void)a; (void)n; return 0; }   /* (Linux test builds: diagnostics read GPU-visible memory only) */
 static int plat_readable_span(u64 a, u64 *end) { *end = ~0ull; (void)a; return 1; }
 static void *plat_alloc_rw(u64 n) { void *p = mmap(0, n, 3, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0); return p == MAP_FAILED ? 0 : p; }
@@ -1581,6 +1761,7 @@ static void plat_sleep_ms(u32 ms) { usleep(ms * 1000); }
 static __thread u64 g_gs_cell;
 static u32 plat_tls_alloc_disp(void) { return 0; }
 static u32 plat_tls_extra_disp(void) { return 0; }
+static u32 g_tls_idx, g_tls_extra_idx, g_tls_burned;   /* (Windows only; for the log line) */
 static void plat_set_thread_pointer(void *tp) {
     g_gs_cell = (u64)tp;
     syscall(SYS_arch_prctl, ARCH_SET_GS, (unsigned long)&g_gs_cell);
@@ -1720,7 +1901,13 @@ static int plat_key(int vk) { (void)vk; return 0; }
 typedef struct { int dummy; } PlatAudio;   /* Linux harness: no sound device (the caller paces with the timer) */
 static PlatAudio *plat_audio_open(u32 freq, u32 frames) { (void)freq; (void)frames; return 0; }
 static void plat_audio_write(PlatAudio *a, const short *lr, u32 frames) { (void)a; (void)lr; (void)frames; }
+typedef struct { u32 queued_before, sleeps, dropped, waited; u64 wait_ticks, max_sleep_ticks; i64 level; } PlatAudioStat;
+static void plat_audio_write2(PlatAudio *a, const short *lr, u32 frames, PlatAudioStat *st) { (void)a; (void)lr; (void)frames; (void)st; }
+static void plat_audio_wait(PlatAudio *a, PlatAudioStat *st) { (void)a; st->waited = 1; st->queued_before = 0; st->sleeps = 0; st->dropped = 0; st->wait_ticks = 0; st->max_sleep_ticks = 0; st->level = -1; }
 static void plat_audio_close(PlatAudio *a) { (void)a; }
+static u32 g_plat_audio_nbuf = 6;
+static int plat_audio_thread_prio(int winprio, int mmcss) { (void)winprio; (void)mmcss; return 0; }
+static int plat_this_thread_prio(void) { return 0; }
 static int plat_mouse(u32 *x, u32 *y) { (void)x; (void)y; return 0; }
 
 /* ---- E5: writable host files and directory queries (save data) ---- */

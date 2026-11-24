@@ -28,6 +28,7 @@ static int pshot_due(u64 f) { if (g_rp_running && g_npshot) return 1; for (int i
 static int g_opt_nocull;           /* --no-cull: draw back faces too (diagnostic) */
 static int g_opt_dumpimg = -1, g_dumpimg_last = -1, g_dumpimg_rt;   /* image dump: first frame, last frame (-1: just the first), render targets only */
 static int g_opt_no_gpu_diag;         /* --no-gpu-diag: no checkpoint markers / device-fault reporting */
+static int g_opt_amd_markers; static volatile u32 *g_amk_map; static u64 g_amk_last_log;   /* w32_issues --gpu-markers-amd (default off): VK_AMD_buffer_marker breadcrumbs where NV checkpoints are missing */
 static int g_opt_no_pred;             /* --no-predication: ignore the game's occlusion queries / predicated draws (the old behaviour) */
 static int g_cond_ok, g_pkt_pred;     /* conditional rendering available; the packet being executed has the predicate bit */
 static void gq_init(void);
@@ -65,6 +66,7 @@ static int g_rc_fresh_wseq; static u64 g_rc_wseq_top;   /* t135: --replay-fresh-
 static int g_nrw; static u32 g_rw_w, g_rw_h;   /* replay watch: addresses given; t107b: --replay-watch-size WxH watches every image of that size */
 static u64 g_rw_tex[G2S_MAX_TEX]; static u32 g_rw_texf[G2S_MAX_TEX]; static int g_rw_ntex;   /* t107b: the pixel shader's textures of the draw just made (pixel history) */
 static int g_opt_helpers_auto = 1;   /* t106: --no-helpers-auto = live-mask EXEC in every pixel shader (t52-t105) */
+static int g_opt_rs_depth_max = -1;   /* w30_visual: -1 auto (default: on whenever a render scale other than 1 is used), 1 --rs-depth-max, 0 --no-rs-depth-max / rs_depth_max = 0; see gcn2spv.c EM.w30_fpmax */
 static int g_opt_quad_branch_all = -1;   /* t103: --quad-branch-all / --no-quad-branch-all; -1 = on for every GPU vendor except NVIDIA (G2SIn.quad_branch_all) */
 static int g_opt_float_controls, g_opt_exact_mad;   /* STATUS 88: --float-controls, --exact-mad (gcn2spv.h fp_ctl / exact_mad) */
 static int g_gather_ext_ok;          /* the device has shaderImageGatherExtended (non-constant texel offsets) */
@@ -185,10 +187,47 @@ static int vkr_write_data(u64 a, const u32 *src, u32 n) { (void)a; (void)src; (v
 static void vkr_lw_check(int at_next) { (void)at_next; }
 #else
 #include "vk_common.h"
+/* w21_perf --vram-log (default off): every vkAllocateMemory / vkFreeMemory of ours counted by source line and memory type, reported
+   with the driver's heap figures (issue 7: ~1.5 GB of the VRAM in use was not accounted for by images / VRAM copies / mirror / staging). */
+static int g_opt_vram_log;
+typedef struct { u64 h, size; u32 line, mt; } VaEnt;
+enum { VA_N = 1 << 16, VA_SITES = 128 };
+static VaEnt *g_va; static struct { u32 line, mt; u64 bytes, n, peak; } g_va_site[VA_SITES]; static int g_va_nsite; static u64 g_va_fail;
+static volatile u64 g_va_type[32];   /* bytes now, by memory type */
+static PMutex g_va_m; static int g_va_init;
+static void va_note(u64 h, u64 size, u32 line, u32 mt, int add) {
+    if (!g_va_init) { pm_init(&g_va_m); g_va_init = 1; }
+    pm_lock(&g_va_m);
+    if (!g_va) g_va = (VaEnt *)calloc(VA_N, sizeof(VaEnt));
+    if (g_va) {
+        u32 i = (u32)((h * 0x9E3779B97F4A7C15ull) >> 48) & (VA_N - 1);
+        if (add) { for (u32 n = 0; n < VA_N; n++, i = (i + 1) & (VA_N - 1)) if (!g_va[i].h || g_va[i].h == 1) { g_va[i].h = h; g_va[i].size = size; g_va[i].line = line; g_va[i].mt = mt; break; } }
+        else { for (u32 n = 0; n < VA_N; n++, i = (i + 1) & (VA_N - 1)) { if (!g_va[i].h) break; if (g_va[i].h == h) { size = g_va[i].size; line = g_va[i].line; mt = g_va[i].mt; g_va[i].h = 1; add = -1; break; } } }
+        if (add && mt < 32) { if (add > 0) g_va_type[mt] += size; else g_va_type[mt] -= size; }
+        if (add) { int k = 0; while (k < g_va_nsite && !(g_va_site[k].line == line && g_va_site[k].mt == mt)) k++;
+            if (k == g_va_nsite && k < VA_SITES) { g_va_site[k].line = line; g_va_site[k].mt = mt; g_va_nsite++; }
+            if (k < g_va_nsite) { if (add > 0) { g_va_site[k].bytes += size; g_va_site[k].n++; if (g_va_site[k].bytes > g_va_site[k].peak) g_va_site[k].peak = g_va_site[k].bytes; } else { g_va_site[k].bytes -= size; g_va_site[k].n--; } } }
+    }
+    pm_unlock(&g_va_m);
+}
+static VkResult va_alloc_(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a, VkDeviceMemory *m, u32 line) {
+    VkResult r = (vkAllocateMemory)(d, ai, a, m);
+    if (g_opt_vram_log) { if (r == VK_SUCCESS && m && *m) va_note((u64)(uintptr_t)*m, ai->allocationSize, line, ai->memoryTypeIndex, 1); else g_va_fail++; }
+    return r;
+}
+static void va_free_(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *a) {
+    if (g_opt_vram_log && m) va_note((u64)(uintptr_t)m, 0, 0, 0, 0);
+    (vkFreeMemory)(d, m, a);
+}
+#define vkAllocateMemory(d_, i_, a_, m_) va_alloc_(d_, i_, a_, m_, (u32)__LINE__)
+#define vkFreeMemory(d_, m_, a_) va_free_(d_, m_, a_)
 #include "e6_compat.h"   /* STATUS 88: pipeline-cache header check, SPIR-V capability scan (shared with the host tests) */
 
 static int g_vk_on;
-static int g_vk_nmem_seen;
+#define MTM_END (G2S_PT_BASE + G2S_PT_SIZE)   /* w20_mem (e6_memmap.c) */
+#define MTM_NPG (MTM_END >> 16)
+static int g_opt_cscpu; static u32 *g_ccp_gpu; static volatile int g_ccp_who_cur = 3; static u8 *g_ccp_who;   /* w20_mem --cs-copy-cpu (e6_memmap.c) */
+static int g_vk_nmem_seen; static u32 g_vk_impgen_seen;   /* w20_mem: g_mem_imp_gen seen */
 static void *g_vklog;
 static void vl(const char *s) { if (g_vklog) plat_write(g_vklog, s); }
 static void vl_x(u64 v) { char b[20]; fmt_hex(b, v); vl(b); }
@@ -274,6 +313,7 @@ static int g_opt_rs_movie = 1; static u64 g_n_rs_movie;   /* w3: Bink movie plan
 static void (*g_gfx_mem_report_fn)(void);   /* w4 */
 static int g_opt_rs_ui = 3, g_rs_draw_ui, g_rs_draw_scaled; static u64 g_n_rs_ui_lin, g_n_rs_ui_tgt, g_n_rs_ui_draws;
 #define RS_UI_ADDR(a) (((u64)(a) >> 32) == 0x10)
+static int g_opt_rt_clear_log, g_opt_no_copy_fast;   /* w25_fix (--rt-clear-log): fills that touch a render target without clearing it, embedded-VS draws skipped */
 /* w5 (--render-scale): passes that take the size of a pixel from the game's constants or read the scaled picture at the game's size
    --rs-aa 1 (default): the anti-aliasing pass (FXAA 3.11 quality, PS hash RS_PS_FXAA) gets its 1/width, 1/height constants for the
        PHYSICAL picture, so its edge search steps one physical pixel and its taps lie half a physical pixel apart (with the game's
@@ -392,6 +432,10 @@ static void prof_add(u64 a, u64 b, double ms, u32 verts) {
    the renderer is no longer paced by the game's wait for the GPU, and 8 batches (a quarter of a frame) of lead made it
    wait for a free slot whenever the GPU fell behind in one part of the frame (0.8 ms a frame in the cave). */
 enum { NSLOT = 32, QPS_MAX = 1024, CHUNK = 64 }; static int g_nslot = 8;
+static int g_nslot_req;   /* w28i_16: 0 = automatic (default): 16 batch slots with 8 GB or more of video memory (the largest device-local heap,
+   or --sim-vram-gb) AND the normal 512 MB upload buffer (low system memory mode off), 8 otherwise; --batch-slots N (8..32) sets it by
+   hand. Chosen once at device creation, after the low-memory decision and before the upload / index rings are made (vk_nslot_decide). */
+
 #define QPS (8192u / (u32)g_nslot)   /* t107e: 8 batches in flight (was 4: in the stranger scene the CPU waited 3-4 ms per frame for a free one while the GPU worked through a burst; the staging buffer and index ring grew with it, so each batch keeps its share) */
 /* CHUNK: draws/dispatches per batch handed to the GPU while the frame is still being translated (32 until STATUS 62: 64 was 6 ms faster in the station frame) */
 /* GPU timing. Per-draw timestamps (the "GPU time by shader" table) cost GPU time: a bottom-of-pipe timestamp after every
@@ -463,7 +507,9 @@ static void slot_push(VSlot *S, u64 addr, const void *src, u32 n, int irq) {
    2: at the hand-over, whatever is in flight (measurement only). */
 /* (variables declared before e6_defer.c) policy 3 (t196) = 1 + batches with write-backs to game memory hold the labels */
 /* batch finished on the GPU (called with g_slock held): GPU timings, then the label writes in order */
+static void cschk_done(u64 seq);
 static void slot_complete(VSlot *S) {
+    if (g_opt_cscpu >= 2) cschk_done(S->seq);   /* w20_mem --cs-copy-cpu 2: copies of this batch checked before its labels */
     if (V.qp && S->cb) {   /* batch start / end timestamps (see g_opt_gpu_times) */
         u64 r2[2]; u32 b2 = (u32)(S - g_slot) * QPS + QPS - 2;
         if (vkGetQueryPoolResults(V.dev, V.qp, b2, 2, sizeof r2, r2, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && r2[1] >= r2[0]) {
@@ -661,6 +707,17 @@ static void vk_lost_report(void) {
             for (u64 id = lo; id <= top; id++) { say("      "); ck_say(id); say("\n"); }
         }
         say("    markers issued in total: "); say_dec((i64)g_ck_seq); say("\n");
+    } else if (g_amk_map) {   /* w32_issues --gpu-markers-amd */
+        u32 t32 = g_amk_map[0], b32 = g_amk_map[1]; u64 hi = g_ck_seq & ~0xFFFFFFFFull;
+        u64 top = hi | t32; if (top > g_ck_seq && top >= 0x100000000ull) top -= 0x100000000ull;
+        u64 bot = hi | b32; if (bot > g_ck_seq && bot >= 0x100000000ull) bot -= 0x100000000ull;
+        say("    AMD buffer markers (--gpu-markers-amd): last started "); ck_say(top); say("\n    last finished "); ck_say(bot); say("\n");
+        if (top > bot) {
+            say("    items started on the GPU but not finished (the hang or fault is among these):\n");
+            u64 lo = bot + 1; if (top >= lo + 16) lo = top - 15;
+            for (u64 id = lo; id <= top; id++) { say("      "); ck_say(id); say("\n"); }
+        } else say("    (no item between the two markers: the GPU had finished every marked item; the fault is after the last one or outside a draw)\n");
+        say("    markers issued in total: "); say_dec((i64)g_ck_seq); say("\n");
     } else say("    (no checkpoint support in this driver)\n");
     if (p_vkGetDeviceFaultInfoEXT) {
         VkDeviceFaultCountsEXT fc = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
@@ -750,6 +807,15 @@ static int g_opt_sysheap_log;       /* --sys-heap-log */
    the same way, so it is not supported by evidence). */
 static int g_lowsys_vram_tight; static u64 g_lowsys_vbud, g_lowsys_vsize;
 static u64 g_sim_vram;   /* (t196 --sim-vram-gb, defined below; a tentative definition) */
+static u64 g_sim_vram_drv, g_sim_vram_bud; static int g_opt_no_flashback;   /* w21_perf --sim-vram-driver-mb D / --sim-vram-budget-mb B (with --sim-vram-gb): VRAM use = OUR device-local allocations (--vram-log tracking) + D, budget = B; --no-flashback */
+static u64 va_ours_devlocal(void);
+static u64 g_sim_vram_over;
+static int g_opt_img_evict_block; static u64 g_n_blk_evict; static int vimg_evict_blockwise(void); static int g_opt_lowvram_tex = -1;   /* w28_int: -1 auto (default: on whenever the --vram-fit budgets apply, i.e. cards under 12 GB), 1 on (same condition), 0 off (--no-lowvram-tex / low_vram_textures = 0) */ static u32 g_opt_img_protect; static u32 IMP_BLOCK_MB = 256; static u64 IMP_DEDICATED_MIN = 64ull << 20;   /* w21_perf --sim-vram-overhead-mb M (with --sim-vram-gb): M MB of this card's driver extras left out of the VRAM use (calibration to a smaller card; a model) */
+static u64 va_ours_devlocal(void) {   /* w21_perf: our device-local allocations now (tracked when --vram-log is on) */
+    if (!V.pd) return 0; static VkPhysicalDeviceMemoryProperties mp; static int got; if (!got) { vkGetPhysicalDeviceMemoryProperties(V.pd, &mp); got = 1; }
+    u64 t = 0; for (u32 k = 0; k < mp.memoryTypeCount && k < 32; k++) if (mp.memoryTypes[k].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) t += g_va_type[k];
+    return t;
+}
 static int vramheap_query(u64 *use, u64 *bud, u64 *size) {
     *use = *bud = *size = 0;
     if (!g_has_mem_budget || !V.pd) return 0;
@@ -762,6 +828,9 @@ static int vramheap_query(u64 *use, u64 *bud, u64 *size) {
     if (h == 0xFFFFFFFFu) return 0;
     *use = b.heapUsage[h]; *bud = b.heapBudget[h]; *size = p2.memoryProperties.memoryHeaps[h].size;
     if (g_sim_vram && *size > g_sim_vram) { *bud = *bud > *size - g_sim_vram ? *bud - (*size - g_sim_vram) : 1; *size = g_sim_vram; }   /* (as mem_pressure_tick) */
+    if (g_sim_vram && g_sim_vram_over) *use = *use > g_sim_vram_over ? *use - g_sim_vram_over : 0;   /* w21_perf --sim-vram-overhead-mb */
+    if (g_sim_vram && g_sim_vram_drv) *use = va_ours_devlocal() + g_sim_vram_drv;
+    if (g_sim_vram && g_sim_vram_bud) *bud = g_sim_vram_bud;
     return 1;
 }
 static int g_lowsys_on, g_lowsys_tight; static u64 g_lowsys_budget, g_lowsys_need, g_lowsys_need_low, g_lowsys_peak, g_lowsys_n90, g_lowsys_n100;
@@ -786,7 +855,49 @@ static u64 game_mem_mapped(void) {
     for (int i = 0; i < n; i++) t += g_mem[i].hi - g_mem[i].lo;
     return t;
 }
-/* render thread, at device creation, before the upload ring is made */
+/* w34_mem: low_driver_memory (settings.ini) = auto (default) / 0 / 1; --import-gpu-only / --no-import-gpu-only / --low-driver-memory
+   auto|0|1 on the command line. auto: on only when the w17_mem detection above finds the driver's system-memory budget small
+   (g_lowsys_tight, the same decision v0.4.1 makes for its low system memory mode - not influenced by --low-sys-mem /
+   --no-low-sys-mem); off otherwise, so PCs with a large budget run exactly as before (every mark made before the decision is
+   cleared before the first import). One line in UntilDawn.log says on / off, automatic or set, and why. */
+static void vk_ldm_decide(int have, u64 bud) {
+    static const char *const src[] = {"default", "low_driver_memory in settings.ini", "command line"};
+    say("  low driver memory (w34_mem): ");
+    if (g_opt_imp_gpu_only == 2) {
+        int on = g_lowsys_tight != 0;
+        mem_noimp_settle(on);
+        say(on ? "ON (automatic" : "off (automatic");
+        say(g_ldm_src == 1 ? ", low_driver_memory = auto in settings.ini" : g_ldm_src == 2 ? ", --low-driver-memory auto" : ", default auto"); say("): ");
+        if (on) say(g_lowsys_tight == 2 ? (have ? "small VRAM budget with the system heap near its limit" : "no budget figures from the driver and under 20 GB of RAM")
+                                         : "the graphics driver's system-memory budget is small");
+        else say("the graphics driver's system-memory budget is large enough");
+        if (have && bud) { say(" - budget "); say_dec((i64)(bud >> 20)); say(" MB"); if (g_sim_sys_budget) say(" (simulated: --sim-sys-budget)");
+            say(", needed about "); say_dec((i64)(g_lowsys_need >> 20)); say(" MB = "); say_dec((i64)(g_lowsys_need * 100 / bud)); say(" % (on above 90 %)"); }
+        if (on) { say("; game memory only the processor uses (no PS4 GPU access) is not handed to the driver: "); say_dec((i64)(g_mem_noimp_bytes >> 20)); say(" MB so far"); }
+        else if (g_ldm_cleared) { say("; "); say_dec((i64)g_ldm_cleared); say(" ranges ("); say_dec((i64)(g_ldm_cleared_bytes >> 20)); say(" MB) marked while undecided are imported as usual"); }
+        say("\n");
+        return;
+    }
+    say(g_opt_imp_gpu_only ? "ON (set: " : "off (set: "); say(src[g_ldm_src < 0 || g_ldm_src > 2 ? 0 : g_ldm_src]);
+    if (g_ldm_src == 2) say(g_opt_imp_gpu_only ? ", --import-gpu-only / --low-driver-memory 1" : ", --no-import-gpu-only / --low-driver-memory 0");
+    else if (g_ldm_src == 1) say(g_opt_imp_gpu_only ? " = 1" : " = 0");
+    say("; the automatic choice would be "); say(g_lowsys_tight ? "on" : "off"); say(")\n");
+}
+static void vk_nslot_decide(void) {   /* w28i_16: called right AFTER vk_lowsys_decide (which therefore sees 8 slots, as in w28i_15) */
+    if (g_nslot_req) { g_nslot = g_nslot_req;
+        say("  batch slots: "); say_dec(g_nslot); say(" (set by --batch-slots)\n"); return; }
+    u64 vr = g_sim_vram ? g_sim_vram : g_dev.vram;
+    u64 stage = g_stage_small_req && !g_stage_big_req ? (128ull << 20) : g_stage_mb_req && !g_stage_big_req ? g_stage_mb_req << 20 : (512ull << 20);
+    /* 7.5 GB: cards sold as 8 GB report a device-local heap a little under 8 GiB on some drivers. 16 only with the normal
+       512 MB upload buffer: in low system memory mode (128 MB buffer) 8 keeps each slot's share as before. */
+    int big = vr >= (7680ull << 20), normal = stage == (512ull << 20) && !g_lowsys_on;
+    g_nslot = big && normal ? 16 : 8;
+    say("  batch slots: "); say_dec(g_nslot); say(" (automatic: ");
+    if (!vr) say("video memory size unknown");
+    else { say_dec((i64)(vr >> 20)); say(g_sim_vram ? " MB of video memory (--sim-vram-gb)" : " MB of video memory"); say(big ? ", 8 GB or more" : ", under 8 GB"); }
+    if (big && !normal) { say(g_lowsys_on ? ", but low system memory mode is on (upload buffer " : ", but the upload buffer is not the normal 512 MB ("); say_dec((i64)(stage >> 20)); say(" MB)"); }
+    say(" -> "); say_dec(g_nslot); say("; --batch-slots 8 / 16 sets it by hand)\n");
+}/* render thread, at device creation, before the upload ring is made */
 static void vk_lowsys_decide(void) {
     u64 use, bud, size; int have = sysheap_query(&use, &bud, &size);
     u64 mapped = game_mem_mapped(), ring = (48ull << 20) * (u64)g_nslot / 8;
@@ -824,6 +935,7 @@ static void vk_lowsys_decide(void) {
         if (g_lowsys_vbud) { say("; VRAM budget "); say_dec((i64)(g_lowsys_vbud >> 20)); say(" MB"); if (g_sim_vram) say(" (simulated card)"); }
         say("; Optimised Rendering and GPU optimisations are left as set\n");
     }
+    vk_ldm_decide(have, bud);   /* w34_mem: low_driver_memory = auto follows this decision */
     if (g_lowsys_tight) {
         say("    LOW MEMORY: the graphics driver lets this program keep about "); say_dec((i64)(bud >> 20)); say(" MB in system memory (about half of the PC's RAM)");
         if (g_sim_sys_budget) say(" [simulated]");
@@ -848,13 +960,14 @@ static void vk_lowsys_tick(void) {
         say(" headroom "); say_dec((i64)(vb > vu ? (vb - vu) >> 20 : 0)); say(" MB"); if (g_sim_vram) say(" simulated card"); } }
     say("; low mode "); say(g_lowsys_on ? "on" : "off"); say(", Optimised Rendering "); say(g_fr_req == 1 ? "on" : g_fr_req == 0 ? "off" : "raw options"); say(", GPU optimisations "); say(g_gpuopt_req == 1 ? "on" : g_gpuopt_req == 0 ? "off" : "raw options"); say("\n");
 }
+static void mtm_final(void); static void mtm_init(void);   /* w20_mem (e6_memmap*.c) */
 /* ---------------------------------------------------------------- memory import */
 /* t109: the region of each 64 KB page of the page-table window (index + 1), so finding a region needs no search
    (arenas are now imported in pieces, so there are hundreds of regions) */
 static u16 *g_reg_pg; static u64 g_n_vreg_slow;
 static void reg_pg_set(int idx) {
     VReg *R = &V.reg[idx];
-    if (!g_reg_pg) { g_reg_pg = (u16 *)calloc(G2S_PT_SIZE >> 16, 2); if (!g_reg_pg) return; }
+    if (!g_reg_pg) { g_reg_pg = (u16 *)lean_calloc(G2S_PT_SIZE >> 16, 2); if (!g_reg_pg) return; }
     for (u64 a = R->lo & ~0xFFFFull; a < R->hi; a += 0x10000) if (a >= G2S_PT_BASE && a - G2S_PT_BASE < G2S_PT_SIZE) g_reg_pg[(a - G2S_PT_BASE) >> 16] = (u16)(idx + 1);
 }
 static VReg *vreg_of(u64 a, u64 n) {
@@ -941,12 +1054,23 @@ static void vk_import_regions(void) {
         if (g_dev.max_alloc && (!lim || g_dev.max_alloc < lim)) lim = g_dev.max_alloc;
         g_import_chunk = lim & ~0xFFFFull;
         if (g_import_chunk && g_import_chunk < (64ull << 20)) g_import_chunk = 64ull << 20;   /* (a limit this small is not real; the import will say so) */
+        mtm_init();   /* w20_mem (render thread, device creation: before any mark) */
+        if (g_opt_cscpu && !g_ccp_gpu) { g_ccp_gpu = (u32 *)calloc(MTM_NPG, 4); g_ccp_who = (u8 *)calloc(MTM_NPG, 1); if (!g_ccp_gpu) g_opt_cscpu = 0;
+            vl("  --cs-copy-cpu "); vl_d(g_opt_cscpu); vl(" (w20_mem): the game's compute copies over memory no other GPU work uses run on the CPU (2: checked only)\n"); }
         vl("  import piece limit "); vl_d((i64)(g_import_chunk >> 20)); vl(" MB (device maxBufferSize / maxMemoryAllocationSize)\n");
         if (g_dev.host_align > 4096) { vl("  host import alignment "); vl_x(g_dev.host_align); vl(" is above the 4 KB pages game memory is mapped with\n"); }
     }
     static int done_i;   /* t109: g_mem only grows; ranges before done_i were handled at an earlier call */
     int nm = (int)__atomic_load_n(&g_nmem, __ATOMIC_ACQUIRE);
-    for (int i = done_i; i < nm; i++) {
+    /* w20_mem --import-gpu-only: ranges left out (CPU-only memory) wait in skip[]; one that mem_promote cleared is imported now */
+    static int skip[4096], nskip; static u32 seen_gen; int todo[64], ntodo = 0;
+    u32 gen = __atomic_load_n(&g_mem_imp_gen, __ATOMIC_ACQUIRE);
+    if (gen != seen_gen) { seen_gen = gen;
+        for (int q = 0; q < nskip && ntodo < 64; q++) if (!__atomic_load_n(&g_mem_noimp[skip[q]], __ATOMIC_ACQUIRE)) { todo[ntodo++] = skip[q]; skip[q--] = skip[--nskip]; }
+        if (ntodo == 64) seen_gen--; }   /* (more next time) */
+    for (int ii = -ntodo; ii < nm - done_i; ii++) {
+        int i = ii < 0 ? todo[ii + ntodo] : done_i + ii;
+        if (ii >= 0 && __atomic_load_n(&g_mem_noimp[i], __ATOMIC_ACQUIRE)) { if (nskip < 4096) skip[nskip++] = i; continue; }
         u64 lo0 = g_mem[i].lo, hi0 = g_mem[i].hi;
         int have = 0; for (int k = 0; k < V.nreg; k++) if (V.reg[k].lo == lo0) { have = 1; break; }
         if (have) continue;
@@ -1212,6 +1336,7 @@ static void vkr_init(void) {
     const char *dexts[12] = {"VK_KHR_swapchain", "VK_EXT_external_memory_host", "VK_KHR_push_descriptor"}; u32 ndext = 3;
     int has_ck = !g_opt_no_gpu_diag && vk_has_ext(V.pd, "VK_NV_device_diagnostic_checkpoints");
     int has_fault = !g_opt_no_gpu_diag && vk_has_ext(V.pd, "VK_EXT_device_fault");
+    int has_amk = !g_opt_no_gpu_diag && g_opt_amd_markers && !has_ck && vk_has_ext(V.pd, "VK_AMD_buffer_marker");   /* w32_issues */
     int has_cond = !g_opt_no_pred && vk_has_ext(V.pd, "VK_EXT_conditional_rendering");
     VkPhysicalDeviceConditionalRenderingFeaturesEXT crq = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     if (has_cond) { VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &crq}; vkGetPhysicalDeviceFeatures2(V.pd, &q2); if (!crq.conditionalRendering) has_cond = 0; }
@@ -1219,6 +1344,7 @@ static void vkr_init(void) {
     if (has_fault) { VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &ffq}; vkGetPhysicalDeviceFeatures2(V.pd, &q2); if (!ffq.deviceFault) has_fault = 0; }
     if (has_ck) dexts[ndext++] = "VK_NV_device_diagnostic_checkpoints";
     if (has_fault) dexts[ndext++] = "VK_EXT_device_fault";
+    if (has_amk) dexts[ndext++] = "VK_AMD_buffer_marker";
     if (has_cond) dexts[ndext++] = "VK_EXT_conditional_rendering";
     g_has_mem_budget = vk_has_ext(V.pd, "VK_EXT_memory_budget") && vkGetPhysicalDeviceMemoryProperties2;   /* t109: the driver's per-heap usage and budget (memory report) */
     if (g_has_mem_budget) dexts[ndext++] = "VK_EXT_memory_budget";
@@ -1256,6 +1382,22 @@ static void vkr_init(void) {
             if (g_opt_rs_gen) say("    --rs-generic (w7): the scaled shaders take the ratio from push constants - one set of shaders and pipelines for every scale up to 2\n");
             say("    render scale (t196, --render-scale "); say_dec(g_rs_pct); say("): screen-sized targets and storage images are "); say_dec(n_); say("/"); say_dec(d_); say(" of the game's size (1920x1080 -> ");
             say_dec(rs_up(1920)); say("x"); say_dec(rs_up(1080)); say("); every shader is translated anew for it\n"); } }
+    {   /* w30_visual: tile depth bounds over every physical pixel (gcn2spv.c EM.w30_fpmax) - decided once, before any translation.
+           Needed only when a game pixel covers MORE than one screen-sized-target pixel (render scale num/den > 1, the same
+           in both axes): then the game-resolution depth-maximum passes read one physical pixel of several and can miss
+           the others. The internal resolution is never below the game's 1920x1080 (ud_launch.c k_disp_pct starts at
+           100; a smaller screen gets the 1080p picture filtered down at presentation), so at 1:1 the passes read every
+           pixel and nothing is corrected. A footprint below one pixel would be empty or a neighbour's texel - never used. */
+        int req_ = g_opt_rs_depth_max;
+        int need_ = g_rs_on && g_rs_num > g_rs_den, path_ = g_opt_rs_gen;
+        g_opt_rs_depth_max = need_ && path_ && req_ != 0;
+        say("    tile depth bounds (w30_visual, rs_depth_max / --rs-depth-max): ");
+        if (g_opt_rs_depth_max) { say(req_ < 0 ? "on (automatic: " : "on (rs_depth_max = 1 / --rs-depth-max: "); say("render scale "); say_dec(g_rs_num); say("/"); say_dec(g_rs_den);
+            say(" - more than one screen pixel per game pixel; the game-resolution depth-maximum passes now read every one, no thin lines on faces)\n"); }
+        else if (req_ == 0) say("off (rs_depth_max = 0 / --no-rs-depth-max)\n");
+        else if (!need_) say("off (internal resolution 1920x1080: one screen pixel per game pixel, the depth passes already read every pixel - nothing to correct)\n");
+        else say("off (not available: this render scale uses shaders with the scale built in (above 2x or without --rs-generic))\n");
+    }
     VkPhysicalDeviceVulkan12Features e12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &e13}; e12.bufferDeviceAddress = 1;
     VkPhysicalDeviceFeatures2 ef = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e12};
     ef.features.shaderInt64 = 1; ef.features.shaderStorageImageWriteWithoutFormat = 1; ef.features.shaderStorageImageReadWithoutFormat = 1;
@@ -1277,6 +1419,21 @@ static void vkr_init(void) {
     if (has_ck) { real_vkCmdSetCheckpointNV = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(V.dev, "vkCmdSetCheckpointNV");
                   p_vkGetQueueCheckpointDataNV = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(V.dev, "vkGetQueueCheckpointDataNV");
                   g_ck_on = real_vkCmdSetCheckpointNV && p_vkGetQueueCheckpointDataNV; }
+    if (has_amk) {   /* w32_issues --gpu-markers-amd: 2 x u32 in host memory (cached+coherent preferred: system RAM, readable after a loss) */
+        real_vkCmdWriteBufferMarkerAMD = (PFN_vkCmdWriteBufferMarkerAMD)vkGetDeviceProcAddr(V.dev, "vkCmdWriteBufferMarkerAMD");
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bci.size = 256; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkBuffer b = 0; VkDeviceMemory m = 0; void *p = 0;
+        if (real_vkCmdWriteBufferMarkerAMD && vkCreateBuffer(V.dev, &bci, 0, &b) == VK_SUCCESS) {
+            VkMemoryRequirements mr; vkGetBufferMemoryRequirements(V.dev, b, &mr);
+            u32 mt = vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            if (mt == 0xFFFFFFFFu) mt = vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, mt};
+            if (mt != 0xFFFFFFFFu && vkAllocateMemory(V.dev, &mai, 0, &m) == VK_SUCCESS && vkBindBufferMemory(V.dev, b, m, 0) == VK_SUCCESS && vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
+                ((volatile u32 *)p)[0] = 0; ((volatile u32 *)p)[1] = 0; g_amk_map = (volatile u32 *)p; g_amk_buf = b; g_ck_on = 1;
+            }
+        }
+        if (!g_amk_buf) real_vkCmdWriteBufferMarkerAMD = 0;
+    }
     if (has_fault) { p_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(V.dev, "vkGetDeviceFaultInfoEXT"); g_fault_on = p_vkGetDeviceFaultInfoEXT != 0; }
     real_vkCmdCopyQueryPoolResults = (PFN_vkCmdCopyQueryPoolResults)vkGetDeviceProcAddr(V.dev, "vkCmdCopyQueryPoolResults");
     if (has_cond) { real_vkCmdBeginConditionalRenderingEXT = (PFN_vkCmdBeginConditionalRenderingEXT)vkGetDeviceProcAddr(V.dev, "vkCmdBeginConditionalRenderingEXT");
@@ -1285,7 +1442,7 @@ static void vkr_init(void) {
     say("    pixel-shader branches decided per 2x2 quad (t103): "); say(g_opt_quad_branch_all > 0 ? "every pixel shader" : "only shaders with quad swizzles (NVIDIA default; --quad-branch-all turns it on)"); say("\n");
     say("    32-lane subgroups for cross-lane shaders: "); say(g_dev.sg_ctl ? "requested where the GPU allows it\n" : (g_dev.sg_min == 32 && g_dev.sg_max == 32 ? "not needed (fixed 32-lane subgroups)\n" : "not available on this GPU\n"));
     say("    occlusion queries + predicated draws (ZPass predication): "); say(g_cond_ok ? "on (Vulkan conditional rendering)\n" : "not available - predicated draws always drawn\n");
-    say("    GPU crash diagnostics: checkpoints "); say(g_ck_on ? "on" : "not available"); say(", fault report "); say(g_fault_on ? "on" : "not available"); say("\n");
+    say("    GPU crash diagnostics: checkpoints "); say(g_amk_buf ? "on (AMD buffer markers, --gpu-markers-amd)" : g_ck_on ? "on" : g_opt_amd_markers ? "not available (--gpu-markers-amd: VK_AMD_buffer_marker not offered by this driver)" : "not available"); say(", fault report "); say(g_fault_on ? "on" : "not available"); say("\n");
     { VkFormatProperties fp_; vkGetPhysicalDeviceFormatProperties(V.pd, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp_); VkFormatFeatureFlags ff = fp_.optimalTilingFeatures;
       if (!g_opt_nostencil && (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) && (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) V.ds_fmt = VK_FORMAT_D32_SFLOAT_S8_UINT;
       vl(V.ds_fmt ? "  depth targets: D32 float + 8-bit stencil\n" : "  depth targets: D32 float, no stencil\n"); }
@@ -1317,6 +1474,7 @@ static void vkr_init(void) {
         vkAllocateMemory(V.dev, &mai, 0, &V.umem); vkBindBufferMemory(V.dev, V.ubuf, V.umem, 0);
         vkMapMemory(V.dev, V.umem, 0, mr.size, 0, (void **)&V.umap); mem_name(V.umap, "renderer: per-draw buffer");
         vk_lowsys_decide();   /* w17_mem: may choose the 128 MB ring */
+        vk_nslot_decide();   /* w28i_16: batch slots from the card's video memory and the upload buffer just chosen (before the rings are made below) */
         /* t111: 128 MB (8 batch slots of 16 MB) - t112: 512 MB again by default (t110's behaviour; --stage-128 for the
            smaller ring, an experiment: see stage_tmp / stage_dev) */
         V.stage_size = g_stage_small_req && !g_stage_big_req ? (128ull << 20) : (512ull << 20);
@@ -1458,7 +1616,7 @@ static void vkr_init(void) {
     par_init();   /* t128 */
     vk_import_regions(); g_vk_nmem_seen = g_nmem;
     g_mem_new_hook = vk_preimport;   /* t107: later mappings are imported when they are made */
-    g_mem_report_gpu = vk_mem_report;   /* t109 */ g_mem_pressure_fn = mem_pressure_tick;   /* t194 */
+    g_mem_report_gpu = vk_mem_report;   /* t109 */ g_mem_final_fn = mtm_final;   /* w20_mem */ g_mem_pressure_fn = mem_pressure_tick;   /* t194 */
     g2s_spv_compress = !g_opt_keep_modules;   /* t114: released words kept compressed, so destroyed modules can be made again */
     g_mem_import_hook = vk_preimport_r;   /* t111: lazily committed granules are imported while still read-only */
     vk_scale_budgets();
@@ -1532,7 +1690,7 @@ static void sf_compute_push(void) { g_sf_pc_ep++; }
 static void vk_begin_cb(void) {
     if (V.recording) return;
     g_rd_epoch++; sf_new_cb();
-    if (g_nmem != g_vk_nmem_seen) { g_vk_nmem_seen = g_nmem; T0(); vk_import_regions(); TADD(g_t_import); }
+    if (g_nmem != g_vk_nmem_seen || g_mem_imp_gen != g_vk_impgen_seen) { g_vk_nmem_seen = g_nmem; g_vk_impgen_seen = g_mem_imp_gen; T0(); vk_import_regions(); TADD(g_t_import); }
     vk_lz_traps();   /* t111 */
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, 0, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (g_slot[g_slot_cur].pending) { T0(); slot_wait_idle(g_slot_cur); TADD1(g_t_wait); g_t_slotw += t1_ - t0_; }   /* normally free already: the other slot is the one in flight */
@@ -1607,6 +1765,9 @@ static WbEnt g_wb[32]; static int g_nwb; static u64 g_n_wb, g_n_wb_rows, g_n_wb_
 static void gw_note_at(u64 lo, u64 hi, int line);
 #define gw_note(lo, hi) gw_note_at((lo), (hi), __LINE__)
 static int vk_locate(u64 a, u64 n, VkBuffer *buf, u64 *off);
+/* w20_mem: vk_locate by caller, for --mem-touch-map (which kind of GPU buffer use touches game memory, and how many bytes) */
+enum { BC_IDX, BC_DMA, BC_FILL, BC_CSF, BC_WB, BC_RB, BC_WRD, BC_OTHER, BC_CSS, BC_CSD, BC_N };   /* BC_CSF compute fills, BC_CSS / BC_CSD compute copy source / destination (done as transfers) */
+static int vk_locate_c(int cls, u64 a, u64 n, VkBuffer *buf, u64 *off);
 static void rm_never(u64 lo, u64 hi); static void rm_request(u64 lo, u64 hi); static void rm_note_cpu_write(u64 a);   /* read mirror (STATUS 55) */
 static void rm_unwatch_images(u64 lo, u64 hi); static void sh_note_cpu_write(u64 a);
 static void wb_add(VImg *m, u64 addr, u32 pitch, u32 w, u32 h, u32 bpe) {
@@ -1631,10 +1792,10 @@ static void wb_flush(void) {
         u64 bytes = (u64)e->pitch * (e->h - 1) * (e->bpe / 8) + (u64)e->w * (e->bpe / 8);
         VkBuffer buf; u64 off;
         u32 w = e->w < e->m->w ? e->w : e->m->w, h = e->h < e->m->h ? e->h : e->m->h;
-        if (!vk_locate(e->addr, bytes, &buf, &off)) {   /* t109: across a region end (arena pieces): row by row */
+        if (!vk_locate_c(BC_WB, e->addr, bytes, &buf, &off)) {   /* t109: across a region end (arena pieces): row by row */
             u64 rb = (u64)e->pitch * (e->bpe / 8), wb = (u64)w * (e->bpe / 8); int any = 0;
             for (u32 y = 0; y < h; y++) {
-                if (!vk_locate(e->addr + rb * y, wb, &buf, &off)) { g_n_wb_rowskip++; continue; }
+                if (!vk_locate_c(BC_WB, e->addr + rb * y, wb, &buf, &off)) { g_n_wb_rowskip++; continue; }
                 VkBufferImageCopy bic = {off, e->pitch, 1, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, (i32)y, 0}, {w, 1, 1}};
                 vkCmdCopyImageToBuffer(V.cb, e->m->img, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &bic); any = 1;
             }
@@ -1901,7 +2062,7 @@ static u64 g_sh_budget = 6ull << 30; static int g_sh_min_shift = 20, g_sh_max = 
    stranger scene); they remain for ranges outside the table or longer than 64 pages. */
 static u16 *g_sh_pg;
 static void sh_pg_set(u64 lo, u64 hi, u16 v) {
-    if (!g_sh_pg) { g_sh_pg = (u16 *)calloc(G2S_PT_SIZE >> 16, 2); if (!g_sh_pg) return; }
+    if (!g_sh_pg) { g_sh_pg = (u16 *)lean_calloc(G2S_PT_SIZE >> 16, 2); if (!g_sh_pg) return; }
     for (u64 a = lo; a < hi; a += 0x10000) if (a >= G2S_PT_BASE && a - G2S_PT_BASE < G2S_PT_SIZE) g_sh_pg[(a - G2S_PT_BASE) >> 16] = v;
 }
 static int sh_pg_ok(u64 a, u64 n) { return g_sh_pg && n && n <= (64ull << 16) && a >= G2S_PT_BASE && a + n <= G2S_PT_BASE + G2S_PT_SIZE && a + n > a; }
@@ -1921,7 +2082,10 @@ static int shadow_overlaps_rw(u64 a, u64 n) {   /* GPU-written copies whose RAM 
     return 0; }
 /* buffer + offset for a GPU address range (VRAM copy first, else the imported region); 0 when it straddles */
 static void vk_adopt_new_memory(void);
+#include "e6_memmap.c"   /* w20_mem: --mem-touch-map (which game memory the GPU uses) */
 static int vk_locate(u64 a, u64 n, VkBuffer *buf, u64 *off) {
+    if (g_mtm_pg) mtm_mark(a, a + n, MT_BUF);   /* w20_mem (diagnostic) */
+    if (g_ccp_gpu) cs_mark(a, a + n);   /* w20_mem --cs-copy-cpu: memory other GPU work uses */
     if (__atomic_load_n(&g_nlz, __ATOMIC_ACQUIRE)) { lz_ensure(a, n); vk_adopt_new_memory(); }   /* t111 (--lazy-memory only since t112): a buffer the GPU uses directly must be committed and imported (also what other threads committed since the last look) */
     VShadow *S = shadow_of(a, n); if (S) { *buf = S->buf; *off = a - S->lo; return 1; }
     if (shadow_overlaps(a, n)) return 0;
@@ -2104,11 +2268,43 @@ static int g_opt_ww_probe = 1;   /* t118: 1 by default (t117 measured -0.3 to -0
 static u64 g_ww_vfy_ranges, g_ww_vfy_found, g_ww_vfy_pages;   /* verify: ranges the probe found unwritten, of them the reset scan found written, its pages */
 static int g_ww_mode;        /* this submit */
 static u64 g_ww_calls, g_ww_bytes, g_ww_dirty, g_ww_skipped, g_ww_probes, g_t_ww[5], g_t_wwm[2], g_n_wwm[2], g_ww_nsub;   /* t_wwm: time in the write-tracking calls only, per way */   /* t_ww: CPU-written list, VRAM copies, mirror finished copies, mirror CPU writes, mirror new pages */
+/* w31_perf --ww-probe-span MB (default 0 = off): the probe (written pages without reset) is asked once for a window of
+   MB megabytes from the range's start (inside its imported region), and the answer is kept for the following ranges of
+   the same scan that fall inside the window (at most 2 ms). A range with no page in the kept list skips the reset scan, as
+   with its own probe; a write after the window's probe stays in the OS tracking (no reset was made) and is found at the
+   next scan - the same as a write right after a per-range probe (the existing rule). A range with a written page in the
+   list gets the reset scan as before. Window errors (not one watchable allocation) fall back to the per-range probe;
+   a full answer list covers the window only up to its last page. Fewer system calls: ~500 probes a frame in the prologue. */
+static u32 g_opt_wwspan; static void **g_wws_pg; static i64 g_wws_n; static u64 g_wws_lo, g_wws_hi, g_wws_t, g_n_wws_calls, g_n_wws_hits, g_n_wws_fail;
+enum { WWS_CAP = 16384 };
+static int wws_lookup(u64 lo, u64 n) {   /* 1 = a written page in [lo, lo + n) per the window's answer, 0 = none, -1 = not covered */
+    u64 now = plat_ticks();
+    if (!(g_wws_hi && lo >= g_wws_lo && lo + n <= g_wws_hi && now - g_wws_t < plat_ticks_per_sec() / 500)) {
+        if (!g_wws_pg) { g_wws_pg = (void **)malloc(sizeof(void *) * WWS_CAP); if (!g_wws_pg) { g_opt_wwspan = 0; return -1; } }
+        VReg *R = vreg_of(lo, n); if (!R) return -1;
+        static VReg *bad_; static u64 bad_t_; if (R == bad_ && now - bad_t_ < plat_ticks_per_sec() / 500) return -1;   /* (a window failed in this region just now) */
+        u64 hi = lo + ((u64)g_opt_wwspan << 20); if (hi > R->hi) hi = R->hi; if (hi < lo + n) return -1;
+        g_n_wws_calls++;
+        i64 r = plat_dirty_list((void *)lo, hi - lo, g_wws_pg, WWS_CAP);
+        if (r < 0) { g_n_wws_fail++; g_wws_hi = 0; bad_ = R; bad_t_ = now; return -1; }
+        if (r == WWS_CAP) hi = ((u64)g_wws_pg[r - 1] & ~0xFFFull);   /* (full: complete only below the last page handed back) */
+        g_wws_lo = lo; g_wws_hi = hi; g_wws_n = r; g_wws_t = now;
+        if (lo + n > hi) return -1;
+    }
+    i64 l = 0, h = g_wws_n;   /* first page at or above lo (ascending) */
+    while (l < h) { i64 m = (l + h) / 2; if ((u64)g_wws_pg[m] < lo) l = m + 1; else h = m; }
+    g_n_wws_hits++;
+    return l < g_wws_n && (u64)g_wws_pg[l] < lo + n;
+}
 static i64 ww_scan_reset(u64 lo, u64 n, void **out, u64 max, int pass) {
     u64 t = plat_ticks();
     int unwritten = 0;
+    if (g_ww_mode && pass == 0 && g_opt_wwspan && g_ww_mode != 3) { int w = wws_lookup(lo, n);   /* w31_perf */
+        if (w == 0) { g_ww_probes++; g_ww_skipped++; g_t_wwm[1] += plat_ticks() - t; return 0; }
+        if (w == 1) { g_ww_probes++; goto reset_scan; } }
     if (g_ww_mode && pass == 0) { static void *one[1]; g_ww_probes++; i64 r = plat_dirty_list((void *)lo, n, one, 1);
         if (r == 0) { g_ww_skipped++; if (g_ww_mode != 3) { g_t_wwm[1] += plat_ticks() - t; return 0; } unwritten = 1; g_ww_vfy_ranges++; } }   /* (verify: the reset scan runs anyway) */
+    reset_scan:
     g_ww_calls++; g_ww_bytes += n;
     i64 r = plat_dirty_pages((void *)lo, n, out, max); if (r > 0) g_ww_dirty += (u64)r;
     if (unwritten && r > 0) { g_ww_vfy_found++; g_ww_vfy_pages += (u64)r; }   /* written between the probe and the reset (a race), or a probe that missed */
@@ -2277,8 +2473,10 @@ static void vk_ram_budgets(void) {
     if (rm < g_rm_budget) g_rm_budget = rm;
     vl("  memory budgets for a PC with "); vl_d((i64)(ram >> 20)); vl(" MB of RAM (t194): images at most "); vl_d((i64)(img >> 20)); vl(" MB, VRAM copies "); vl_d((i64)(g_sh_budget >> 20)); vl(" MB, read mirror "); vl_d((i64)(g_rm_budget >> 20)); vl(" MB\n");
 }
+static void mtm_tick(void);   /* w20_mem (e6_memmap_rep.c) */
 static void mem_pressure_tick(u64 sys_avail, u64 commit_avail) {   /* any thread (the housekeeping thread, every 10 s) */
     vk_lowsys_tick();   /* w17_mem */
+    mtm_tick();   /* w20_mem */
     if (g_opt_vram_fit && g_has_mem_budget && V.img_budget && V.pd) {   /* t196: the card is nearly full (other programs use it too) */
         VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
@@ -2288,6 +2486,9 @@ static void mem_pressure_tick(u64 sys_avail, u64 commit_avail) {   /* any thread
         if (hi != 0xFFFFFFFFu) {
             u64 size = p2.memoryProperties.memoryHeaps[hi].size, bud = b.heapBudget[hi], use = b.heapUsage[hi];
             if (g_sim_vram && size > g_sim_vram) bud = bud > size - g_sim_vram ? bud - (size - g_sim_vram) : 1;
+            if (g_sim_vram && g_sim_vram_over) use = use > g_sim_vram_over ? use - g_sim_vram_over : 0;   /* w21_perf */
+            if (g_sim_vram && g_sim_vram_drv) use = va_ours_devlocal() + g_sim_vram_drv;
+            if (g_sim_vram && g_sim_vram_bud) bud = g_sim_vram_bud;
             if (bud && use + (g_lowsys_on ? (768ull << 20) : (384ull << 20)) > bud) {   /* (w17_mem: 768 MB in low system memory mode) */
                 u64 real = img_real_bytes(), want = real - real / 8; if (want < (1536ull << 20)) want = 1536ull << 20;
                 if (want < V.img_budget) { __atomic_store_n(&g_img_budget_req, want, __ATOMIC_RELEASE); g_n_vram_pressure++; } }
@@ -2335,6 +2536,9 @@ static void vk_scale_budgets(void) {
         g_vram_img_cap = img; g_opt_img_budget_real = 1;
         if (sh < g_sh_budget) g_sh_budget = sh;
         if (rm < g_rm_budget) g_rm_budget = rm;
+        if (g_opt_lowvram_tex) {   /* w21_perf --lowvram-tex (default off): the texture-memory set for cards under 12 GB (job_B26) */
+            IMP_BLOCK_MB = 64; IMP_DEDICATED_MIN = 32ull << 20; g_opt_img_evict_block = 1; if (!g_opt_img_protect) g_opt_img_protect = 60;
+            say(g_opt_lowvram_tex < 0 ? "  low-VRAM textures (automatic: card under 12 GB; low_vram_textures = 0 / --no-lowvram-tex turns it off): 64 MB image blocks," : "  low-VRAM textures (w21_perf --lowvram-tex): 64 MB image blocks, block-wise eviction, images used in the last "); say_dec(g_opt_img_protect); say(" frames kept while the driver's VRAM budget has room\n"); }
         vl("  VRAM budgets to fit the card (t196, --vram-fit): images at most "); vl_d((i64)(img >> 20)); vl(" MB (counted as allocated), VRAM copies "); vl_d((i64)(g_sh_budget >> 20)); vl(" MB, read mirror "); vl_d((i64)(g_rm_budget >> 20)); vl(" MB of "); vl_d((i64)(vram_ >> 20)); vl(" MB\n");
     }
 }
@@ -2351,7 +2555,7 @@ static int rm_push(u32 **a, u32 *n, u32 *cap, u32 v) { if (*n == *cap) { u32 nc 
 static int rm_init(void) {
     if (g_rm_st) return 1;
     if (g_opt_no_rm || !V.pt_map) return 0;
-    g_rm_st = (u8 *)calloc(RM_NPG, 1); g_rm_slot = (u32 *)calloc(RM_NPG, 4);
+    g_rm_st = (u8 *)lean_calloc(RM_NPG, 1); g_rm_slot = (u32 *)lean_calloc(RM_NPG, 4);
     if (!g_rm_st || !g_rm_slot) { free(g_rm_st); free(g_rm_slot); g_rm_st = 0; g_rm_slot = 0; g_opt_no_rm = 1; return 0; }
     return 1;
 }
@@ -2420,12 +2624,31 @@ static u32 rm_alloc_slot(void) {
     return (u32)(g_rm_nblk++) << 16;
 }
 /* images whose bytes overlap [lo, hi) lose their "unchanged since the last check" state (CPU writes found here) */
+/* w31_perf --unwatch-index (default off): the unwatch loops below walk a compact copy of every watched image's byte
+   range (16 bytes per image, contiguous) instead of the 4,096 VImg records (cache misses: up to 10 % of the renderer's own
+   code in the prologue, M12 profile). Invariant: every image with watched = 1 has its current [addr, addr + wlen) in
+   g_uw_lo / g_uw_hi (written where watched becomes 1 - tex_track_restart - the only such place; addr / wlen do not change
+   while watched: a move clears watched). Entries may be stale (image unwatched, freed or reused): every candidate is
+   checked on the real record, so exactly the same images lose their state as without the option. */
+static int g_opt_uwix; static u64 g_uw_lo[4096], g_uw_hi[4096];
 static void rm_unwatch_images(u64 lo, u64 hi) {
+    if (g_opt_uwix) {
+        for (int i = 0; i < V.nimg; i++) if (g_uw_hi[i] > lo && g_uw_lo[i] < hi) { VImg *o = &V.img[i];
+            if (o->img && o->watched && o->addr < hi && lo < o->addr + o->wlen) { o->watched = 0; g_uw_hi[i] = 0; } }
+        return; }
     for (int i = 0; i < V.nimg; i++) { VImg *o = &V.img[i]; if (o->img && o->watched && o->addr < hi && lo < o->addr + o->wlen) o->watched = 0; }
 }
 /* t165x (review 6, X2-6): the same for n runs sorted by address (not overlapping) - one pass over the images */
 static void rm_unwatch_runs(const u64 *lo, const u64 *hi, u32 n) {
     if (!n) return;
+    if (g_opt_uwix) {   /* w31_perf: candidates from the compact ranges (the runs' overall span first), checked on the record */
+        u64 slo = lo[0], shi = hi[n - 1];
+        for (int i = 0; i < V.nimg; i++) { u64 ue = g_uw_hi[i]; if (ue <= slo || g_uw_lo[i] >= shi) continue;
+            VImg *o = &V.img[i]; if (!o->img || !o->watched) { g_uw_hi[i] = 0; continue; }
+            u64 a = o->addr, e = o->addr + o->wlen; u32 l = 0, h = n;
+            while (l < h) { u32 m = (l + h) / 2; if (hi[m] <= a) l = m + 1; else h = m; }
+            if (l < n && lo[l] < e) { o->watched = 0; g_uw_hi[i] = 0; } }
+        return; }
     for (int i = 0; i < V.nimg; i++) { VImg *o = &V.img[i]; if (!o->img || !o->watched) continue;
         u64 a = o->addr, e = o->addr + o->wlen; u32 l = 0, h = n;   /* first run whose end is past the image's start */
         while (l < h) { u32 m = (l + h) / 2; if (hi[m] <= a) l = m + 1; else h = m; }
@@ -2748,14 +2971,15 @@ static u8 g_gw_wd[GW_N], g_gw_wd_next;   /* w2: the write is a WRITE_DATA block 
 static void gw_log(u64 lo, u64 hi);
 static void rm_cp_written(u64 lo, u64 hi); static void rm_cp_update(u64 a, const u32 *src, u32 n);
 /* a write by the command processor / copy engine (WRITE_DATA, DMA, query results, write-backs) into RAM: mirrored pages get it too */
-static void gw_note_at(u64 lo, u64 hi, int line) { rm_cp_written(lo, hi); gw_log(lo, hi); if (g_opt_wbg | g_wbg_audit) wbg_note(lo, hi, 1, line); }
+static void ccp_note_write(u64 lo, u64 hi);
+static void gw_note_at(u64 lo, u64 hi, int line) { ccp_note_write(lo, hi); rm_cp_written(lo, hi); gw_log(lo, hi); if (g_opt_wbg | g_wbg_audit) wbg_note(lo, hi, 1, line); }
 /* a shader's store into RAM: its pages are not mirrored any more (the store goes wherever the page table points) */
 static void gw_log_as(u64 lo, u64 hi, const char *who, int ctx);
 /* t165w (review 2, N4): a shader store's range is an upper bound and its command is not recorded yet - for the
    coherence code a write before its command (ctx 1: the CPU's bytes in the range go to VRAM first), not an exact write
    already recorded (ctx 2 left the CPU's bytes the shader never stores out of VRAM, and a copy-back then lost them) */
 static int shadow_overlaps_rw(u64 a, u64 n);
-static void gw_note_shader(u64 lo, u64 hi) { rm_never(lo, hi); gw_log_as(lo, hi, "shader store", 1); if (g_opt_wbg | g_wbg_audit) wbg_note(lo, hi, 2, 0); }
+static void gw_note_shader(u64 lo, u64 hi) { ccp_note_write(lo, hi); rm_never(lo, hi); gw_log_as(lo, hi, "shader store", 1); if (g_opt_wbg | g_wbg_audit) wbg_note(lo, hi, 2, 0); }
 /* add [a, b) to the ranges written back at the end of the batch; the list stays disjoint (merged when ranges overlap or
    touch; when all 8 are used, the new range joins the one it extends least) */
 static void sh_wr_add(VShadow *S, u64 a, u64 b) {
@@ -2965,9 +3189,9 @@ static int coh_init(void) {   /* renderer thread, once the device exists */
     if (!g_coh_mode || !V.dev) return 0;
     static int pm_done; if (!pm_done) { pm_init(&g_coh_m); pm_done = 1; }   /* the lock first */
     u64 np = G2S_PT_SIZE >> 16;
-    u16 *mask = (u16 *)calloc(np, 2); g_coh_seq = (u32 *)calloc(np, 4); g_coh_prot = (u8 *)calloc(np, 1); g_coh_mixed = (u8 *)calloc(np, 1); g_coh_fr = (u32 *)calloc(np, 4); g_coh_run = (u8 *)calloc(np, 1);
-    g_coh_ownf = (u8 *)calloc(np, 1); g_coh_ro = (u16 *)calloc(np, 2); g_coh_pend = (u16 *)calloc(np, 2); g_coh_rr = (u16 *)calloc(np, 2);
-    g_coh_hgen = (u32 *)calloc(np, 4); g_coh_seen = (u16 *)calloc(np, 2); g_coh_seenprot = (u8 *)calloc(np, 1);
+    u16 *mask = (u16 *)lean_calloc(np, 2); g_coh_seq = (u32 *)lean_calloc(np, 4); g_coh_prot = (u8 *)lean_calloc(np, 1); g_coh_mixed = (u8 *)lean_calloc(np, 1); g_coh_fr = (u32 *)lean_calloc(np, 4); g_coh_run = (u8 *)lean_calloc(np, 1);
+    g_coh_ownf = (u8 *)lean_calloc(np, 1); g_coh_ro = (u16 *)lean_calloc(np, 2); g_coh_pend = (u16 *)lean_calloc(np, 2); g_coh_rr = (u16 *)lean_calloc(np, 2);
+    g_coh_hgen = (u32 *)lean_calloc(np, 4); g_coh_seen = (u16 *)lean_calloc(np, 2); g_coh_seenprot = (u8 *)lean_calloc(np, 1);
     int ok = mask && g_coh_seq && g_coh_prot && g_coh_mixed && g_coh_hgen && g_coh_seen && g_coh_seenprot && g_coh_fr && g_coh_run && g_coh_ownf && g_coh_ro && g_coh_pend && g_coh_rr
         && coh_arr_init(&g_ra_arr, sizeof(CohRa), 64ull << 20) && coh_arr_init(&g_snapa_arr, 8, 8ull << 20) && coh_arr_init(&g_snapd_arr, 4096, 4ull << 30)
         && coh_arr_init(&g_patch_arr, sizeof(CohPatch), 256ull << 20) && coh_arr_init(&g_pl_arr, sizeof(CohPush), 64ull << 20) && coh_arr_init(&g_kl_arr, sizeof(CohPush), 64ull << 20);
@@ -3740,7 +3964,7 @@ static void wbg_done(u64 seq) {
 static struct { u64 seq; u32 lo, hi; } *g_rdg_st;
 static void wbg_note_read(u32 pg, u64 lo, u64 hi) {
     if (hi <= lo || !g_opt_wbg) return;
-    if (!g_rdg_st) { g_rdg_st = calloc(RM_NPG, sizeof *g_rdg_st); if (!g_rdg_st) { g_opt_rdg = 0; g_fr_rdg_fail = 1; return; } }   /* (w16_rel rc2: reported, fr_flip_check) */
+    if (!g_rdg_st) { g_rdg_st = lean_calloc(RM_NPG, sizeof *g_rdg_st); if (!g_rdg_st) { g_opt_rdg = 0; g_fr_rdg_fail = 1; return; } }   /* (w16_rel rc2: reported, fr_flip_check) */
     u64 seq = g_sub_seq + 1, a0 = rm_addr(pg); u32 l = (u32)(lo - a0), h = (u32)(hi - a0);
     if (g_rdg_st[pg].seq == seq) { if (l >= g_rdg_st[pg].lo && h <= g_rdg_st[pg].hi) return; if (l < g_rdg_st[pg].lo) g_rdg_st[pg].lo = l; if (h > g_rdg_st[pg].hi) g_rdg_st[pg].hi = h; }
     else { g_rdg_st[pg].seq = seq; g_rdg_st[pg].lo = l; g_rdg_st[pg].hi = h; }
@@ -4101,7 +4325,7 @@ static void coh_report(void) {
 static u64 *g_gwp_pg, *g_gwp_ch; static int g_gwp_off;
 static void gwp_mark(u64 lo, u64 hi, u64 seq1) {
     if (g_gwp_off) return;
-    if (!g_gwp_pg) { g_gwp_pg = (u64 *)calloc(G2S_PT_SIZE >> 16, 8); g_gwp_ch = (u64 *)calloc(G2S_PT_SIZE >> 22, 8); if (!g_gwp_pg || !g_gwp_ch) { g_gwp_off = 1; return; } }
+    if (!g_gwp_pg) { g_gwp_pg = (u64 *)lean_calloc(G2S_PT_SIZE >> 16, 8); g_gwp_ch = (u64 *)lean_calloc(G2S_PT_SIZE >> 22, 8); if (!g_gwp_pg || !g_gwp_ch) { g_gwp_off = 1; return; } }
     if (lo < G2S_PT_BASE) lo = G2S_PT_BASE; if (hi > G2S_PT_BASE + G2S_PT_SIZE) hi = G2S_PT_BASE + G2S_PT_SIZE;
     if (hi <= lo) return;
     for (u64 p = (lo - G2S_PT_BASE) >> 16, e = (hi - 1 - G2S_PT_BASE) >> 16; p <= e; p++) g_gwp_pg[p] = seq1;
@@ -4217,11 +4441,13 @@ static void vk_lz_trap_check(void) {   /* once per flip, render thread */
 }
 static void vk_adopt_new_memory(void) {
     int n = __atomic_load_n(&g_nmem, __ATOMIC_ACQUIRE);
-    if (n != g_vk_nmem_seen) { g_vk_nmem_seen = n; T0(); vk_import_regions(); TADD(g_t_import); }
+    if (n != g_vk_nmem_seen || g_mem_imp_gen != g_vk_impgen_seen) { g_vk_nmem_seen = n; g_vk_impgen_seen = g_mem_imp_gen; T0(); vk_import_regions(); TADD(g_t_import); }
     vk_lz_traps();
 }
 static void vk_shadow_for(const G2SOut *o) {
     gw_setup_begin();   /* w3 */
+    if (g_mtm_pg) mtm_mark_out(o);   /* w20_mem (diagnostic) */
+    if (g_ccp_gpu) cs_mark_out(o);   /* w20_mem --cs-copy-cpu */
     if (__atomic_load_n(&g_nlz, __ATOMIC_ACQUIRE)) {   /* t111 (--lazy-memory only since t112: without it, new memory is adopted per submit as in t110) */
         for (u32 i = 0; i < o->nwr; i++) lz_ensure(o->wr_lo[i], o->wr_hi[i] - o->wr_lo[i]);   /* memory the GPU writes must exist */
         vk_adopt_new_memory(); }
@@ -4310,6 +4536,7 @@ static EKey *ek_get(u64 k, int add) {
     for (u32 i = (u32)(k >> 47) & (EK_N - 1), n = 0; n < 64; i = (i + 1) & (EK_N - 1), n++) { if (g_ek[i].key == k) return &g_ek[i]; if (!g_ek[i].key) { if (!add) return 0; g_ek[i].key = k; return &g_ek[i]; } }
     return 0;
 }
+static u64 g_tc_ev8, g_tc_evb_bytes;   /* w21_perf --tex-ws-log: evictions of images used in the last 8 frames; bytes evicted for the memory budget */
 static void tc_note_create(const VImg *m) {
     EKey *e = ek_get(ek_key(m->addr, m->w, m->h, m->fmt, m->levels), 1); if (!e) return;
     if (!e->n_create++) g_tc_new++;
@@ -4317,7 +4544,7 @@ static void tc_note_create(const VImg *m) {
     else g_tc_again++;
 }
 static void tc_note_evict(const VImg *m) {
-    u32 age = (u32)V.frame - m->last_use; g_tc_evage[age < 60 ? 0 : age < 600 ? 1 : 2]++; g_tc_ev[g_evict_reason < 3 ? g_evict_reason : 0]++; g_tc_evbytes += m->bytes;
+    u32 age = (u32)V.frame - m->last_use; if (age < 8) g_tc_ev8++; if (g_evict_reason == 2) g_tc_evb_bytes += m->bytes; g_tc_evage[age < 60 ? 0 : age < 600 ? 1 : 2]++; g_tc_ev[g_evict_reason < 3 ? g_evict_reason : 0]++; g_tc_evbytes += m->bytes;
     EKey *e = ek_get(ek_key(m->addr, m->w, m->h, m->fmt, m->levels), 1); if (e) e->evict_frame = (u32)V.frame ? (u32)V.frame : 1;
 }
 /* free the least recently used image that was not used in this frame (so no recorded command refers to it) */
@@ -4328,6 +4555,24 @@ static int vimg_evict_(void); static int vimg_drop(int bi);
 /* w2: limits for one eviction pass (set around the call): only images unused for more than g_evict_min_idle frames, and
    no GPU-written ones. Used by the real-memory budget (--vram-fit / --image-budget-real), see vimg_create_lv_. */
 static u32 g_evict_min_idle; static int g_evict_no_gw, g_opt_real_evict_any;
+/* w21_perf --img-protect N (default off; issue 7, GTX 1060 6 GB): with the card-fitted image budget (--vram-fit, cards under 12 GB)
+   the prologue's textures in use (> 2 GB) did not fit the 2,048 MB budget: every new texture evicted one used a few frames
+   before (player's log: up to 1,572 such evictions and 339 re-creations within 60 frames per 60-flip window; texture checks
+   30-58 ms and GPU busy +45 % in those windows). With the option the budget's eviction takes only images unused for N+ frames
+   (and never GPU-written ones); when there is none, the image goes over the budget instead - but only while the driver's own
+   VRAM budget (VK_EXT_memory_budget, --sim-vram-gb applied) keeps --img-protect-margin MB (default 768) free after it.
+   Otherwise the eviction is as before. Eviction never changes pictures (a texture is uploaded again from game memory). */
+static u64 g_img_protect_margin = 768ull << 20; static int g_opt_tex_ws_log;
+static u64 g_n_protect_over, g_n_protect_fallback, g_n_protect_q, g_protect_over_peak;
+static u64 g_hq_frame = ~0ull, g_hq_use, g_hq_bud, g_hq_added; static int g_hq_ok;
+static int vramheap_query(u64 *use, u64 *bud, u64 *size);
+static int img_protect_room(u64 need) {
+    if (g_hq_frame != V.frame) { u64 sz; g_hq_ok = vramheap_query(&g_hq_use, &g_hq_bud, &sz); g_hq_frame = V.frame; g_hq_added = 0; g_n_protect_q++; }
+    if (!g_hq_ok || !g_hq_bud) return 0;
+    if (g_hq_use + g_hq_added + need + g_img_protect_margin > g_hq_bud) return 0;
+    g_hq_added += need; return 1;
+}
+
 static int vimg_evict(void) {
     u64 t0 = plat_ticks(); int r = vimg_evict_(); g_t_vevict += plat_ticks() - t0;
     return r;
@@ -4370,7 +4615,9 @@ static int vimg_drop(int bi) {   /* t196: the freeing half of vimg_evict_ (also 
    per image; a streaming burst of 50 textures cost ~50 ms in one frame). Images now take their memory from 256 MB
    blocks per memory type (first fit in a sorted free list, merged on free). Images over 64 MB, and those the driver
    wants dedicated, keep their own allocation. --no-image-pool restores the old way. */
-enum { IMP_BLOCK_MB = 256, IMP_BLOCKS = 128, IMP_DEDICATED_MIN = 64u << 20 };
+enum { IMP_BLOCKS = 128 };
+/* w21_perf --img-block-mb N (16..256, default 256): pool block size; images of half a block or more (64 MB at most) get their own allocation */
+
 typedef struct { u64 off, len; } ImFree;
 typedef struct { VkDeviceMemory mem; u64 size, used; u32 mt; ImFree *fr; u32 nfr, frcap; } ImBlock;
 static ImBlock g_imb[IMP_BLOCKS]; static int g_nimb; static int g_opt_no_img_pool;
@@ -4461,6 +4708,21 @@ static void img_mem_free(VImg *m) {
     if (m->pool) { imb_free(&g_imb[m->pool - 1], m->poff, m->plen); g_imp_bytes_pooled -= m->plen; m->pool = 0; }
     else if (m->mem) vkFreeMemory(V.dev, m->mem, 0);
     m->mem = 0;
+}
+/* w21_perf --img-evict-block (default off): the real-memory budget loop (--vram-fit) evicts from the pool block with the fewest
+   bytes in use first, so that blocks empty and go back to the driver (P6 profile, prologue: 9 blocks of 256 MB = 2,304 MB held
+   1,197 MB of images; the real-budget loop freed scattered images and never a block). Same eligibility as vimg_evict_. */
+static int vimg_evict_blockwise(void) {
+    u64 done = __atomic_load_n(&g_done_seq, __ATOMIC_ACQUIRE); u8 tried[IMP_BLOCKS]; h_memset(tried, 0, sizeof tried);
+    for (int round = 0; round < 8; round++) {
+        int bk = -1; for (int k = 0; k < g_nimb; k++) if (g_imb[k].mem && g_imb[k].used && !tried[k] && (bk < 0 || g_imb[k].used < g_imb[bk].used)) bk = k;
+        if (bk < 0) return -1;
+        tried[bk] = 1; int bi = -1;
+        for (int i = 0; i < V.nimg; i++) { VImg *m = &V.img[i];
+            if (m->img && m->addr > 1 && m->pool == (u32)bk + 1 && (u64)m->last_use + 2 + g_evict_min_idle < (u64)V.frame + 1 && m->use_seq <= done && !m->gpu_written && (bi < 0 || m->last_use < V.img[bi].last_use)) bi = i; }
+        if (bi >= 0) { g_n_blk_evict++; u64 t0 = plat_ticks(); int r = vimg_drop(bi); g_t_vevict += plat_ticks() - t0; return r; }
+    }
+    return -1;
 }
 /* t196 (--image-max-age N): once per flip, under the GPU lock. Memory textures only: their bytes are in game memory
    and they are uploaded again like any new texture when the game uses them again (what the table-full eviction
@@ -4579,9 +4841,20 @@ static VImg *vimg_create_lv_(u64 addr, u32 w, u32 h, u32 d, VkFormat f, int is3d
            images themselves stay under the budget as without the option. --real-evict-any: as t196. */
         u64 need_ = img_mem_need(m->img, &mr); int ne = 0;
         g_evict_min_idle = 60; g_evict_no_gw = 1;
-        while (need_ && img_real_bytes() + need_ > V.img_budget && ne++ < 64) { if (vimg_evict() < 0) break; V.n_budget_evict++; g_n_real_evict++; need_ = img_mem_need(m->img, &mr); }
+        while (need_ && img_real_bytes() + need_ > V.img_budget && ne++ < 64) { if ((g_opt_img_evict_block ? vimg_evict_blockwise() : -1) < 0 && vimg_evict() < 0) break; V.n_budget_evict++; g_n_real_evict++; need_ = img_mem_need(m->img, &mr); }
         g_evict_min_idle = 0; g_evict_no_gw = 0;
-        while (V.img_bytes + mr.size > V.img_budget) { if (vimg_evict() < 0) break; V.n_budget_evict++; }
+        if (g_opt_img_protect) {   /* w21_perf */
+            g_evict_min_idle = g_opt_img_protect; g_evict_no_gw = 1;
+            while (V.img_bytes + mr.size > V.img_budget) {
+                if (vimg_evict() >= 0) { V.n_budget_evict++; continue; }
+                if (img_protect_room(img_mem_need(m->img, &mr))) { g_n_protect_over++; break; }
+                g_n_protect_fallback++; g_evict_min_idle = 0; g_evict_no_gw = 0;
+                while (V.img_bytes + mr.size > V.img_budget) { if (vimg_evict() < 0) break; V.n_budget_evict++; }
+                break; }
+            g_evict_min_idle = 0; g_evict_no_gw = 0;
+            if (V.img_bytes + mr.size > V.img_budget && V.img_bytes + mr.size - V.img_budget > g_protect_over_peak) g_protect_over_peak = V.img_bytes + mr.size - V.img_budget;
+        }
+        else while (V.img_bytes + mr.size > V.img_budget) { if (vimg_evict() < 0) break; V.n_budget_evict++; }
     }
     else while (V.img_bytes + mr.size > V.img_budget) { if (vimg_evict() < 0) break; V.n_budget_evict++; }
     g_evict_reason = 0;
@@ -4653,6 +4926,7 @@ static u64 mem_hash(const u8 *p, u64 n) {
 /* self check of the mip chain layout on real data (BC1 / BC3 colour endpoints): the average colour of a level-i block
    should be close to the average of the 2x2 level-(i-1) blocks it was made from, and much further from an unrelated
    block. Counts per level kind (2D macro-tiled or 1D) go to the log. */
+static int g_opt_mipchk;   /* w31_perf / w28i_15: the mip layout self-check below is a diagnostic, OFF by default (--mip-selfcheck): it reads the just de-tiled bytes back from write-combined staging memory (52-61 ms of the prologue area-entry frame); log-only, nothing depends on it */
 static u32 g_mipchk_n, g_mipchk_ok[2], g_mipchk_mid[2], g_mipchk_bad[2];   /* error vs unrelated: < 0.5, 0.5..0.85, >= 0.85 (wrong layout gives ~1) */
 static void bc_rgb(const u8 *blk, int *c) {
     u32 a = blk[0] | blk[1] << 8, b = blk[2] | blk[3] << 8;
@@ -4691,6 +4965,29 @@ static void mip_selfcheck(const u8 *stage, const VkBufferImageCopy *bic, const M
    texture into a freed target), the old image must not win any more. A sample of the memory is recorded each frame
    the GPU writes the target; a different sample now, or a logged copy-engine / shader write over it, means the
    memory is newer than the image. */
+/* w34_mem --dsync-diag (diagnostic, default off): every R32 -> depth draw counts into its own 256-byte slot of the counter buffer (a ring
+   of 128 slots instead of one shared counter), with what the pass used recorded beside it, so the pass whose texels trip the check
+   is named exactly: flip, the R32 image (address, size, GPU-written or uploaded from memory, uploads, last upload frame, written
+   back, copy), the depth image, and whether the R32 image's memory is game memory left out of the GPU import (low_driver_memory)
+   or imported. Also counts render targets marked in left-out memory. --dsync-trip-at N (tests): the check turns itself off at
+   flip N as if it had tripped (the copy path from then on), to show the pictures of the fallback. */
+static int g_opt_dsy_diag, g_opt_dsy_force = -1;
+enum { DSY_SLOTS = 128, DSY_STRIDE = 64 };   /* (u32 units: 256 bytes, the largest storage-buffer offset alignment Vulkan allows) */
+typedef struct { u64 flip, addr, dst, n; u32 w, h, nup, upf; u8 gw, wb, copy, lo, imp, used; } DsyRec;
+static DsyRec g_dsyr[DSY_SLOTS]; static u32 g_dsy_next; static u64 g_dsy_lo_passes, g_ldm_rt_lo, g_ldm_rt_lo_n; static u64 g_ldm_rt_lo_at[16];
+static int ldm_left_out(u64 lo, u64 n) {   /* (w34_mem) any byte of [lo, lo+n) in game memory the import left out */
+    if (!g_opt_imp_gpu_only || !n) return 0;
+    int nm = (int)__atomic_load_n(&g_nmem, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nm; i++) if (__atomic_load_n(&g_mem_noimp[i], __ATOMIC_ACQUIRE) && g_mem[i].lo < lo + n && lo < g_mem[i].hi) return 1;
+    return 0;
+}
+static void dsy_rec_say(const DsyRec *r, u32 cnt) {
+    say("      pass "); say_dec((i64)r->n); say(" flip "); say_dec((i64)r->flip); say(": R32 image "); say_hex(r->addr); say(" "); say_dec(r->w); say("x"); say_dec(r->h);
+    say(r->gw ? " GPU-written" : " uploaded from memory"); say(", uploads "); say_dec(r->nup); say(" (last frame "); say_dec(r->upf); say(")");
+    if (r->wb) say(", written back"); if (r->copy) say(", a copy"); say("; depth "); say_hex(r->dst);
+    say("; memory "); say(r->lo ? "LEFT OUT of the import (low_driver_memory)" : r->imp ? "imported" : "not in an imported region");
+    if (cnt) { say("; texels counted "); say_dec(cnt); } say("\n");
+}
 static u64 rt_mem_bytes(const VImg *m) { u64 b = (u64)(m->lw ? m->lw : m->w) * (m->lh ? m->lh : m->h) * (m->bpe ? m->bpe : 32) / 8; return b; }   /* (t191: the surface's own size) */
 static u64 mem_sig(u64 a, u64 len) {
     if (len < 64 || !mem_ok(a, len)) return 0;
@@ -4704,6 +5001,10 @@ static u64 mem_sig(u64 a, u64 len) {
 static void rt_mark(VImg *m) {
     if (m->msig_frame == V.frame + 1) return;   /* once per frame */
     m->msig_frame = V.frame + 1; m->csig_frame = 0; m->cstale = 0;
+    if (g_opt_dsy_diag && ldm_left_out(m->addr, rt_mem_bytes(m))) { g_ldm_rt_lo++;   /* w34_mem: a render target over memory the import left out */
+        int seen = 0; for (u64 k = 0; k < g_ldm_rt_lo_n; k++) if (g_ldm_rt_lo_at[k] == m->addr) seen = 1;
+        if (!seen && g_ldm_rt_lo_n < 16) { g_ldm_rt_lo_at[g_ldm_rt_lo_n++] = m->addr; say("    --dsync-diag (w34_mem): render target "); say_hex(m->addr); say(" "); say_dec(m->w); say("x"); say_dec(m->h);
+            say(" fmt "); say_dec(m->fmt); say(m->depth ? " depth" : ""); say(" lies in game memory left out of the GPU import (flip "); say_dec((i64)g_flips); say(")\n"); } }
     m->msig = mem_sig(m->addr, rt_mem_bytes(m)); m->mgw = g_gw_seq;
 }
 static u64 g_rt_stale;
@@ -5027,7 +5328,8 @@ static int dsc_ensure(u64 bytes) {
 #include "e6_dsync_spv.h"
 static int g_opt_dsync_cs, g_opt_dsync_draw;
 static struct { int init, cs_ok, draw_ok, tripped; VkDescriptorSetLayout dsl_cs, dsl_fs; VkPipelineLayout pl_cs, pl_fs; VkPipeline p_cs, p_d[2]; VkBuffer cbuf; VkDeviceMemory cmem; volatile u32 *cnt; u64 ms; } g_dsy;
-static u64 g_n_dsy_cs, g_n_dsy_draw, g_n_dsy_no[5], g_n_dsy_px;   /* no: 0 formats / kind of image, 1 usage, 2 pipelines not available, 3 turned off (texels a depth write could change), 4 a game occlusion query is open (the draw would be counted) */
+static u64 g_n_dsy_cs, g_n_dsy_draw, g_n_dsy_no[5], g_n_dsy_px;
+   /* no: 0 formats / kind of image, 1 usage, 2 pipelines not available, 3 turned off (texels a depth write could change), 4 a game occlusion query is open (the draw would be counted) */
 static VkShaderModule dsy_mod(const u32 *w, u64 nw) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, 0, 0, 4 * nw, w}; VkShaderModule m = 0; if (vkCreateShaderModule(V.dev, &ci, 0, &m)) m = 0; return m; }
 static void dsy_init(void) {
     if (g_dsy.init) return;
@@ -5045,14 +5347,15 @@ static void dsy_init(void) {
                     {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_COMPUTE_BIT, mc, "main", 0}, g_dsy.pl_cs, 0, -1};
                 g_dsy.cs_ok = !vkCreateComputePipelines(V.dev, 0, 1, &cci, 0, &g_dsy.p_cs) && g_dsy.p_cs; } } }
     if (mv && mf && pf.fragmentStoresAndAtomics) {   /* draw: binding 0 the R32 image (sampled image), 1 the counter buffer; one pipeline per depth format */
-        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
+        u64 cbsz = g_opt_dsy_diag ? (u64)DSY_SLOTS * DSY_STRIDE * 4 : 256;   /* w34_mem --dsync-diag: a slot per pass */
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, cbsz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0};
         VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, 0}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, 0}};
         VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, 0, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 2, b};
         int ok = !vkCreateBuffer(V.dev, &bci, 0, &g_dsy.cbuf);
         if (ok) { VkMemoryRequirements mr; vkGetBufferMemoryRequirements(V.dev, g_dsy.cbuf, &mr); void *map = 0;
             VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, vk_find_mem(V.pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
-            ok = mai.memoryTypeIndex != 0xFFFFFFFFu && !vkAllocateMemory(V.dev, &mai, 0, &g_dsy.cmem) && !vkBindBufferMemory(V.dev, g_dsy.cbuf, g_dsy.cmem, 0) && !vkMapMemory(V.dev, g_dsy.cmem, 0, 256, 0, &map) && map;
-            if (ok) { g_dsy.cnt = (volatile u32 *)map; for (int i = 0; i < 64; i++) g_dsy.cnt[i] = 0; } }
+            ok = mai.memoryTypeIndex != 0xFFFFFFFFu && !vkAllocateMemory(V.dev, &mai, 0, &g_dsy.cmem) && !vkBindBufferMemory(V.dev, g_dsy.cbuf, g_dsy.cmem, 0) && !vkMapMemory(V.dev, g_dsy.cmem, 0, cbsz, 0, &map) && map;
+            if (ok) { g_dsy.cnt = (volatile u32 *)map; for (u64 i = 0; i < cbsz / 4; i++) g_dsy.cnt[i] = 0; } }
         ok = ok && !vkCreateDescriptorSetLayout(V.dev, &dci, 0, &g_dsy.dsl_fs);
         if (ok) { VkPipelineLayoutCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 0, 0, 1, &g_dsy.dsl_fs, 0, 0}; ok = !vkCreatePipelineLayout(V.dev, &pci, 0, &g_dsy.pl_fs); }
         for (int k = 0; ok && k < 2; k++) {   /* 0: D32_SFLOAT, 1: D32_SFLOAT_S8_UINT (the stencil attachment bound, never tested or written) */
@@ -5092,8 +5395,19 @@ static int dsy_pass(VImg *src, VImg *dst, u32 w, u32 h) {
     if (!(cl->usage & (to_depth ? VK_IMAGE_USAGE_SAMPLED_BIT : VK_IMAGE_USAGE_STORAGE_BIT)) || !(dp->usage & (to_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_SAMPLED_BIT))) { g_n_dsy_no[1]++; return 0; }
     dsy_init();
     if (to_depth) {
-        if (g_dsy.cnt && !g_dsy.tripped && g_dsy.cnt[0]) {   /* texels a depth write could have changed were synced: back to the copy */
+        u32 bad_slot = 0xFFFFFFFFu; int forced = 0;
+        if (g_dsy.cnt && !g_dsy.tripped && g_opt_dsy_diag) for (u32 k = 0; k < DSY_SLOTS; k++) if (g_dsy.cnt[k * DSY_STRIDE]) { bad_slot = k; break; }   /* w34_mem */
+        if (g_dsy.cnt && !g_dsy.tripped && g_opt_dsy_force >= 0 && g_flips >= (u64)g_opt_dsy_force) {   /* w34_mem --dsync-trip-at (tests) */
+            g_dsy.tripped = 1; forced = 1;
+            say("    --dsync-trip-at "); say_dec(g_opt_dsy_force); say(" (w34_mem, test): --dsync-draw turned off at flip "); say_dec((i64)g_flips); say(" as if it had tripped (the copy path from now on)\n"); }
+        if (!forced && g_dsy.cnt && !g_dsy.tripped && (g_opt_dsy_diag ? bad_slot != 0xFFFFFFFFu : g_dsy.cnt[0] != 0)) {   /* texels a depth write could have changed were synced: back to the copy */
             g_dsy.tripped = 1;
+            if (g_opt_dsy_diag) { static u32 c[DSY_SLOTS]; u32 tot = 0; for (u32 k = 0; k < DSY_SLOTS; k++) { c[k] = g_dsy.cnt[k * DSY_STRIDE]; tot += c[k]; } g_dsy.cnt[0] = tot;   /* (the exit line reads slot 0) */
+                say("    --dsync-diag (w34_mem): the passes with texels a depth write could change:\n");
+                for (u32 k = 0; k < DSY_SLOTS; k++) if (c[k] && g_dsyr[k].used) dsy_rec_say(&g_dsyr[k], c[k]);
+                say("      R32 -> depth passes so far "); say_dec((i64)g_dsy_next); say(", of them with the R32 image in memory left out of the import "); say_dec((i64)g_dsy_lo_passes);
+                say("; render targets marked in left-out memory "); say_dec((i64)g_ldm_rt_lo); say("; the last 4 passes:\n");
+                for (u32 j = 1; j <= 4 && j <= g_dsy_next; j++) { const DsyRec *r = &g_dsyr[(g_dsy_next - j) % DSY_SLOTS]; if (r->used) dsy_rec_say(r, 0); } }
             say("    *** --dsync-draw (w12_gpu): R32 texels outside what a depth write keeps exactly (not in 0..1, NaN, -0 or denormal) were synced to a depth buffer - turned off for the rest of the run (flip "); say_dec((i64)g_flips); say(", "); say_dec((i64)g_dsy.cnt[0]); say(" texels so far)\n"); }
         if (g_dsy.tripped) { g_n_dsy_no[3]++; return 0; }
         if (g_gq_active >= 0) { g_n_dsy_no[4]++; return 0; }
@@ -5104,6 +5418,11 @@ static int dsy_pass(VImg *src, VImg *dst, u32 w, u32 h) {
         VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, 0, 0, {{0, 0}, {w, h}}, 1, 0, 0, 0, &da, dp->stencil ? &da : 0};
         VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f}; VkRect2D sc = {{0, 0}, {w, h}};
         VkDescriptorImageInfo ii = {0, cl->view, VK_IMAGE_LAYOUT_GENERAL}; VkDescriptorBufferInfo bi = {g_dsy.cbuf, 0, VK_WHOLE_SIZE};
+        if (g_opt_dsy_diag) {   /* w34_mem: this pass's own counter slot, and what it uses */
+            u32 k = g_dsy_next % DSY_SLOTS; g_dsy.cnt[k * DSY_STRIDE] = 0; bi.offset = (u64)k * DSY_STRIDE * 4; bi.range = DSY_STRIDE * 4;
+            DsyRec *r = &g_dsyr[k]; r->n = g_dsy_next++; r->flip = g_flips; r->addr = cl->addr; r->dst = dp->addr; r->w = cl->w; r->h = cl->h; r->nup = cl->n_up; r->upf = cl->up_frame;
+            r->gw = (u8)(cl->gpu_written != 0); r->wb = (u8)(cl->wb != 0); r->copy = (u8)(cl->is_copy != 0); r->used = 1;
+            r->lo = (u8)ldm_left_out(cl->addr, rt_mem_bytes(cl)); r->imp = (u8)(vreg_of(cl->addr, 1) != 0); if (r->lo) g_dsy_lo_passes++; }
         VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, 0, 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii, 0, 0},
                                       {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, 0, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, &bi, 0}};
         vkCmdBeginRendering(V.cb, &ri);
@@ -5337,6 +5656,10 @@ static void tex_stale_check(u64 lo, u64 len, u32 w, u32 h, u32 dfmt, u32 tm) {
 static u64 g_tc[11], g_t_tx[7];   /* t129: [4] full hash, [5] de-tiling, [6] the rest of the upload (staging, barriers, the copy command) */   /* g_t_tx: ticks in the checks (with waits for GPU writers), re-starting the write tracking, hashing, uploading */
 /* images other than m whose bytes overlap [a, b) lose their "clean" state (their write tracking was used up there) */
 static void img_unwatch_others(const VImg *m, u64 a, u64 b) {
+    if (g_opt_uwix) {
+        for (int i = 0; i < V.nimg; i++) if (g_uw_hi[i] > a && g_uw_lo[i] < b) { VImg *o = &V.img[i];
+            if (o != m && o->img && o->watched && o->addr < b && a < o->addr + o->wlen) { o->watched = 0; g_uw_hi[i] = 0; } }
+        return; }
     for (int i = 0; i < V.nimg; i++) { VImg *o = &V.img[i]; if (o != m && o->img && o->watched && o->addr < b && a < o->addr + o->wlen) o->watched = 0; }
 }
 /* restart the CPU write tracking of a texture's bytes. The reset hands back the pages written since the last reset:
@@ -5354,6 +5677,7 @@ static void tex_track_restart(VImg *m, u64 lo, u64 len) {
     if (rhi) img_unwatch_others(m, rlo, rhi);
     if (r < 0) { ok = 0; img_unwatch_others(m, lo, lo + len); }
     m->watched = ok; m->up_seq = g_gw_done; m->wlen = len;
+    if ((uintptr_t)m >= (uintptr_t)&V.img[0] && (uintptr_t)m < (uintptr_t)&V.img[4096]) { int ix_ = (int)(m - V.img); { g_uw_lo[ix_] = m->addr; g_uw_hi[ix_] = ok ? m->addr + len : 0; } }   /* w31_perf --unwatch-index (kept always: cheap) */
 }
 static void tex_wait_log(const VImg *m, u64 lo, u64 len, u32 tm, u32 dfmt) {
     vl("  texture upload waits for the GPU (t107e): "); vl_x(lo); vl(" + "); vl_x(len); vl(" "); vl_d(m->w); vl("x"); vl_d(m->h); vl(" dfmt "); vl_d(dfmt); vl(" tiling "); vl_d(tm);
@@ -5650,7 +5974,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
             VImg *o = chix_find(fh_, w, h, f, nlev, 0);
             if (o && o->last_use + 2 < V.frame && o->d == (is3d ? d : layers) && o->is3d == is3d && o->arrayed == (arrayed && !is3d)) {
                 int slot = (int)(o - V.img); img_unlink(slot); o->addr = addr; img_link(slot);
-                o->watched = 0; o->frame_uploaded = 0; o->up_lo = lo_; o->up_len = len_; o->hash = mem_hash((const u8 *)lo_, len_) ^ ((u64)first_ << 56) ^ ((u64)nlev << 60);
+                o->watched = 0; o->frame_uploaded = 0; o->up_lo = lo_; o->up_len = len_; if (g_mtm_pg) mtm_mark(lo_, lo_ + len_, MT_TEX); o->hash = mem_hash((const u8 *)lo_, len_) ^ ((u64)first_ << 56) ^ ((u64)nlev << 60);
                 g_n_tmove_reused++; g_n_tmove_bytes += len_; m = o;
                 static int nl; if (nl++ < 20) { vl("  moved texture reused (t118c): "); vl_d(w); vl("x"); vl_d(h); vl(" vkformat "); vl_d(f); vl(" now at "); vl_x(addr); vl(", frame "); vl_d((i64)V.frame); vl("\n"); } } } }
     int rs_st_ = g_rs_on && storage && !is3d && !arrayed && layers <= 1 && tm != 8 && rs_elig(w, h);   /* t196: a screen-sized storage image is scaled like the targets */
@@ -5750,7 +6074,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
                         so += ((u64)L[i].ew * L[i].eh * L[i].slices * bpe / 8 + 15) & ~15ull; }
                     vkCmdCopyBufferToImage(V.cb, V.stage, m->img, VK_IMAGE_LAYOUT_GENERAL, nb, bic);
                     V.stage_used += (out + 255) & ~255ull;
-                    m->last_use = V.frame; m->use_seq = g_sub_seq + 1; m->hash = 0; m->watched = 0; m->n_up++; m->up_frame = V.frame; m->up_first = first; m->up_nlev = nlev; m->up_lo = lo; m->up_len = len;
+                    m->last_use = V.frame; m->use_seq = g_sub_seq + 1; m->hash = 0; m->watched = 0; m->n_up++; m->up_frame = V.frame; m->up_first = first; m->up_nlev = nlev; m->up_lo = lo; m->up_len = len; if (g_mtm_pg) mtm_mark(lo, lo + len, MT_TEX);
                     chix_drop(m); m->fhash = 0;   /* t119: filled later from GPU-written bytes: not in the content index */
                     V.n_uploads++; if (nlev > 1) V.n_mip_uploads++;
                     vk_region_copy_post(m, 0);
@@ -5792,7 +6116,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
             static int nl; if (nl++ < 30) { vl("  texture with the bytes of another image (t118c): "); vl_x(m->addr); vl(" = "); vl_x(o->addr); vl(" (");
                 vl(m->addr > o->addr ? "+" : "-"); vl_x(m->addr > o->addr ? m->addr - o->addr : o->addr - m->addr); vl(") "); vl_d(m->w); vl("x"); vl_d(m->h); vl(" vkformat "); vl_d(m->fmt);
                 vl(", the other unused for "); vl_d((i64)(V.frame - o->last_use)); vl(" frames, frame "); vl_d((i64)V.frame); vl("\n"); } } }
-    m->n_up++; m->up_frame = V.frame; m->up_first = first; m->up_nlev = nlev; m->up_lo = lo; m->up_len = len;
+    m->n_up++; m->up_frame = V.frame; m->up_first = first; m->up_nlev = nlev; m->up_lo = lo; m->up_len = len; if (g_mtm_pg) mtm_mark(lo, lo + len, MT_TEX);   /* w20_mem */
     m->hash = hsh; m->fhash = fh; if (!m->is_copy && !m->gpu_written) chix_note(m); else chix_drop(m);
     u64 out = 0;
     for (u32 i = first; i < nlev; i++) out += ((u64)L[i].ew * L[i].eh * L[i].slices * bpe / 8 + 15) & ~15ull;
@@ -5819,7 +6143,7 @@ static VImg *vk_texture(const u32 *T, int storage, VkFormat *viewfmt, u32 *lbase
         bic[nb++] = (VkBufferImageCopy){so, bc ? L[i].ew * 4 : L[i].ew, bc ? L[i].eh * 4 : L[i].eh, {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, is3d ? 1 : L[i].slices}, {0, 0, 0}, {lw, lh, ldp}};
         so += ((u64)L[i].ew * L[i].eh * L[i].slices * bpe / 8 + 15) & ~15ull;
     }
-    if (nlev - first >= 2 && (dfmt == 35 || dfmt == 37) && (g_mipchk_n < 400 || (V.n_uploads & 7) == 0)) mip_selfcheck(smap, bic, L, first, nlev, dfmt, tm, w, h);
+    if (g_opt_mipchk && nlev - first >= 2 && (dfmt == 35 || dfmt == 37) && (g_mipchk_n < 400 || (V.n_uploads & 7) == 0)) mip_selfcheck(smap, bic, L, first, nlev, dfmt, tm, w, h);
     vkCmdCopyBufferToImage(V.cb, sbuf, m->img, VK_IMAGE_LAYOUT_GENERAL, nb, bic);
     if (sbuf == V.stage) V.stage_used += (out + 255) & ~255ull;
     V.n_uploads++; if (nlev > 1) V.n_mip_uploads++;
@@ -6168,7 +6492,7 @@ static void vk_tr_device(G2SIn *in) {
     }
     in->max_shared = g_opt_force_borrow ? 1 : g_dev.max_shared;   /* t104: wave-vote slots must fit the device's shared memory */
     if (in->tess_mode == 3) in->tess_shared_max = g_opt_no_tess_shared ? 0 : g_max_shared;
-    if (g_rs_on) in->diag_salt = G2S_RS_TAG | RS_SALT_ND() | (g_opt_rs_sub && in->stage == G2S_CS ? 0x8000u : 0u);   /* t196: shaders that know about scaled images (their own translation keys, modules and pipelines) */
+    if (g_rs_on) in->diag_salt = G2S_RS_TAG | RS_SALT_ND() | (g_opt_rs_sub && in->stage == G2S_CS ? 0x8000u : 0u) | (g_opt_rs_depth_max > 0 && g_opt_rs_gen && in->stage == G2S_CS ? G2S_W30_FPMAX : 0u);   /* t196: shaders that know about scaled images (their own translation keys, modules and pipelines) */
 }
 /* t181: the translator's inputs for a stage from register values - the renderer's (ren 1: also its tessellation /
    geometry pass state and diagnostics) or the look-ahead thread's own copy of the registers (ren 0) */
@@ -6224,7 +6548,7 @@ static void vk_tr_build(G2SIn *in, int stage, u32 lo, u32 rsrc1, u32 rsrc2, cons
         if (g_diag_mode == 3) in->quad_branch_all = 0;
         if (g_diag_mode == 4) in->sdata_binding = 0;
     }
-    if (g_rs_on) in->diag_salt = G2S_RS_TAG | RS_SALT_ND() | (g_opt_rs_sub && in->stage == G2S_CS ? 0x8000u : 0u);   /* t196 (the diagnostic salts above are not kept with a render scale) */
+    if (g_rs_on) in->diag_salt = G2S_RS_TAG | RS_SALT_ND() | (g_opt_rs_sub && in->stage == G2S_CS ? 0x8000u : 0u) | (g_opt_rs_depth_max > 0 && g_opt_rs_gen && in->stage == G2S_CS ? G2S_W30_FPMAX : 0u);   /* t196 (the diagnostic salts above are not kept with a render scale) */
 }
 static int spec_take(const G2SIn *in, G2SOut *out); static void spec_after(void);   /* t181 (e6_spec.c) */
 static int g_opt_smrd_log; static void smrd_lit_note(int stage, u64 code_addr, u32 pc, u32 lit, int cnt, int sbuf, u64 base, int base_known, u32 vs1, u32 vs2);   /* w5_smrd */
@@ -6298,7 +6622,7 @@ static void ov_apply(u64 a, void *dst, u64 n) {
 static int vkr_write_data(u64 a, const u32 *src, u32 n) {
     if (!g_vk_on || g_opt_cpu_writedata || !n || (n & 3) || (a & 3) || n > 65536 || !mem_ok(a, n)) { g_n_wd_cpu++; return 0; }
     VkBuffer buf; u64 off;
-    if (!vk_locate(a, n, &buf, &off)) { g_n_wd_cpu++; return 0; }
+    if (!vk_locate_c(BC_WRD, a, n, &buf, &off)) { g_n_wd_cpu++; return 0; }
     if (!g_ovbuf) { g_ovbuf = (u8 *)plat_alloc_rw(OV_BYTES); if (!g_ovbuf) { g_n_wd_cpu++; return 0; } mem_name(g_ovbuf, "renderer: WRITE_DATA overlay"); }
     ov_retire();
     if (g_nov >= OV_N || n > OV_BYTES / 4) { g_n_wd_cpu++; return 0; }
@@ -6367,7 +6691,7 @@ static int ov_add(u64 a, const void *src, u32 n) {   /* remember bytes the GPU w
 static int vkr_dma_copy(u64 dst, u64 src, u32 n) {
     if (!g_vk_on || !g_opt_gpu_dma || !n || (n & 3) || n > (1u << 20) || (src < dst + n && dst < src + n)) return 0;
     VkBuffer sb, db; u64 so, dof;
-    if (!vk_locate(src, n, &sb, &so) || !vk_locate(dst, n, &db, &dof)) { g_n_dma_cpu_fallback++; return 0; }
+    if (!vk_locate_c(BC_DMA, src, n, &sb, &so) || !vk_locate_c(BC_DMA, dst, n, &db, &dof)) { g_n_dma_cpu_fallback++; return 0; }
     static u8 tmp[1u << 20]; mem_copy(tmp, (const void *)src, n); ov_apply(src, tmp, n);   /* what the copy will most likely write */
     if (!ov_add(dst, tmp, n)) { g_n_dma_cpu_fallback++; return 0; }
     vk_begin_cb(); vk_barrier();
@@ -6379,7 +6703,7 @@ static int vkr_dma_copy(u64 dst, u64 src, u32 n) {
 static int vkr_dma_fill(u64 dst, u32 n, u32 v) {
     if (!g_vk_on || !g_opt_gpu_dma || !n || (n & 3) || n > (1u << 20)) return 0;
     VkBuffer db; u64 dof;
-    if (!vk_locate(dst, n, &db, &dof)) { g_n_dma_cpu_fallback++; return 0; }
+    if (!vk_locate_c(BC_FILL, dst, n, &db, &dof)) { g_n_dma_cpu_fallback++; return 0; }
     static u32 tmp[1u << 18]; for (u32 i = 0; i < n / 4; i++) tmp[i] = v;
     if (!ov_add(dst, tmp, n)) { g_n_dma_cpu_fallback++; return 0; }
     vk_begin_cb(); vk_barrier();
@@ -6432,7 +6756,7 @@ static void gq_barrier(void) {   /* transfer writes -> everything (conditional r
 /* the game's results block in the PS4 layout: every counter valid (bit 63), RB 0's end counter = the pixel count */
 static void gq_write_game(int q, u64 base, int from_query) {
     VkBuffer gb; u64 goff;
-    if (!vk_locate(base, 128, &gb, &goff)) return;
+    if (!vk_locate_c(BC_OTHER, base, 128, &gb, &goff)) return;
     static const u32 valid0[32] = {0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u,
                                    0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u, 0, 0x80000000u};
     vkCmdUpdateBuffer(V.cb, gb, goff, 128, valid0);
@@ -7480,7 +7804,10 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
         V.n_draws_ok++;
         return;
     }
-    if (g_emb_vs) { vk_skip("embedded VS (rect clears) not implemented"); return; }
+    if (g_emb_vs) { vk_skip("embedded VS (rect clears) not implemented");
+        if (g_opt_rt_clear_log) { static int n_; if (n_ < 100) { n_++; say("  rt-clear-log (w25_fix): draw with an embedded VS SKIPPED, flip "); say_dec((i64)g_flips); say(" target "); say_hex((u64)g_ctx[CTX_CB_COLOR0_BASE] << 8);
+            say(" mask "); say_hex(tmask); say(" PS "); say_hex((u64)g_shr[SH_PGM_LO_PS] << 8); say(" count "); say_dec((i64)count); say("\n"); } }
+        return; }
     VkPrimitiveTopology topo; int strip = 0, quads = 0, tess = 0; u32 npatch = 0;
     switch (g_ucfg[UC_VGT_PRIMITIVE_TYPE]) {
     case 1: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
@@ -7546,7 +7873,7 @@ static void vkr_draw_body(const char *kind, u32 count, int indexed, u32 first_in
     if (indexed && !quads && !gsd && !tess) {
         u32 isz = g_index_type ? 4 : 2; ixlen = (u64)(first_index + count) * isz;
         rm_request(g_index_base, g_index_base + ixlen);   /* read mirror: index buffers too */
-        ib_ok = rm_locate(g_index_base, ixlen, &ib, &ioff) || vk_locate(g_index_base, ixlen, &ib, &ioff);
+        ib_ok = rm_locate(g_index_base, ixlen, &ib, &ioff) || vk_locate_c(BC_IDX, g_index_base, ixlen, &ib, &ioff);
         if (!ib_ok && ixlen <= (1u << 20) && mem_ok(g_index_base, ixlen)) ixneed = (ixlen + 255) & ~255ull;
     }
     if (qneed + ixneed + fold_need(&vs) + fold_need(&ps) > V.qsize / (u64)g_nslot / 2) { vk_skip("quad list too large"); return; }
@@ -7866,9 +8193,14 @@ static int fill_clear_value(VkFormat f, u32 v, VkClearColorValue *c) {
 static void rt_fill(u64 lo, u64 hi, u32 val) {
     for (int i = 0; i < V.nimg; i++) {
         VImg *m = &V.img[i];
-        if (!m->img || m->is_copy || !m->gpu_written || m->is3d) continue;
+        if (!m->img || m->is_copy || m->is3d) continue;
         u64 a = m->addr, n = rt_mem_bytes(m);
+        if (g_opt_rt_clear_log && a < hi && a + n > lo && (!m->gpu_written || a < lo || a + n > hi || n < 4096)) { static int n_; if (n_ < 300) { n_++;
+            say("  rt-clear-log (w25_fix): fill "); say_hex(lo); say("-"); say_hex(hi); say(" value "); say_hex(val); say(" flip "); say_dec((i64)g_flips); say(" touches image "); say_hex(a); say(" "); say_dec(m->w); say("x"); say_dec(m->h);
+            say(" ("); say_dec((i64)n); say(" bytes, fmt "); say_dec((i64)m->fmt); say(m->gpu_written ? ", GPU-written" : ", not GPU-written"); say(m->depth ? ", depth" : ""); say(a >= lo && a + n <= hi ? ", covered" : ", PARTLY covered: not cleared"); say(")\n"); } }
+        if (!m->gpu_written) continue;
         if (a < lo || a + n > hi || n < 4096) continue;
+        if (g_opt_rt_clear_log && RS_UI_ADDR(a)) { static int n2_; if (n2_ < 100) { n2_++; say("  rt-clear-log (w25_fix): interface target "); say_hex(a); say(" "); say_dec(m->w); say("x"); say_dec(m->h); say(" cleared by a fill, value "); say_hex(val); say(", flip "); say_dec((i64)g_flips); say("\n"); } }
         VkClearColorValue cv; h_memset(&cv, 0, sizeof cv);
         if (val && (m->depth || !fill_clear_value(m->fmt, val, &cv))) { g_n_rt_fill_skipped++; continue; }
         vk_begin_cb(); vk_end_rendering();
@@ -7914,7 +8246,7 @@ static int vk_dma_fastpath(u32 x, u32 y, u32 z) {
         for (u32 j = 1; j <= mask; j++) if (pat[j] != pat[0]) return 0;   /* only a single repeated value becomes a fill */
         u64 bytes = n * 4;
         VkBuffer bd; u64 od;
-        if (!vk_locate(da, bytes, &bd, &od) || (od & 3)) return 0;
+        if (!vk_locate_c(BC_CSF, da, bytes, &bd, &od) || (od & 3)) return 0;
         vk_begin_cb(); vk_barrier();   /* earlier draws / dispatches may still read or write it */
         vkCmdFillBuffer(V.cb, bd, od, bytes, pat[0]);
         gw_note(da, da + bytes);
@@ -7924,7 +8256,7 @@ static int vk_dma_fastpath(u32 x, u32 y, u32 z) {
         return 1;
     }
     if (nuser != 8 || tx != 64 || ty_ > 1 || tz > 1 || z != 1) return 0;
-    if (code_is(code, &k_cs_copy) && y == 1) {
+    if (code_is(code, &k_cs_copy) && y == 1 && !g_opt_no_copy_fast) {   /* w25_fix: --no-copy-fastpath = the game's copy shader runs */
         const u32 *S = ud, *D = ud + 4;
         u64 sa = S[0] | ((u64)(S[1] & 0xFFF) << 32), da = D[0] | ((u64)(D[1] & 0xFFF) << 32);
         u32 ss = (S[1] >> 16) & 0x3FFF, ds = (D[1] >> 16) & 0x3FFF;
@@ -7933,8 +8265,19 @@ static int vk_dma_fastpath(u32 x, u32 y, u32 z) {
         u64 n = (u64)x * 64; if (S[2] < n) n = S[2]; if (D[2] < n) n = D[2];
         u64 bytes = n * ss;
         if (!bytes) return 1;
+        int cpu_ = cs_copy_try(sa, da, bytes);   /* w20_mem --cs-copy-cpu (1: done on the CPU; -1: check mode, GPU copy unmarked) */
+        if (cpu_ == 1) return 1;   /* (our memcpy is a CPU write: write-watch sees it like the game's own, as for textures over it) */
         VkBuffer bs, bd; u64 os_, od;
-        if (!vk_locate(sa, bytes, &bs, &os_) || !vk_locate(da, bytes, &bd, &od) || (sa < da + bytes && da < sa + bytes)) return 0;
+        if (cpu_ == -1) g_ccp_nomark = 1;
+        int loc_ = vk_locate_c(BC_CSS, sa, bytes, &bs, &os_) && vk_locate_c(BC_CSD, da, bytes, &bd, &od);
+        g_ccp_nomark = 0;
+        if (!loc_ || (sa < da + bytes && da < sa + bytes)) { cl_note("compute copy (not by the copy engine: shader runs)", sa, da, bytes, 1); return 0; }
+        cl_note("compute copy (copy engine)", sa, da, bytes, 1);
+        if (g_cl_hi && ((sa < g_cl_hi && sa + bytes > g_cl_lo) || (da < g_cl_hi && da + bytes > g_cl_lo)) && g_cl_n <= 20000) {   /* w25_fix: where the two ends live, and the source bytes the CPU sees now */
+            VShadow *ss_ = shadow_of(sa, bytes), *ds_ = shadow_of(da, bytes); u64 h_ = 1469598103934665603ull; u64 hn_ = bytes < 65536 ? bytes : 65536;
+            if (mem_ok(sa, hn_)) for (u64 q = 0; q < hn_; q += 8) h_ = (h_ ^ *(const u64 *)(sa + q)) * 1099511628211ull;
+            say("    copy-log detail: source "); say(ss_ ? "in a VRAM copy" : "in RAM"); say(", destination "); say(ds_ ? "in a VRAM copy" : "in RAM");
+            say(", source RAM hash (first 64 KB) "); say_hex(h_); say(", GPU writes in flight over the source "); say_dec(gw_inflight(sa, sa + bytes)); say("\n"); }
         vk_begin_cb(); vk_barrier();   /* earlier draws / dispatches may still read or write it */
         VkBufferCopy bc = {os_, od, bytes};
         vkCmdCopyBuffer(V.cb, bs, bd, 1, &bc);
@@ -7961,7 +8304,7 @@ static int vk_dma_fastpath(u32 x, u32 y, u32 z) {
         u64 bytes = lim > 0 ? (u64)lim : 0; if (span < bytes) bytes = span; if (D[2] < bytes) bytes = D[2] & ~3ull;
         if (!bytes) return 1;
         VkBuffer bd; u64 od;
-        if (!vk_locate(da, bytes, &bd, &od) || (od & 3)) return 0;
+        if (!vk_locate_c(BC_CSF, da, bytes, &bd, &od) || (od & 3)) return 0;
         vk_begin_cb(); vk_barrier();   /* earlier draws / dispatches may still read or write it */
         vkCmdFillBuffer(V.cb, bd, od, bytes & ~3ull, cb[2]);
         gw_note(da, da + bytes);
@@ -8024,7 +8367,7 @@ static void csck_read(u64 a, u64 n, u8 *dst) {
                 else if (g_sh[i].lo > p && g_sh[i].lo < e) e = g_sh[i].lo; }
             if (sh) { if (sh->hi < e) e = sh->hi; VkBufferCopy bc = {p - sh->lo, p - b0, e - p}; vkCmdCopyBuffer(V.cb, sh->buf, V.stage, 1, &bc); }
             else { VkBuffer rb; u64 ro;
-                if (mem_ok(p, e - p) && vk_locate(p, e - p, &rb, &ro)) { VkBufferCopy bc = {ro, p - b0, e - p}; vkCmdCopyBuffer(V.cb, rb, V.stage, 1, &bc); }
+                if (mem_ok(p, e - p) && vk_locate_c(BC_RB, p, e - p, &rb, &ro)) { VkBufferCopy bc = {ro, p - b0, e - p}; vkCmdCopyBuffer(V.cb, rb, V.stage, 1, &bc); }
                 else { if (nbad < 16) { badlo[nbad] = p - b0; badhi[nbad] = e - b0; nbad++; } g_csck_bad += e - p; } }
             p = e; }
         vk_submit_wait();
@@ -8233,7 +8576,7 @@ static void vkr_gds_fill(u32 off, u32 n, u32 v) {
 }
 static void vkr_gds_read(u32 off, u64 dst, u32 n) {   /* CP DMA from GDS into game memory, in order on the GPU */
     if (!g_vk_on || !V.gds || off + n > 65536) return;
-    VkBuffer bd; u64 od; if (!vk_locate(dst, n, &bd, &od)) return;
+    VkBuffer bd; u64 od; if (!vk_locate_c(BC_OTHER, dst, n, &bd, &od)) return;
     vk_begin_cb(); vk_barrier();
     VkBufferCopy bc = {off, od, n};
     vkCmdCopyBuffer(V.cb, V.gds, bd, 1, &bc);
@@ -8589,7 +8932,7 @@ static void vk_replay_snapmem(u64 step) {
                 if (p >= g_sh[i].lo && p < g_sh[i].hi) sh = &g_sh[i];
                 else if (g_sh[i].lo > p && g_sh[i].lo < e) e = g_sh[i].lo; }
             if (sh) { if (sh->hi < e) e = sh->hi; VkBufferCopy bc = {p - sh->lo, p - a, e - p}; vkCmdCopyBuffer(V.cb, sh->buf, V.stage, 1, &bc); nv++; }
-            else if (mem_ok(p, e - p)) { VkBuffer rb; u64 ro; if (vk_locate(p, e - p, &rb, &ro)) { VkBufferCopy bc = {ro, p - a, e - p}; vkCmdCopyBuffer(V.cb, rb, V.stage, 1, &bc); } else bad = 1; }
+            else if (mem_ok(p, e - p)) { VkBuffer rb; u64 ro; if (vk_locate_c(BC_RB, p, e - p, &rb, &ro)) { VkBufferCopy bc = {ro, p - a, e - p}; vkCmdCopyBuffer(V.cb, rb, V.stage, 1, &bc); } else bad = 1; }
             else bad = 1;
             p = e; }
         vk_submit_wait();
@@ -8953,6 +9296,7 @@ static void vkr_snap(u32 n) {
    E6's submit translation and the present itself, so "game" is the rest of its frame time. */
 /* t109: the renderer's part of the memory report (e3_hle.c mem_report): its own pools, and the driver's figures per
    memory heap (VK_EXT_memory_budget: what this program uses of each heap, and the budget the driver gives it) */
+#include "e6_memmap_rep.c"   /* w20_mem: --mem-touch-map figures */
 static void vk_mem_report(void) {
     if (!g_vk_on || !V.dev) return;
     u64 nimg = 0; for (int i = 0; i < V.nimg; i++) if (V.img[i].img) nimg++;
@@ -8986,6 +9330,19 @@ static void vk_mem_report(void) {
         if (g2s_spv_compress_lazy) { u64 lq, lp, ld; g2s_spv_lazy_stats(&lq, &lp, &ld); say("; w2: compressed between frames "); say_dec((i64)ld); say(", waiting "); say_dec((i64)lq); say(" (most "); say_dec((i64)lp); say(")"); } }
     say("), graphics pipelines ");
     say_dec(V.npipe); say(", compute pipelines "); say_dec(g_ncpipe); say(", samplers "); say_dec(V.nsamp); say(", images "); { int ni = 0; for (int i = 0; i < V.nimg; i++) if (V.img[i].img) ni++; say_dec(ni); } say("\n");
+    if (g_opt_cscpu) {   /* w20_mem step 1 */
+        say("      compute copies (w20_mem --cs-copy-cpu "); say_dec(g_opt_cscpu); say("): seen "); say_dec((i64)g_ccp_n[0]); say(", on the CPU "); say_dec((i64)g_ccp_n[1]); say(" ("); say_dec((i64)(g_ccp_bytes[0] >> 20));
+        say(" MB); on the GPU because: other GPU use of the pages "); say_dec((i64)g_ccp_n[2]); say(", GPU write in flight "); say_dec((i64)g_ccp_n[3]); say(", VRAM copy "); say_dec((i64)g_ccp_n[4]);
+        say(", page protection "); say_dec((i64)g_ccp_n[5]); say(", overlap / not game memory "); say_dec((i64)g_ccp_n[6]); say(", GPU-written image over it "); say_dec((i64)g_ccp_n[7]); say(", outside the RenderData pool "); say_dec((i64)g_ccp_n[9]);
+        say(", frame budget ("); say_dec(g_ccp_budget_mb); say(" MB) "); say_dec((i64)g_ccp_n[8]);
+        say(" (in-flight use by: shader reads "); say_dec((i64)g_ccp_whyn[1]); say(", shader writes "); say_dec((i64)g_ccp_whyn[2]); say(", other buffer use "); say_dec((i64)g_ccp_whyn[3]); say(", GPU copies / fills "); say_dec((i64)g_ccp_whyn[4]); say(")");
+        if (g_opt_cscpu == 3) { say("; verify: source unchanged until the batch finished "); say_dec((i64)g_ccp_vfy_same); say(", changed by later work of the batch (fine) "); say_dec((i64)g_ccp_vfy_expl); say(", CHANGED "); say_dec((i64)g_ccp_vfy_changed); say(" ("); say_dec((i64)(g_ccp_vfy_changed_bytes >> 10)); say(" KB");
+            if (g_ccp_vfy_changed) { say(", first at "); say_hex(g_ccp_vfy_first); } say("), not checked "); say_dec((i64)g_cschk_skipped); }
+        if (g_opt_cscpu == 2) { say("; check: CPU copy would have given the same bytes "); say_dec((i64)g_cschk_same); say(", DIFFERENT "); say_dec((i64)g_cschk_diff); say(" ("); say_dec((i64)(g_cschk_diff_bytes >> 10));
+            say(" KB"); if (g_cschk_diff) { say(", first at "); say_hex(g_cschk_first_diff); } say("), not checked "); say_dec((i64)g_cschk_skipped); say(", waiting "); say_dec((i64)(g_cschk_w - g_cschk_r)); }
+        say("\n");
+    }
+    if (g_opt_lean_tables) { say("      lean tables (w20_mem --lean-tables): "); say_dec(g_nlean); say(" reserving "); say_dec((i64)(g_lean_bytes >> 20)); say(" MB, committed on first use "); say_dec((i64)(g_lean_commits * 64 >> 10)); say(" MB"); if (g_lean_fail) { say(", COMMIT FAILURES "); say_dec((i64)g_lean_fail); } say("\n"); }
     if (g_has_mem_budget && !g_memrep_crash) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
@@ -9000,6 +9357,7 @@ static void vk_mem_report(void) {
         { u64 imp = __atomic_load_n(&g_imp_bytes, __ATOMIC_RELAXED);   /* w17_mem */
           say("      system memory for the GPU (w17_mem): game memory imported "); say_dec((i64)(imp >> 20)); say(" MB, upload buffer "); say_dec((i64)(V.stage_size >> 20)); say(" MB, index ring ");
           say_dec((i64)(V.qsize >> 20)); say(" MB, own upload buffers "); say_dec((i64)(g_stmp_live >> 20)); say(" MB; low system memory mode "); say(g_lowsys_on ? (g_opt_lowsys > 0 ? "on (forced)" : "on") : "off");
+          if (g_opt_imp_gpu_only) { say(g_ldm_auto_on == 1 ? "; low driver memory (automatic): CPU-only memory not imported " : "; --import-gpu-only: CPU-only memory not imported "); say_dec((i64)(g_mem_noimp_bytes >> 20)); say(" MB, imported later "); say_dec((i64)g_mem_promoted); say(" ranges ("); say_dec((i64)(g_mem_promoted_bytes >> 20)); say(" MB)"); }
           if (g_lowsys_peak) { say("; peak use "); say_dec((i64)(g_lowsys_peak >> 20)); say(" MB, 10 s checks over 90 % "); say_dec((i64)g_lowsys_n90); say(", at or over the budget "); say_dec((i64)g_lowsys_n100); }
           say("\n"); }
     }
@@ -9016,6 +9374,11 @@ static void vkr_ab_flip(u64 flips) {
     g_opt_bk_present = !g_ab_off; g_opt_prescan = !g_ab_off;
 }
 static void vkr_perf_window(u64 flips, u64 window_ticks, u64 draws_total) {
+    if (g_amk_map && flips % 600 == 0) {   /* w32_issues --gpu-markers-amd: the markers advance (sanity line for players' logs) */
+        u32 t32 = g_amk_map[0], b32 = g_amk_map[1];
+        say("    AMD buffer markers (--gpu-markers-amd): issued "); say_dec((i64)g_ck_seq); say(", last started "); say_dec((i64)t32); say(", last finished "); say_dec((i64)b32);
+        say(t32 == (u32)g_amk_last_log ? " - NOT ADVANCING\n" : "\n"); g_amk_last_log = t32;
+    }
     static u64 l_sub, l_draw, l_tr, l_tex, l_pipe, l_wait, l_pres, l_pace, l_busy, l_draws, l_bar, l_batches, l_disp, l_bsub, l_wbk, l_ndisp; static int primed;
     if (!g_vk_on || !flips) return;
     if (!primed) { primed = 1; window_ticks = 0; }   /* first call: only take the starting values */
@@ -9057,6 +9420,7 @@ static void vkr_perf_window(u64 flips, u64 window_ticks, u64 draws_total) {
             say("; write-tracking calls "); say_dec((i64)((g_ww_calls - lc) / 60)); say(" over "); say_dec((i64)((g_ww_bytes - lb) / 60 >> 20)); say(" MB, written pages "); say_dec((i64)((g_ww_dirty - ld) / 60));
             say(" (the times above include the copies they record)");
             if (g_opt_ww_probe) { say("; probes "); say_dec((i64)((g_ww_probes - lpr) / 60)); say(", ranges found unwritten "); say_dec((i64)((g_ww_skipped - ls) / 60)); }
+            if (g_opt_wwspan) { static u64 lc_, lh_, lf_; say("; w31 probe windows "); say_dec((i64)((g_n_wws_calls - lc_) / 60)); say(" (answered from a window "); say_dec((i64)((g_n_wws_hits - lh_) / 60)); say(", failed "); say_dec((i64)(g_n_wws_fail - lf_)); say(")"); lc_ = g_n_wws_calls; lh_ = g_n_wws_hits; lf_ = g_n_wws_fail; }
             else say("; --no-ww-probe");
             if (g_opt_ww_probe == 3) { static u64 lvr, lvf, lvp; say("; verify: unwritten ranges "); say_dec((i64)(g_ww_vfy_ranges - lvr)); say(", of them the reset found written ");
                 say_dec((i64)(g_ww_vfy_found - lvf)); say(" ("); say_dec((i64)(g_ww_vfy_pages - lvp)); say(" pages)"); lvr = g_ww_vfy_ranges; lvf = g_ww_vfy_found; lvp = g_ww_vfy_pages; }
@@ -9102,6 +9466,32 @@ static void vkr_perf_window(u64 flips, u64 window_ticks, u64 draws_total) {
               say(", again otherwise "); say_dec((i64)(g_tc_again - l_again)); say("; evicted because the table was full "); say_dec((i64)(g_tc_ev[1] - l_ev[1]));
               say(", for the memory budget "); say_dec((i64)(g_tc_ev[2] - l_ev[2])); say(" (unused for <60 frames "); say_dec((i64)(g_tc_evage[0] - l_age[0]));
               say(", <600 "); say_dec((i64)(g_tc_evage[1] - l_age[1])); say(", longer "); say_dec((i64)(g_tc_evage[2] - l_age[2])); say(")");
+              if (g_opt_tex_ws_log) {   /* w21_perf */
+                  u64 b1 = 0, b8 = 0, b60 = 0; for (int i = 0; i < V.nimg; i++) { VImg *m = &V.img[i]; if (!m->img) continue; u64 a = now > m->last_use ? now - m->last_use : 0; if (a <= 1) b1 += m->bytes; if (a < 8) b8 += m->bytes; if (a < 60) b60 += m->bytes; }
+                  static u64 l8, lbb, lpo, lpf; u64 hu = 0, hb = 0, hs = 0; int hq = vramheap_query(&hu, &hb, &hs);
+                  say("\n    texture working set (w21_perf): MB of images used in the last frame "); say_dec((i64)(b1 >> 20)); say(", 8 frames "); say_dec((i64)(b8 >> 20)); say(", 60 frames "); say_dec((i64)(b60 >> 20));
+                  say("; this window evicted: used in the last 8 frames "); say_dec((i64)(g_tc_ev8 - l8)); say(", for the budget "); say_dec((i64)((g_tc_evb_bytes - lbb) >> 20)); say(" MB");
+                  say("; image memory real "); say_dec((i64)(img_real_bytes() >> 20)); say(" MB (pool "); say_dec(g_imp_live); say(" x "); say_dec(IMP_BLOCK_MB); say(" MB holding "); say_dec((i64)(g_imp_bytes_pooled >> 20)); say(" MB; budget "); say_dec((i64)(V.img_budget >> 20)); say(" MB; blockwise evictions "); say_dec((i64)g_n_blk_evict); say(")");
+                  if (hq) { say("; driver VRAM heap "); say_dec((i64)(hu >> 20)); say(" of "); say_dec((i64)(hb >> 20)); say(" MB budget ("); say_dec((i64)(hs >> 20)); say(" MB)"); }
+                  if (g_opt_img_protect) { say("; --img-protect "); say_dec(g_opt_img_protect); say(": over the budget instead "); say_dec((i64)(g_n_protect_over - lpo)); say(", no room -> evicted as before "); say_dec((i64)(g_n_protect_fallback - lpf)); say(", most over "); say_dec((i64)(g_protect_over_peak >> 20)); say(" MB"); }
+                  l8 = g_tc_ev8; lbb = g_tc_evb_bytes; lpo = g_n_protect_over; lpf = g_n_protect_fallback; }
+              if (g_opt_vram_log && (V.frame / 60) % 10 == 0) {   /* w21_perf: every ~600 flips */
+                  VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(V.pd, &mp);
+                  u64 dl = 0, hv = 0, ho = 0; pm_lock(&g_va_m);
+                  for (int k = 0; k < g_va_nsite; k++) { u32 f = g_va_site[k].mt < mp.memoryTypeCount ? mp.memoryTypes[g_va_site[k].mt].propertyFlags : 0;
+                      if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) hv += g_va_site[k].bytes; else if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) dl += g_va_site[k].bytes; else ho += g_va_site[k].bytes; }
+                  u64 hu = 0, hb = 0, hs = 0; int hq = vramheap_query(&hu, &hb, &hs);
+                  say("\n    VRAM by allocation (w21_perf --vram-log): ours device-local "); say_dec((i64)(dl >> 20)); say(" MB + device-local host-visible "); say_dec((i64)(hv >> 20)); say(" MB; host memory "); say_dec((i64)(ho >> 20)); say(" MB");
+                  if (hq) { say("; driver VRAM heap use "); say_dec((i64)(hu >> 20)); say(" MB -> not ours (driver objects, swapchain, pipelines ...) about "); say_dec((i64)(hu > dl + hv ? (hu - dl - hv) >> 20 : 0)); say(" MB"); }
+                  say("; failed "); say_dec((i64)g_va_fail); say("\n      by e6_vk.c / e6_prep.c line (MB now / peak, allocations, memory type flags):");
+                  for (int pass = 0; pass < g_va_nsite && pass < 24; pass++) { int bk = -1; for (int k = 0; k < g_va_nsite; k++) { int done = 0; for (int q = 0; q < pass; q++) {} (void)done;
+                          if (g_va_site[k].peak >= (1ull << 20) && (bk < 0 || g_va_site[k].bytes > g_va_site[bk].bytes) && !(g_va_site[k].n & 0x80000000u)) bk = k; }
+                      if (bk < 0) break; u32 f = g_va_site[bk].mt < mp.memoryTypeCount ? mp.memoryTypes[g_va_site[bk].mt].propertyFlags : 0;
+                      say(" @"); say_dec(g_va_site[bk].line); say(" "); say_dec((i64)(g_va_site[bk].bytes >> 20)); say("/"); say_dec((i64)(g_va_site[bk].peak >> 20)); say(" x"); say_dec((i64)g_va_site[bk].n); say(" f"); say_dec(f); say(";");
+                      g_va_site[bk].n |= 0x80000000u; }
+                  for (int k = 0; k < g_va_nsite; k++) g_va_site[k].n &= 0x7FFFFFFFu;
+                  pm_unlock(&g_va_m); }
+
               l_new = g_tc_new; l_again = g_tc_again; l_b60 = g_tc_back60; l_b600 = g_tc_back600; l_bl = g_tc_backlong; for (int k = 0; k < 3; k++) { l_ev[k] = g_tc_ev[k]; l_age[k] = g_tc_evage[k]; } } }
         say("\n"); }
 #undef MS
@@ -9373,7 +9763,7 @@ static void vkr_flip_body(u64 addr, u32 w, u32 h) {
     if (!src && nolog++ < 5) { vl("flip "); vl_d(V.frame); vl(": no rendered image at display buffer "); vl_x(addr); vl("\n"); }
     if (src && g_opt_catch_flash) vk_catch_flash(src, w < src->w ? w : src->w, h < src->h ? h : src->h);
     if (src && (shot_due(g_flips) || (g_rp_running && g_npshot))) vk_shot(src, w < src->w ? w : src->w, h < src->h ? h : src->h);
-    if (src && g_dev_mode && src->bpe == 32 && !src->depth) flb_record(src, w < src->w ? w : src->w, h < src->h ? h : src->h);   /* t107f: flashback */
+    if (src && g_dev_mode && !g_opt_no_flashback && src->bpe == 32 && !src->depth) flb_record(src, w < src->w ? w : src->w, h < src->h ? h : src->h);   /* t107f: flashback */
     if (g_fb_req) { g_fb_req = 0; flb_save(); }
     if (g_skip_blank) {   /* a movie was skipped: its paused last frame stays in the display buffer; show black until it changes */
         if (g_skip_blank == 1) { g_skip_blank = 2; g_skip_blank_seq = V.wseq; g_skip_blank_t0 = plat_ticks(); }   /* anything drawn after this counts as new */
@@ -9668,7 +10058,9 @@ static void vkr_report(void) {
     say("    depth <-> R32 syncs as single image copies (t194, VK_KHR_maintenance8"); say(g_has_m8 ? "): " : ", not available): "); say_dec((i64)g_n_depth_sync8);
     say("; w12_gpu: as shader passes: depth -> R32 by compute (--dsync-cs "); say(g_opt_dsync_cs ? "on) " : "off) "); say_dec((i64)g_n_dsy_cs); say(", R32 -> depth by a draw (--dsync-draw "); say(g_opt_dsync_draw ? "on) " : "off) "); say_dec((i64)g_n_dsy_draw);
     if (g_opt_dsync_cs || g_opt_dsync_draw) { say(" ("); say_dec((i64)(g_n_dsy_px >> 20)); say(" Mpx; pipelines made in "); say_dec((i64)g_dsy.ms); say(" ms; left to the copy: image kinds "); say_dec((i64)g_n_dsy_no[0]); say(", usage "); say_dec((i64)g_n_dsy_no[1]); say(", no pipeline "); say_dec((i64)g_n_dsy_no[2]);
-        say(", open occlusion query "); say_dec((i64)g_n_dsy_no[4]); say(", after turning itself off "); say_dec((i64)g_n_dsy_no[3]); say("; R32 texels a depth write could change (must be 0): "); say_dec(g_dsy.cnt ? (i64)g_dsy.cnt[0] : 0); say(g_dsy.tripped ? " - TURNED OFF during the run)" : ")"); }
+        say(", open occlusion query "); say_dec((i64)g_n_dsy_no[4]); say(", after turning itself off "); say_dec((i64)g_n_dsy_no[3]); say("; R32 texels a depth write could change (must be 0): "); say_dec(g_dsy.cnt ? (i64)g_dsy.cnt[0] : 0); say(g_dsy.tripped ? " - TURNED OFF during the run)" : ")");
+        if (g_opt_dsy_diag) { say("; --dsync-diag: passes "); say_dec((i64)g_dsy_next); say(", R32 image in left-out memory "); say_dec((i64)g_dsy_lo_passes); say(", render-target marks in left-out memory "); say_dec((i64)g_ldm_rt_lo); }
+        if (g_opt_dsy_force >= 0) { say("; --dsync-trip-at "); say_dec(g_opt_dsy_force); } }
     say("\n    w12_gpu: snapshots of depth + stencil targets: both planes "); say_dec((i64)g_n_fb_ds[0]); say(", depth plane only (--fb-depth-only "); say(g_opt_fb_depth_only ? "on) " : "off) "); say_dec((i64)g_n_fb_ds[1]); say("\n");
     if (g_ram_img_cap || g_n_pressure) { say("    memory budgets (t194): RAM "); say_dec((i64)(ram_total() >> 20)); say(" MB"); if (g_sim_ram) say(" (--sim-ram-gb)"); say(", image budget held to "); say_dec((i64)(g_ram_img_cap >> 20)); say(" MB, lowered under memory pressure "); say_dec((i64)g_n_pressure); say(" times\n"); }
     say("    image memory peak "); say_dec((i64)(V.img_bytes_peak >> 20)); say(" MB of budget "); say_dec((i64)(V.img_budget >> 20)); say(" MB, freed to stay in budget "); say_dec((i64)V.n_budget_evict); say(", pipelines "); say_dec(V.npipe); say("/65536, compute "); say_dec(g_ncpipe); say("/16384, shader modules "); say_dec(V.nmod); say("/65536, views "); say_dec(V.nview); say("/32768, samplers "); say_dec(V.nsamp); say(" (recycled "); say_dec((i64)V.n_samp_recycled); say(")\n");
@@ -9704,7 +10096,7 @@ static void vkr_report(void) {
       say("), compile time "); say_dec((i64)(g_pj_compile_ticks / tf)); say(" ms, renderer waited "); say_dec((i64)(g_pj_wait_ticks / tf));
       say(" ms; largest batch "); say_dec((i64)g_pj_max_batch); say(" pipelines; batches recorded and replayed "); say_dec((i64)D.drains); say(" (largest "); say_dec((i64)D.max_rec); say(" commands)\n"); }
     say("    mip chains uploaded "); say_dec((i64)V.n_mip_uploads); say(g_opt_nomips ? " (--no-mips: base level only)" : "");
-    say(", mip layout check (good / unclear / bad): 2D levels "); say_dec(g_mipchk_ok[0]); say(" / "); say_dec(g_mipchk_mid[0]); say(" / "); say_dec(g_mipchk_bad[0]);
+    say(g_opt_mipchk ? ", mip layout check (--mip-selfcheck; good / unclear / bad): 2D levels " : ", mip layout check off (default; --mip-selfcheck): 2D levels "); say_dec(g_mipchk_ok[0]); say(" / "); say_dec(g_mipchk_mid[0]); say(" / "); say_dec(g_mipchk_bad[0]);
     say(", 1D levels "); say_dec(g_mipchk_ok[1]); say(" / "); say_dec(g_mipchk_mid[1]); say(" / "); say_dec(g_mipchk_bad[1]); say("\n");
     say("    constant engine: "); say_dec((i64)g_ce_writes); say(" RAM writes, "); say_dec((i64)g_ce_dumps); say(" dumps ("); say_dec((i64)(g_ce_dump_dw >> 18)); say(" MB, rejected "); say_dec((i64)g_ce_dump_bad); say("); CP DMA: ");
     say_dec((i64)g_dma_ops); say(" ops, "); say_dec((i64)(g_dma_bytes_cpu >> 20)); say(" MB, GDS writes "); say_dec((i64)g_dma_gds); say(", GDS reads "); say_dec((i64)g_dma_gds_rd); say(", skipped "); say_dec((i64)g_dma_skipped);
@@ -10562,4 +10954,5 @@ static void coh_selftest(void) {
     coh_report();
 }
 #include "e6_capture.c"   /* replay captures (RENDERER_PLAN stage 1) */
+#include "e6_framelog.c"   /* w31_perf --frame-log */
 #endif

@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This guide covers v0.4.1 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
+This guide covers v0.5.0 (a work-in-progress test release). You need two things: **the release download** from this project, and **your own
 copy of the original PS4 game**. The download does not contain the game.
 
 ---
@@ -11,7 +11,7 @@ copy of the original PS4 game**. The download does not contain the game.
 
 - Windows 10 or 11, 64-bit, and a PC that meets the [system requirements](../README.md#system-requirements).
 - A current graphics driver from NVIDIA, AMD or Intel (it provides Vulkan).
-- A decrypted dump of **Until Dawn for PS4, CUSA02636, with the 01.03 update applied**, made from your own
+- A decrypted dump of **Until Dawn for PS4, CUSA02636 or CUSA00194, with the 01.03 update applied** (other editions: `COMPATIBILITY.txt`), made from your own
   **legally obtained** copy of the game. Other regions
   (for example the European or Asian releases) and other versions are not supported; the program checks the
   game's executables and tells you if they don't match.
@@ -23,7 +23,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 
 ## 2. Download and extract the release
 
-1. Download `UntilDawn_PC_v0.4.1.zip` from the
+1. Download `UntilDawn_PC_v0.5.0.zip` from the
    [Releases page](https://github.com/SuperCatElvis/UntilDawn_PC/releases).
 2. Extract it to a folder **you can write to**, for example `D:\Games\UntilDawn_WIP`.
    Don't use `C:\Program Files`: the program keeps its settings, logs, shader cache and saves in its own folder.
@@ -31,7 +31,7 @@ The program does not decrypt anything. It needs the game files in their decrypte
 After extracting you have:
 
 ```
-UntilDawn_0.4.1\
+UntilDawn_0.5.0\
   UntilDawn.exe                     the game
   pipelines.udm                     the shader list prepared on the first start (keep it here)
   Config\settings.ini               settings (see section 5)
@@ -43,7 +43,11 @@ UntilDawn_0.4.1\
     README_COMPAT.txt
   README.txt
   INSTALLATION.txt                  this guide
-  CHANGELOG_v0.4.1.md               what is new in this version
+  CHANGELOG_v0.5.0.md               what is new in this version
+  COMPATIBILITY.txt                 which PS4 editions work (and which are experimental)
+  LANGUAGE_PACKS_README.txt         how to add the languages of a second edition you own
+  UDLanguageImporter.exe            the Language Importer (optional)
+  ud_langscan.exe                   the same as a command-line tool
   CHANGELOG_v0.4.0.md               what was new in v0.4.0
   Controls.txt
   KNOWN_ISSUES.txt
@@ -129,7 +133,7 @@ Choose **one** of these three ways:
 Copy the contents of your game folder into the release's `Game` folder, so that this file exists:
 
 ```
-UntilDawn_0.4.1\Game\eboot.bin
+UntilDawn_0.5.0\Game\eboot.bin
 ```
 
 ### Option B — point `settings.ini` at your game
@@ -237,7 +241,7 @@ and videos are scaled to match.
 | A file is reported missing although it is there (often a very long `localcachepink/streams/...` name) | With WIP 0.1.2 the folder path was too long (260-character Windows limit); WIP 0.1.3 and later fix this, so update. On 0.1.2, move the release so the path to `Game\` is 62 characters or fewer. See [Known issues](KNOWN_ISSUES.md#false-missing-files-message-with-a-long-folder-path--fixed-in-wip-013). |
 | **One** long-named file is reported missing and it really is not in `Game\localcachepink\streams` | The copy skipped it (common when copying from a long path). Copy the game again with `robocopy "<your dump>" "<release>\Game" /E`. See [Known issues](KNOWN_ISSUES.md#one-game-file-reported-missing-although-the-game-was-copied). |
 | "The game folder was not found" or "eboot.bin is missing from the game folder" | The `Game` folder (or `game_dir`) does not point at the folder that contains `eboot.bin`. Check section 3. |
-| A message says the version or region does not match | You need CUSA02636 with the 01.03 update applied. Base-game files without the update, or another region, are refused. |
+| A message says the version or edition does not match | You need CUSA02636 or CUSA00194 with the 01.03 update applied. Base-game files without the update are refused; so is any eboot.bin that is not the original 01.03 program. The message shows what was found; see `COMPATIBILITY.txt`. |
 | A message says a file is missing or has the wrong size | Your copy is incomplete, or the update was not applied over the base game. Re-copy the files. |
 | A message about the CPU | Your CPU lacks an instruction set the game's code uses (see the [requirements](../README.md#system-requirements)). This cannot be worked around. |
 | A message about the graphics card or Vulkan | Update your graphics driver. If it still fails, run the [compatibility tester](COMPATIBILITY_TESTING.md) and report the result. |
@@ -247,7 +251,7 @@ and videos are scaled to match.
 | The game runs out of memory or Windows warns about low memory | Keep the page file on ("System managed"); close other large programs. 16 GB of RAM is recommended. |
 | The game crashed | Start it again (saves are kept), then [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.previous.log`. |
 | The game stops with a message about **GPU coherence** | It could not keep the game's memory consistent safely (for example because other software interfered) and stopped rather than go on with possibly wrong data. Set `gpu_coherence = 0` in `Config\settings.ini` (change the existing line or add it), start again, and [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.previous.log`. |
-| The game stops with a graphics "device lost" error, or `Logs\UntilDawn.log` shows **LOW MEMORY** (often PCs with 16 GB of RAM) | Since v0.4.1 the program detects this and uses a little less memory, but demanding scenes can still crash on these PCs. Close other programs (web browser, game launchers, overlays, recording tools) before playing; v0.3.2 may work better there. Please [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.log`. |
+| The game stops with a graphics "device lost" error, or `Logs\UntilDawn.log` shows **LOW MEMORY** (often PCs with 16 GB of RAM) | Since v0.5.0 the program detects this and uses a little less memory, but demanding scenes can still crash on these PCs. Close other programs (web browser, game launchers, overlays, recording tools) before playing; v0.3.2 may work better there. Please [report it](../README.md#reporting-bugs) with `Logs\UntilDawn.log`. |
 | The game runs too slowly at your monitor's resolution | Set `render_resolution = 1080p` (or `1440p`) in `Config\settings.ini`; the picture is scaled to the monitor. A lower `frame_rate_limit` (for example `30`) also helps in heavy scenes. |
 | Something looks wrong, flickers or crashes since v0.4.0 | Try `optimised_rendering = 0`, then `gpu_optimisations = 0`, and [report](../README.md#reporting-bugs) which one made a difference, with `Logs\UntilDawn.log`. |
 | Something looks or runs worse in 0.3.x than in 0.2.1 | Try `gpu_coherence = 0` once to see whether GPU coherence is involved, and report both results with the logs. |

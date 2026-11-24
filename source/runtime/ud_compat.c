@@ -29,6 +29,9 @@ static void check(const char *what, int ok, const char *detail) {
     rp(ok ? "PASS  " : "FAIL  "); rp(what); if (detail && detail[0]) { rp("  ("); rp(detail); rp(")"); } rp("\n");
     if (ok) g_npass++; else g_nfail++;
 }
+#ifdef _WIN32
+static void tls_probe(const char *when);   /* issue #9 (below) */
+#endif
 static void info(const char *what, const char *detail) { rp("INFO  "); rp(what); if (detail && detail[0]) { rp("  ("); rp(detail); rp(")"); } rp("\n"); g_ninfo++; }
 static void fmt_f(char *b, float f) {   /* %.9g by hand (no libc): sign, integer part, 7 decimals */
     Sb s = {b, 0, 40}; u32 u; mem_copy(&u, &f, 4);
@@ -83,6 +86,23 @@ static void cpu_tests(void) {
     kv_x("cpu.cpuid1.ecx", C.f1_ecx); kv_x("cpu.cpuid1.edx", C.f1_edx); kv_x("cpu.cpuid7.ebx", C.f7_ebx); kv_x("cpu.cpuid81.ecx", C.e1_ecx); kv_x("cpu.xcr0", C.xcr0_lo);
     kv_d("cpu.logical_processors", plat_ncpu());
     check("CPU has every instruction set the game's code uses (AVX, F16C, BMI1, LZCNT, POPCNT, MOVBE, SSE4.2)", C.ok, C.ok ? "" : C.missing);
+    {   /* w24_compat: which missing sets the opt-in replacement (cpu_compat = 1, --cpu-compat auto) covers */
+        static const char *names[4] = {"F16C", "BMI1", "LZCNT", "MOVBE"}; const int have[4] = {C.has_f16c, C.has_bmi1, C.has_lzcnt, C.has_movbe};
+        char cov[64] = "", hard[160] = ""; const char *q = C.missing;
+        for (int i = 0; i < 4; i++) if (!have[i]) { sc_str_app(cov, sizeof cov, names[i]); sc_str_app(cov, sizeof cov, " "); }
+        while (*q) { const char *e = q; while (*e && *e != ' ') e++; int c = 0;
+            for (int i = 0; i < 4; i++) { int L = str_len(names[i]); if (e - q == L) { int eq = 1; for (int k = 0; k < L; k++) if (q[k] != names[i][k]) eq = 0; if (eq) c = 1; } }
+            if (!c) { int o = str_len(hard); for (const char *t = q; t < e && o < 150; t++) hard[o++] = *t; hard[o++] = ' '; hard[o] = 0; }
+            q = *e ? e + 1 : e; }
+        kv("cpu_missing_replaceable", cov[0] ? cov : "none");
+        kv("cpu_missing_not_replaceable", hard[0] ? hard : "none");
+        if (C.ok) info("CPU compatibility setting not needed (every instruction set is present)", "");
+        else if (!hard[0]) {
+            check("CPU can run the game with the opt-in CPU compatibility setting (the missing instructions are replaced by native code)", 1, cov);
+            rp("      -> to enable it, put this line in Config\\settings.ini:  cpu_compat = 1\n");
+            if (!C.has_f16c) rp("      (no F16C: the game's half-float conversions in skinning cost about 5 ns each, a few percent of one core)\n");
+        } else check("CPU can run the game with the opt-in CPU compatibility setting", 0, "not replaceable: these sets are used in millions of places (AVX) or are basic requirements");
+    }
     check("OS saves the AVX register state (XCR0 bits 1 and 2)", C.ymm_enabled, "");
     check("invariant time-stamp counter (the game clock is derived from RDTSC)", C.has_invariant_tsc, C.has_invariant_tsc ? "" : "the clock may drift with CPU frequency changes");
     info(C.has_sse4a ? "CPU has SSE4a: the game's 96 EXTRQ sites run as integer code anyway (same result on every CPU)" : "CPU has no SSE4a (Intel): the game's 96 EXTRQ sites run as integer code", "");
@@ -143,7 +163,18 @@ static void cpu_tests(void) {
     { u32 idx = TlsAlloc(); if (idx < 64) { void *want = (void *)0x1234567890ABull; TlsSetValue(idx, want); u64 got; u32 disp = 0x1480 + 8 * idx;
         __asm__ volatile("movq %%gs:(%1), %0" : "=r"(got) : "r"((u64)disp)); char det[48]; Sb s = {det, 0, sizeof det}; sb_s(&s, "slot "); sb_d(&s, idx); sb_s(&s, " at gs:"); sb_x(&s, disp);
         check("TEB.TlsSlots offset 0x1480 holds TlsSetValue's value (the TLS patch's gs:[] address)", got == (u64)want, det); }
-      else check("a TLS slot below 64 is available", 0, ""); }
+      else info("no TLS slot below 64 left (other programs' DLLs took them): the game uses an expansion slot (issue #9)", "");
+      kv_d("tls_first_free_slot", idx);
+      /* issue #9: the expansion path - a slot >= 64, read through TEB.TlsExpansionSlots (gs:[0x1780]) */
+      u32 burn[80]; int nb = 0; u32 hi = idx;
+      while (hi < 64 && nb < 80) { burn[nb++] = hi; hi = TlsAlloc(); if (hi == 0xFFFFFFFFu) break; }
+      if (hi >= 64 && hi != 0xFFFFFFFFu) { void *want = (void *)0x0FEDCBA987654321ull; TlsSetValue(hi, want); u64 arr, got = 0;
+          __asm__ volatile("movq %%gs:0x1780, %0" : "=r"(arr)); if (arr) got = *(u64 *)(arr + 8 * (u64)(hi - 64));
+          char det[48]; Sb s = {det, 0, sizeof det}; sb_s(&s, "slot "); sb_d(&s, hi);
+          check("TEB.TlsExpansionSlots (gs:[0x1780]) holds TlsSetValue's value for a slot >= 64 (the fallback when 64 are taken)", got == (u64)want, det);
+          TlsFree(hi); }
+      for (int k = 0; k < nb; k++) if (burn[k] != idx) TlsFree(burn[k]);
+    }
     /* game memory: PS4-style fixed addresses, write-watch, execute permission (the game's code pages are in it too) */
     { u8 *p = (u8 *)plat_alloc_at((void *)0x200000000ull, 64ull << 20);
       check("64 MB of game memory at address 0x200000000 (the PS4 direct-memory area)", p == (u8 *)0x200000000ull, "");
@@ -434,6 +465,7 @@ static int gpu_setup(void) {
     rp("\n== Vulkan ==\n");
     if (!vk_load_global()) { check("vulkan-1.dll loads (a Vulkan driver is installed)", 0, ""); return 0; }
     check("vulkan-1.dll loads (a Vulkan driver is installed)", 1, "");
+    tls_probe("vulkan_loader");   /* issue #9 */
     u32 iv = 0; if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&iv);
     { char b[40]; Sb s = {b, 0, sizeof b}; sb_d(&s, VK_API_VERSION_MAJOR(iv)); sb_s(&s, "."); sb_d(&s, VK_API_VERSION_MINOR(iv)); sb_s(&s, "."); sb_d(&s, VK_API_VERSION_PATCH(iv)); kv("vulkan.loader", b); }
     plat_window_open(); for (int i = 0; i < 300 && !g_win.hwnd; i++) plat_sleep_ms(10);
@@ -442,6 +474,7 @@ static int gpu_setup(void) {
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, 0, "UntilDawnCompat", 1, "UD", 1, VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, 0, 0, &app, 0, 0, 2, iexts};
     VkResult r = vkCreateInstance(&ici, 0, &G.inst); check("vkCreateInstance (Vulkan 1.3 application)", r == VK_SUCCESS, ""); if (r) return 0;
+    tls_probe("vkCreateInstance");   /* issue #9: the driver (ICD) and the enabled implicit layers are loaded now */
     vk_load_instance(G.inst);
     VkPhysicalDevice pds[16]; u32 npd = 16; vkEnumeratePhysicalDevices(G.inst, &npd, pds);
     kv_d("vulkan.devices", npd);
@@ -489,6 +522,7 @@ static int gpu_setup(void) {
     ef.features.fragmentStoresAndAtomics = f2.features.fragmentStoresAndAtomics; ef.features.vertexPipelineStoresAndAtomics = f2.features.vertexPipelineStoresAndAtomics; ef.features.imageCubeArray = f2.features.imageCubeArray; ef.features.occlusionQueryPrecise = f2.features.occlusionQueryPrecise;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &ef, 0, 1, &qci, 0, 0, 3, dexts, 0};
     r = vkCreateDevice(G.pd, &dci, 0, &G.dev); { char d[24]; fmt_dec(d, r); check("vkCreateDevice with the renderer's features and extensions", r == VK_SUCCESS, r ? d : ""); } if (r) return 0;
+    tls_probe("vkCreateDevice");   /* issue #9 */
     vk_load_device(G.dev); vkGetDeviceQueue(G.dev, G.qfi, 0, &G.q); g_gather_ext_ok = (int)f2.features.shaderImageGatherExtended;
     /* game-style memory, imported */
     G.host_size = 64ull << 20; G.host = (u8 *)plat_alloc_at((void *)0x200000000ull, G.host_size); if (!G.host) G.host = (u8 *)plat_alloc_rwx(G.host_size);
@@ -536,6 +570,61 @@ static int gpu_setup(void) {
 }
 #endif
 
+#ifdef _WIN32
+/* ---- issue #9: TLS slots and Vulkan implicit layers ----
+   The game's thread pointer must sit in one of the 64 TLS slots inside the thread block (else the slower fallback,
+   TEB.TlsExpansionSlots). DLLs loaded into the process (the Vulkan loader, the graphics driver, Vulkan implicit layers
+   of overlays / recorders / launchers, injected tools) take slots too. ud_compat counts the free inline slots at
+   start and after each Vulkan step, and lists the implicit layers registered on this PC (every Vulkan program loads
+   the enabled ones). */
+static int tls_free_inline(u32 *first) {   /* free slots below 64 now (allocates them all, then frees them) */
+    u32 got[1100]; int n = 0, below = 0; *first = 0xFFFFFFFFu;
+    for (;;) { u32 i = TlsAlloc(); if (i == 0xFFFFFFFFu) break; if (*first == 0xFFFFFFFFu) *first = i; got[n++] = i; if (i < 64) below++; if (i >= 64 || n >= 1100) break; }
+    for (int k = 0; k < n; k++) TlsFree(got[k]);
+    return below;
+}
+static int g_tls_free0 = -1;
+static void tls_probe(const char *when) {
+    u32 first; int f = tls_free_inline(&first);
+    char k[64]; Sb s = {k, 0, sizeof k}; sb_s(&s, "tls.free_inline_slots."); sb_s(&s, when); kv_d(k, f);
+    if (g_tls_free0 < 0) { g_tls_free0 = f; kv_d("tls.first_free_slot.start", first); }
+    else { char d[96]; Sb t = {d, 0, sizeof d}; sb_d(&t, g_tls_free0 - f); sb_s(&t, " slots taken since the start, "); sb_d(&t, f); sb_s(&t, " of 64 still free");
+           char w[96]; Sb u = {w, 0, sizeof w}; sb_s(&u, "TLS slots after "); sb_s(&u, when); info(w, d); }
+}
+__declspec(dllimport) long WINAPI RegOpenKeyExA(void *, const char *, u32, u32, void **);
+__declspec(dllimport) long WINAPI RegEnumValueA(void *, u32, char *, u32 *, u32 *, u32 *, u8 *, u32 *);
+__declspec(dllimport) long WINAPI RegEnumKeyExA(void *, u32, char *, u32 *, u32 *, char *, u32 *, void *);
+__declspec(dllimport) long WINAPI RegQueryValueExA(void *, const char *, u32 *, u32 *, u8 *, u32 *);
+__declspec(dllimport) long WINAPI RegCloseKey(void *);
+static int g_nlayers;
+static void layer_line(const char *where, const char *path, int enabled) {
+    rp("INFO  Vulkan implicit layer ("); rp(where); rp(enabled ? ", enabled): " : ", disabled): "); rp(path); rp("\n"); g_ninfo++; g_nlayers++;
+}
+static void list_layers_key(void *root, const char *rootname) {
+    void *h = 0; if (RegOpenKeyExA(root, "SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers", 0, 0x20019 | 0x100, &h)) return;
+    for (u32 i = 0; i < 512; i++) { char name[1024]; u32 nl = sizeof name, type = 0, v = 1, vl = 4;
+        if (RegEnumValueA(h, i, name, &nl, 0, &type, (u8 *)&v, &vl)) break;
+        layer_line(rootname, name, type == 4 && v == 0); }
+    RegCloseKey(h);
+}
+static void list_layers(void) {
+    rp("\n== Vulkan implicit layers (loaded into every Vulkan program, the game too) ==\n");
+    list_layers_key((void *)(u64)0x80000002u, "HKLM");
+    list_layers_key((void *)(u64)0x80000001u, "HKCU");
+    /* layers that graphics drivers register with their adapter (Windows 10+) */
+    void *h = 0;
+    if (!RegOpenKeyExA((void *)(u64)0x80000002u, "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}", 0, 0x20019 | 0x100, &h)) {
+        for (u32 i = 0; i < 64; i++) { char sub[256]; u32 sl = sizeof sub; if (RegEnumKeyExA(h, i, sub, &sl, 0, 0, 0, 0)) break;
+            void *a = 0; if (RegOpenKeyExA(h, sub, 0, 0x20019 | 0x100, &a)) continue;
+            static char buf[8192]; u32 type = 0, bl = sizeof buf - 2;
+            if (!RegQueryValueExA(a, "VulkanImplicitLayers", 0, &type, (u8 *)buf, &bl)) { buf[bl] = 0; buf[bl + 1] = 0;
+                for (char *p = buf; *p; p += str_len(p) + 1) { char w[64]; Sb s = {w, 0, sizeof w}; sb_s(&s, "driver, adapter "); sb_s(&s, sub); layer_line(w, p, 1); } }
+            RegCloseKey(a); }
+        RegCloseKey(h);
+    }
+    kv_d("vulkan.implicit_layers", g_nlayers);
+}
+#endif
 int e3_main(int argc, char **argv) {
     int no_gpu = 0, fpctl = 0; const char *game = 0;
     for (int i = 1; i < argc; i++) { if (str_eq(argv[i], "--no-gpu") || str_eq(argv[i], "--cpu-only")) no_gpu = 1; else if (str_eq(argv[i], "--fpctl")) fpctl = 1;
@@ -547,6 +636,9 @@ int e3_main(int argc, char **argv) {
     g_rep = plat_open_write("ud_compat_report.txt");
     rp("Until Dawn native port v" UD_VERSION " - hardware compatibility test (build " __DATE__ " " __TIME__ ")\n");
     { u32 maj = 0, mn = 0, bld = 0; if (plat_os_version(&maj, &mn, &bld)) { char b[48]; Sb s = {b, 0, sizeof b}; sb_d(&s, maj); sb_s(&s, "."); sb_d(&s, mn); sb_s(&s, " build "); sb_d(&s, bld); kv("os.windows", b); } }
+#ifdef _WIN32
+    tls_probe("start"); list_layers();   /* issue #9 */
+#endif
     cpu_tests();
 #ifdef _WIN32
     if (!no_gpu) { if (gpu_setup()) { gpu_semantic_tests(fpctl); if (game) { if (g_corp_fpctl) g_corp_fpctl = (g_dev.fc_rte32 ? 4 : 0) | (g_dev.fc_szinf32 ? 16 : 0) | (g_dev.fc_den_ftz32 ? 2 : 0); corpus_test(game); } } }

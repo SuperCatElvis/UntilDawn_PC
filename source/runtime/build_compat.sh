@@ -13,6 +13,6 @@ CF="-Ivk --target=x86_64-pc-windows-msvc -O1 -ffreestanding -fno-builtin -mno-st
 clang $CF -c ud_compat.c -o $O/ud_compat.obj
 clang $CF -O2 -c gcn2spv.c -o $O/gcn2spv_compat.obj
 clang $CF -O2 -Wno-missing-field-initializers -D_WIN32 -c ../renderer/udr_shader_sig.c -o $O/udr_shader_sig_compat.obj
-for d in kernel32 msvcrt user32 gdi32 winmm; do llvm-dlltool -m i386:x86-64 -d $d.def -l $O/$d.lib; done
-lld-link $TS /subsystem:console /entry:entry /nodefaultlib /stack:0x400000 $O/ud_compat.obj $O/gcn2spv_compat.obj $O/udr_shader_sig_compat.obj $O/kernel32.lib $O/msvcrt.lib $O/user32.lib $O/gdi32.lib $O/winmm.lib /out:$B/ud_compat.exe
+for d in kernel32 msvcrt user32 gdi32 winmm advapi32; do llvm-dlltool -m i386:x86-64 -d $d.def -l $O/$d.lib; done
+lld-link $TS /subsystem:console /entry:entry /nodefaultlib /stack:0x400000 $O/ud_compat.obj $O/gcn2spv_compat.obj $O/udr_shader_sig_compat.obj $O/kernel32.lib $O/msvcrt.lib $O/user32.lib $O/gdi32.lib $O/winmm.lib $O/advapi32.lib /out:$B/ud_compat.exe
 echo "built $B/ud_compat.exe"

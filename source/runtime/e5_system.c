@@ -9,11 +9,19 @@ static SYSV int ss_get_status(u8 *st) {
     if (st) h_memset(st, 0, 0x88);   /* eventNum 0, not overlaid, not in background */
     return 0;
 }
+/* w24_compat: languages. --sys-language N = the PS4 system language the game is told (SCE_SYSTEM_SERVICE_PARAM_ID_LANG:
+   0 ja, 1 en-US, 2 fr, 3 es, 4 de, 5 it, 6 nl, 7 pt-PT, 8 ru, 9 ko, 10 zh-TW, 11 zh-CN, 12 fi, 13 sv, 14 da, 15 no, 16 pl,
+   17 pt-BR, 18 en-GB, 19 tr, 20 es-LA; default 1). The game maps it to its own language index (eboot+0xacf4ea) and keeps
+   it if the title's language list has it (else its first one). --text-language L / --speech-language L (the game's index:
+   1 en, 2 fr, 3 es, 4 de, 5 it, 6 nl, 7 pt, 8 zh-TW, 9 ko, 10 ru, 11 pl, 12 da, 13 fi, 14 no, 15 sv, 16 ja, 17 es-LA,
+   18 pt-BR, 19 tr, 20 zh-CN) use the game's own override (eboot+0x1290339): sceAppContentAppParamGetInt USER_DEFINED_PARAM
+   1 / 2 = mask of allowed text / speech languages, 4 / 3 = the language used when the current one is not allowed. */
+static int g_opt_sys_lang = -1, g_opt_text_lang, g_opt_speech_lang;
 static SYSV int ss_param_get_int(int id, int *v) {
     TRACE("sceSystemServiceParamGetInt", id, v, 0);
     if (!v) return (int)0x80A10001;
     switch (id) {
-    case 1: *v = 1; break;      /* language: English (US) */
+    case 1: *v = g_opt_sys_lang >= 0 ? g_opt_sys_lang : 1; break;      /* language: English (US); w24_compat --sys-language */
     case 2: *v = 0; break;      /* date format YYYYMMDD */
     case 3: *v = 0; break;      /* 12-hour clock */
     case 4: *v = 0; break;      /* time zone offset (minutes) */
@@ -65,6 +73,13 @@ static float g_pad_q[4] = {1, 0, 0, 0};                    /* orientation (w, x,
 static u64 g_pad_q_t;
 static int g_mouse_aim; static float g_aim_vx, g_aim_vy;
 static u64 g_pad_ctrl_reads; static float g_pad_max_gyro;
+#include "e5_gyro_cal.h"
+static int g_opt_gyro_cal = 1; static float g_gyro_deadband_deg = 0.5f; static int g_opt_gyro_log;   /* w25_fix: --gyro-cal, --gyro-deadband DEG, --gyro-log; w28_int: gyro calibration ON by default (w25f2 v2, validated on a DualSense; settings gyro_calibration, --no-gyro-cal) */
+/* --swipe FLIP:DIR (w25_fix; test option, default none) - a scripted touch-pad swipe (left / right / up / down) over 15 flips
+   from FLIP; for unattended runs (the Dr Hill book page turn is a swipe left) */
+static u64 g_swipe_at[32]; static u8 g_swipe_dir[32]; static int g_nswipe;
+static GyroCal g_gcal; static int g_gcal_init;
+static float g_glog_sum[3], g_glog_t; static u32 g_glog_n, g_glog_lines;
 static void pad_orientation_reset(void) { g_pad_q[0] = 1; g_pad_q[1] = g_pad_q[2] = g_pad_q[3] = 0; }
 static void pad_orientation_step(const float w[3], float dt) {   /* q += 0.5 * q * (0, w) * dt, normalised */
     float *q = g_pad_q, x = w[0] * dt * 0.5f, y = w[1] * dt * 0.5f, z = w[2] * dt * 0.5f;
@@ -116,18 +131,35 @@ static u32 g_pad_last;
    may take any time in either run. Samples: u32 ms, u32 buttons, u8 lx ly rx ry l2 r2, u16 0 (16 bytes), after a
    16-byte header "UDIN1". */
 typedef struct { u32 ms, b; u8 v[6]; u16 z; } InRec;
+/* w21_perf --input-anchor recap | input | flip:N (default recap = t199d above). "input": RECORDING - time 0 is the first
+   controller input (a button, a stick off centre by more than 14, a trigger) from flip 250 on, recorded with that input;
+   the header keeps that flip (bytes 8-11, mode 'I' at byte 12). REPLAY of such a file - time 0 is that same flip (the
+   menus run at the frame-rate limit, so flip N is the same point of the menu in both runs). "flip:N": time 0 = flip N in
+   both (a replay given flip:N overrides the file's flip). Samples also keep their flip since time 0 in z (u16, capped).
+   Saves that resume without a "previously on" movie (issue-6 Chapter 6) never reached the t199d time 0. */
 static const char *g_inrec_path, *g_inrep_path; static void *g_inrec_h; static InRec g_inrec_buf[64]; static int g_inrec_nb; static u64 g_inrec_n;
 static InRec *g_inrep; static u64 g_inrep_n, g_inrep_i, g_inrep_used; static u64 g_in_t0; static int g_inrep_done;
-static i64 in_anchor_ms(void) {
-    if (!g_in_t0) { u64 rf = __atomic_load_n(&g_recap_flip, __ATOMIC_ACQUIRE); if (rf < 250) return -1; g_in_t0 = plat_ticks(); say("  input record / replay: time 0 at flip "); say_dec((i64)g_flips); say("\n"); }
+static int g_in_mode; static u64 g_in_flip, g_in_t0_flip; static int g_in_flip_set;   /* w21_perf: 0 recap, 1 input, 2 flip */
+static i64 in_anchor_ms(int active) {
+    if (!g_in_t0) {
+        if (g_in_mode == 0) { u64 rf = __atomic_load_n(&g_recap_flip, __ATOMIC_ACQUIRE); if (rf < 250) return -1; }
+        else if (g_in_mode == 2) { if (g_flips < g_in_flip) return -1; }
+        else { if (g_flips < 250 || !active) return -1; }
+        g_in_t0 = plat_ticks(); g_in_t0_flip = g_flips;
+        say("  input record / replay: time 0 at flip "); say_dec((i64)g_flips);
+        say(g_in_mode == 0 ? " (the \"previously on\" movie)\n" : g_in_mode == 2 ? " (--input-anchor flip / the recording's anchor flip)\n" : " (--input-anchor input: the first controller input)\n"); }
     return (i64)((plat_ticks() - g_in_t0) * 1000 / plat_ticks_per_sec());
 }
 static void inrec_flush(void) { if (g_inrec_h && g_inrec_nb) { plat_write_bin(g_inrec_h, g_inrec_buf, (u64)g_inrec_nb * sizeof(InRec)); g_inrec_nb = 0; } }
 static void inrec_note(u32 b, int lx, int ly, int rx, int ry, int l2, int r2) {
-    i64 ms = in_anchor_ms(); if (ms < 0) return;
+    #define INDEF(v) ((v) > 128 ? (v) - 128 : 128 - (v))
+    int active = b || INDEF(lx) > 14 || INDEF(ly) > 14 || INDEF(rx) > 14 || INDEF(ry) > 14 || l2 > 0 || r2 > 0;
+    #undef INDEF
+    i64 ms = in_anchor_ms(active); if (ms < 0) return;
     if (!g_inrec_h) { g_inrec_h = plat_open_write(g_inrec_path); if (!g_inrec_h) { say("  --record-input: cannot write the file\n"); g_inrec_path = 0; return; }
-        char hd[16] = "UDIN1"; plat_write_bin(g_inrec_h, hd, 16); }
-    InRec r; r.ms = (u32)ms; r.b = b; r.v[0] = (u8)lx; r.v[1] = (u8)ly; r.v[2] = (u8)rx; r.v[3] = (u8)ry; r.v[4] = (u8)l2; r.v[5] = (u8)r2; r.z = 0;
+        char hd[16] = "UDIN1"; *(u32 *)(hd + 8) = (u32)g_in_t0_flip; hd[12] = g_in_mode == 1 ? 'I' : g_in_mode == 2 ? 'F' : 0; plat_write_bin(g_inrec_h, hd, 16); }
+    u64 df = g_flips - g_in_t0_flip;
+    InRec r; r.ms = (u32)ms; r.b = b; r.v[0] = (u8)lx; r.v[1] = (u8)ly; r.v[2] = (u8)rx; r.v[3] = (u8)ry; r.v[4] = (u8)l2; r.v[5] = (u8)r2; r.z = (u16)(df > 65535 ? 65535 : df);
     static InRec last; static int have;
     if (have && last.b == r.b && !h_memcmp(last.v, r.v, 6) && r.ms - last.ms < 250) return;   /* unchanged: one sample every 250 ms */
     last = r; have = 1; g_inrec_buf[g_inrec_nb++] = r; g_inrec_n++;
@@ -137,8 +169,12 @@ static int inrep_get(u32 *b, int *lx, int *ly, int *rx, int *ry, int *l2, int *r
     if (!g_inrep) { u64 sz = 0; u8 *f = plat_read_file(g_inrep_path, &sz);
         if (!f || sz < 32 || h_memcmp(f, "UDIN1", 5)) { say("  --replay-input: cannot read the file\n"); g_inrep_path = 0; return 0; }
         g_inrep = (InRec *)(f + 16); g_inrep_n = (sz - 16) / sizeof(InRec);
-        say("  --replay-input: "); say_dec((i64)g_inrep_n); say(" samples, "); say_dec((i64)(g_inrep[g_inrep_n - 1].ms / 1000)); say(" s\n"); }
-    i64 ms = in_anchor_ms(); if (ms < 0) return 0;
+        say("  --replay-input: "); say_dec((i64)g_inrep_n); say(" samples, "); say_dec((i64)(g_inrep[g_inrep_n - 1].ms / 1000)); say(" s");
+        if ((f[12] == 'I' || f[12] == 'F') && !g_in_flip_set) { g_in_mode = 2; g_in_flip = *(const u32 *)(f + 8); say(", recorded with --input-anchor "); say(f[12] == 'I' ? "input" : "flip"); say(": time 0 at flip "); say_dec((i64)g_in_flip); }
+        else if (g_in_flip_set) { say(", time 0 at flip "); say_dec((i64)g_in_flip); say(" (--input-anchor flip)"); }
+        else if (g_in_mode == 1) { g_in_mode = 0; say(" (a recording without an input anchor: time 0 = the \"previously on\" movie)"); }
+        say("\n"); }
+    i64 ms = in_anchor_ms(1); if (ms < 0) return 0;
     if ((u64)ms > (u64)g_inrep[g_inrep_n - 1].ms + 500) { if (!g_inrep_done) { g_inrep_done = 1; say("  --replay-input: the recording ended at flip "); say_dec((i64)g_flips); say("\n"); } return 0; }
     while (g_inrep_i + 1 < g_inrep_n && g_inrep[g_inrep_i + 1].ms <= (u32)ms) g_inrep_i++;
     const InRec *r = &g_inrep[g_inrep_i]; if (r->ms > (u32)ms) return 0;
@@ -234,6 +270,24 @@ static SYSV int pad_read_state(int h, u8 *d) {
         u64 now = plat_ticks(); float dt = g_pad_q_t ? (float)(now - g_pad_q_t) / (float)plat_ticks_per_sec() : 0.0f; g_pad_q_t = now;
         if (dt > 0.1f) dt = 0.1f;
         float w[3]; for (int k = 0; k < 3; k++) w[k] = cp.gyro[k] * g_motion_scale;
+        if (g_opt_gyro_cal) {   /* w25_fix: remove the zero-rate offset (e5_gyro_cal.h) */
+            if (!g_gcal_init) { gyro_cal_init(&g_gcal, g_gyro_deadband_deg * 0.0174532925f); g_gcal_init = 1; }
+            float c[3]; gyro_cal_step(&g_gcal, w, cp.accel, dt > 0 ? dt : 0.01f, c);
+            for (int k = 0; k < 3; k++) w[k] = c[k];
+        }
+        if (g_opt_gyro_log && g_glog_lines < 400) {   /* w25_fix: mean raw angular velocity every 2 s (the offset when the pad lies still) */
+            for (int k = 0; k < 3; k++) g_glog_sum[k] += cp.gyro[k];
+            g_glog_n++; g_glog_t += dt;
+            if (g_glog_t >= 2.0f) { g_glog_lines++;
+                say("  gyro (w25_fix): mean raw mrad/s");
+                for (int k = 0; k < 3; k++) { say(" "); say_dec((i64)(g_glog_sum[k] / (float)g_glog_n * 1000.0f)); }
+                say(" over "); say_dec((i64)g_glog_n); say(" reads, accel mg");
+                for (int k = 0; k < 3; k++) { say(" "); say_dec((i64)(cp.accel[k] * 1000.0f)); }
+                if (g_opt_gyro_cal && g_gcal_init) { say("; estimated offset mrad/s"); for (int k = 0; k < 3; k++) { say(" "); say_dec((i64)(g_gcal.bias[k] * 1000.0f)); }
+                    say(g_gcal.learned_t > 0 ? " (learned)" : " (none yet)"); say(", learning now "); say(g_gcal.still_t > 0 ? "yes" : "no"); say(", steady s "); say_dec((i64)g_gcal.steady_t); }
+                say(", flip "); say_dec((i64)g_flips); say("\n");
+                g_glog_sum[0] = g_glog_sum[1] = g_glog_sum[2] = 0; g_glog_n = 0; g_glog_t = 0; }
+        }
         pad_orientation_step(w, dt);
         for (int k = 0; k < 3; k++) { float a = w[k] < 0 ? -w[k] : w[k]; if (a > g_pad_max_gyro) g_pad_max_gyro = a; }
         *(float *)(d + 12) = g_pad_q[1]; *(float *)(d + 16) = g_pad_q[2]; *(float *)(d + 20) = g_pad_q[3]; *(float *)(d + 24) = g_pad_q[0];
@@ -261,6 +315,15 @@ static SYSV int pad_read_state(int h, u8 *d) {
         was_down = down;
         if (tx >= 0) { d[52] = 1; *(u16 *)(d + 60) = (u16)tx; *(u16 *)(d + 62) = (u16)ty; d[64] = tid; }
     }
+    if (g_nswipe && !d[52]) {   /* w25_fix: scripted swipes (--swipe) */
+        static u8 stid;
+        for (int i = 0; i < g_nswipe; i++) if (g_flips >= g_swipe_at[i] && g_flips < g_swipe_at[i] + 15) {
+            u64 p = (g_flips - g_swipe_at[i]) * 1000 / 14; int c = (int)(p * 1700 / 1000) + 110, cy = (int)(p * 800 / 1000) + 70;
+            int tx, ty, k = g_swipe_dir[i];
+            if (k == 0) { tx = 1920 - c; ty = 471; } else if (k == 1) { tx = c; ty = 471; } else if (k == 2) { tx = 960; ty = 943 - cy; } else { tx = 960; ty = cy; }
+            if (g_flips == g_swipe_at[i]) stid++;
+            d[52] = 1; *(u16 *)(d + 60) = (u16)(tx > 1919 ? 1919 : tx); *(u16 *)(d + 62) = (u16)(ty > 942 ? 942 : ty); d[64] = stid; break; }
+    }
     if (ctrl && cp.ntouch && !d[52]) {   /* the controller's own touch pad (DualShock 4 / DualSense) */
         d[52] = (u8)cp.ntouch;
         for (int f = 0; f < cp.ntouch && f < 2; f++) { *(u16 *)(d + 60 + 8 * f) = cp.tx[f] > 1919 ? 1919 : cp.tx[f]; *(u16 *)(d + 62 + 8 * f) = cp.ty[f] > 942 ? 942 : cp.ty[f]; d[64 + 8 * f] = cp.tid[f]; }
@@ -282,7 +345,9 @@ static SYSV int pad_ok(void) { return 0; }
 static SYSV int pad_vibration(int h, const u8 *p) { (void)h; if (p) plat_pad_rumble(p[0], p[1]); return 0; }
 static SYSV int pad_reset_orientation(int h) {
     (void)h; pad_orientation_reset();
-    static int nl; if (nl++ < 50 && g_pad_ctrl_reads) { say("  pad: orientation reset by the game (largest angular velocity since the last reset: "); say_dec((i64)(g_pad_max_gyro * 1000.0f)); say(" mrad/s)\n"); }
+    static int nl; if (nl++ < (g_opt_gyro_log ? 1000 : 50) && g_pad_ctrl_reads) { say("  pad: orientation reset by the game (largest angular velocity since the last reset: "); say_dec((i64)(g_pad_max_gyro * 1000.0f)); say(" mrad/s");
+        if (g_opt_gyro_log) { say(", flip "); say_dec((i64)g_flips); if (g_opt_gyro_cal && g_gcal_init) { say(", gyro offset removed (mrad/s)"); for (int k = 0; k < 3; k++) { say(" "); say_dec((i64)(g_gcal.bias[k] * 1000.0f)); } } }
+        say(")\n"); }
     g_pad_max_gyro = 0;
     return 0;
 }
@@ -412,6 +477,9 @@ static SYSV int ac_param_get_int(int id, int *v) {
     static const char *keys[4] = {"USER_DEFINED_PARAM_1", "USER_DEFINED_PARAM_2", "USER_DEFINED_PARAM_3", "USER_DEFINED_PARAM_4"};
     u32 x = 0;
     if (id >= 1 && id <= 4) sfo_get_int(keys[id - 1], &x);
+    if (g_opt_text_lang && (id == 1 || id == 4)) x = id == 1 ? 0 : (u32)g_opt_text_lang;      /* w24_compat: no text language allowed -> PARAM_4 */
+    if (g_opt_speech_lang && (id == 2 || id == 3)) x = id == 2 ? 0 : (u32)g_opt_speech_lang;  /* w24_compat: no speech language allowed -> PARAM_3 */
+    if (id >= 1 && id <= 4 && (g_opt_sys_lang >= 0 || g_opt_text_lang || g_opt_speech_lang)) { say("  sceAppContentAppParamGetInt(USER_DEFINED_PARAM_"); say_dec(id); say(") -> "); say_dec((i64)x); say(" (w24_compat language options)\n"); }
     *v = (int)x; return 0;
 }
 /* libSceGnmDriver */
@@ -499,6 +567,7 @@ static int sfo_str(const u8 *d, u64 n, const char *key, char *out, int outn) {  
     }
     return 0;
 }
+static const char *ud_edition_title(void);   /* ud_launch.c (w38_rel) */
 static int ac_addon_present(const char *label) {
     int L = 0; while (L < 17 && label[L]) { char c = label[L]; if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return 0; L++; }
     if (L == 0 || L > 16) return 0;
@@ -511,8 +580,10 @@ static int ac_addon_present(const char *label) {
     if (!sfo_str(buf, n, "CONTENT_ID", cid, sizeof cid)) return 0;
     cl = str_len(cid);
     if (cl < L + 1 || cid[cl - L - 1] != '-' || !str_eq(cid + cl - L, dir)) return 0;
-    for (int i = 0; i + 9 <= cl; i++) if (cid[i] == 'C' && cid[i + 1] == 'U' && cid[i + 2] == 'S' && cid[i + 3] == 'A' && cid[i + 4] == '0' && cid[i + 5] == '2' && cid[i + 6] == '6' && cid[i + 7] == '3' && cid[i + 8] == '6') return 1;
-    return 0;
+    /* w38_rel: the add-on must belong to the player's edition (CONTENT_ID = 6-char publisher, '-', 9-char title, '_', ...) */
+    if (cl < 17 || cid[6] != '-' || cid[16] != '_') return 0;
+    char tid[10]; mem_copy(tid, cid + 7, 9); tid[9] = 0;
+    return str_eq(tid, ud_edition_title());
 }
 static SYSV int ac_ent_key(int label_kind, const char *label, void *key) {
     TRACE("sceAppContentGetEntitlementKey", label_kind, label, key);

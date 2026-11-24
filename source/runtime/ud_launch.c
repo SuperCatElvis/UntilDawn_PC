@@ -75,11 +75,60 @@ static int sha_file(const char *path, char out[65]) {
     hf_close(f); sha_hex(&s, out); return 1;
 }
 
-/* ---------------------------------------------------------------- the supported game version */
-/* CUSA02636 (EP9000, "Until Dawn") with the 01.03 update applied. The binary patches in this program (TLS, SSE4a,
-   RDTSC sites) are made for exactly these two executables. */
+/* ---------------------------------------------------------------- the supported game editions (w38_rel)
+   The binary patches in this program (TLS, SSE4a, RDTSC sites, ...) and every code / data address it uses are made for one
+   executable: Until Dawn 01.03 as built for CUSA02636. Other regional editions are accepted when their eboot.bin is THE SAME
+   PROGRAM: same size and the same bytes once three harmless, region-specific ranges are left out (MEASURED 24 Nov on
+   CUSA00194 01.03, the only differences from CUSA02636 01.03 are exactly these 59 bytes):
+     file 0x430 (32 B)      SELF header digest (signature data, outside the loaded program)
+     file 0x188526c (28 B)  region tag + build date string ("EU2" / "EU1" + "Tue Oct 06 10:58:13 2015")
+     file 0x2363c60 (20 B)  build id in the dynamic-library data
+   UD_EBOOT_CODE_FP = SHA-256 of the file with those ranges zeroed (same value for CUSA02636 01.03 and CUSA00194 01.03).
+   Anything else is a different program and is refused with an explanation - never run with patches made for another build. */
 #define UD_EBOOT_V103_SHA "ca291314cdd5308694eb9243f1ba098e97817087e5356d78d94cf8854abebd26"
 #define UD_EBOOT_V100_SHA "fdd1e3247e1f931e277336099062aa240c362b48ae0a7d68e08390dfbd743789"
+#define UD_EBOOT_194_V100_SHA "5f0a12dc4bdba2700a5c22e047488382778827f227f390340c918aacffa93da2"
+#define UD_EBOOT_SIZE     41400250ull
+#define UD_EBOOT_CODE_FP  "57521f285989d84b807f97d15d72beafb81c891bda00eba60b6bc793e490ffd8"
+static const struct { u64 off, len; } k_ud_eboot_mask[] = {{0x430, 32}, {0x188526c, 28}, {0x2363c60, 20}};
+
+/* status: 2 = supported (tested in game by us), 1 = experimental (accepted when the code check passes; not tested by us) */
+typedef struct { const char *title, *region, *eboot_sha; const UdFile *files; u64 nfiles; int status, lp_sku; } UdEdition;
+static const UdEdition k_ud_editions[] = {
+    {"CUSA02636", "Europe 2 (EP9000; en es pt ru pl + da fi no sv text)", UD_EBOOT_V103_SHA,
+        g_ud_files_2636, sizeof g_ud_files_2636 / sizeof g_ud_files_2636[0], 2, 1},
+    {"CUSA00194", "Europe 1 (EP9000; en fr de it + nl tr text)", "8e833bb6b1f782c6949b9a87000b12b460b774f73db885692d44a92a8b63be60",
+        g_ud_files_194, sizeof g_ud_files_194 / sizeof g_ud_files_194[0], 2, 0},
+    {"CUSA00359", "Americas (UP9000; en fr es-LA pt-BR in the game code)", "f7667bbf415edce1f6ac2a5a7d869accc4a1787990f2c776b23a4a8e69ef6d67",
+        g_ud_files_359, sizeof g_ud_files_359 / sizeof g_ud_files_359[0], 1, -1},
+    /* code-region table of the game (eboot 01.03): known titles whose files nobody has measured yet */
+    {"CUSA01913", "UK (en)", 0, 0, 0, 1, -1},
+    {"CUSA00902", "Japan (ja)", 0, 0, 0, 1, -1},
+    {"CUSA01423", "Asia (en ko zh-TW zh-CN)", 0, 0, 0, 1, -1},
+    {"CUSA02915", "region 9 (all 20 languages in the game code)", 0, 0, 0, 1, -1},
+};
+#define UD_NEDITION ((int)(sizeof k_ud_editions / sizeof k_ud_editions[0]))
+static const UdEdition *g_ud_edition;        /* the player's edition, set by ud_validate (player start) or ud_detect_edition */
+static int g_ud_edition_code_checked;
+static u64 g_ud_nfiles_checked;        /* 1 = accepted through the code check (not a SHA-256 we list) */
+static const UdEdition *ud_edition_by_title(const char *t) { for (int i = 0; i < UD_NEDITION; i++) if (str_eq(t, k_ud_editions[i].title)) return &k_ud_editions[i]; return 0; }
+static const char *ud_edition_title(void) { return g_ud_edition ? g_ud_edition->title : "CUSA02636"; }
+static const char *ud_tid_title(void) { return g_ud_edition ? g_ud_edition->title : 0; }
+static int ud_edition_lp_sku(void) { return g_ud_edition ? g_ud_edition->lp_sku : 1; }
+/* one pass over eboot.bin: plain SHA-256 and the code fingerprint (masked ranges zeroed); returns the file size or -1 */
+static i64 ud_eboot_hashes(const char *path, char plain[65], char code[65]) {
+    void *f = hf_open_rb(path); if (!f) return -1;
+    static u8 buf[1 << 20]; Sha256 a, b; sha_init(&a); sha_init(&b); u64 n, pos = 0;
+    while ((n = hf_read(f, buf, sizeof buf)) > 0) {
+        sha_add(&a, buf, n);
+        for (u64 k = 0; k < sizeof k_ud_eboot_mask / sizeof k_ud_eboot_mask[0]; k++) {
+            u64 lo = k_ud_eboot_mask[k].off, hi = lo + k_ud_eboot_mask[k].len;
+            for (u64 x = lo > pos ? lo : pos; x < hi && x < pos + n; x++) buf[x - pos] = 0;
+        }
+        sha_add(&b, buf, n); pos += n;
+    }
+    hf_close(f); sha_hex(&a, plain); sha_hex(&b, code); return (i64)pos;
+}
 #define UD_PRX_V103_SHA   "b0020e11d8236bfd0c57821b673027ad615670df5175557e74ee0b61a27ca3af"
 
 /* ---------------------------------------------------------------- settings (Config\settings.ini) */
@@ -111,14 +160,59 @@ typedef struct {
     int seen_fast, seen_gpuopt, seen_fps, seen_disp;   /* the file has such a line */
     int fps_asked;           /* frame_rate_limit as written (before the 240 ceiling) */
     int fresh;               /* rc3: the file was written with the defaults at this start (its values are the defaults, not the player's) */
+    /* w24_compat (not in the template yet; default off / auto) */
+    int cpu_compat;          /* cpu_compat = 1: older CPUs (BMI1 / LZCNT / MOVBE / F16C replaced where missing) */
+    int sys_lang1;           /* language = <name>: the PS4 system language + 1 (0 = auto: English) */
+    int text_lang, speech_lang;   /* text_language / speech_language = <name>: the game's language index (0 = as the language) */
+    int lang_game;           /* w33_lang: language = <name> as the game's index (for the imported-language mapping) */
+    char languages_dir[1024]; /* w33_lang: languages_dir = folder of the Languages\\<code> packs (default: next to UntilDawn.exe) */
+    char lang_experimental[512]; /* language_experimental = <edition>\\<lang> (EXPERIMENTAL pack, explicit only) */
+    int lang_verify;         /* language_verify: 0 not set (= quick), 1 size, 2 quick, 3 full */
+    char lang_overlay[1024]; /* w33_lang: language_overlay = DIR[;DIR...] - read-only folders with imported language files (default: none; not in the template) */
+    /* w26_update */
+    int update_check;        /* update_check: 1 = ask GitHub for a newer release at a player start (ud_update.exe); default UD_UPDATE_CHECK_DEFAULT */
+    char update_skip[32];    /* update_skip_version: the release the player chose to skip ("Skip version") */
+    /* w28_int (integrated development build): the merged workstreams' settings */
+    int audio_late_read;     /* audio_late_read: 1 = the game's sound buffer is read after the wait (w27_audio, default 1) */
+    int audio_limiter;       /* audio_limiter: 1 = peak limiter instead of hard clipping (w27_audio, default 1) */
+    int gyro_cal;            /* gyro_calibration: 1 = the gyro's zero-rate offset is removed (w25_fix v2, default 1) */
+    int low_vram_tex;        /* low_vram_textures: -1 auto (default; acts on cards under 12 GB only), 1 on (same condition), 0 off (w21_perf) */
+    int low_driver_mem;      /* low_driver_memory: -1 auto (default, w34_mem: on when the driver's system-memory budget is small), 1 on, 0 off (w20_mem --import-gpu-only) */
+    int guard_fixed;         /* guard_fixed_maps: 1 = the address guard covers the game's early fixed mappings (w20_mem, default 1; not in the template) */
+    int dof;                 /* depth_of_field: 1 = as on the PS4 (default), 0 = the game's blur stages skipped (e3_loader.c patch_dof) */
+    int seen_dof;
+    int rs_depth_max;        /* rs_depth_max: -1 auto (default: on whenever the internal resolution is not 1080p), 1 on, 0 off (w30_visual) */
+    int seen_rdm;
+    int seen_alr, seen_alim, seen_gyro, seen_lvt, seen_ldm, seen_cpuc, seen_lang, seen_upd;   /* the file has such a line */
 } UdSettings;
+#ifndef UD_UPDATE_CHECK_DEFAULT
+#define UD_UPDATE_CHECK_DEFAULT 1   /* w38_rel (user decision 25 Nov): on by default; a development build still never updates */
+#endif
 static UdSettings g_uds = {"", 60, 0, 1280, 720, 0, 1, "", 0, 512, 1, 1, 1, 0, 0};
 static int g_ud_release;     /* started as the player-facing program (no command-line arguments) */
+static int g_guard_fixed;   /* w20_mem --guard-fixed-maps (w28_int: the default; e3_main) */
+static int g_ldm_mig_why;   /* w28_int: why an old low_driver_memory = 0 was kept (ud_ldm_migrate) */
 
 static int ud_key_is(const char *a, const char *b) { while (*b) { if ((*a | 0x20) != (*b | 0x20)) return 0; a++; b++; } return *a == 0; }
+
 static void ud_trim(char *s) { int n = str_len(s); while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) s[--n] = 0; }
 static int ud_atoi(const char *s) { int v = 0, neg = 0; while (*s == ' ') s++; if (*s == '-') { neg = 1; s++; } while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return neg ? -v : v; }
 /* w16_rel: on / off value (1, on, true, yes, enabled / 0, off, false, no, disabled; an inline ; or # comment ignored); other text: def */
+/* w24_compat: language names (or the number itself) -> the game's language index 1..20 (e5_system.c) / the PS4 system id */
+static const char *const g_ud_lang_names[21] = {"", "english", "french", "spanish", "german", "italian", "dutch", "portuguese", "chinese_traditional", "korean",
+    "russian", "polish", "danish", "finnish", "norwegian", "swedish", "japanese", "spanish_latam", "portuguese_brazil", "turkish", "chinese_simplified"};
+static const signed char g_ud_game2sys[21] = {-1, 1, 2, 3, 4, 5, 6, 7, 10, 9, 8, 16, 14, 12, 15, 13, 0, 20, 17, 19, 11};
+static int ud_lang_index(const char *v) {
+    char b[32]; int k = 0; while (*v == ' ' || *v == '"') v++; while (v[k] && v[k] != ';' && v[k] != '#' && v[k] != '"' && k < 31) { b[k] = v[k]; k++; } b[k] = 0; ud_trim(b);
+    if (b[0] >= '0' && b[0] <= '9') { int x = ud_atoi(b); return x >= 1 && x <= 20 ? x : 0; }
+    for (int i = 1; i <= 20; i++) if (ud_key_is(b, g_ud_lang_names[i])) return i;
+    /* w38_rel: short codes (ISO 639-1, with region where the game has two variants); '-' or '_' both accepted */
+    static const char *const codes[21] = {"", "en", "fr", "es", "de", "it", "nl", "pt", "zh-tw", "ko", "ru", "pl", "da", "fi", "no", "sv", "ja", "es-la", "pt-br", "tr", "zh-cn"};
+    for (int k = 0; b[k]; k++) if (b[k] == '_') b[k] = '-';
+    for (int i = 1; i <= 20; i++) if (ud_key_is(b, codes[i])) return i;
+    if (ud_key_is(b, "nb") || ud_key_is(b, "norsk")) return 14;
+    return 0;   /* auto / unknown */
+}
 static int ud_bool(const char *v, int def) {
     char b[32]; int k = 0; while (*v == ' ' || *v == '\t' || *v == '"' || *v == '\'') v++;
     while (v[k] && v[k] != ';' && v[k] != '#' && v[k] != '"' && v[k] != '\'' && k < 31) { b[k] = v[k]; k++; } b[k] = 0; ud_trim(b);
@@ -129,11 +223,11 @@ static int ud_bool(const char *v, int def) {
 }
 enum { UD_FPS_CEILING = 240 };   /* w16_rel: the highest frame-rate limit (w14_speed: physics and cloth keep real time up to 240 fps) */
 
-static const char *k_ud_ini_default =   /* w16_rel: the v0.4.0 defaults (written on the first start; earlier files are kept and only get the new lines) */
+static const char *k_ud_ini_default =   /* w38_rel: the v0.5.0 defaults, in the order the user chose (25 Nov); earlier files keep their order and only get the new lines */
     "; Until Dawn (native PC build) - settings\r\n"
     "; Delete this file to restore the defaults; it is recreated on the next start.\r\n"
     "\r\n"
-    "; Folder with the original game files (your own extracted CUSA02636 install with the 01.03 update).\r\n"
+    "; Folder with the original game files (your own extracted CUSA02636 or CUSA00194 install with the 01.03 update).\r\n"
     "; Empty = the Game folder next to UntilDawn.exe.\r\n"
     "game_dir =\r\n"
     "\r\n"
@@ -142,16 +236,62 @@ static const char *k_ud_ini_default =   /* w16_rel: the v0.4.0 defaults (written
     "; counts as 240. This setting is independent of optimised_rendering below.\r\n"
     "frame_rate_limit = 60\r\n"
     "\r\n"
+    "; borderless (default) = the game fills the whole monitor, at the monitor's own resolution; windowed = a window.\r\n"
+    "; Alt+Enter switches between the two while the game runs. The picture always keeps its 16:9 shape (black bars\r\n"
+    "; on other monitor shapes, never stretched).\r\n"
+    "display_mode = borderless\r\n"
+    "\r\n"
+    "; 1 = Halloween Hunt 2015: the game's original Halloween screen and hidden pumpkins (an event that was only active\r\n"
+    "; from 28 to 31 October 2015; your Windows date is not changed). 0 = off, the normal game. Restart after changing.\r\n"
+    "halloween_hunt = 0\r\n"
+    "\r\n"
+    "; 1 = depth of field as on the PS4 (default). 0 = off: the game's blur stages are skipped - depth of field, bokeh\r\n"
+    "; and motion blur. Restart after changing.\r\n"
+    "depth_of_field = 1\r\n"
+    "\r\n"
+    "; ---- LANGUAGE ------------------------------------------------------------------------------------------------\r\n"
+    "; To change the language: write one value (the name or the code) after  language =  below, save, and restart.\r\n"
+    ";   Example:  language = french     or     language = fr        auto = English\r\n"
+    "; Menus, subtitles and voices change together; the game loads a language's voices with its text.\r\n"
+    "; A language of YOUR edition (see the editions column) works at once. A language that only ANOTHER edition has\r\n"
+    "; must be imported once from your own copy of that edition with UDLanguageImporter.exe (next to UntilDawn.exe);\r\n"
+    "; without the import the game uses English. Logs\\UntilDawn.log says at start which case applies.\r\n"
+    ";\r\n"
+    ";   name                 code    voices       editions that contain it                    status\r\n"
+    ";   english              en      yes          every edition                               verified\r\n"
+    ";   spanish              es      yes          CUSA02636 (Europe 2)                        verified\r\n"
+    ";   portuguese           pt      yes          CUSA02636 (Europe 2)                        verified\r\n"
+    ";   russian              ru      yes          CUSA02636 (Europe 2)                        verified\r\n"
+    ";   polish               pl      yes          CUSA02636 (Europe 2)                        verified\r\n"
+    ";   danish               da      text only    CUSA02636 (Europe 2)                        verified\r\n"
+    ";   finnish              fi      text only    CUSA02636 (Europe 2)                        verified\r\n"
+    ";   norwegian            no      text only    CUSA02636 (Europe 2)                        verified\r\n"
+    ";   swedish              sv      text only    CUSA02636 (Europe 2)                        verified\r\n"
+    ";   french               fr      yes          CUSA00194 (Europe 1), CUSA00359 (Americas)  verified from CUSA00194\r\n"
+    ";   german               de      yes          CUSA00194 (Europe 1)                        verified\r\n"
+    ";   italian              it      yes          CUSA00194 (Europe 1)                        verified\r\n"
+    ";   dutch                nl      text only    CUSA00194 (Europe 1)                        verified\r\n"
+    ";   turkish              tr      text only    CUSA00194 (Europe 1)                        verified\r\n"
+    ";   spanish_latam        es-la   yes (1)      CUSA00359 (Americas)                        EXPERIMENTAL\r\n"
+    ";   portuguese_brazil    pt-br   yes (1)      CUSA00359 (Americas)                        EXPERIMENTAL\r\n"
+    ";   japanese             ja      unknown      CUSA00902 (Japan)                           EXPERIMENTAL, untested\r\n"
+    ";   korean               ko      unknown      CUSA01423 (Asia)                            EXPERIMENTAL, untested\r\n"
+    ";   chinese_traditional  zh-tw   unknown      CUSA01423 (Asia)                            EXPERIMENTAL, untested\r\n"
+    ";   chinese_simplified   zh-cn   unknown      CUSA01423 (Asia)                            EXPERIMENTAL, untested\r\n"
+    "; (1) the CUSA00359 file list has text and voice files for these two languages; not yet tested in game.\r\n"
+    "; EXPERIMENTAL languages are used only from an experimental import (language_experimental, see LANGUAGE_PACKS_README.txt).\r\n"
+    "; Optional: text_language / speech_language split menus + subtitles from voices (same names or codes), e.g.\r\n"
+    "; text_language = russian with English voices. auto = as language above.\r\n"
+    "language = auto\r\n"
+    "\r\n"
+    "text_language = auto\r\n"
+    "speech_language = auto\r\n"
+    "\r\n"
     "; Optimised Rendering (Fast Mode): 1 = on (default), 0 = off.\r\n"
     "; The game goes on with its next frame while the graphics card finishes the previous one, with safety checks\r\n"
     "; that keep the game's memory consistent. Clearly faster, the same picture. It does not change the frame-rate\r\n"
     "; limit. If you see a problem, set 0 to check whether it is related.\r\n"
     "optimised_rendering = 1\r\n"
-    "\r\n"
-    "; borderless (default) = the game fills the whole monitor, at the monitor's own resolution; windowed = a window.\r\n"
-    "; Alt+Enter switches between the two while the game runs. The picture always keeps its 16:9 shape (black bars\r\n"
-    "; on other monitor shapes, never stretched).\r\n"
-    "display_mode = borderless\r\n"
     "\r\n"
     "; Monitor: auto (the primary monitor) or its number in the monitor list of Logs\\UntilDawn.log (1, 2, ...).\r\n"
     "monitor = auto\r\n"
@@ -200,9 +340,40 @@ static const char *k_ud_ini_default =   /* w16_rel: the v0.4.0 defaults (written
     "; geometry and the missing lake water). 0 = off, only for troubleshooting.\r\n"
     "gpu_coherence = 1\r\n"
     "\r\n"
-    "; 1 = Halloween Hunt 2015: the game's original Halloween screen and hidden pumpkins (an event that was only active\r\n"
-    "; from 28 to 31 October 2015; your Windows date is not changed). 0 = off, the normal game. Restart after changing.\r\n"
-    "halloween_hunt = 0\r\n"
+    "; Sound: 1 = the game's sound is read when it is played, as on the PS4 (no repeated sound buffers: removes the\r\n"
+    "; crackle / spikes heard mostly at 4K and in slow scenes) (default). 0 = as version 0.4.1.\r\n"
+    "audio_late_read = 1\r\n"
+    "\r\n"
+    "; Sound: 1 = a limiter keeps loud moments from clipping (the game's 7.1 mix, folded to stereo, can go above full\r\n"
+    "; scale) (default). 0 = hard clipping as in version 0.4.1.\r\n"
+    "audio_limiter = 1\r\n"
+    "\r\n"
+    "; Motion sensors of a DualShock 4 / DualSense: 1 = the controller's gyro offset is measured while it is still and\r\n"
+    "; removed, so the \"Don't Move\" moments do not drift (default). 0 = the raw sensor values, as in version 0.4.1.\r\n"
+    "gyro_calibration = 1\r\n"
+    "\r\n"
+    "; Graphics cards with less than 12 GB of video memory: auto (default) = texture memory in smaller blocks and\r\n"
+    "; recently used textures kept (far fewer texture reloads on 6-8 GB cards). No effect on 12 GB or larger cards.\r\n"
+    "; 0 = off.\r\n"
+    "low_vram_textures = auto\r\n"
+    "\r\n"
+    "; Thin dark lines on faces at resolutions above 1080p: auto (default) = the game's tiled-lighting depth bounds\r\n"
+    "; include every pixel whenever the picture is rendered at another size than 1920x1080. 1 = always, 0 = off.\r\n"
+    "rs_depth_max = auto\r\n"
+    "\r\n"
+    "; auto (default) = on only when the graphics driver's budget for system memory is small (PCs with little RAM, e.g.\r\n"
+    "; 16 GB): game memory that only the processor uses is then not handed to the graphics driver (about 1.5 GB less\r\n"
+    "; driver memory). 1 = always on, 0 = always off. Restart after changing.\r\n"
+    "low_driver_memory = auto\r\n"
+    "\r\n"
+    "; 1 = support for older processors that lack BMI1, LZCNT, MOVBE or F16C (e.g. Intel Sandy / Ivy Bridge, AMD FX):\r\n"
+    "; those instructions of the game are replaced by equivalent code. Only needed if the program says the processor is\r\n"
+    "; not supported (Compatibility Test: compat\\ud_compat.exe). 0 = off (default).\r\n"
+    "cpu_compat = 0\r\n"
+    "\r\n"
+    "; 1 = check GitHub for a newer release at start (default; you are asked before anything is installed, and your game files,\r\n"
+    "; saves, settings and language packs are never touched). 0 = off.\r\n"
+    "update_check = 1\r\n"
     "\r\n"
     "; 1 = developer mode: capture keys (Ctrl+P, Ctrl+O, Ctrl+N, F6, F11), status text, diagnostic files in Logs\\captures\r\n"
     "developer = 0\r\n";
@@ -290,6 +461,26 @@ static void ud_parse_ini(char *t) {
         else if (ud_key_is(line, "window_width")) { int x = ud_atoi(v); if (x >= 320 && x <= 16384) g_uds.window_w = x; }
         else if (ud_key_is(line, "window_height")) { int x = ud_atoi(v); if (x >= 240 && x <= 16384) g_uds.window_h = x; }
         else if (ud_key_is(line, "developer")) g_uds.developer = ud_atoi(v) != 0;
+        else if (ud_key_is(line, "cpu_compat")) { g_uds.cpu_compat = ud_bool(v, 0); g_uds.seen_cpuc = 1; }   /* w24_compat */
+        else if (ud_key_is(line, "language")) { int x = ud_lang_index(v); g_uds.sys_lang1 = x ? g_ud_game2sys[x] + 1 : 0; g_uds.lang_game = x; g_uds.seen_lang = 1; }   /* w24_compat */
+        else if (ud_key_is(line, "audio_late_read")) { g_uds.audio_late_read = ud_bool(v, 1); g_uds.seen_alr = 1; }   /* w28_int (w27_audio) */
+        else if (ud_key_is(line, "audio_limiter")) { g_uds.audio_limiter = ud_bool(v, 1); g_uds.seen_alim = 1; }   /* w28_int (w27_audio) */
+        else if (ud_key_is(line, "gyro_calibration")) { g_uds.gyro_cal = ud_bool(v, 1); g_uds.seen_gyro = 1; }   /* w28_int (w25_fix) */
+        else if (ud_key_is(line, "low_vram_textures")) { char b[16]; int k = 0; while (v[k] && v[k] != ' ' && v[k] != ';' && v[k] != '#' && k < 15) { b[k] = v[k]; k++; } b[k] = 0;
+            g_uds.low_vram_tex = ud_key_is(b, "auto") ? -1 : ud_bool(v, -1); g_uds.seen_lvt = 1; }
+        else if (ud_key_is(line, "rs_depth_max")) { char b[16]; int k = 0; while (v[k] && v[k] != ' ' && v[k] != ';' && v[k] != '#' && k < 15) { b[k] = v[k]; k++; } b[k] = 0;
+            g_uds.rs_depth_max = ud_key_is(b, "auto") ? -1 : ud_bool(v, -1); g_uds.seen_rdm = 1; }   /* w30_visual: auto / 1 / 0 */   /* w28_int (w21_perf): auto / 1 / 0 */
+        else if (ud_key_is(line, "depth_of_field")) { g_uds.dof = ud_bool(v, 1); g_uds.seen_dof = 1; }   /* w28_int */
+        else if (ud_key_is(line, "low_driver_memory")) { char b[16]; int k = 0; while (v[k] && v[k] != ' ' && v[k] != ';' && v[k] != '#' && k < 15) { b[k] = v[k]; k++; } b[k] = 0;
+            g_uds.low_driver_mem = ud_key_is(b, "auto") ? -1 : ud_bool(v, -1); g_uds.seen_ldm = 1; }   /* w34_mem: auto / 1 / 0 (unknown = auto) */   /* w28_int (w20_mem) */
+        else if (ud_key_is(line, "guard_fixed_maps")) g_uds.guard_fixed = ud_bool(v, 1);   /* w28_int (w20_mem; troubleshooting only, not in the template) */
+        else if (ud_key_is(line, "text_language")) g_uds.text_lang = ud_lang_index(v);
+        else if (ud_key_is(line, "speech_language")) g_uds.speech_lang = ud_lang_index(v);
+        else if (ud_key_is(line, "languages_dir") || ud_key_is(line, "language_experimental")) { char *dst = ud_key_is(line, "languages_dir") ? g_uds.languages_dir : g_uds.lang_experimental; int cap = ud_key_is(line, "languages_dir") ? 1024 : 512;
+            int n = str_len(v); while (n > 0 && (v[n - 1] == ' ' || v[n - 1] == '\t' || v[n - 1] == '\r')) n--; if (n >= cap) n = 0; mem_copy(dst, v, (u64)n); dst[n] = 0; }   /* w33_lang */
+        else if (ud_key_is(line, "language_verify")) g_uds.lang_verify = ud_key_is(v, "full") ? 3 : ud_key_is(v, "size") ? 1 : 2;   /* w33_lang */
+        else if (ud_key_is(line, "language_overlay")) { int n = str_len(v); while (n > 0 && (v[n - 1] == ' ' || v[n - 1] == '\t' || v[n - 1] == '\r')) n--;
+            if (n >= (int)sizeof g_uds.lang_overlay) n = 0; mem_copy(g_uds.lang_overlay, v, (u64)n); g_uds.lang_overlay[n] = 0; }   /* w33_lang */
         else if (ud_key_is(line, "renderer_thread")) g_uds.renderer_thread = ud_atoi(v) != 0;
         else if (ud_key_is(line, "gpu")) { int n = str_len(v); if (n >= (int)sizeof g_uds.gpu) n = sizeof g_uds.gpu - 1; mem_copy(g_uds.gpu, v, (u64)n); g_uds.gpu[n] = 0; }
         else if (ud_key_is(line, "present_mode")) g_uds.present_mode = ud_key_is(v, "fifo") ? 1 : ud_key_is(v, "mailbox") ? 2 : ud_key_is(v, "immediate") ? 3 : 0;
@@ -304,12 +495,15 @@ static void ud_parse_ini(char *t) {
             if (off) g_uds.gpu_coherence_off = 1;
             g_uds.gpu_coherence = !g_uds.gpu_coherence_off; }
         else if (ud_key_is(line, "shader_preparation")) { int pv = ud_atoi(v); g_uds.shader_prep = pv == 2 ? 2 : pv != 0; }   /* t159; t164: 2 = background */
+        else if (ud_key_is(line, "update_check")) { g_uds.update_check = ud_bool(v, UD_UPDATE_CHECK_DEFAULT); g_uds.seen_upd = 1; }   /* w26_update */
+        else if (ud_key_is(line, "update_skip_version")) { int n = 0; while (v[n] && v[n] != ' ' && v[n] != ';' && n < (int)sizeof g_uds.update_skip - 1) { g_uds.update_skip[n] = v[n]; n++; } g_uds.update_skip[n] = 0; }
         else if (ud_key_is(line, "heap_slot_mb")) { int x = ud_atoi(v); g_uds.heap_slot_mb = x == 2048 ? 2048 : x < 64 ? 64 : x > 512 ? 512 : x; }   /* t130 */
     }
 }
 static void ud_load_settings(const char *cfg_dir) {
     char p[1100]; path_join(p, cfg_dir, "settings.ini"); { int k = 0; while (p[k] && k < (int)sizeof g_ud_ini_path - 1) { g_ud_ini_path[k] = p[k]; k++; } g_ud_ini_path[k] = 0; }
-    g_uds.disp_auto = 1; g_uds.fast_render = 1; g_uds.gpu_opt = 1; g_uds.fps_asked = 60;   /* w16_rel: the v0.4.0 defaults (a line in the file wins) */
+    g_uds.disp_auto = 1; g_uds.fast_render = 1; g_uds.gpu_opt = 1; g_uds.fps_asked = 60; g_uds.update_check = UD_UPDATE_CHECK_DEFAULT;   /* w16_rel: the v0.4.0 defaults (a line in the file wins) */
+    g_uds.audio_late_read = 1; g_uds.audio_limiter = 1; g_uds.gyro_cal = 1; g_uds.low_vram_tex = -1; g_uds.low_driver_mem = -1; g_uds.guard_fixed = 1; g_uds.dof = 1; g_uds.rs_depth_max = -1;   /* w28_int: the merged defaults (a file without these lines gets them) */
     u64 n = 0; char *t = (char *)plat_read_file(p, &n);
     if (!t) {   /* first start: write the defaults */
         void *f = plat_open_write(p);
@@ -341,61 +535,95 @@ static int sfo_get(const u8 *d, u64 n, const char *key, char *out, int outn) {
     return 0;
 }
 
-/* 0 = the folder holds the supported game files; otherwise msg says what is wrong */
+/* param.sfo of a game folder: TITLE_ID / APP_VER (0 if unreadable) */
+static int ud_read_sfo(const char *dir, char id[32], char ver[16]) {
+    char p[1200]; path_join(p, dir, "sce_sys/param.sfo"); u64 n = 0; u8 *d = (u8 *)plat_read_file(p, &n);
+    id[0] = ver[0] = 0; if (!d) return 0;
+    sfo_get(d, n, "TITLE_ID", id, 32); sfo_get(d, n, "APP_VER", ver, 16); return 1;
+}
+/* developer runs (no validation): the edition from param.sfo only, for the language rules and add-on names */
+static void ud_detect_edition(const char *dir) {
+    char id[32], ver[16]; if (g_ud_edition || !ud_read_sfo(dir, id, ver)) return;
+    g_ud_edition = ud_edition_by_title(id);
+}
+static void ud_supported_list(UdMsg *msg) {
+    um(msg, "\n\nSupported: Until Dawn (2015) for PS4 with update 01.03 - CUSA02636 or CUSA00194 (Europe); CUSA00359 (Americas) "
+            "is experimental. See COMPATIBILITY.txt next to UntilDawn.exe.");
+}
+/* 0 = the folder holds a usable game; otherwise msg says what is wrong */
 static int ud_validate(const char *dir, UdMsg *msg) {
-    char p[1200], h[65];
+    char p[1200], h[65], code[65];
     if (!plat_is_dir(dir)) {
         um(msg, "The game folder was not found:\n    "); um(msg, dir);
-        um(msg, "\n\nUntil Dawn needs the original game files from your own copy of the PS4 game (CUSA02636, "
-                "updated to version 01.03), extracted into that folder. See README.txt next to UntilDawn.exe.");
+        um(msg, "\n\nUntil Dawn needs the original game files from your own copy of the PS4 game, "
+                "updated to version 01.03, extracted into that folder. See README.txt next to UntilDawn.exe.");
+        ud_supported_list(msg);
         return 1;
     }
     path_join(p, dir, "eboot.bin");
-    if (!sha_file(p, h)) {
+    i64 esz = ud_eboot_hashes(p, h, code);
+    if (esz < 0) {
         um(msg, "eboot.bin is missing from the game folder:\n    "); um(msg, dir);
-        um(msg, "\n\nThe folder must contain the extracted PS4 game (CUSA02636) with the 01.03 update applied: "
+        um(msg, "\n\nThe folder must contain the extracted PS4 game with the 01.03 update applied: "
                 "eboot.bin, all_programs.prx, sce_sys\\param.sfo, localcachepink\\, Movies\\ and audio\\.");
         return 2;
     }
-    if (!str_eq(h, UD_EBOOT_V103_SHA)) {
-        if (str_eq(h, UD_EBOOT_V100_SHA))
-            um(msg, "The game folder holds version 01.00 of Until Dawn. This program needs version 01.03: "
-                    "apply the 01.03 update to the extracted game files (the update replaces eboot.bin, "
-                    "all_programs.prx and 151 data files).");
-        else { um(msg, "eboot.bin is not the supported version of Until Dawn (CUSA02636, version 01.03).\n\nFound SHA-256:\n    "); um(msg, h);
-               um(msg, "\nexpected:\n    " UD_EBOOT_V103_SHA "\n\nThe file may be damaged, from another region or another version, "
-                       "or modified (speed patches and other mods replace this file)."); }
+    char id[32], ver[16]; int have_sfo = ud_read_sfo(dir, id, ver);
+    const UdEdition *E = 0;
+    for (int i = 0; i < UD_NEDITION; i++) if (k_ud_editions[i].eboot_sha && str_eq(h, k_ud_editions[i].eboot_sha)) { E = &k_ud_editions[i]; break; }
+    int same_code = (u64)esz == UD_EBOOT_SIZE && str_eq(code, UD_EBOOT_CODE_FP);
+    if (!same_code) {
+        if (str_eq(h, UD_EBOOT_V100_SHA) || str_eq(h, UD_EBOOT_194_V100_SHA) || (have_sfo && ver[0] && !str_eq(ver, "01.03")))
+            { um(msg, "The game folder holds version "); um(msg, ver[0] ? ver : "01.00"); um(msg, " of Until Dawn. This program needs version 01.03: "
+                    "apply the 01.03 update to the extracted game files (the update replaces eboot.bin, all_programs.prx and a number of data files)."); }
+        else {
+            um(msg, "eboot.bin is not a version of Until Dawn that this program can run");
+            if (E) { um(msg, " ("); um(msg, E->title); um(msg, ": its program code differs from the 01.03 build this program is made for)"); }
+            um(msg, ".\n\nThis program changes the game's own code at fixed places, so it only runs the exact 01.03 program. Found:\n    title ");
+            um(msg, id[0] ? id : "?"); um(msg, ", version "); um(msg, ver[0] ? ver : "?"); um(msg, "\n    SHA-256 "); um(msg, h);
+            um(msg, "\n    code fingerprint "); um(msg, code);
+            um(msg, "\n\nThe file may be damaged, from another version, or modified (speed patches and other mods replace this file). "
+                    "If this is an unmodified 01.03 dump of another regional edition, please report the lines above.");
+        }
+        ud_supported_list(msg);
         um(msg, "\n\nGame folder: "); um(msg, dir);
         return 3;
     }
+    /* the same program: which edition? (a listed SHA-256, else the title in param.sfo) */
+    if (!E && have_sfo) E = ud_edition_by_title(id);
+    char eh[65]; mem_copy(eh, h, sizeof eh);   /* the eboot's SHA-256 (h is reused for the prx) */
     path_join(p, dir, "all_programs.prx");
     if (!sha_file(p, h) || !str_eq(h, UD_PRX_V103_SHA)) {
         um(msg, "all_programs.prx in the game folder is missing or is not the version that belongs to eboot.bin 01.03.\n\nGame folder: "); um(msg, dir);
         return 4;
     }
-    path_join(p, dir, "sce_sys/param.sfo");
-    { u64 n = 0; u8 *d = (u8 *)plat_read_file(p, &n); char id[32] = "", ver[16] = "";
-      if (d) { sfo_get(d, n, "TITLE_ID", id, sizeof id); sfo_get(d, n, "APP_VER", ver, sizeof ver); }
-      if (!d || !str_eq(id, "CUSA02636") || !str_eq(ver, "01.03")) {
-          um(msg, "sce_sys\\param.sfo is missing or does not describe Until Dawn CUSA02636 version 01.03");
-          if (d) { um(msg, " (found title "); um(msg, id[0] ? id : "?"); um(msg, ", version "); um(msg, ver[0] ? ver : "?"); um(msg, ")"); }
-          um(msg, ".\n\nGame folder: "); um(msg, dir);
-          return 5;
-      } }
-    /* every data file: present with the right size */
-    int nbad = 0, nmiss = 0; u64 nfiles = sizeof g_ud_manifest / sizeof g_ud_manifest[0];
-    UdMsg list = {0}; static char lb[2048]; list.b = lb; list.cap = sizeof lb; lb[0] = 0;
-    for (u64 i = 0; i < nfiles; i++) {
-        path_join(p, dir, g_ud_manifest[i].path);
-        i64 sz = plat_file_size(p);
-        if (sz == (i64)g_ud_manifest[i].size) continue;
-        if (sz < 0) nmiss++; else nbad++;
-        if (nmiss + nbad <= 8) { um(&list, "    "); um(&list, g_ud_manifest[i].path); um(&list, sz < 0 ? "  (missing)\n" : "  (wrong size)\n"); }
+    if (!have_sfo || !str_eq(ver, "01.03") || (E && !str_eq(id, E->title)) || (!E && !id[0])) {
+        um(msg, "sce_sys\\param.sfo is missing or does not describe Until Dawn version 01.03");
+        if (E && have_sfo && id[0] && !str_eq(id, E->title)) { um(msg, " of "); um(msg, E->title); um(msg, ", the edition its eboot.bin belongs to"); }
+        if (have_sfo) { um(msg, " (found title "); um(msg, id[0] ? id : "?"); um(msg, ", version "); um(msg, ver[0] ? ver : "?"); um(msg, ")"); }
+        um(msg, ".\n\nGame folder: "); um(msg, dir);
+        return 5;
     }
+    g_ud_edition = E; g_ud_edition_code_checked = !E || !E->eboot_sha || !str_eq(eh, E->eboot_sha);
+    /* every data file: the files all editions share, then the edition's own (unknown edition: shared files only) */
+    int nbad = 0, nmiss = 0; u64 nfiles = 0;
+    UdMsg list = {0}; static char lb[2048]; list.b = lb; list.cap = sizeof lb; lb[0] = 0;
+    for (int part = 0; part < 2; part++) {
+        const UdFile *F = part ? (E ? E->files : 0) : g_ud_common_files;
+        u64 nf = part ? (E ? E->nfiles : 0) : sizeof g_ud_common_files / sizeof g_ud_common_files[0];
+        for (u64 i = 0; F && i < nf; i++) {
+            path_join(p, dir, F[i].path); nfiles++;
+            i64 sz = plat_file_size(p);
+            if (sz == (i64)F[i].size) continue;
+            if (sz < 0) nmiss++; else nbad++;
+            if (nmiss + nbad <= 8) { um(&list, "    "); um(&list, F[i].path); um(&list, sz < 0 ? "  (missing)\n" : "  (wrong size)\n"); }
+        }
+    }
+    g_ud_nfiles_checked = nfiles;
     if (nmiss || nbad) {
         um(msg, "Some of the original game files are missing or incomplete (");
         um_d(msg, nmiss); um(msg, " missing, "); um_d(msg, nbad); um(msg, " with the wrong size, of ");
-        um_d(msg, (i64)nfiles); um(msg, " checked):\n\n"); um(msg, lb);
+        um_d(msg, (i64)nfiles); um(msg, " checked for "); um(msg, id); um(msg, "):\n\n"); um(msg, lb);
         if (nmiss + nbad > 8) um(msg, "    ...\n");
         um(msg, "\nCopy the complete extracted game (with the 01.03 update) into:\n    "); um(msg, dir);
         return 6;
@@ -490,4 +718,123 @@ static void disp_setup(int replay) {
     int iw = disp_pct_w(g_rs_pct), ih = disp_pct_h(g_rs_pct);
     say("display: internal resolution "); say_dec(iw); say("x"); say_dec(ih); say(rr_mode == 2 ? " (render_resolution " : " (auto: the picture area's; wanted "); if (rr_mode == 2) { say_dec(rr_w); say("x"); say_dec(rr_h); } else { say_dec(pw); say("x"); say_dec(ph); }
     say(iw == pw && ih == ph ? "), shown pixel for pixel" : iw > pw ? "), filtered down to the picture area" : "), enlarged to the picture area"); say(g_rs_pct == 100 ? "; the game's own resolution\n" : "\n");
+}
+
+/* ---------------------------------------------------------------- w28_int (w28i_10): low_driver_memory = 0 written by earlier dev builds
+   w28i_1 .. w28i_9 wrote "low_driver_memory = 0" by themselves (template of a fresh file, or the "(added by this version)" block
+   added to an older file). auto is now the default. Such a line is changed to auto ONLY when the file is provably as the program
+   wrote it: the line sits directly under one of those two exact comment blocks, AND every other setting in the file still has
+   its default value (only lines the program itself writes or the player must set - game_dir, display_mode, monitor, window
+   size / place, update_skip_version - may differ). Anything else - another comment, another value, any changed setting - may be
+   the player's own choice: the 0 is kept and the log says how to switch to auto. Returns 1 migrated, 2 kept, 0 not applicable. */
+static const char *const k_ldm_old_blocks[2] = {
+    "; 1 = game memory that only the processor uses is not handed to the graphics driver (about 1.5 GB less driver\r\n"
+    "; memory; may help PCs with 16 GB of RAM). Experimental. 0 = off (default). Restart after changing.\r\n"
+    "low_driver_memory = 0\r\n",
+    "; (added by this version) 1 = game memory only the processor uses is not handed to the graphics driver (about\r\n"
+    "; 1.5 GB less driver memory). Experimental. 0 = off (default). Restart after changing.\r\n"
+    "low_driver_memory = 0\r\n" };
+static const char *const k_ldm_new_block =
+    "; auto (default) = on only when the graphics driver's budget for system memory is small (PCs with little RAM, e.g.\r\n"
+    "; 16 GB): game memory that only the processor uses is then not handed to the graphics driver (about 1.5 GB less\r\n"
+    "; driver memory). 1 = always on, 0 = always off. Restart after changing.\r\n"
+    "low_driver_memory = auto\r\n";
+static const char *const k_ud_defaults[][2] = {   /* every setting earlier versions wrote, with its default value */
+    {"frame_rate_limit", "60"}, {"optimised_rendering", "1"}, {"render_resolution", "auto"}, {"renderer_thread", "1"}, {"gpu", "auto"},
+    {"present_mode", "auto"}, {"gpu_optimisations", "1"}, {"heap_slot_mb", "512"}, {"heap_slot_reuse", "1"}, {"shader_preparation", "1"},
+    {"gpu_coherence", "1"}, {"halloween_hunt", "0"}, {"language", "auto"}, {"text_language", "auto"}, {"speech_language", "auto"},
+    {"audio_late_read", "1"}, {"audio_limiter", "1"}, {"gyro_calibration", "1"}, {"low_vram_textures", "auto"}, {"depth_of_field", "1"},
+    {"low_driver_memory", "0"}, {"rs_depth_max", "auto"}, {"cpu_compat", "0"}, {"update_check", "0"}, {"developer", "0"} };
+static const char *const k_ud_prog_keys[] = {"game_dir", "display_mode", "monitor", "window_width", "window_height", "window_x", "window_y", "update_skip_version"};
+static int ud_find(const char *t, const char *s) { int n = str_len(s); for (int i = 0; t[i]; i++) { int k = 0; while (k < n && t[i + k] == s[k]) k++; if (k == n) return i; } return -1; }
+/* w38_rel: the language comments of an earlier version's settings file are replaced by the new list (all 20 languages, codes,
+   editions, voices, import). Only those exact comment lines change; every value (language = ... etc.) stays as the player set it. */
+static const char *const k_lang_old_doc[2] = {"; Language of the menus, subtitles and voices, chosen by the game itself as on a PS4 set to that language:\r\n; auto (English) or english, russian, polish, spanish, portuguese, swedish, norwegian, finnish, danish.\r\n; Tested with these game files (CUSA02636): russian and polish work. Languages this edition does not contain\r\n; (e.g. french, german, italian) fall back to English. Restart after changing.\r\n", "; Optional: menus / subtitles (text_language) and voices (speech_language) in different languages, through the\r\n; game's own override, e.g. text_language = russian with English voices. auto = as language above. Use only\r\n; languages that work with language = (the override does not check what the game files contain).\r\n"};
+static const char *k_lang_new_doc =
+    "; ---- LANGUAGE ------------------------------------------------------------------------------------------------\r\n"
+    "; To change the language: write one value (the name or the code) after  language =  below, save, and restart.\r\n"
+    ";   Example:  language = french     or     language = fr        auto = English\r\n"
+    "; Menus, subtitles and voices change together; the game loads a language's voices with its text.\r\n"
+    "; A language of YOUR edition (see the editions column) works at once. A language that only ANOTHER edition has\r\n"
+    "; must be imported once from your own copy of that edition with UDLanguageImporter.exe (next to UntilDawn.exe);\r\n"
+    "; without the import the game uses English. Logs\\UntilDawn.log says at start which case applies.\r\n"
+    ";\r\n"
+    ";   name                 code    voices       editions that contain it                    status\r\n"
+    ";   english              en      yes          every edition                               verified\r\n"
+    ";   spanish              es      yes          CUSA02636 (Europe 2)                        verified\r\n"
+    ";   portuguese           pt      yes          CUSA02636 (Europe 2)                        verified\r\n"
+    ";   russian              ru      yes          CUSA02636 (Europe 2)                        verified\r\n"
+    ";   polish               pl      yes          CUSA02636 (Europe 2)                        verified\r\n"
+    ";   danish               da      text only    CUSA02636 (Europe 2)                        verified\r\n"
+    ";   finnish              fi      text only    CUSA02636 (Europe 2)                        verified\r\n"
+    ";   norwegian            no      text only    CUSA02636 (Europe 2)                        verified\r\n"
+    ";   swedish              sv      text only    CUSA02636 (Europe 2)                        verified\r\n"
+    ";   french               fr      yes          CUSA00194 (Europe 1), CUSA00359 (Americas)  verified from CUSA00194\r\n"
+    ";   german               de      yes          CUSA00194 (Europe 1)                        verified\r\n"
+    ";   italian              it      yes          CUSA00194 (Europe 1)                        verified\r\n"
+    ";   dutch                nl      text only    CUSA00194 (Europe 1)                        verified\r\n"
+    ";   turkish              tr      text only    CUSA00194 (Europe 1)                        verified\r\n"
+    ";   spanish_latam        es-la   yes (1)      CUSA00359 (Americas)                        EXPERIMENTAL\r\n"
+    ";   portuguese_brazil    pt-br   yes (1)      CUSA00359 (Americas)                        EXPERIMENTAL\r\n"
+    ";   japanese             ja      unknown      CUSA00902 (Japan)                           EXPERIMENTAL, untested\r\n"
+    ";   korean               ko      unknown      CUSA01423 (Asia)                            EXPERIMENTAL, untested\r\n"
+    ";   chinese_traditional  zh-tw   unknown      CUSA01423 (Asia)                            EXPERIMENTAL, untested\r\n"
+    ";   chinese_simplified   zh-cn   unknown      CUSA01423 (Asia)                            EXPERIMENTAL, untested\r\n"
+    "; (1) the CUSA00359 file list has text and voice files for these two languages; not yet tested in game.\r\n"
+    "; EXPERIMENTAL languages are used only from an experimental import (language_experimental, see LANGUAGE_PACKS_README.txt).\r\n"
+    "; Optional: text_language / speech_language split menus + subtitles from voices (same names or codes), e.g.\r\n"
+    "; text_language = russian with English voices. auto = as language above.\r\n";
+static void ud_lang_doc_migrate(void) {
+    if (g_uds.fresh || !g_ud_ini_path[0] || !g_dopt_save) return;
+    u64 n = 0; char *t = (char *)plat_read_file(g_ud_ini_path, &n); if (!t) return;
+    char *z = (char *)malloc(n + 1); if (!z) return; mem_copy(z, t, n); z[n] = 0;
+    int at = ud_find(z, k_lang_old_doc[0]); if (at < 0) { free(z); return; }
+    int ol = str_len(k_lang_old_doc[0]), nl = str_len(k_lang_new_doc);
+    char *o = (char *)malloc(n + (u64)nl + 1); if (!o) { free(z); return; }
+    mem_copy(o, z, (u64)at); mem_copy(o + at, k_lang_new_doc, (u64)nl); mem_copy(o + at + nl, z + at + ol, n - (u64)at - (u64)ol); u64 m = n - (u64)ol + (u64)nl; o[m] = 0;
+    int a2 = ud_find(o, k_lang_old_doc[1]);   /* the old text_language comment, now part of the new list */
+    if (a2 >= 0) { int l2 = str_len(k_lang_old_doc[1]); mem_copy(o + a2, o + a2 + l2, m - (u64)a2 - (u64)l2 + 1); }
+    void *f = plat_open_write(g_ud_ini_path); if (f) { plat_write(f, o); plat_close(f); }
+    say("settings: the language notes in Config\\settings.ini were updated (all 20 languages, codes and editions); your values are unchanged\n");
+    free(o); free(z);
+}
+
+static int ud_ldm_migrate(void) {
+    if (!g_uds.seen_ldm || g_uds.low_driver_mem != 0 || g_uds.fresh || !g_ud_ini_path[0]) return 0;
+    u64 n = 0; char *t = (char *)plat_read_file(g_ud_ini_path, &n); if (!t) return 0;
+    char *z = (char *)malloc(n + 1); if (!z) return 0; mem_copy(z, t, n); z[n] = 0;
+    int at = -1, blk = -1; for (int b = 0; b < 2 && at < 0; b++) { at = ud_find(z, k_ldm_old_blocks[b]); blk = b; }
+    int why = at < 0 ? 1 : 0;   /* 1: the line or its comment is not the program's own text */
+    if (!why) {   /* every other setting at its default? */
+        char *c = (char *)malloc(n + 1); if (!c) { free(z); return 0; } mem_copy(c, z, n + 1);
+        for (char *q = c; *q && !why; ) {
+            char *line = q; while (*q && *q != '\n') q++; if (*q) *q++ = 0;
+            ud_trim(line); while (*line == ' ' || *line == '\t') line++;
+            if (!*line || *line == ';' || *line == '#' || *line == '[') continue;
+            char *eq = line; while (*eq && *eq != '=') eq++; if (!*eq) { why = 2; break; }
+            *eq = 0; char *v = eq + 1; ud_trim(line); while (*v == ' ' || *v == '\t') v++; ud_trim(v);
+            int prog = 0; for (unsigned k = 0; k < sizeof k_ud_prog_keys / sizeof k_ud_prog_keys[0]; k++) if (ud_key_is(line, k_ud_prog_keys[k])) prog = 1;
+            if (prog) continue;
+            int known = 0; for (unsigned k = 0; k < sizeof k_ud_defaults / sizeof k_ud_defaults[0]; k++) if (ud_key_is(line, k_ud_defaults[k][0])) { known = 1; if (!ud_key_is(v, k_ud_defaults[k][1])) why = 2; }
+            if (!known) why = 2;
+        }
+        free(c);
+    }
+    if (why) {
+        g_ldm_mig_why = why;
+        say("settings: low_driver_memory = 0 kept - ");
+        say(why == 1 ? "the line is not the text an earlier development build wrote" : "the file has other settings changed by hand");
+        say(", so 0 may be your own choice. The default is now auto (on only when the graphics driver's budget for system memory is small); to use it, write  low_driver_memory = auto  in Config\\settings.ini\n");
+        free(z); return 2;
+    }
+    g_uds.low_driver_mem = -1;
+    if (g_dopt_save) {
+        int ol = str_len(k_ldm_old_blocks[blk]), nl = str_len(k_ldm_new_block);
+        char *o = (char *)malloc(n + (u64)nl + 1);
+        if (o) { mem_copy(o, z, (u64)at); mem_copy(o + at, k_ldm_new_block, (u64)nl); mem_copy(o + at + nl, z + at + ol, n - (u64)at - (u64)ol); o[n - ol + nl] = 0;
+            void *f = plat_open_write(g_ud_ini_path); if (f) { plat_write(f, o); plat_close(f); } free(o); }
+    }
+    say("settings: low_driver_memory = 0 was written by an earlier development build (the file is otherwise as the program wrote it) - now auto, the new default");
+    say(g_dopt_save ? " (Config\\settings.ini updated)\n" : " (not saved: not a player start)\n");
+    free(z); return 1;
 }

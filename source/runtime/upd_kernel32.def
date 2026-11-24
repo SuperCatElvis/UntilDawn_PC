@@ -1,0 +1,27 @@
+LIBRARY kernel32.dll
+EXPORTS
+CreateFileA
+ReadFile
+WriteFile
+CloseHandle
+FlushFileBuffers
+GetFileAttributesA
+CreateDirectoryA
+MoveFileExA
+DeleteFileA
+RemoveDirectoryA
+FindFirstFileA
+FindNextFileA
+FindClose
+GetModuleFileNameA
+GetCommandLineA
+ExitProcess
+CreateThread
+WaitForSingleObject
+GetLastError
+GetLocalTime
+GetCurrentThreadId
+GetFileSizeEx
+LoadLibraryA
+GetProcAddress
+GetEnvironmentVariableA

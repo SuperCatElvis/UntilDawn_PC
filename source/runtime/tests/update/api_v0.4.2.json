@@ -1,0 +1,55 @@
+{
+  "url": "https://api.github.com/repos/SuperCatElvis/UntilDawn_PC/releases/100000002",
+  "assets_url": "https://api.github.com/repos/SuperCatElvis/UntilDawn_PC/releases/100000002/assets",
+  "html_url": "https://github.com/SuperCatElvis/UntilDawn_PC/releases/tag/v0.4.2",
+  "id": 100000002,
+  "author": {
+    "login": "SuperCatElvis",
+    "id": 1,
+    "html_url": "https://github.com/SuperCatElvis",
+    "type": "User",
+    "site_admin": false
+  },
+  "node_id": "RE_test",
+  "tag_name": "v0.4.2",
+  "target_commitish": "main",
+  "name": "Until Dawn PC v0.4.2",
+  "draft": false,
+  "immutable": false,
+  "prerelease": false,
+  "created_at": "2026-11-20T10:00:00Z",
+  "published_at": "2026-11-20T10:05:00Z",
+  "assets": [
+    {
+      "url": "https://api.github.com/repos/SuperCatElvis/UntilDawn_PC/releases/assets/1",
+      "id": 1,
+      "name": "UntilDawn_PC_v0.4.2.zip",
+      "label": null,
+      "uploader": { "login": "SuperCatElvis", "id": 1, "type": "User", "site_admin": false },
+      "content_type": "application/zip",
+      "state": "uploaded",
+      "size": 3800000,
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "download_count": 0,
+      "created_at": "2026-11-20T10:01:00Z",
+      "updated_at": "2026-11-20T10:01:30Z",
+      "browser_download_url": "https://github.com/SuperCatElvis/UntilDawn_PC/releases/download/v0.4.2/UntilDawn_PC_v0.4.2.zip"
+    },
+    {
+      "url": "https://api.github.com/repos/SuperCatElvis/UntilDawn_PC/releases/assets/2",
+      "id": 2,
+      "name": "UntilDawn_PC_v0.4.2.zip.sha256.txt",
+      "label": "",
+      "uploader": { "login": "SuperCatElvis", "id": 1, "type": "User", "site_admin": false },
+      "content_type": "text/plain",
+      "state": "uploaded",
+      "size": 91,
+      "download_count": 0,
+      "browser_download_url": "https://github.com/SuperCatElvis/UntilDawn_PC/releases/download/v0.4.2/UntilDawn_PC_v0.4.2.zip.sha256.txt"
+    }
+  ],
+  "tarball_url": "https://api.github.com/repos/SuperCatElvis/UntilDawn_PC/tarball/v0.4.2",
+  "zipball_url": "https://api.github.com/repos/SuperCatElvis/UntilDawn_PC/zipball/v0.4.2",
+  "body": "## Release notes\r\n\r\n- Fixes \"quoted\" things é and \\ backslashes.\r\n- Second line.",
+  "reactions": { "url": "x", "total_count": 1, "+1": 1 }
+}

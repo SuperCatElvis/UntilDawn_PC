@@ -8,6 +8,7 @@ GetFileSizeEx
 CloseHandle
 VirtualAlloc
 VirtualQuery
+ReadProcessMemory
 GetLastError
 SetThreadPriority
 SetThreadAffinityMask
@@ -16,6 +17,7 @@ ExitProcess
 AddVectoredExceptionHandler
 TlsAlloc
 TlsSetValue
+TlsFree
 TlsGetValue
 CreateThread
 WaitForSingleObject
@@ -94,3 +96,9 @@ GetCurrentProcess
 GetCommandLineW
 CreateProcessW
 GetModuleFileNameW
+GetThreadPriority
+GetEnvironmentVariableA
+GetDiskFreeSpaceExA
+GetConsoleProcessList
+ReadConsoleInputA
+FlushConsoleInputBuffer

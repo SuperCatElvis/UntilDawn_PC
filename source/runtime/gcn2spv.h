@@ -16,6 +16,7 @@ enum { G2S_VS = 0, G2S_PS = 1, G2S_CS = 2 };
    as floats num / den, den / num, the shift) - one SPIR-V module, one driver pipeline for every scale; the salt's num /
    den bits are 0 */
 #define G2S_RS_GEN 0x4000u
+#define G2S_W30_FPMAX 0x1000u   /* w30_visual --rs-depth-max (with G2S_RS_GEN, compute only): see gcn2spv.c EM.w30_fpmax */
 /* w2: the sub-pixel shift of even denominators (see RS_E in gcn2spv.c); salt bit 7 = translated without it (--rs-no-shift) */
 static int g2s_opt_rs_noshift;
 #define RS_E(d) (g2s_opt_rs_noshift ? 0u : (u32)!((d) & 1u))
@@ -293,6 +294,7 @@ extern int g2s_ld_group;   /* t196: 1 = the dwords of one load instruction share
 extern int g2s_movrel_sel;   /* t156: 1 = V_MOVREL* as select chains over the registers (as before) */
 extern u64 g2s_kp[G2S_KP_N], g2s_kp_key; extern u32 g2s_kp_cnt[4]; extern int g2s_kp_fresh;
 void g2s_memo_path_stats(u64 o[8]);   /* t155: exact-input entries found / with other memory / relocated from them; relocation attempts from other inputs / reused */
+extern unsigned long long g2s_mtm_ntr, g2s_mtm_nunk, g2s_mtm_nfull, g2s_mtm_unk_addr[32];   /* w20_mem (diagnostic counters) */
 extern int g2s_memo_nodups, g2s_memo_nokc;   /* t155 test: 1 = repeated memo read ranges read again (as before t155) */
 u64 g2s_memo_full(void);   /* t154: setups translated in full (neither an exact nor a relocated reuse) */
 void g2s_memo_nokeep(u64 out6[6]);   /* t154: full translations not kept for reuse: failed, translation cache full, recorder out of memory, memory not re-readable, code hash failed, no memory to pack */

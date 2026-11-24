@@ -1,0 +1,14 @@
+LIBRARY user32.dll
+EXPORTS
+GetMessageA
+SendMessageA
+EnableWindow
+GetWindowTextA
+ShowWindow
+UpdateWindow
+InvalidateRect
+BeginPaint
+EndPaint
+FillRect
+PostQuitMessage
+SetTimer

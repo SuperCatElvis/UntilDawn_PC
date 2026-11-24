@@ -1369,6 +1369,7 @@ typedef struct {
     int fix_z;
     int wave_sync; u32 vote_var, lidx_var, vote_n;   /* compute + LDS: emulate 64-lane lockstep (uniform branches, LDS barriers) */
     int vote_borrow; u32 vote_save, lds_dw;          /* t104: votes in the last LDS dword (G2SIn.max_shared) */
+    int w30_fpmax;   /* w30_visual: game-resolution compute reading a scaled image: max over the logical texel's physical footprint (G2S_W30_FPMAX) */
     int quad_br, helper_exec;   /* E6 pixel shader with quad swizzles: conditional branches decided per 2x2 quad (quad_branch) */
     u32 dbg_var[4];                /* diagnostic: the kept VGPRs (G2SIn dbg_pc) */
 } EM;
@@ -2431,6 +2432,7 @@ static int em_mimg(EM *e, const GInst *I) {
         u32 cc[3]; for (int i = 0; i < ncoord; i++) cc[i] = bc(s, t_i, ld(s, U, vreg_var(s, vaddr + i)));
         u32 rs_n_, rs_d_; int rs_ = g2s_rs(e->in, &rs_n_, &rs_d_) && dim != 2 && !arrayed && !s->nat;   /* t196 */
         u32 rs_lo[2] = {0, 0}, rs_hi[2] = {0, 0}, rs_blk = 0, rs_c0[2] = {0, 0}, rs_main = 0;
+        u32 lcc_[2] = {ncoord >= 2 ? cc[0] : 0, ncoord >= 2 ? cc[1] : 0};   /* w30_visual: the logical coordinates */
         if (rs_ && n[6] == 'L') rs_map_load(e, b, cc);
         if (rs_ && n[6] != 'L') { rs_map_store(e, b, cc, rs_c0, rs_lo, rs_hi, &rs_blk, &rs_main); cc[0] = rs_c0[0]; cc[1] = rs_c0[1]; }
         u32 coord = ncoord == 3 ? E3(80, t_vi, cc[0], cc[1], cc[2]) : E2(80, t_vi, cc[0], cc[1]);
@@ -2439,8 +2441,18 @@ static int em_mimg(EM *e, const GInst *I) {
             u32 res;
             if (tx->storage) res = op1(s, &s->code, 98, rtype, 2, (u32[]){ld(s, e->t_img[b], s->tex_var[b]), coord});
             else { u32 img = tex_img(e, b); res = op1(s, &s->code, 95, rtype, 4, (u32[]){img, coord, 2, lod}); }
+            u32 fpm_ = 0;
+            if (rs_ && e->w30_fpmax && !tx->storage && !tx->is_int && ncoord == 2) {   /* w30_visual: see EM.w30_fpmax */
+                u32 B_ = s->t_bool, img = tex_img(e, b), m_ = E2(81, F, res, 0u), lo_[2], hi_[2];
+                for (int a = 0; a < 2; a++) { u32 l_ = bc(s, U, lcc_[a]); lo_[a] = rs_F(e, l_); hi_[a] = E2(130, U, rs_F(e, E2(128, U, l_, cu(s, 1))), cu(s, 1)); }
+                for (int j = 0; j < 2; j++) for (int i = 0; i < 2; i++) {
+                    u32 px_ = E2(128, U, lo_[0], cu(s, (u32)i)), py_ = E2(128, U, lo_[1], cu(s, (u32)j));
+                    px_ = E3(169, U, E2(172, B_, px_, hi_[0]), hi_[0], px_); py_ = E3(169, U, E2(172, B_, py_, hi_[1]), hi_[1], py_);   /* (min with the footprint's last texel) */
+                    u32 f_ = op1(s, &s->code, 95, rtype, 4, (u32[]){img, E2(80, t_vi, bc(s, t_i, px_), bc(s, t_i, py_)), 2, lod});
+                    m_ = GL2(80, F, m_, E2(81, F, f_, 0u)); }
+                fpm_ = E3(169, F, E2(167, B_, rs_tex(e, b), E1(168, B_, rs_own(e))), m_, E2(81, F, res, 0u)); }
             int o = 0;
-            for (int i = 0; i < 4; i++) if (dmask & (1u << i)) { u32 c = E2(81, tx->is_int ? U : F, res, (u32)i); wr_vreg(s, vdata + o++, tx->is_int ? c : as_u(s, c)); }
+            for (int i = 0; i < 4; i++) if (dmask & (1u << i)) { u32 c = (fpm_ && o == 0 && i == 0) ? fpm_ : E2(81, tx->is_int ? U : F, res, (u32)i); wr_vreg(s, vdata + o++, tx->is_int ? c : as_u(s, c)); }
         } else {
             u32 comp[4]; int o = 0;
             for (int i = 0; i < 4; i++) {
@@ -3187,6 +3199,9 @@ static int em_structured(EM *e) {
     return ok;
 }
 
+/* w20_mem (--mem-touch-map): fresh translations, those with a GPU load through a descriptor not known when translating
+   (its memory is not in the read list), and those whose read list was full (16) - counters only, nothing changes */
+unsigned long long g2s_mtm_ntr, g2s_mtm_nunk, g2s_mtm_nfull, g2s_mtm_unk_addr[32];
 static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
     for (int i = 0; i < (int)sizeof(out->err); i++) out->err[i] = 0;
     out->nfold = 0; out->fold_dw = 0; out->nrd = 0;
@@ -3226,6 +3241,7 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
         if (!dup && out->nwr < 16) { out->wr_lo[out->nwr] = base; out->wr_hi[out->nwr] = base + bytes; out->nwr++; }
     }
     out->wr_unknown = 0;   /* (out->nrd: the scalar loads that are not folded were listed by g2s_load) */
+    int mtm_unk = 0, mtm_full = 0;   /* w20_mem: loads the read list cannot name (diagnostic counters only) */
     for (int i = 0; i < nins; i++) {   /* buffers read on the GPU (STATUS 55) */
         const GInst *I = &ins[i]; int rd = 0;
         if (I->enc == E_MUBUF || I->enc == E_MTBUF) {
@@ -3233,6 +3249,8 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
             if (wr && (I->desc < 0 || !descs[I->desc].known)) out->wr_unknown = 1;
             rd = (I->fl & GF_BLOAD) != 0;
         } else if ((I->fl & GF_SBLOAD) && I->fold < 0) rd = 1;
+        if (rd && (I->desc < 0 || !descs[I->desc].known)) mtm_unk = 1;
+        if (rd && out->nrd >= 16) mtm_full = 1;
         if (!rd || I->desc < 0) continue;
         const GDesc *D = &descs[I->desc];
         if (!D->known) continue;
@@ -3243,6 +3261,9 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
         if (!dup && out->nrd < 16) { out->rd_lo[out->nrd] = base; out->rd_hi[out->nrd] = base + bytes; out->nrd++; }
     }
     out->n_inst = (u32)nins;
+    __atomic_add_fetch(&g2s_mtm_ntr, 1, __ATOMIC_RELAXED);
+    if (mtm_full) __atomic_add_fetch(&g2s_mtm_nfull, 1, __ATOMIC_RELAXED);
+    if (mtm_unk) { u64 k = __atomic_fetch_add(&g2s_mtm_nunk, 1, __ATOMIC_RELAXED); if (k < 32) g2s_mtm_unk_addr[k] = in->code_addr; }
     e->s = s; e->in = in; e->out = out; e->ins = ins; e->n = nins; e->descs = descs;
     e->fix_z = in->fix_z;
     /* E6 pixel shaders that swizzle across their 2x2 quads (quad-wide "derivatives" of their own, like the light-tiling
@@ -3251,6 +3272,20 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
        quad operation (undefined results). STATUS 52. */
     e->helper_exec = ps_needs_live_exec(ins, nins);
     e->quad_br = 0;   /* (t107: e is reused, not freshly zeroed) */
+    e->w30_fpmax = 0;
+    if (in->stage == G2S_CS && (in->diag_salt & 0xFFFF0000u) == G2S_RS_TAG && (in->diag_salt & G2S_RS_GEN) && (in->diag_salt & G2S_W30_FPMAX)) {
+        /* w30_visual (test, --rs-depth-max): a compute program that only takes float maxima (no minima) of what it loads - the
+           tile depth-bound reductions of the game's tiled lighting (0x24f318d00 / 0x24f319100: per 16 pixels the maximum
+           depth). Run at the game's resolution it read every scaled texel at the representative physical pixel only, so a
+           pixel whose own physical depth lies beyond (the first physical pixel of a logical one at a tile's left / top
+           edge) fell outside its tile's bound and lost lights: the thin lines on faces at 1440p. Reading the maximum over
+           the logical texel's physical footprint makes the bound cover every physical pixel. */
+        int mx_ = 0, mn_ = 0;
+        for (int i = 0; i < nins; i++) { const char *nm_ = ins[i].name; if (!nm_) continue;
+            if (g2s_starts(nm_, "V_MAX") && (g2s_streq(nm_ + 5, "_F32") || g2s_streq(nm_ + 5, "3_F32") || g2s_streq(nm_ + 5, "_LEGACY_F32"))) mx_ = 1;
+            if ((g2s_starts(nm_, "V_MIN") || g2s_starts(nm_, "V_MED3")) && (g2s_streq(nm_ + 5, "_F32") || g2s_streq(nm_ + 5, "3_F32") || g2s_streq(nm_ + 5, "_LEGACY_F32"))) mn_ = 1; }
+        e->w30_fpmax = mx_ && !mn_;
+    }
     int e6ps = in->stage == G2S_PS && !in->native && !in->gs_mode && !in->tess_mode;
     if (e6ps && in->quad_branch_all && (ps_live_exec(e) || in->helpers_auto)) e->quad_br = 1;   /* t103: every E6 pixel shader (G2SIn.quad_branch_all); t106: also those whose helpers run like covered pixels */
     else if (ps_live_exec(e)) for (int i = 0; i < nins; i++) if (ins[i].enc == E_DS && g2s_streq(ins[i].name, "DS_SWIZZLE_B32")) { e->quad_br = 1; break; }
@@ -3327,14 +3362,14 @@ static int g2s_translate_full(const G2SIn *in, G2SOut *out) {
     }
     /* cache miss: clear the builders as a fresh allocation would be, keeping what the setup above wrote */
     {
-        int hx = e->helper_exec, qb = e->quad_br, fz = e->fix_z, nb = ndesc < 4096 ? ndesc : 4096;
+        int w30f_ = e->w30_fpmax; int hx = e->helper_exec, qb = e->quad_br, fz = e->fix_z, nb = ndesc < 4096 ? ndesc : 4096;
         static int k_bod[4096]; static u16 k_tnb[G2S_MAX_TEX][2];
         for (int i = 0; i < nb; i++) k_bod[i] = e->bind_of_desc[i];
         for (u32 b = 0; b < out->ntex && b < G2S_MAX_TEX; b++) { k_tnb[b][0] = e->tex_nb[b][0]; k_tnb[b][1] = e->tex_nb[b][1]; }
         { unsigned char *z = (unsigned char *)s; for (size_t k = 0; k < sizeof(SB); k++) z[k] = 0; }
         { unsigned char *z = (unsigned char *)e; for (size_t k = 0; k < sizeof(EM); k++) z[k] = 0; }
         e->s = s; e->in = in; e->out = out; e->ins = ins; e->n = nins; e->descs = descs;
-        e->fix_z = fz; e->helper_exec = hx; e->quad_br = qb;
+        e->fix_z = fz; e->helper_exec = hx; e->quad_br = qb; e->w30_fpmax = w30f_;
         for (int i = 0; i < 4096; i++) e->bind_of_desc[i] = -1;
         for (int i = 0; i < nb; i++) e->bind_of_desc[i] = k_bod[i];
         for (u32 b = 0; b < out->ntex && b < G2S_MAX_TEX; b++) { e->tex_nb[b][0] = k_tnb[b][0]; e->tex_nb[b][1] = k_tnb[b][1]; }

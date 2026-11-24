@@ -30,3 +30,4 @@ GetMonitorInfoA
 MonitorFromWindow
 SetWindowPos
 SetWindowLongPtrA
+CreateIconFromResourceEx

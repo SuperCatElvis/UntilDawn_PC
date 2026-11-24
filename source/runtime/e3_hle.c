@@ -118,7 +118,24 @@ static SYSV void h_qsort(void *base, u64 n, u64 sz, int (SYSV *cmp)(const void *
 }
 
 /* ---------------- heap (host) ---------------- */
-static SYSV void *h_malloc(u64 n) { TRACE("malloc", n, 0, 0); void *p = malloc(n ? n : 1); if (p) h_memset(p, 0, n); return p; }
+/* w34_mem --zero-log (diagnostic, default off): bytes our code fills with zeros, by place, and how many of them were not in RAM
+   before (sampled working-set query, ranges of 64 KB and up): pages our zeroing brings into RAM. 0 map in place (zero flag), 1 map in
+   place over released memory, 2 arena (fixed flexible), 3 pool mapping, 4 the game's malloc / memalign (host heap). */
+static int g_opt_zero_decommit, g_opt_hw_res; static u64 g_zd_bytes, g_zd_n, g_zd_fail;   /* w34_mem (see zero_inplace) */
+static int g_opt_zerolog; static volatile u64 g_zl_bytes[5], g_zl_fresh[5], g_zl_n[5];
+static void zl_note(int site, u64 a, u64 n) {
+    if (!g_opt_zerolog || !n) return;
+    __atomic_add_fetch(&g_zl_bytes[site], n, __ATOMIC_RELAXED); __atomic_add_fetch(&g_zl_n[site], 1, __ATOMIC_RELAXED);
+    if (n >= (64u << 10)) { u64 lo = (a + 0xFFF) & ~0xFFFull, hi = (a + n) & ~0xFFFull; if (hi > lo) { u64 r = plat_resident(lo, hi); __atomic_add_fetch(&g_zl_fresh[site], (hi - lo) > r ? (hi - lo) - r : 0, __ATOMIC_RELAXED); } }
+}
+static void zl_say(void) {
+    if (!g_opt_zerolog) return;
+    static const char *const nm[5] = {"map in place", "map in place over released memory", "arena", "pool", "game malloc"};
+    say("; zero-fills by our code (w34_mem, MB filled / of it not in RAM before / calls):");
+    for (int k = 0; k < 5; k++) { say(k ? ", " : " "); say(nm[k]); say(" "); say_dec((i64)(g_zl_bytes[k] >> 20)); say(" / "); say_dec((i64)(g_zl_fresh[k] >> 20)); say(" / "); say_dec((i64)g_zl_n[k]); }
+    if (g_opt_zero_decommit) { say("; --zero-decommit: "); say_dec((i64)(g_zd_bytes >> 20)); say(" MB in "); say_dec((i64)g_zd_n); say(" ranges zeroed by decommit, failures "); say_dec((i64)g_zd_fail); }
+}
+static SYSV void *h_malloc(u64 n) { TRACE("malloc", n, 0, 0); void *p = malloc(n ? n : 1); if (p) { zl_note(4, (u64)p, n); h_memset(p, 0, n); } return p; }
 static SYSV void h_free(void *p) { if (p) free(p); }
 static SYSV void *h_calloc(u64 a, u64 b) { return calloc(a ? a : 1, b ? b : 1); }
 static SYSV void *h_realloc(void *p, u64 n) { return realloc(p, n ? n : 1); }
@@ -129,7 +146,7 @@ static SYSV void *h_memalign(u64 al, u64 n) {
     if (!raw) return 0;
     u64 a = ((u64)raw + 16 + al - 1) & ~(al - 1);
     ((void **)a)[-1] = raw;   /* leaked on free: E3 only */
-    h_memset((void *)a, 0, n);
+    zl_note(4, a, n); h_memset((void *)a, 0, n);
     return (void *)a;
 }
 
@@ -267,6 +284,88 @@ static double va_dbl(SysVaList *v) {
 typedef struct { char *buf; u64 cap, len; } Out;
 static void out_c(Out *o, char c) { if (o->len + 1 < o->cap) o->buf[o->len] = c; o->len++; }
 static void out_pad(Out *o, char c, int n) { while (n-- > 0) out_c(o, c); }
+/* w29_book: C99 %f / %F / %e / %E / %g / %G / %a / %A with exact output. Until now %e / %g were printed
+   like %f, so "%.14g" of 1.0 gave "1.00000000000000" instead of "1" - and the game's embedded Lua 5.1 turns every
+   number into text with sprintf("%.14g") (tostring, .. concatenation, lua_tostring). Conversion: the double's exact
+   decimal expansion (big integer, base 1e9: mantissa * 2^e or mantissa * 5^-e), rounded at the requested digit, ties to
+   even - the text glibc / the PS4 libc print, for every precision (capped at 700 digits). */
+typedef struct { u32 l[130]; int n; } FgBig;   /* little-endian base 1e9; 2^53 * 5^1074 has < 820 digits */
+static void fgb_mul(FgBig *b, u32 m) { u64 c = 0; for (int i = 0; i < b->n; i++) { u64 t = (u64)b->l[i] * m + c; b->l[i] = (u32)(t % 1000000000u); c = t / 1000000000u; } while (c && b->n < 130) { b->l[b->n++] = (u32)(c % 1000000000u); c /= 1000000000u; } }
+static int fg_exact(double v, char *d, int *dexp) {   /* v > 0 finite: its exact digits into d (no leading / trailing zeros), value = 0.d * 10^dexp */
+    u64 bits; mem_copy(&bits, &v, 8); int be = (int)((bits >> 52) & 0x7ff); u64 m = bits & 0xfffffffffffffull; int e2;
+    if (be) { m |= 1ull << 52; e2 = be - 1075; } else e2 = -1074;
+    while (!(m & 1)) { m >>= 1; e2++; }
+    FgBig b; b.n = 0; while (m) { b.l[b.n++] = (u32)(m % 1000000000u); m /= 1000000000u; }
+    int k = e2 >= 0 ? e2 : -e2;
+    if (e2 >= 0) { while (k >= 29) { fgb_mul(&b, 1u << 29); k -= 29; } if (k) fgb_mul(&b, 1u << k); }
+    else { while (k >= 13) { fgb_mul(&b, 1220703125u); k -= 13; } u32 p = 1; while (k--) p *= 5; if (p > 1) fgb_mul(&b, p); }
+    int n = 0; char t[12];
+    { u32 x = b.l[b.n - 1]; int c = 0; do { t[c++] = (char)('0' + x % 10); x /= 10; } while (x); while (c) d[n++] = t[--c]; }
+    for (int i = b.n - 2; i >= 0; i--) { u32 x = b.l[i]; for (int j = 8; j >= 0; j--) { d[n + j] = (char)('0' + x % 10); x /= 10; } n += 9; }
+    *dexp = n + (e2 >= 0 ? 0 : e2);
+    while (n > 1 && d[n - 1] == '0') n--;
+    return n;
+}
+static void fg_rnd(const char *d, int n, int K, char *r, int *dexp) {   /* the first K >= 1 digits of 0.d * 10^dexp, rounded ties-to-even, into r; a carry raises dexp */
+    for (int i = 0; i < K; i++) r[i] = i < n ? d[i] : '0';
+    if (K >= n) return;
+    int up = d[K] > '5'; if (d[K] == '5') { int rest = 0; for (int i = K + 1; i < n; i++) if (d[i] != '0') { rest = 1; break; } up = rest || ((r[K - 1] - '0') & 1); }
+    if (!up) return;
+    int i = K - 1; while (i >= 0 && r[i] == '9') r[i--] = '0';
+    if (i >= 0) { r[i]++; return; }
+    r[0] = '1'; (*dexp)++;
+}
+static char g_fg_d[900], g_fg_r[1100]; static volatile int g_fg_lk;
+static int fmt_flt(char *w, int wcap, double v, int prec, char conv, int alt) {   /* v >= 0 finite into w (no sign); returns the length */
+    int k = 0, up = conv >= 'A' && conv <= 'Z'; char c = (char)(conv | 0x20);
+    #define FGP(ch) do { if (k < wcap - 1) w[k++] = (ch); } while (0)
+    if (c == 'a') {   /* hex: 0x1.hhhp+e (subnormals 0x0.hhhp-1022); a precision rounds ties to even */
+        u64 bits; mem_copy(&bits, &v, 8); int be = (int)((bits >> 52) & 0x7ff); u64 m = bits & 0xfffffffffffffull; int e = be ? be - 1023 : (m ? -1022 : 0); int lead = be ? 1 : 0;
+        int nd = 13;
+        if (prec == 0) { u64 half = 1ull << 51; if (m > half || (m == half && (lead & 1))) lead++; m = 0; nd = 0; }   /* ties to even on the leading digit */
+        else if (prec > 0 && prec < 13) { int sh = 4 * (13 - prec); u64 rem = m & ((1ull << sh) - 1), half = 1ull << (sh - 1); m >>= sh; if (rem > half || (rem == half && (m & 1))) m++; if (prec == 0 ? m != 0 : (m >> (4 * prec)) != 0) { m = prec ? m & ((1ull << (4 * prec)) - 1) : 0; lead++; } nd = prec; }
+        else if (prec < 0) { while (nd > 0 && !(m & 15)) { m >>= 4; nd--; } }
+        const char *hx = up ? "0123456789ABCDEF" : "0123456789abcdef";
+        FGP('0'); FGP(up ? 'X' : 'x'); FGP((char)('0' + lead));
+        if (nd > 0 || alt || prec > 13) FGP('.');
+        for (int i = nd - 1; i >= 0; i--) FGP(hx[(m >> (4 * i)) & 15]);
+        for (int i = 13; i < prec; i++) FGP('0');
+        FGP(up ? 'P' : 'p'); FGP(e < 0 ? '-' : '+'); { int ae = e < 0 ? -e : e; char t[8]; int c2 = 0; do { t[c2++] = (char)('0' + ae % 10); ae /= 10; } while (ae); while (c2) FGP(t[--c2]); }
+        return k;
+    }
+    if (prec < 0) prec = 6; if (prec > 700) prec = 700;
+    while (__atomic_exchange_n(&g_fg_lk, 1, __ATOMIC_ACQUIRE)) { }
+    char *d = g_fg_d, *r = g_fg_r; int n, dexp;
+    if (v == 0) { d[0] = '0'; n = 1; dexp = 1; } else n = fg_exact(v, d, &dexp);
+    int isg = c == 'g', fprec = prec;
+    if (c == 'e' || isg) {
+        int P = isg ? (prec == 0 ? 1 : prec) : prec + 1, de = dexp;
+        fg_rnd(d, n, P, r, &de); int X = v == 0 ? 0 : de - 1, estyle = !isg || X < -4 || X >= P;
+        if (estyle) {
+            FGP(r[0]); if (P > 1 || alt) FGP('.'); for (int i = 1; i < P; i++) FGP(r[i]);
+            if (isg && !alt && P > 1) { while (k > 0 && w[k - 1] == '0') k--; if (k > 0 && w[k - 1] == '.') k--; }
+            FGP(up ? 'E' : 'e'); FGP(X < 0 ? '-' : '+'); { int ae = X < 0 ? -X : X; char t[8]; int c2 = 0; do { t[c2++] = (char)('0' + ae % 10); ae /= 10; } while (ae); if (c2 < 2) t[c2++] = '0'; while (c2) FGP(t[--c2]); }
+            __atomic_store_n(&g_fg_lk, 0, __ATOMIC_RELEASE); return k;
+        }
+        fprec = P - 1 - X;
+    }
+    {   /* fixed point: dexp + fprec digits */
+        int de = dexp, K = dexp + fprec;
+        if (v == 0) { de = 1; K = 1 + fprec; for (int i = 0; i < K; i++) r[i] = '0'; }
+        else if (K < 0) de = -fprec;
+        else if (K == 0) { int rest = 0; for (int i = 1; i < n; i++) if (d[i] != '0') rest = 1; if (d[0] > '5' || (d[0] == '5' && rest)) { de = dexp + 1; r[0] = '1'; } else de = -fprec; }
+        else { fg_rnd(d, n, K, r, &de); for (int i = K; i < de + fprec; i++) r[i] = '0'; }
+        int ip = de;   /* integer digits r[0..ip-1], fraction r[ip..ip+fprec-1] (negative index = leading zero) */
+        if (ip <= 0) FGP('0'); else for (int i = 0; i < ip; i++) FGP(r[i]);
+        int fs = k;
+        if (fprec > 0 || alt) FGP('.');
+        for (int i = 0; i < fprec; i++) { int j = ip + i; FGP(j < 0 ? '0' : r[j]); }
+        if (isg && !alt && fprec > 0) { while (k > fs && w[k - 1] == '0') k--; if (k > fs && w[k - 1] == '.') k--; }
+    }
+    __atomic_store_n(&g_fg_lk, 0, __ATOMIC_RELEASE);
+    #undef FGP
+    return k;
+}
 static int fmt_core(char *buf, u64 cap, const char *f, SysVaList *va) {
     Out o = {buf, cap, 0};
     for (; *f; f++) {
@@ -314,18 +413,21 @@ static int fmt_core(char *buf, u64 cap, const char *f, SysVaList *va) {
                 const u16 *w = (const u16 *)s; while (w[n] && n < 79) { tmp[n] = (char)w[n]; n++; } s = tmp;
             } else { while (s[n] && (prec < 0 || n < prec)) n++; }
             break; }
+        case 'a': case 'A':   /* fall through */
         case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
             double v = va_dbl(va);
-            if (prec < 0) prec = 6;
-            if (v != v) { s = "nan"; n = 3; break; }
-            if (v < 0) { tmp[n++] = '-'; v = -v; } else if (plus) tmp[n++] = '+';
-            if (v > 1e18) { s = "inf/large"; n = 9; break; }
-            double r = 0.5; for (int i = 0; i < prec; i++) r /= 10; v += r;
-            u64 ip = (u64)v; double fr = v - (double)ip;
-            char t2[24]; int k = 0; do { t2[k++] = (char)('0' + ip % 10); ip /= 10; } while (ip);
-            while (k) tmp[n++] = t2[--k];
-            if (prec > 0) { tmp[n++] = '.'; for (int i = 0; i < prec && n < 78; i++) { fr *= 10; int d = (int)fr; tmp[n++] = (char)('0' + d); fr -= d; } }
-            break; }
+            /* w29_book: exact C99 conversion (the only path); sign, width, '-' and '0' flags handled here */
+            u64 bits; mem_copy(&bits, &v, 8); int neg = (int)(bits >> 63); char sg = neg ? '-' : plus ? '+' : space ? ' ' : 0; double av = neg ? -v : v;
+            char loc[1200]; int L, isup = *f >= 'A' && *f <= 'Z';
+            if (av != av || av > 1.7976931348623157e308) { const char *t = av != av ? (isup ? "NAN" : "nan") : (isup ? "INF" : "inf"); L = 0; while (t[L]) { loc[L] = t[L]; L++; } zero = 0; }
+            else L = fmt_flt(loc, sizeof loc, av, prec, *f, alt);
+            int total = L + (sg ? 1 : 0);
+            if (!left && !zero) out_pad(&o, ' ', width - total);
+            if (sg) out_c(&o, sg);
+            if (!left && zero) { int pre = (*f == 'a' || *f == 'A') ? 2 : 0; for (int i = 0; i < pre; i++) out_c(&o, loc[i]); out_pad(&o, '0', width - total); for (int i = pre; i < L; i++) out_c(&o, loc[i]); }
+            else for (int i = 0; i < L; i++) out_c(&o, loc[i]);
+            if (left) out_pad(&o, ' ', width - total);
+            continue; }
         case '%': tmp[0] = '%'; n = 1; break;
         case 'n': va_int(va); continue;
         default: tmp[0] = '%'; tmp[1] = *f; n = 2; if (!*f) { f--; n = 1; } break;
@@ -389,10 +491,51 @@ static int wmount_add(const char *vpath, const char *host) {
     return -1;
 }
 static void wmount_del(const char *vpath) { for (int i = 0; i < 8; i++) if (g_wm[i].used && str_eq(g_wm[i].vpath, vpath)) g_wm[i].used = 0; }
+/* w33_lang: --lang-overlay DIR[;DIR...] (or |) (settings: language_overlay). Up to 4 read-only folders searched, in order, for game
+   files that are NOT in the game folder - language data of another regional edition of the player's own copy (CUSA00194:
+   its 443 dialogue / speech lumps, none of which exists in CUSA02636). The game folder always wins: a file present there
+   is never redirected, so with no overlay (the default) nothing changes. Never written to. Hits and misses are logged. */
+static int g_lump_open_log, g_lump_open_lines;   /* w33_lang --lump-open-log (default off) */
+static char g_lov_dir[4][1024]; static int g_lov_n; static int g_lov_hits, g_lov_miss, g_lov_lines;
+static void lov_add_list(const char *v) {
+    while (*v && g_lov_n < 4) {
+        int k = 0; while (*v == ' ' || *v == ';' || *v == '|') v++;
+        while (v[k] && v[k] != ';' && v[k] != '|') k++;
+        int e = k; while (e > 0 && (v[e - 1] == ' ' || v[e - 1] == '\\' || v[e - 1] == '/')) e--;
+        if (e > 0 && e < 1023) { mem_copy(g_lov_dir[g_lov_n], v, (u64)e); g_lov_dir[g_lov_n][e] = 0; g_lov_n++; }
+        v += k;
+    }
+}
+static void lov_apply(char *out, const char *rel) {   /* out = the game-folder path of rel; replaced only when that does not exist */
+    if (!g_lov_n || !rel || !rel[0] || plat_file_size(out) >= 0 || plat_is_dir(out)) return;
+    char t[1100];
+    for (int k = 0; k < g_lov_n; k++) {
+        path_join(t, g_lov_dir[k], rel);
+        if (plat_file_size(t) >= 0) {
+            int n = __atomic_add_fetch(&g_lov_hits, 1, __ATOMIC_RELAXED);
+            if (__atomic_add_fetch(&g_lov_lines, 1, __ATOMIC_RELAXED) <= 600) { say("  lang-overlay: "); say(rel); say(" <- overlay "); say_dec(k + 1); say(" (lookup "); say_dec(n); say(", flip "); say_dec((i64)g_plat_frame); say(")\n"); }
+            int m = 0; while (t[m]) { out[m] = t[m]; m++; } out[m] = 0; return;
+        }
+    }
+    __atomic_add_fetch(&g_lov_miss, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&g_lov_lines, 1, __ATOMIC_RELAXED) <= 600) { say("  lang-overlay: not found in the game folder or any overlay: "); say(rel); say(" (flip "); say_dec((i64)g_plat_frame); say(")\n"); }
+}
 /* returns 1 for read-only game files, 2 for writable mounts, 0 for unknown paths */
+static const char *ud_tid_title(void);   /* ud_launch.c (w38_rel) */
 static int map_path(char *out, const char *p) {
-    if (str_starts(p, "/app0/")) { path_join(out, g_game_dir, p + 6); return 1; }
-    if (str_starts(p, "/app0")) { path_join(out, g_game_dir, p + 5); return 1; }
+    if (str_starts(p, "/app0/")) { path_join(out, g_game_dir, p + 6); if (g_lov_n) lov_apply(out, p + 6);
+        /* w38_rel: CUSA00194's game folder has an EMPTY title-id.txt (0 bytes, as dumped). The game reads it at start and
+           crashes on an empty file (R11/R16: access violation at eboot+0x965790 right after opening it). The game's own
+           built-in default for that file is "<TITLE_ID>_00" (CUSA00194_00, measured w33), so an empty file is answered with
+           a copy holding exactly that, kept in Cache\title-id.txt. The game folder is never changed. */
+        if (str_eq(p + 6, "title-id.txt") && plat_file_size(out) == 0 && ud_tid_title()) {
+            static char tid_path[1100]; static int tid_ok = -1;
+            if (tid_ok < 0) { tid_ok = 0; plat_mkdir("Cache"); plat_exe_dir(tid_path, sizeof tid_path); path_join(tid_path, tid_path, "Cache/title-id.txt");
+                void *f = plat_open_write(tid_path); if (f) { plat_write(f, ud_tid_title()); plat_write(f, "_00"); plat_close(f); tid_ok = plat_file_size(tid_path) > 0; }
+                say("  title-id.txt (w38_rel): the game folder's file is empty - "); say(tid_ok ? "answered with " : "could not write "); say(ud_tid_title()); say("_00\n"); }
+            if (tid_ok > 0) { int n = str_len(tid_path); mem_copy(out, tid_path, (u64)n + 1); } }
+        return 1; }
+    if (str_starts(p, "/app0")) { path_join(out, g_game_dir, p + 5); if (g_lov_n && p[5]) lov_apply(out, p + 5); return 1; }
     for (int i = 0; i < 8; i++) if (g_wm[i].used) {
         int n = str_len(g_wm[i].vpath);
         if (str_starts(p, g_wm[i].vpath) && (p[n] == 0 || p[n] == '/')) { path_join(out, g_wm[i].host, p + n); return 2; }
@@ -489,7 +632,19 @@ static void note_level_open(const char *p) {
 }
 #include "e6_ahead.c"   /* w11_load: --read-ahead */
 static int g_ra_fd_pid[MAX_FD];
-static volatile u64 g_hh_opens;   /* t167: game files with "halloween" in their name opened (the pumpkins' assets) */
+static volatile u64 g_hh_opens;
+/* w25_fix (--open-log TEXT): opens of game files whose path contains TEXT (e.g. psy_book), and every read of them:
+   offset, bytes, result and the game-memory address the data went to (first 3000 lines) - where the Dr Hill book's page
+   sets land, compared with the textures the book draws sample */
+static const char *g_open_log_pat; static int g_open_log_fail_all, g_open_log_chain; static void ol_where(u64 a); static const char *ol_thread_name(void); static u8 g_ol_fd[MAX_FD]; static volatile u32 g_ol_lines;
+static int ol_match(const char *p) { if (!g_open_log_pat || !p) return 0; for (const char *q = p; *q; q++) { int k = 0; while (g_open_log_pat[k] && (q[k] | 0x20) == (g_open_log_pat[k] | 0x20)) k++; if (!g_open_log_pat[k]) return 1; } return 0; }
+static void ol_fail(const char *what, const char *p) {   /* failed lookups of matching paths (and with --open-log-fail-all every failed one) */
+    if (!g_open_log_pat || !p || (!ol_match(p) && !g_open_log_fail_all) || __atomic_add_fetch(&g_ol_lines, 1, __ATOMIC_RELAXED) > 3000) return;
+    say("  open-log (w25_fix): FAILED "); say(what); say(" "); say(p); say(" flip "); say_dec((i64)g_plat_frame); say("\n"); }
+static void ol_read(int fd, const void *b, i64 r, u64 n, i64 off) {
+    if (!g_ol_fd[fd] || __atomic_add_fetch(&g_ol_lines, 1, __ATOMIC_RELAXED) > 3000) return;
+    say("  open-log (w25_fix): fd "); say_dec(fd); say(off >= 0 ? " pread at " : " read"); if (off >= 0) say_dec(off); say(" bytes "); say_dec((i64)n); say(" -> "); say_dec(r);
+    say(" into "); say_hex((u64)b); say(" flip "); say_dec((i64)g_plat_frame); say("\n"); }   /* t167: game files with "halloween" in their name opened (the pumpkins' assets) */
 static SYSV int h_kopen(const char *p, int flags, int mode) {
     TRACE("sceKernelOpen", p, flags, mode);
     if (p) note_level_open(p);
@@ -499,23 +654,30 @@ static SYSV int h_kopen(const char *p, int flags, int mode) {
     char hp[1100];
     tr("    open \""); tr(p); tr("\" flags "); tr_hex((u64)flags); tr("\n");
     int kind = map_path(hp, p);
-    if (!kind) return (int)0x80020002;                              /* ENOENT */
+    if (!kind) { ol_fail("open (path not mapped)", p); return (int)0x80020002; }                              /* ENOENT */
     void *f;
     if (kind == 2) {
         if (plat_is_dir(hp)) return (int)0x80020015;                /* EISDIR: directory handles not supported yet */
         int exists = 0; { void *t = hf_open_rb(hp); if (t) { exists = 1; hf_close(t); } }
         if ((flags & 0x800) && (flags & 0x200) && exists) return (int)0x80020011;   /* O_EXCL: EEXIST */
-        if (!exists && !(flags & 0x200)) return (int)0x80020002;
+        if (!exists && !(flags & 0x200)) { ol_fail("open (no such file, save/temp area)", p); return (int)0x80020002; }
         f = (flags & 3) ? hf_open_rw(hp, (flags & 0x200) != 0, (flags & 0x400) != 0) : hf_open_rb(hp);
         if (f && (flags & 8)) hf_seek(f, 0, 2);                     /* O_APPEND */
     } else {
         if (flags & 3) return (int)0x8002001E;                      /* EROFS: never write into the game folder */
         f = hf_open_rb(hp);
     }
-    if (!f) return (int)0x80020002;
+    if (!f) { ol_fail("open (no such file)", p); return (int)0x80020002; }
+    if (g_lump_open_log && kind == 1) { const char *q = p; while (*q && !str_starts(q, "_lump_")) q++;   /* w33_lang --lump-open-log: which lumps the game opens (diagnostic) */
+        if (*q && __atomic_add_fetch(&g_lump_open_lines, 1, __ATOMIC_RELAXED) <= 4000) { say("  lump open: "); say(q + 6); say(" (flip "); say_dec((i64)g_plat_frame); say(")\n"); } }
     int rapid_ = kind == 1 ? ra_open(p) : -1;   /* w11_load */
     pm_lock(&g_fd_alloc);
-    for (int i = 3; i < MAX_FD; i++) if (!g_fd[i]) { g_fd[i] = f; g_ra_fd_pid[i] = rapid_; fd_set_path(i, p); pm_unlock(&g_fd_alloc); return i; }
+    for (int i = 3; i < MAX_FD; i++) if (!g_fd[i]) { g_fd[i] = f; g_ra_fd_pid[i] = rapid_; fd_set_path(i, p); g_ol_fd[i] = (u8)ol_match(p); pm_unlock(&g_fd_alloc);
+        if (g_ol_fd[i] && __atomic_add_fetch(&g_ol_lines, 1, __ATOMIC_RELAXED) <= 3000) { say("  open-log (w25_fix): open fd "); say_dec(i); say(" "); say(p); say(" flip "); say_dec((i64)g_plat_frame);
+            if (g_open_log_chain) { say(" thread "); say(ol_thread_name()); say(" chain:"); u64 fp = (u64)__builtin_frame_address(0), lo = fp;   /* w25_fix --open-log-chain: frame-pointer walk (our frames, then the game's) */
+                for (int k = 0; k < 24 && fp >= lo && fp < lo + (8ull << 20) && !(fp & 7) && plat_readable(fp, 16); k++) { u64 ret = ((u64 *)fp)[1], nf = ((u64 *)fp)[0]; if (!ret) break; say(" "); ol_where(ret); if (nf <= fp) break; fp = nf; } }
+            say("\n"); }
+        return i; }
     pm_unlock(&g_fd_alloc);
     hf_close(f); return (int)0x80020018;
 }
@@ -562,7 +724,7 @@ static void ra_delay(int hit) { if (!g_opt_read_delay_ms || hit) return; u64 t0 
 static SYSV i64 h_kread(int fd, void *b, u64 n) {
     if (fd < 3 || fd >= MAX_FD || !g_fd[fd]) return (i64)0x80020009;
     fd_lock(fd); ra_delay(g_ra_ready && g_fd[fd] && g_ra_fd_pid[fd] >= 0 ? ra_read(g_ra_fd_pid[fd], hf_seek(g_fd[fd], 0, 1), n) : 0);
-    i64 r = g_fd[fd] ? (i64)game_read(g_fd[fd], b, n) : (i64)0x80020009; fd_unlock(fd); fd_read_note(fd, r, n, -1, "read"); if (r > 0) hw_note((u64)b, (u64)r, 2); return r;
+    i64 r = g_fd[fd] ? (i64)game_read(g_fd[fd], b, n) : (i64)0x80020009; fd_unlock(fd); fd_read_note(fd, r, n, -1, "read"); ol_read(fd, b, r, n, -1); if (r > 0) hw_note((u64)b, (u64)r, 2); return r;
 }
 static SYSV i64 h_klseek(int fd, i64 o, int w) {
     if (fd < 3 || fd >= MAX_FD || !g_fd[fd]) return (i64)0x80020009;
@@ -578,7 +740,7 @@ static SYSV i64 h_kpread(int fd, void *b, u64 n, i64 off) {
     ra_delay(g_ra_ready && g_ra_fd_pid[fd] >= 0 ? ra_read(g_ra_fd_pid[fd], off, n) : 0);   /* w11_load */
     hf_seek(g_fd[fd], off, 0); i64 r = (i64)game_read(g_fd[fd], b, n);
     if (cur >= 0) hf_seek(g_fd[fd], cur, 0);
-    fd_unlock(fd); fd_read_note(fd, r, n, off, "pread"); if (r > 0) hw_note((u64)b, (u64)r, 2); return r;
+    fd_unlock(fd); fd_read_note(fd, r, n, off, "pread"); ol_read(fd, b, r, n, off); if (r > 0) hw_note((u64)b, (u64)r, 2); return r;
 }
 static SYSV i64 h_kwrite(int fd, const void *b, u64 n) {
     if (fd == 1 || fd == 2) { char t[1024]; u64 k = n < 1023 ? n : 1023; h_memcpy(t, b, k); t[k] = 0; game_print(t); return (i64)n; }
@@ -679,10 +841,11 @@ static SYSV int h_kstat(const char *p, u8 *st) {
     TRACE("sceKernelStat", p, st, 0);
     char hp[1100];
     tr("    stat \""); tr(p); tr("\"\n");
-    if (!map_path(hp, p)) return (int)0x80020002;
+    if (!map_path(hp, p)) { ol_fail("stat (path not mapped)", p); return (int)0x80020002; }
     if (plat_is_dir(hp)) { fill_stat(st, 0, 1); return 0; }
     void *f = hf_open_rb(hp);
-    if (!f) return (int)0x80020002;
+    if (!f) { ol_fail("stat (no such file)", p); return (int)0x80020002; }
+    if (ol_match(p) && __atomic_add_fetch(&g_ol_lines, 1, __ATOMIC_RELAXED) <= 3000) { say("  open-log (w25_fix): stat ok "); say(p); say(" flip "); say_dec((i64)g_plat_frame); say("\n"); }
     u64 sz = (u64)hf_seek(f, 0, 2); hf_close(f);
     fill_stat(st, sz, 0);
     return 0;
@@ -756,15 +919,49 @@ static void memiv_add(u64 lo, u64 hi) {   /* (under g_memreg_m) */
     __atomic_store_n(&g_memiv_n, (u32)m, __ATOMIC_RELAXED);
     __atomic_store_n(&g_memiv_seq, s + 2, __ATOMIC_RELEASE);
 }
-static void mem_register(void *p, u64 len) {
+/* w20_mem --import-gpu-only (experiment, default off): direct-memory mappings the game made WITHOUT the PS4's GPU access bits
+   (prot 0x10 / 0x20) are registered for the CPU (mem_ok) but not imported into Vulkan (not pinned, not in the driver's system
+   heap). On the PS4 the GPU cannot reach such memory at all. g_mem_noimp[i] marks them; mem_promote() clears the mark when a
+   mapping WITH GPU access lands on such memory later (an arena run shared with CPU-only mappings): the renderer imports it at
+   its next look (g_mem_imp_gen). */
+static int g_opt_imp_gpu_only;   /* --import-gpu-only: 1 on, 0 off; w34_mem: 2 = automatic, not decided yet (low_driver_memory = auto): CPU-only
+                                   mappings are marked as with 1 until the renderer decides (vk_lowsys_decide -> mem_noimp_settle) */
+static int g_ldm_src;             /* w34_mem: where the low_driver_memory choice came from: 0 default, 1 settings.ini, 2 command line */
+static u64 g_ldm_cleared, g_ldm_cleared_bytes; static int g_ldm_auto_on = -1;   /* w34_mem: automatic decision (-1 none, 0 off, 1 on); ranges unmarked when it chose off */
+static u8 g_mem_noimp[4096]; static volatile u32 g_mem_imp_gen; static u64 g_mem_noimp_bytes, g_mem_promoted, g_mem_promoted_bytes;
+static void mem_register_x(void *p, u64 len, int noimp) {
     if (!p || !len) return;
     pm_once(&g_memreg_m, &g_memreg_st); pm_lock(&g_memreg_m);
+    if (noimp && !g_opt_imp_gpu_only) noimp = 0;   /* w34_mem: the automatic choice went to off while this mapping was being made */
     if (g_nmem < 4096) {
-        if (g_mem_new_hook) g_mem_new_hook((u64)p, len);
+        if (g_mem_new_hook && !noimp) g_mem_new_hook((u64)p, len);
+        g_mem_noimp[g_nmem] = (u8)(noimp != 0); if (noimp) g_mem_noimp_bytes += len;
         g_mem[g_nmem].lo = (u64)p; g_mem[g_nmem].hi = (u64)p + len;
         __atomic_store_n(&g_nmem, g_nmem + 1, __ATOMIC_RELEASE);
         memiv_add((u64)p, (u64)p + len);
     }
+    pm_unlock(&g_memreg_m);
+}
+static void mem_register(void *p, u64 len) { mem_register_x(p, len, 0); }
+static void mem_promote(u64 lo, u64 len) {   /* w20_mem: memory a GPU-accessible mapping now uses must be imported */
+    if (!g_opt_imp_gpu_only || !len) return;
+    pm_once(&g_memreg_m, &g_memreg_st); pm_lock(&g_memreg_m);
+    int n = g_nmem, any = 0;
+    for (int i = 0; i < n; i++) if (g_mem_noimp[i] && g_mem[i].lo < lo + len && lo < g_mem[i].hi) {
+        g_mem_noimp[i] = 0; g_mem_promoted++; g_mem_promoted_bytes += g_mem[i].hi - g_mem[i].lo; g_mem_noimp_bytes -= g_mem[i].hi - g_mem[i].lo; any = 1;
+        if (g_mem_promoted <= 20) { say("    --import-gpu-only: memory "); say_hex(g_mem[i].lo); say(" - "); say_hex(g_mem[i].hi); say(" now also holds a mapping with GPU access: imported from now on\n"); } }
+    if (any) __atomic_add_fetch(&g_mem_imp_gen, 1, __ATOMIC_RELEASE);
+    pm_unlock(&g_memreg_m);
+}
+/* w34_mem: low_driver_memory = auto - the renderer's decision (render thread, device creation, before the first import). on: as
+   --import-gpu-only from the start (the marks made so far stay); off: every mark is cleared, so everything is imported as without it. */
+static void mem_noimp_settle(int on) {
+    pm_once(&g_memreg_m, &g_memreg_st); pm_lock(&g_memreg_m);
+    g_ldm_auto_on = on;
+    if (on) g_opt_imp_gpu_only = 1;
+    else { g_opt_imp_gpu_only = 0;
+        for (int i = 0; i < g_nmem; i++) if (g_mem_noimp[i]) { __atomic_store_n(&g_mem_noimp[i], 0, __ATOMIC_RELEASE); g_ldm_cleared++; g_ldm_cleared_bytes += g_mem[i].hi - g_mem[i].lo; }
+        g_mem_noimp_bytes = 0; }
     pm_unlock(&g_memreg_m);
 }
 /* t111: register a range that is already imported (lazily committed granules: lz_commit_g imports them itself) */
@@ -811,7 +1008,7 @@ static Arena g_arena[ARENA_MAX]; static int g_narena;
 static PMutex g_arena_m; static volatile int g_arena_st;
 static u64 g_arena_reserved, g_arena_committed, g_arena_runs, g_arena_commit_fail;
 static int ar_bit(const Arena *A, u32 g) { return (int)((A->cbits[g >> 6] >> (g & 63)) & 1); }
-static int arena_commit(Arena *A, u64 a, u64 len) {   /* (under g_arena_m) commit the granules of [a, a+len) not committed yet */
+static int arena_commit(Arena *A, u64 a, u64 len, int noimp) {   /* (under g_arena_m) commit the granules of [a, a+len) not committed yet */
     const u64 G = 1ull << AR_GRAN_SH;
     u32 ng = (u32)((A->hi - A->lo + G - 1) >> AR_GRAN_SH);
     u32 g0 = (u32)((a - A->lo) >> AR_GRAN_SH), g1 = (u32)((a + (len ? len : 1) - 1 - A->lo) >> AR_GRAN_SH);
@@ -827,7 +1024,7 @@ static int arena_commit(Arena *A, u64 a, u64 len) {   /* (under g_arena_m) commi
         if (!plat_commit((void *)lo, hi - lo)) { g_arena_commit_fail++; tr("    arena: commit failed at "); tr_hex(lo); tr("\n"); return 0; }
         for (u32 k = g; k <= e; k++) A->cbits[k >> 6] |= 1ull << (k & 63);
         A->committed += hi - lo; g_arena_committed += hi - lo; g_arena_runs++;
-        mem_register((void *)lo, hi - lo);
+        mem_register_x((void *)lo, hi - lo, noimp);
         g = e;
     }
     return 1;
@@ -835,7 +1032,7 @@ static int arena_commit(Arena *A, u64 a, u64 len) {   /* (under g_arena_m) commi
 /* Arenas start at 64 MB; a heap that grows past the end of its arena gets an adjacent one twice as large (up to 1 GB).
    (1 GB per heap pinned ~32 GB of memory in the GPU driver for ~700 MB of actual mappings.) t109: reserved, committed
    as used (arena_commit); zero = the mapping must read as zero (flexible memory) where it was committed before. */
-static void *arena_take(u64 a, u64 len, int zero) {
+static void *arena_take(u64 a, u64 len, int zero, int noimp) {
     void *r = 0;
     pm_once(&g_arena_m, &g_arena_st); pm_lock(&g_arena_m);
     {   /* inside existing arenas (also across adjacent ones): commit what is missing */
@@ -844,8 +1041,8 @@ static void *arena_take(u64 a, u64 len, int zero) {
         if (cov) {
             int ok = 1; p = a;
             while (ok && p < e) { int k = -1; for (int i = 0; i < g_narena; i++) if (p >= g_arena[i].lo && p < g_arena[i].hi) { k = i; break; }
-                u64 q = g_arena[k].hi < e ? g_arena[k].hi : e; ok = arena_commit(&g_arena[k], p, q - p); p = q; }
-            if (ok) { r = (void *)a; if (zero && len) { h_memset(r, 0, len); hw_note(a, len, 3); } }
+                u64 q = g_arena[k].hi < e ? g_arena[k].hi : e; ok = arena_commit(&g_arena[k], p, q - p, noimp); p = q; }
+            if (ok) { r = (void *)a; if (zero && len) { zl_note(2, a, len); h_memset(r, 0, len); hw_note(a, len, 3); } }
             pm_unlock(&g_arena_m); return r;
         }
     }
@@ -862,7 +1059,7 @@ static void *arena_take(u64 a, u64 len, int zero) {
         Arena *A = &g_arena[g_narena]; h_memset(A, 0, sizeof *A); A->lo = a; A->hi = a + s; A->grow = grow;
         g_narena++; g_arena_reserved += s;
         tr("    arena: reserved "); tr_hex(s); tr(" bytes at "); tr_hex(a); tr(" for small fixed-address mappings (committed as used)\n");
-        if (arena_commit(A, a, len)) r = p;
+        if (arena_commit(A, a, len, noimp)) r = p;
         break;
     }
     pm_unlock(&g_arena_m);
@@ -910,7 +1107,7 @@ static void *pool_alloc(u64 len) {
             break;
         }
     }
-    if (r) { g_pool_used += len; h_memset(r, 0, len); hw_note((u64)r, len, 3); }   /* fresh mappings read as zero, as on the PS4 */
+    if (r) { g_pool_used += len; zl_note(3, (u64)r, len); h_memset(r, 0, len); hw_note((u64)r, len, 3); }   /* fresh mappings read as zero, as on the PS4 */
     pm_unlock(&g_pool_lock);
     return r;
 }
@@ -1046,8 +1243,41 @@ static int mem_spans(u64 a, u64 n) {
     return 0;
 }
 static u64 g_fixed_inplace, g_fixed_reused_zeroed;
+/* w34_mem (8 GB investigation, both default off):
+   --zero-decommit: an in-place re-mapping that must read as zero, over game memory left out of the GPU import (low_driver_memory:
+     CPU-only memory, never seen by the GPU), is zeroed by decommitting and committing its whole pages again instead of writing zeros:
+     the pages read as zero and stay out of RAM until the game uses them (memset brought 0.7-1.1 GB into RAM in A160). Imported
+     memory, pools and ranges under 64 KB are zeroed as before. Needs --watch-heap-resident (or no --watch-heap): the heap watch
+     must not read a page in the moment it is decommitted.
+   --watch-heap-resident: the heap watch reads only pages that are in RAM (working-set query per 512 pages; through
+     ReadProcessMemory, which cannot fault). A page out of RAM has not changed since it was last in RAM (a write brings it back),
+     so no change is missed; never-used pages are no longer brought into RAM by the watch. */
+static int mem_all_noimp(u64 lo, u64 n) {   /* [lo, lo+n) inside one registered range left out of the import */
+    if (g_opt_imp_gpu_only != 1) return 0;
+    int nm = (int)__atomic_load_n(&g_nmem, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nm; i++) if (lo >= g_mem[i].lo && lo + n <= g_mem[i].hi) return __atomic_load_n(&g_mem_noimp[i], __ATOMIC_ACQUIRE) != 0;
+    return 0;
+}
+static void lz_zero(u64 a, u64 n); static void hw_forget(u64 lo, u64 hi); static int g_hw_on;   /* (e6_heapwatch.c) */
+static PMutex g_zd_m; static volatile int g_zd_st;   /* w34_mem: decommit + commit vs the heap watch's reads */
+static void zd_lock(void) { pm_once(&g_zd_m, &g_zd_st); pm_lock(&g_zd_m); }
+static void zd_unlock(void) { pm_unlock(&g_zd_m); }
+static void zero_inplace(u64 a, u64 n) {
+    if (g_opt_zero_decommit && (!g_hw_on || g_opt_hw_res) && !__atomic_load_n(&g_nlz, __ATOMIC_ACQUIRE) && n >= (64u << 10) && mem_all_noimp(a, n)) {   /* (the plain heap watch reads without the lock: then as before) */
+        u64 lo = (a + 0xFFF) & ~0xFFFull, hi = (a + n) & ~0xFFFull;
+        if (lo > a) h_memset((void *)a, 0, lo - a);
+        if (a + n > hi) h_memset((void *)hi, 0, a + n - hi);
+        zd_lock();
+        if (VirtualFree((void *)lo, hi - lo, 0x4000 /* MEM_DECOMMIT */)) {
+            int ok = plat_commit((void *)lo, hi - lo) || plat_commit((void *)lo, hi - lo);
+            if (ok) { hw_forget(lo, hi); zd_unlock(); g_zd_bytes += hi - lo; g_zd_n++; return; }
+            zd_unlock(); g_zd_fail++; say("    *** --zero-decommit (w34_mem): could not commit "); say_hex(lo); say(" again (out of commit?)\n"); return; }
+        zd_unlock(); g_zd_fail++; h_memset((void *)lo, 0, hi - lo); return;
+    }
+    lz_zero(a, n);
+}
 static int dmap_live_over(u64 va, u64 len);
-static void *map_at_hint(void *hint, u64 len, int fixed, int zero) {
+static void *map_at_hint(void *hint, u64 len, int fixed, int zero, int noimp) {
     void *p = 0;
     /* MAP_FIXED over a range that is already mapped (the game re-maps pieces of its own 3 GB streaming region):
        like FreeBSD, the new mapping replaces the old one at that same address - the game keeps using its address */
@@ -1055,12 +1285,12 @@ static void *map_at_hint(void *hint, u64 len, int fixed, int zero) {
         /* t134: a range the game released earlier (a heap slot reused since t131, or any released mapping) is a fresh
            mapping to the game: it reads as zero, like a pool mapping. A range still mapped keeps its bytes (the
            streaming region's own re-mapping of pieces it uses). */
-        if (zero) { lz_zero((u64)hint, len); hw_note((u64)hint, len, 3); }   /* t111: (granules not committed yet read zero already) */
-        else if (!dmap_live_over((u64)hint, len)) { lz_zero((u64)hint, len); hw_note((u64)hint, len, 3); g_fixed_reused_zeroed++; }
+        if (zero) { zl_note(0, (u64)hint, len); zero_inplace((u64)hint, len); hw_note((u64)hint, len, 3); }   /* t111: (granules not committed yet read zero already) */
+        else if (!dmap_live_over((u64)hint, len)) { zl_note(1, (u64)hint, len); zero_inplace((u64)hint, len); hw_note((u64)hint, len, 3); g_fixed_reused_zeroed++; }
         g_fixed_inplace++;
         return hint;
     }
-    if (hint && (p = arena_take((u64)hint, len, fixed && zero)) != 0) {   /* (zeroed as in the in-place case above: fixed flexible mappings) */ tr("    mapped "); tr_hex(len); tr(" bytes at "); tr_hex((u64)p); tr(" (arena)\n"); return p; }
+    if (hint && (p = arena_take((u64)hint, len, fixed && zero, noimp)) != 0) {   /* (zeroed as in the in-place case above: fixed flexible mappings) */ tr("    mapped "); tr_hex(len); tr(" bytes at "); tr_hex((u64)p); tr(" (arena)\n"); return p; }
     int lazy = lz_ok(len);   /* t111: reserved, committed on first use */
     if (hint) {
         p = lazy ? plat_reserve_at(hint, len) : plat_alloc_at(hint, len);
@@ -1080,7 +1310,7 @@ static void *map_at_hint(void *hint, u64 len, int fixed, int zero) {
         low_next = at + ((len + 0x1FFFFF) & ~0x1FFFFFull) + (p ? 0 : 0x40000000ull);
     }
     if (!p) { lazy = 0; p = plat_alloc_rwx(len); tr("    WARNING: mapping above the GPU's 40-bit range\n"); }
-    if (lazy) lz_add(p, len); else mem_register(p, len);
+    if (lazy) lz_add(p, len); else mem_register_x(p, len, noimp);
     tr("    mapped "); tr_hex(len); tr(" bytes at "); tr_hex((u64)p); tr(" (requested "); tr_hex((u64)hint); tr(lazy ? "; committed as used)\n" : ")\n");
     return p;
 }
@@ -1141,11 +1371,14 @@ static void heap_slot_note(u64 a, u64 len) {
     if (s > g_heap_hi_slot) g_heap_hi_slot = s;
     if (off > st) { if (!g_heap_overflow++) g_heap_overflow_at = a; static int said; if (said++ < 10) { say("  HEAP SLOT OVERFLOW (t130): a mapping at "); say_hex(a); say(" + "); say_hex(len); say(" reaches past its "); say_dec(g_heap_slot_mb); say(" MB heap slot (slot "); say_dec(s); say(")\n"); } }
 }
+static const char *mem_alloc_name(u64 ab);   /* w20_mem (below) */
 static SYSV int h_map_direct(void **addr, u64 len, int prot, int flags, i64 phys, u64 align) {
     TRACE("sceKernelMapDirectMemory", len, prot, phys);
     (void)align;
     void *want = *addr;
-    void *p = map_at_hint(*addr, len, (flags & 0x10) != 0, 0);
+    int noimp_ = g_opt_imp_gpu_only && !(prot & 0x30);   /* w20_mem: CPU-only memory (PS4 protection without GPU access) */
+    void *p = map_at_hint(*addr, len, (flags & 0x10) != 0, 0, noimp_);
+    if (p && g_opt_imp_gpu_only && !noimp_) mem_promote((u64)p, len);
     mj_add(MJ_MAPD, (u64)__builtin_return_address(0), (u64)want, len, (u64)(u32)prot | ((u64)(u32)flags << 32), (u64)phys, p ? 0 : (i64)0x8002000C, (u64)p, 0, 0);
     if (!p) return (int)0x8002000C;
     for (int i = 0; i < g_ndmap; i++)
@@ -1163,7 +1396,13 @@ static SYSV int h_map_direct(void **addr, u64 len, int prot, int flags, i64 phys
         g_dmap[g_ndmap].flip = g_plat_frame; g_dmap[g_ndmap].caller = g_dmap_caller; g_ndmap++; }
     pm_unlock(&g_dmap_lock);
     if (want && p != want && (flags & 0x10)) {   /* MAP_FIXED, but E6 could not give that address */
-        if (g_dfixed_moved++ < 20) { say("  FIXED mapping moved: wanted "); say_hex((u64)want); say(", got "); say_hex((u64)p); say("\n"); }
+        if (g_dfixed_moved++ < 20) { say("  FIXED mapping moved: wanted "); say_hex((u64)want); say(", got "); say_hex((u64)p); say("\n");
+            /* w20_mem: what occupies the wanted range (first 4 regions of it) */
+            for (u64 q = (u64)want, nq = 0; q < (u64)want + len && nq < 4; nq++) { u64 ab, bs, sz; u32 st, ty;
+                if (!plat_query_info(q, &ab, &bs, &sz, &st, &ty) || !sz) break;
+                if (st != 0x10000) { say("    occupied: "); say_hex(bs); say(" + "); say_hex(sz); say(" (allocation "); say_hex(ab); say(st == 0x1000 ? ", committed" : ", reserved");
+                    say(ty == 0x1000000 ? ", program / DLL image" : ty == 0x40000 ? ", mapped file / section" : ", private"); { const char *nm = mem_alloc_name(ab); if (nm) { say(", "); say(nm); } } say(")\n"); }
+                q = bs + sz; } }
         if (g_fixed_stop && !__atomic_exchange_n(&g_fixed_fatal, 1, __ATOMIC_ACQ_REL)) {   /* w16_rel rc3: the game will use the address it asked for - a sure crash later; stop now, clearly */
             say("\n*** The game's memory at "); say_hex((u64)want); say(" could not be placed where the game needs it (host memory is there: address guard line at the start) - the game stops here instead of crashing later. Start it again; saves are kept. (--no-fixed-stop: go on as before)\n");
             if (g_on_fatal) g_on_fatal();
@@ -1199,9 +1438,11 @@ static SYSV int h_release_direct(i64 start, u64 len) {
     pm_unlock(&g_dmap_lock);
     return 0;
 }
+static u64 g_flex_gpu_bytes, g_flex_cpu_bytes;   /* w20_mem: flexible mappings by the game's PS4 protection (GPU read / write bits 0x30 or not) */
 static SYSV int h_map_flexible(void **addr, u64 len, int prot, int flags) {
     TRACE("sceKernelMapFlexibleMemory", len, prot, flags);
-    void *want = *addr, *p = map_at_hint(*addr, len, (flags & 0x10) != 0, 1);
+    void *want = *addr, *p = map_at_hint(*addr, len, (flags & 0x10) != 0, 1, 0);
+    if (p) __atomic_add_fetch((prot & 0x30) ? &g_flex_gpu_bytes : &g_flex_cpu_bytes, len, __ATOMIC_RELAXED);
     mj_add(MJ_MAPF, (u64)__builtin_return_address(0), (u64)want, len, (u64)(u32)prot, (u64)(u32)flags, p ? 0 : (i64)0x8002000C, (u64)p, 0, 0);
     if (!p) return (int)0x8002000C;
     *addr = p; return 0;
@@ -1336,6 +1577,7 @@ static SYSV int h_load_start_module(const char *path, u64 argc, void *argv, u32 
     if (g_prx_loaded) return 2;
     if (load_module(&g_prx, hp)) return (int)0x80020002;
     relocate(&g_prx, 0);
+    patch_isa(&g_prx, 1);   /* w24_compat (--cpu-compat) */
     g_prx_loaded = 1;
     rsq_arm_module(1);   /* t149 --rsqrt-trap */
     probe_arm();   /* t150 --prop-probe */
@@ -1443,6 +1685,7 @@ static const char *mem_alloc_name(u64 ab) {
     return 0;
 }
 static void (*g_mem_pressure_fn)(u64 sys_avail, u64 commit_avail);
+static void (*g_mem_final_fn)(void); static void (*g_alloc_report_fn)(void);   /* w20_mem v0.5 --alloc-log */   /* w20_mem: --mem-touch-map summary at exit */
 /* t196 (stutter): the detail pass of the periodic report (every sixth, i.e. every 3600 flips) stalls the renderer for
    35-39 ms although it runs on the helper thread since t192: in all three sessions of bench/results_dev there is a
    hitch frame at flip 3600k + 602 (19 frames), and the Vulkan log has "slow texture binding: 36 ms, frame 7802 / 11402 /
@@ -1521,6 +1764,8 @@ static void mem_report(const char *why) {
             say(" / "); say_dec((i64)(g_hwk.big[k] >> 20)); say(" in "); say_dec((i64)g_hwk.nbig[k]); say(" / "); say_dec((i64)(g_hwk.freeb[k] >> 20)); }
         say("\n");
     }
+    if (str_eq(why, "at exit") && g_mem_final_fn) g_mem_final_fn();
+    if (str_eq(why, "at exit") && g_alloc_report_fn) g_alloc_report_fn();   /* w20_mem (before the slow zero scan below, which can be cut off) */
     if (str_eq(why, "at exit")) {   /* t110: game memory pages that hold only zeros (never written, or cleared): what committing on first use could save */
         say("      game memory pages holding only zeros (MB zero / MB):");
         u64 zs = 0, ts = 0; int n = (int)__atomic_load_n(&g_nmem, __ATOMIC_ACQUIRE);   /* (committed ranges only: reading reserved ones would commit them) */

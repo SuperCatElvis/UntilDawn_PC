@@ -1,4 +1,4 @@
-# Known issues — v0.4.1
+# Known issues — v0.5.0
 
 [← Back to README](../README.md)
 
@@ -73,6 +73,18 @@ GPUs, and the flickering menus may remain. Things to try:
 3. `present_mode = fifo` in `Config\settings.ini`.
 
 Please report what happened, with `Logs\UntilDawn.log`.
+
+## New in v0.5.0
+
+- **Some PCs with 16 GB of RAM** (see v0.4.1 below): v0.5.0 hands about 1.5 GB less memory to the graphics driver on such
+  PCs automatically (`low_driver_memory = auto`) and uses leaner internal tables. This was measured to lower memory use, but
+  no affected PC has confirmed yet that the crash is gone. Please report how it goes.
+- **CUSA00359 (Americas)** and other editions are accepted only when their program file is the original 01.03 program, and
+  are experimental (not tested by us): see `COMPATIBILITY.txt`.
+- **Languages from the US, Asian and Japanese editions** (Latin American Spanish, Brazilian Portuguese, Japanese, Korean,
+  Chinese) are experimental: they are listed in `settings.ini` but not verified.
+- **A few bright, sharp frames** right after a camera cut in the Chapter 5 stranger scene, before the blur comes on.
+- **Motion-control drift in "Don't Move" moments is fixed** (see the bottom of this page for the old entry).
 
 ## New in v0.4.1
 
@@ -334,7 +346,7 @@ This is a change in the shader translation itself, not an AMD-only switch. On NV
 
 ## Controllers
 
-- **DualSense / DualShock 4 motion controls.** During "Don't Move" sequences, the motion indicator may continuously drift to the left, making it difficult to remain still.
+- **DualSense / DualShock 4 motion controls** (fixed in v0.5.0). During "Don't Move" sequences, the motion indicator could continuously drift to the left.
 - **DualSense / DualShock 4 vibration and light bar.** Vibration and light-bar functionality are not yet implemented. Xbox-style controllers support vibration.
 - **Keyboard controls.** Keys cannot be remapped yet, and L3 / R3 are not currently available on the keyboard.
 
@@ -351,6 +363,6 @@ Please run the [compatibility tester](COMPATIBILITY_TESTING.md) on AMD and Intel
 
 ## Game version and features
 
-- Only **CUSA02636 with the 01.03 update** is supported. Other regions and versions are refused at startup.
+- Supported: **CUSA02636 or CUSA00194 with the 01.03 update** (v0.5.0; see `COMPATIBILITY.txt`). Other versions and modified program files are refused at startup.
 - Online and PlayStation Network features are unavailable; the game reports the network as disconnected.
 - Trophy unlocks are recorded locally in `savedata\` and the log, but there are currently no on-screen trophy notifications.

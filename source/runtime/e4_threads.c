@@ -100,11 +100,14 @@ static void pt_report_history(void) {
         say("      "); say(g_imports[t->h_ix[k]].name); say(" from "); where(t->h_ret[k]);
         say(" args "); say_hex(t->h_a[k]); say(" "); say_hex(t->h_b[k]); say(" "); say_hex(t->h_c[k]); say("\n"); }
 }
-static const char *wait_begin(const char *what) { PThread *t = cur_thread(); const char *o = 0; if (t) { o = t->wait; t->wait = what; } return o; }
+static volatile int g_cwa_on;   /* w35_crash --cloth-world-audit (e3_loader.c): what runs while the cloth world lock is held */
+static void cwa_taken(void *m); static void cwa_released(void *m); static void cwa_wait(const char *what);
+static const char *wait_begin(const char *what) { if (g_cwa_on) cwa_wait(what); PThread *t = cur_thread(); const char *o = 0; if (t) { o = t->wait; t->wait = what; } return o; }
 static void wait_end(const char *o) { PThread *t = cur_thread(); if (t) t->wait = o; }
 #define WAITING(what, stmt) do { const char *wo_ = wait_begin(what); stmt; wait_end(wo_); } while (0)
 
 static u8 *make_thread_block(void);
+static void audio_thread_start(const char *name, int ps4_prio, u64 ps4_aff);   /* e5_audio.c, w27_audio */
 static void thread_main(void *p) {
     PThread *t = (PThread *)p;
     pt_set_current(t);
@@ -112,6 +115,7 @@ static void thread_main(void *p) {
     plat_set_thread_pointer(t->tp);
     plat_fp_thread_init();
     ps4_sched_apply(plat_this_thread(), t->ps4_prio, t->ps4_aff);   /* t133 */
+    audio_thread_start(t->name, t->ps4_prio, t->ps4_aff);   /* w27_audio: --audio-prio / --audio-diag */
     t->ret = t->entry(t->arg);
     pm_lock(&t->jm); t->done = 1; pc_broadcast(&t->jc); pm_unlock(&t->jm);
 }
@@ -244,7 +248,7 @@ static SYSV int mx_px_init(u64 *h, u64 *attr) { return mx_init(h, attr, 0); }
 static SYSV int mx_destroy(u64 *h) { (void)h; return 0; }
 static int mx_recursive(PSMutex *m) { return g_opt_recursive_mutexes || m->type == 2; }
 static int mx_owned_by_me(PSMutex *m) { return m->count && m->owner == pt_get_current(); }
-static void mx_take(PSMutex *m) { if (mx_owned_by_me(m)) m->count++; else { m->owner = pt_get_current(); m->count = 1; } }
+static void mx_take(PSMutex *m) { if (mx_owned_by_me(m)) m->count++; else { m->owner = pt_get_current(); m->count = 1; if (g_cwa_on) cwa_taken(m); } }
 static int mx_lock_impl2(PSMutex *m, u64 ret) {
     if (mx_owned_by_me(m) && !mx_recursive(m)) { __atomic_add_fetch(&g_mx_relock, 1, __ATOMIC_RELAXED); return (int)SCE_EDEADLK; }
     if (pm_trylock(&m->m)) {
@@ -280,7 +284,7 @@ static SYSV int mx_timedlock(u64 *h, u32 us) {
 static SYSV int mx_unlock(u64 *h) {
     PSMutex *m = mutex_of(h); if (!m) return (int)SCE_EINVAL;
     if (!mx_owned_by_me(m)) { __atomic_add_fetch(&g_mx_bad_unlock, 1, __ATOMIC_RELAXED); return (int)SCE_EPERM; }
-    if (--m->count <= 0) { m->count = 0; m->owner = 0; }
+    if (--m->count <= 0) { m->count = 0; m->owner = 0; if (g_cwa_on) cwa_released(m); }
     pm_unlock(&m->m);
     return 0;
 }

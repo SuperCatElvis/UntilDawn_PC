@@ -1,0 +1,14 @@
+LIBRARY user32.dll
+EXPORTS
+MessageBoxA
+CreateWindowExA
+DestroyWindow
+SetWindowTextA
+PeekMessageA
+TranslateMessage
+DispatchMessageA
+GetSystemMetrics
+SetWindowsHookExA
+UnhookWindowsHookEx
+CallNextHookEx
+SetDlgItemTextA

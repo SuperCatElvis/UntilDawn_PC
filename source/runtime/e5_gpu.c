@@ -100,6 +100,7 @@ typedef struct { char nm[96]; void *p; u32 n; } HkJob;
 static HkJob g_hk[HK_N]; static volatile u32 g_hk_w, g_hk_r; static volatile int g_hk_started, g_hk_mem, g_hk_busy; static u64 g_hk_dropped, g_hk_written, g_hk_bytes;
 static PMutex g_hk_lock;
 static void mem_report(const char *why);
+static void flog_drain(int final);   /* w31_perf --frame-log (e6_framelog.c) */
 static void hk_write(const HkJob *j) { void *f = cap_open(j->nm); if (f) { plat_write_bin(f, j->p, j->n); plat_close(f); g_hk_written++; g_hk_bytes += j->n; } free(j->p); }
 static void hk_drain(void) {
     for (;;) { HkJob j; int have = 0;
@@ -110,7 +111,7 @@ static void hk_drain(void) {
 static u32 __stdcall hk_thread(void *arg) {
     (void)arg;
     for (;;) { plat_sleep_ms(15);
-        __atomic_store_n(&g_hk_busy, 1, __ATOMIC_RELEASE); hk_drain();
+        __atomic_store_n(&g_hk_busy, 1, __ATOMIC_RELEASE); hk_drain(); flog_drain(0);
         if (__atomic_exchange_n(&g_hk_mem, 0, __ATOMIC_ACQ_REL)) { say_cap_begin(); mem_report("every 10 s"); say_cap_end(); }
         __atomic_store_n(&g_hk_busy, 0, __ATOMIC_RELEASE); }
     return 0;
@@ -206,7 +207,17 @@ static int g_opt_aq = 1; static u64 g_t_aqwait, g_t_aqidle, g_n_aq_items, g_n_aq
 #include "e6_state.c"
 static int g_emb_vs;                 /* an embedded (driver built-in) VS is bound */
 static u64 g_dma_l2, g_dma_skip_why[8]; static u64 g_ce_dump_bad, g_ce_writes, g_ce_dumps, g_ce_dump_dw, g_dma_ops, g_dma_bytes_cpu, g_dma_skipped, g_ce_forced, g_dma_gds, g_dma_gds_rd;
+/* w25_fix (--copy-log LO-HI, hex): GPU-side copies / fills whose source or destination touches [LO, HI) are logged (first
+   3000): which path ran them (CP DMA on the CPU, the compute copy / fill done by the copy engine), source, destination,
+   bytes, flip - e.g. the streaming staging area (0x2244000000-0x2256000000) -> the Dr Hill book's page textures */
+static u64 g_cl_lo, g_cl_hi; static volatile u32 g_cl_n;
+static void cl_note(const char *kind, u64 s, u64 d, u64 n, int ok) {
+    if (!g_cl_hi || !n) return;
+    if (!((s < g_cl_hi && s + n > g_cl_lo) || (d < g_cl_hi && d + n > g_cl_lo))) return;
+    if (__atomic_add_fetch(&g_cl_n, 1, __ATOMIC_RELAXED) > 20000) return;
+    say("  copy-log (w25_fix): "); say(kind); say(" "); say_hex(s); say(" -> "); say_hex(d); say(" +"); say_dec((i64)n); say(ok ? "" : " NOT DONE"); say(" flip "); say_dec((i64)g_flips); say("\n"); }
 #include "e6_vk.c"
+#ifndef UD_NO_NATIVE   /* w38_rel: release builds (-DUD_NO_NATIVE) leave the experimental native renderer out entirely */
 #include "e7_native.c"   /* our native renderer behind the same interface (--renderer native, RENDERER_PLAN 12) */
 /* from here on every renderer call goes through the selection in e7_native.c */
 #define vkr_init rsel_init
@@ -235,6 +246,9 @@ static u64 g_dma_l2, g_dma_skip_why[8]; static u64 g_ce_dump_bad, g_ce_writes, g
 #define rc_on_flip rsel_rc_on_flip
 #define rc_on_doorbell rsel_rc_on_doorbell
 #define rc_replay rsel_replay
+#else
+static const int g_rnative = 0;   /* E6 only: every vkr_* call goes straight to e6_vk.c */
+#endif
 
 /* ---------------- event delivery to equeues ---------------- */
 typedef struct { u64 eq; u64 ident; short filter; } EvReg;
@@ -419,6 +433,7 @@ static void pm4_parse(const u32 *p, u64 ndw, int engine /*0 graphics DE, 1 const
                         vkr_mem_filled(dst, dst + (n & ~3u), v);
                     } else if (src_sel == 0 && mem_ok(src, n)) {
                         u8 *d = (u8 *)dst; const u8 *sp = (const u8 *)src;
+                        cl_note("CP DMA copy", src, dst, n, 1);
                         if (vkr_dma_copy(dst, src, n)) {}
                         else { if (d < sp || d >= sp + n) for (u32 q = 0; q < n; q++) d[q] = sp[q]; else for (u32 q = n; q-- > 0;) d[q] = sp[q]; hw_note(dst, n, 5); }
                     } else { g_dma_skipped++; g_dma_skip_why[7]++; break; }
@@ -964,6 +979,7 @@ static void do_flip(int idx, i64 arg) {
     }
     g_next_flip_tick = (g_next_flip_tick + interval > now) ? g_next_flip_tick + interval : now + interval;
     gpu_lock();
+    if (g_opt_flog) flog_flip(g_flips + 1, now - g_frame_tick, now);   /* w31_perf --frame-log */
     g_cur.ms = (u32)((now - g_frame_tick) * 1000 / f); g_frame_tick = now;
     g_frames[g_flips % MAX_FRAMES] = g_cur; h_memset(&g_cur, 0, sizeof g_cur);
     frame_end(); frame_begin(g_flips + 2);
@@ -1227,7 +1243,7 @@ static int aq_put(int kind, u32 count, void **dcb, u32 *dsz, void **ccb, u32 *cs
     it->has_dsz = dsz != 0; it->has_ccb = ccb != 0; it->has_csz = csz != 0;
     for (u32 k = 0; (kind & AQ_SUBMIT) && k < count; k++) {
         it->dcb[k] = dcb ? dcb[k] : 0; it->dsz[k] = dsz ? dsz[k] : 0; it->ccb[k] = ccb ? ccb[k] : 0; it->csz[k] = csz ? csz[k] : 0; }
-    if (kind & AQ_FLIP) g_aq_flips++;
+    if (kind & AQ_FLIP) { g_aq_flips++; if (g_opt_flog) flog_note_game_thread(); }   /* w31_perf */
     g_aq_tail++; g_n_aq_items++;
     pc_broadcast(&g_aq_cv);
     pm_unlock(&g_aq_m);
@@ -1850,20 +1866,43 @@ static void e5_print_gpu_summary(void) {
     say(", sound-device buffers "); say_dec((i64)g_audio_dev_buffers); say(" (peak level "); say_dec((i64)g_audio_peak); say("/1000)"); say(", fibers "); say_dec(g_fibers_created); say(" ("); say_dec((i64)g_fiber_runs); say(" runs), audio buffers "); say_dec((i64)g_audio_buffers_total);
     say("\ndetails: "); say(g_cap_dir); say("\\pm4_summary.txt, frames.csv, shaders.csv\n");
 }
+static void audio_diag_finish(void);   /* e5_audio.c, w27_audio */
+static int g_opt_exit_terminate;   /* w25_fix (--exit-terminate): a normal stop ends with TerminateProcess (no DLL unload) */
+/* w25_fix (--exit-watchdog S): if the stop has not ended the process S seconds after it began (drhill_log_01 / 02: the
+   report stopped after the thread sample and the window had to be killed), the log says which part it was in and the
+   process ends (exit code 6) */
+static int g_opt_exit_wd; static volatile int g_exit_stage;
+static const char *const k_exit_stage[] = {"start", "capture writer", "report files", "thread sample", "GPU summary", "renderer report", "fatal hook", "process exit"};
+#ifdef _WIN32
+static WINAPI u32 exit_wd_thread(void *arg) {
+    (void)arg; plat_sleep_ms((u32)g_opt_exit_wd * 1000u);
+    int st = g_exit_stage; say("\n*** exit watchdog (w25_fix): the stop did not finish within "); say_dec(g_opt_exit_wd); say(" s; it was in: ");
+    say(st >= 0 && st < 8 ? k_exit_stage[st] : "?"); say(" - ending the process\n"); plat_log_flush(0, 3000, 1);
+    TerminateProcess((void *)(intptr_t)-1, 6); return 0; }
+#endif
 static void e5_finish(const char *why) {
     if (__atomic_exchange_n(&g_finishing, 1, __ATOMIC_ACQ_REL)) { for (;;) plat_sleep_ms(1000); }
+#ifdef _WIN32
+    if (g_opt_exit_wd > 0) CreateThread(0, 1u << 16, (void *)exit_wd_thread, 0, 0, 0);
+#endif
     say("\n>>> stopping: "); say(why); say("\n");
     plat_log_flush(0, 2000, 1);   /* t165: the stop reason on disk at once (a stop that hangs later is then visible) */
     g_normal_exit = 1;   /* the player closed the game / the frame limit: no error message */
-    rc_wait_writer();
+    audio_diag_finish();   /* w27_audio: --audio-diag summary, CSV / WAV closed */
+    flog_drain(1);   /* w31_perf --frame-log: the rest of the frame log */
+    g_exit_stage = 1; rc_wait_writer();
     say("    (stopping: capture writer idle)\n"); plat_log_flush(0, 2000, 1);
-    e5_write_report();
+    g_exit_stage = 2; e5_write_report();
     say("    (stopping: report files written)\n"); plat_log_flush(0, 2000, 1);
     say("\nwhere each game thread is now:");
-    sample_other_threads();
-    e5_print_gpu_summary();
-    vkr_report();
-    if (g_on_fatal) g_on_fatal();
+    g_exit_stage = 3; sample_other_threads();
+    if (g_opt_exit_wd) { say("    (stopping: threads sampled)\n"); plat_log_flush(0, 2000, 1); }
+    g_exit_stage = 4; e5_print_gpu_summary();
+    if (g_opt_exit_wd) { say("    (stopping: GPU summary written)\n"); plat_log_flush(0, 2000, 1); }
+    g_exit_stage = 5; vkr_report();
+    g_exit_stage = 6; if (g_on_fatal) g_on_fatal();
+    g_exit_stage = 7;
+    if (g_opt_exit_terminate) { say("    (stopping: --exit-terminate: ending the process without unloading the system libraries)\n"); g_plat_hard_exit = 1; }   /* w25_fix: F11_bonus hung in ExitProcess after this point for 40 min */
     plat_exit(0);
 }
 static void e5_window_closed(void) { e5_finish("window closed by user"); }

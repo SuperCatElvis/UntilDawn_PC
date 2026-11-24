@@ -65,21 +65,21 @@ int main(void) {
     g_mem_new_hook = import_hook;
     const u64 MB = 1ull << 20, base = 0x1280000000ull;
     printf("== 1. an arena is reserved; only the granules mapped into are committed and registered ==\n");
-    void *p = arena_take(base, 256 << 10, 0);
+    void *p = arena_take(base, 256 << 10, 0, 0);
     CHECK(p == (void *)base, "first lump-heap mapping at its address");
     CHECK(g_narena == 1 && g_arena[0].hi - g_arena[0].lo == 64 * MB, "arena reserves 64 MB as before");
     CHECK(g_nmem == 1 && g_mem[0].lo == base && g_mem[0].hi == base + 4 * MB, "4 MB committed and registered");
     CHECK(g_imports == 1, "one import (hook) for the first run");
     CHECK(writable(base) && writable(base + 4 * MB - 1), "committed part writable");
     CHECK(!writable(base + 4 * MB), "beyond the committed part not committed");
-    for (u64 o = 256 << 10; o < 4 * MB; o += 256 << 10) CHECK(arena_take(base + o, 256 << 10, 0) == (void *)(base + o), "more 256 KB pieces in the first granule");
+    for (u64 o = 256 << 10; o < 4 * MB; o += 256 << 10) CHECK(arena_take(base + o, 256 << 10, 0, 0) == (void *)(base + o), "more 256 KB pieces in the first granule");
     CHECK(g_nmem == 1, "no new region inside the committed granule");
     printf("== 2. growth: each new run a quarter of what is committed (4 MB at least, 16 MB at most) ==\n");
     {   static const int want[] = {4, 4, 4, 4, 4, 4, 4, 8, 8, 12, 4};   /* runs after the first 4 MB: a quarter of the committed part in whole granules, cut at the arena end (64 MB) */
         int k = 0, bad = 0;
         while (g_arena[0].committed < 64 * MB && k < 11) {
             u64 at = base + g_arena[0].committed; int n0 = g_nmem;
-            if (arena_take(at, 256 << 10, 0) != (void *)at || g_nmem != n0 + 1) { bad++; break; }
+            if (arena_take(at, 256 << 10, 0, 0) != (void *)at || g_nmem != n0 + 1) { bad++; break; }
             u64 run = g_mem[g_nmem - 1].hi - g_mem[g_nmem - 1].lo;
             if (run != (u64)want[k] * MB) { printf("   run %d: %llu MB, expected %d\n", k + 2, (unsigned long long)(run >> 20), want[k]); bad++; }
             k++;
@@ -94,19 +94,19 @@ int main(void) {
     CHECK(!mem_ok(base - 8, 16), "before the arena");
     CHECK(!mem_ok(~0ull - 4, 16), "overflowing range");
     printf("== 4. an adjacent arena is twice as large and starts growing from what the first one committed ==\n");
-    CHECK(arena_take(base + 64 * MB, 256 << 10, 0) == (void *)(base + 64 * MB), "mapping at the arena end");
+    CHECK(arena_take(base + 64 * MB, 256 << 10, 0, 0) == (void *)(base + 64 * MB), "mapping at the arena end");
     CHECK(g_narena == 2 && g_arena[1].hi - g_arena[1].lo == 128 * MB, "second arena 128 MB");
     CHECK(g_mem[g_nmem - 1].lo == base + 64 * MB && g_mem[g_nmem - 1].hi - g_mem[g_nmem - 1].lo == 16 * MB, "its first run 16 MB (a quarter of the 64 MB committed before)");
     CHECK(mem_ok(base + 64 * MB - 8, 16), "across the two arenas");
     printf("== 5. a mapping over two arenas commits in both; zero-filled when asked (flexible memory) ==\n");
     const u64 b2 = 0x1300000000ull;
-    CHECK(arena_take(b2, 256 << 10, 0) == (void *)b2, "third arena");
+    CHECK(arena_take(b2, 256 << 10, 0, 0) == (void *)b2, "third arena");
     memset((void *)b2, 0xAB, 256 << 10);
-    CHECK(arena_take(b2, 256 << 10, 1) == (void *)b2 && ((u8 *)b2)[100] == 0, "re-mapping with zero fills it");
-    CHECK(arena_take(b2 + 60 * MB, 8 * MB, 0) == 0, "a mapping from inside an arena past its end where no arena follows: refused, as before (the caller maps it elsewhere)");
-    CHECK(arena_take(b2 + 64 * MB, 256 << 10, 0) == (void *)(b2 + 64 * MB) && g_arena[g_narena - 1].lo == b2 + 64 * MB, "an adjacent arena after the third");
+    CHECK(arena_take(b2, 256 << 10, 1, 0) == (void *)b2 && ((u8 *)b2)[100] == 0, "re-mapping with zero fills it");
+    CHECK(arena_take(b2 + 60 * MB, 8 * MB, 0, 0) == 0, "a mapping from inside an arena past its end where no arena follows: refused, as before (the caller maps it elsewhere)");
+    CHECK(arena_take(b2 + 64 * MB, 256 << 10, 0, 0) == (void *)(b2 + 64 * MB) && g_arena[g_narena - 1].lo == b2 + 64 * MB, "an adjacent arena after the third");
     CHECK(!writable(b2 + 60 * MB), "end of the third arena not committed yet");
-    CHECK(arena_take(b2 + 60 * MB, 8 * MB, 0) == (void *)(b2 + 60 * MB), "now the same mapping over the two adjacent arenas");
+    CHECK(arena_take(b2 + 60 * MB, 8 * MB, 0, 0) == (void *)(b2 + 60 * MB), "now the same mapping over the two adjacent arenas");
     CHECK(writable(b2 + 60 * MB) && writable(b2 + 68 * MB - 1) && mem_ok(b2 + 60 * MB, 8 * MB), "both parts committed and one range for mem_ok");
     printf("== 6. pools: 64 MB chunks; free ranges never span two chunks ==\n");
     u64 n0 = (u64)g_nmem;
@@ -125,7 +125,7 @@ int main(void) {
     g_stable_lo = base; g_stable_hi = base + 64 * MB;
     pthread_t th[3]; for (int i = 0; i < 3; i++) pthread_create(&th[i], 0, reader, 0);
     while (g_reader_n < 20000) usleep(100);
-    for (int k = 0; k < 1100; k++) arena_take(0x1400000000ull + ((u64)k << 27), 256 << 10, 0);   /* t130: 128 MB apart (the game's slots are 512 MB apart now), more than the table holds */
+    for (int k = 0; k < 1100; k++) arena_take(0x1400000000ull + ((u64)k << 27), 256 << 10, 0, 0);   /* t130: 128 MB apart (the game's slots are 512 MB apart now), more than the table holds */
     for (int k = 0; k < 1500; k++) { mem_register((void *)(0x5000000000ull + ((u64)k << 20)), 0x10000); if (!(k & 63)) sched_yield(); }   /* (address ranges only: not touched) */
     u64 n_at_end = g_reader_n; while (g_reader_n < n_at_end + 20000) usleep(100);
     g_stop = 1; for (int i = 0; i < 3; i++) pthread_join(th[i], 0);

@@ -502,9 +502,20 @@ static void VKAPI_PTR w_EndQuery(VkCommandBuffer cb, VkQueryPool q, u32 i) {
 }
 /* GPU crash diagnostics (VK_NV_device_diagnostic_checkpoints): a marker the driver can report after a device loss */
 static PFN_vkCmdSetCheckpointNV real_vkCmdSetCheckpointNV;
+/* w32_issues (--gpu-markers-amd, GitHub #15): where the NV checkpoints are missing, VK_AMD_buffer_marker writes the
+   same marker id into a host-visible buffer when the GPU starts (top of pipe, offset 0) and finishes (bottom of pipe,
+   offset 4) everything before it; vk_lost_report reads both after a device loss. Diagnostics only. */
+static PFN_vkCmdWriteBufferMarkerAMD real_vkCmdWriteBufferMarkerAMD; static VkBuffer g_amk_buf;
+static void ck_emit(VkCommandBuffer cb, u64 id) {
+    if (real_vkCmdSetCheckpointNV) { real_vkCmdSetCheckpointNV(cb, (const void *)id); return; }
+    if (real_vkCmdWriteBufferMarkerAMD && g_amk_buf) {
+        real_vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_amk_buf, 0, (u32)id);
+        real_vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_amk_buf, 4, (u32)id);
+    }
+}
 static void ck_cmd(VkCommandBuffer cb, u64 id) {
-    if (!real_vkCmdSetCheckpointNV) return;
-    if (!REC_ON(cb)) { real_vkCmdSetCheckpointNV(cb, (const void *)id); return; }
+    if (!real_vkCmdSetCheckpointNV && !(real_vkCmdWriteBufferMarkerAMD && g_amk_buf)) return;
+    if (!REC_ON(cb)) { ck_emit(cb, id); return; }
     u8 *r = dfr_rec(R_CKPT, 8); if (r) *(u64 *)r = id;
 }
 /* game occlusion queries / ZPass predication (see e6_vk.c): query results copy and conditional rendering */
@@ -585,7 +596,7 @@ static void dfr_replay_list(VkCommandBuffer cb, DChunk *head) {
             case R_BEGINCOND: { VkConditionalRenderingBeginInfoEXT ci = {VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT, 0, *(VkBuffer *)r, *(u64 *)(r + 8), ((u32 *)r)[4]};
                                 real_vkCmdBeginConditionalRenderingEXT(cb, &ci); break; }
             case R_ENDCOND: real_vkCmdEndConditionalRenderingEXT(cb); break;
-            case R_CKPT: if (real_vkCmdSetCheckpointNV) real_vkCmdSetCheckpointNV(cb, (const void *)*(u64 *)r); break;
+            case R_CKPT: ck_emit(cb, *(u64 *)r); break;
             case R_TIMESTAMP: real_vkCmdWriteTimestamp(cb, (VkPipelineStageFlagBits)((u32 *)r)[2], *(VkQueryPool *)r, ((u32 *)r)[3]); break;
             default: break;
             }

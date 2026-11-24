@@ -86,6 +86,7 @@ static const char *g_game_dir;
 /* SELF -> segments. Returns 0 on success; fills m->ph and maps data. */
 static u8 *read_file(const char *path, u64 *size) { return (u8 *)plat_read_file(path, size); }
 
+static u64 g_isa_slack;   /* w24_compat: extra stub space after each module (--cpu-compat) */
 static int load_module(Module *m, const char *path) {
     u64 fsz; u8 *f = read_file(path, &fsz);
     if (!f) { say("  cannot read "); say(path); say("\n"); return -1; }
@@ -128,7 +129,8 @@ static int load_module(Module *m, const char *path) {
         if (m->ph[i].type == 1 || m->ph[i].type == 0x61000010u)
             if (m->ph[i].vaddr + m->ph[i].memsz > hi) hi = m->ph[i].vaddr + m->ph[i].memsz;
     hi = (hi + 0xFFFF) & ~0xFFFFull;
-    m->base = (u8 *)plat_alloc_rwx(hi + 0x100000);   /* +1 MB slack: code stubs (EXTRQ detours) */
+    m->base = (u8 *)plat_alloc_rwx(hi + 0x100000 + g_isa_slack);   /* +1 MB slack: code stubs (EXTRQ detours); w24_compat: +1 MB more for the
+                                                                        BMI1 / LZCNT / MOVBE / F16C stubs with --cpu-compat (none otherwise) */
     m->size = hi;
     if (!m->base) { say("  alloc failed\n"); return -1; }
     for (int i = 0; i < m->phnum; i++) {
@@ -245,10 +247,96 @@ STUB_LIST(DEF_STUB)
 #define REF_STUB(n) (void *)stub_##n,
 static void *g_stubs[IMP_MAX] = { STUB_LIST(REF_STUB) };
 
+
+/* ------------------------------------------------------------------ w24_compat: older-CPU support (e3_isa_compat.h)
+   --cpu-compat auto: the game's BMI1 / LZCNT / MOVBE / F16C instructions are replaced by native stubs for each set this
+   CPU lacks (Intel Sandy / Ivy Bridge, AMD Bulldozer .. Steamroller); a CPU that has a set keeps the game's own code.
+   --cpu-compat force: every site replaced (test mode on any CPU). --cpu-compat-count: hit counters per site (log at exit).
+   Settings: cpu_compat = 1 (auto). Default off: nothing changes. */
+#include "e3_isa_compat.h"
+#include "e3_isa_v103.h"
+#include "e3_isa_prx.h"
+static int g_isa_mode, g_isa_count;   /* mode: 0 off, 1 auto, 2 force */
+static u32 g_isa_kinds;               /* the site kinds replaced */
+static int g_isa_n[2], g_isa_skipped[2], g_isa_traps;
+static u64 g_isa_trap_site[16], g_isa_trap_stub[16];
+static u64 *g_isa_cnt[2]; static const IsaSite *g_isa_tab[2]; static int g_isa_ntab[2];
+static u32 isa_kinds_needed(void) {
+    SysCpu C; sys_cpu_detect(&C);
+    u32 k = 0;
+    if (!C.has_bmi1) k |= ISA_NEED_BMI1;
+    if (!C.has_lzcnt) k |= ISA_NEED_LZCNT;
+    if (!C.has_movbe) k |= ISA_NEED_MOVBE;
+    if (!C.has_f16c) k |= ISA_NEED_F16C;
+    return k;
+}
+/* a UD2 written at a trap site: continue in its stub */
+static u64 isa_trap_lookup(u64 rip) { for (int i = 0; i < g_isa_traps; i++) if (g_isa_trap_site[i] == rip) return g_isa_trap_stub[i]; return 0; }
+static void patch_isa(Module *m, int mod) {
+    if (!g_isa_mode) return;
+    const IsaSite *tab = mod ? prx_isa_sites : v103_isa_sites;
+    int n = 0; while (tab[n].va) n++;
+    for (int i = 0; i < n; i++) if (tab[i].va + tab[i].cover > m->size) { say("  CPU compatibility: site table does not fit this module - not applied\n"); return; }
+    if (mod == 0 && !g_isa_kinds) { say("  CPU compatibility (--cpu-compat auto): this CPU has BMI1, LZCNT, MOVBE and F16C - the game's own instructions are kept\n"); return; }
+    if (!g_isa_kinds) return;
+    if (!g_isa_slack) { say("  CPU compatibility: no stub space - not applied\n"); return; }
+    static int h2f_done; if (!h2f_done) { isa_h2f_init(); h2f_done = 1; }
+    u8 *w = m->base + m->size + 0x100000, *end = w + g_isa_slack - 4096, *f2h = 0;
+    if (g_isa_count) { g_isa_cnt[mod] = (u64 *)plat_alloc_rw((u64)n * 8); g_isa_tab[mod] = tab; g_isa_ntab[mod] = n; }
+    int bad_sum = 0, refused = 0, done = 0;
+    for (int i = 0; i < n; i++) {
+        const IsaSite *s = &tab[i]; u8 *site = m->base + s->va;
+        if (!(g_isa_kinds >> (s->kind & 0x7F) & 1)) continue;
+        u32 sum = 0; for (int k = 0; k < s->cover; k++) sum += site[k];
+        if ((sum & 0xFFFF) != s->sum) { if (bad_sum++ < 5) { say("  CPU compatibility: bytes at "); say(mod ? "all_programs+" : "eboot+"); say_hex(s->va); say(" differ from the table (another patch?) - left as is\n"); } continue; }
+        if (w + 512 > end) { say("  CPU compatibility: stub space full\n"); break; }
+        w = (u8 *)(((u64)w + 15) & ~15ull);
+        u8 *st = w; u8 *f0 = f2h;
+        u8 *e = isa_emit_stub(w, s, site, &f2h, g_isa_count ? &g_isa_cnt[mod][i] : 0);
+        if (!e) { refused++; if (refused < 5) { say("  CPU compatibility: form not supported at "); say_hex(s->va); say("\n"); } continue; }
+        if (!f0 && f2h) st = (u8 *)(((u64)f2h + ISA_POOL_SIZE + 15) & ~15ull);   /* the shared constant pool went first */
+        if (s->kind & 0x80) { if (g_isa_traps < 16) { g_isa_trap_site[g_isa_traps] = (u64)site; g_isa_trap_stub[g_isa_traps] = (u64)st; g_isa_traps++; } else { refused++; continue; } }
+        isa_write_site(site, s, st);
+        w = e; done++;
+    }
+    g_isa_n[mod] = done; g_isa_skipped[mod] = bad_sum + refused;
+    if (g_isa_traps) g_isa_trap_fn = isa_trap_lookup;
+    say("  CPU compatibility ("); say(g_isa_mode == 2 ? "--cpu-compat force" : "--cpu-compat auto"); say("): "); say(mod ? "all_programs.prx: " : "eboot: ");
+    say_dec(done); say(" sites replaced by native stubs ("); say_dec((i64)(w - (m->base + m->size + 0x100000)) >> 10); say(" KB of stubs)");
+    if (bad_sum + refused) { say(", NOT replaced: "); say_dec(bad_sum + refused); }
+    say(" - kinds:"); if (g_isa_kinds & ISA_NEED_BMI1) say(" BMI1"); if (g_isa_kinds & ISA_NEED_LZCNT) say(" LZCNT"); if (g_isa_kinds & ISA_NEED_MOVBE) say(" MOVBE"); if (g_isa_kinds & ISA_NEED_F16C) say(" F16C");
+    say(g_isa_count ? " (hit counters on)\n" : "\n");
+}
+static void isa_report(void) {
+    if (!g_isa_mode) return;
+    say("\nCPU compatibility: sites replaced eboot "); say_dec(g_isa_n[0]); say(", all_programs "); say_dec(g_isa_n[1]); say(", not replaced "); say_dec(g_isa_skipped[0] + g_isa_skipped[1]);
+    if (!g_isa_count) { say("\n"); return; }
+    static const char *kn[] = {"", "andn", "bextr", "blsi", "blsr", "blsmsk", "tzcnt", "lzcnt", "movbe", "vcvtph2ps", "vcvtps2ph"};
+    u64 per[11] = {0}, tot = 0;
+    for (int m = 0; m < 2; m++) if (g_isa_cnt[m]) for (int i = 0; i < g_isa_ntab[m]; i++) { u64 c = g_isa_cnt[m][i]; per[g_isa_tab[m][i].kind & 0x7F] += c; tot += c; }
+    say("\n  stub executions (approximate: unlocked counters): "); say_dec((i64)tot); say(" -");
+    for (int k = 1; k <= 10; k++) if (per[k]) { say(" "); say(kn[k]); say(" "); say_dec((i64)per[k]); }
+    say("\n  busiest sites:");
+    for (int r = 0; r < 15; r++) {   /* top 15 by count */
+        u64 best = 0; int bm = -1, bi = -1;
+        for (int m = 0; m < 2; m++) if (g_isa_cnt[m]) for (int i = 0; i < g_isa_ntab[m]; i++) if (g_isa_cnt[m][i] > best) { best = g_isa_cnt[m][i]; bm = m; bi = i; }
+        if (bm < 0) break;
+        say("\n    "); say(bm ? "all_programs+" : "eboot+"); say_hex(g_isa_tab[bm][bi].va); say(" "); say(kn[g_isa_tab[bm][bi].kind & 0x7F]); say(" "); say_dec((i64)best);
+        g_isa_cnt[bm][bi] = 0;   /* (the report is printed once, at exit) */
+    }
+    say("\n");
+}
+
 static int relocate(Module *m, int is_main);
 static u64 g_tls_offset;
 #include "e3_hle.c"    /* HLE implementations + hle_lookup() */
+#ifdef UD_EMBED_UPDATER
+#include "ud_update_blob.h"   /* w38_rel: ud_update.exe inside UntilDawn.exe (made by build_windows_from_linux.sh) */
+#endif
 #include "ud_launch.c"  /* UntilDawn.exe: settings, game-folder validation, player-facing start */
+#ifdef _WIN32
+#include "e3_icon.c"    /* w38_rel: window icon from the player's own sce_sys/icon0.png */
+#endif
 
 /* the import table (e3_imports.h), from the game's own executable: one entry per imported symbol "<NID>#<lib>#<module>"
    that a relocation refers to (as the loader binds them);
@@ -403,19 +491,54 @@ static void setup_malloc_replace(Module *m) {
 }
 
 /* ------------------------------------------------------------------ TLS patching */
+static u8 *g_stub_w;
+/* issue #9: an operation on the extra per-thread qword (slot code from plat_tls_extra_disp), flags as the plain
+   instruction leaves them. op 0: mov qword slot,0; 1: inc qword slot; 2: cmp qword slot,imm32. An expansion slot
+   needs a register: rax, saved below the red zone (lea / push / pop do not change the flags). */
+static u8 *emit_slot_op(u8 *w, u32 code, int op, u32 imm) {
+    static const u8 opb[3][3] = {{0x48, 0xc7, 0x04}, {0x48, 0xff, 0x04}, {0x48, 0x81, 0x3c}};   /* modrm /0 /0 /7 with SIB disp32 */
+    if (!(code & 0x80000000u)) {
+        *w++ = 0x65; *w++ = opb[op][0]; *w++ = opb[op][1]; *w++ = opb[op][2]; *w++ = 0x25; *(u32 *)w = code; w += 4;
+        if (op != 1) { *(u32 *)w = op == 0 ? 0 : imm; w += 4; }
+        return w;
+    }
+    static const u8 pre[] = {0x48, 0x8d, 0x64, 0x24, 0x80, 0x50, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x80, 0x17, 0x00, 0x00};   /* lea rsp,[rsp-128]; push rax; mov rax,gs:[0x1780] */
+    mem_copy(w, pre, sizeof pre); w += sizeof pre;
+    *w++ = 0x48; *w++ = opb[op][1]; *w++ = (u8)(0x80 | (opb[op][2] == 0x3c ? 0x38 : 0)); *(u32 *)w = code & 0x7FFFFFFFu; w += 4;   /* op qword [rax+off] */
+    if (op != 1) { *(u32 *)w = op == 0 ? 0 : imm; w += 4; }
+    static const u8 post[] = {0x58, 0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00};   /* pop rax; lea rsp,[rsp+128] */
+    mem_copy(w, post, sizeof post); w += sizeof post;
+    return w;
+}
 static int patch_tls(Module *m, u32 disp) {
-    /* 64 48 8b 04 25 00 00 00 00  (mov rax, fs:[0])  ->  65 48 8b 04 25 <disp32> (mov rax, gs:[disp]) */
+    /* 64 48 8b 04 25 00 00 00 00  (mov rax, fs:[0])  ->  65 48 8b 04 25 <disp32> (mov rax, gs:[disp]): an inline TEB slot.
+       issue #9, an expansion slot (disp = 0x80000000 | offset): the site becomes jmp stub; the stub does
+       mov rax,gs:[0x1780] (TEB.TlsExpansionSlots); mov rax,[rax+offset]; jmp back (rax is the instruction's own
+       destination; no flags change). Stubs go to the start of the module's stub area (g_stub_w). */
     Phdr *tx = 0;
     for (int i = 0; i < m->phnum; i++) if (m->ph[i].type == 1 && (m->ph[i].flags & 1)) tx = &m->ph[i];
     if (!tx) return 0;
     u8 *p = m->base + tx->vaddr, *e = p + tx->filesz - 9;
-    int n = 0;
+    int n = 0, exp = (disp & 0x80000000u) != 0;
+    u8 *w = g_stub_w ? g_stub_w : m->base + m->size;
     for (; p < e; p++)
         if (p[0] == 0x64 && p[1] == 0x48 && p[2] == 0x8b && p[3] == 0x04 && p[4] == 0x25 &&
             p[5] == 0 && p[6] == 0 && p[7] == 0 && p[8] == 0) {
-            p[0] = 0x65; *(u32 *)(p + 5) = disp; n++; p += 8;
+            if (!exp) { p[0] = 0x65; *(u32 *)(p + 5) = disp; }
+            else {
+                u8 *st = w;
+                static const u8 ld[] = {0x65, 0x48, 0x8b, 0x04, 0x25, 0x80, 0x17, 0x00, 0x00};   /* mov rax,gs:[0x1780] */
+                mem_copy(w, ld, sizeof ld); w += sizeof ld;
+                *w++ = 0x48; *w++ = 0x8b; *w++ = 0x80; *(u32 *)w = disp & 0x7FFFFFFFu; w += 4;    /* mov rax,[rax+offset] */
+                *w++ = 0xe9; *(i32 *)w = (i32)((p + 9) - (w + 4)); w += 4;                         /* jmp back */
+                p[0] = 0xe9; *(i32 *)(p + 1) = (i32)(st - (p + 5)); p[5] = p[6] = p[7] = p[8] = 0xcc;
+            }
+            n++; p += 8;
         }
-    say("  TLS: patched "); say_dec(n); say(" fs:[0] reads to gs:["); say_hex(disp); say("]\n");
+    if (exp) { g_stub_w = (u8 *)(((u64)w + 15) & ~15ull);
+               say("  TLS: slot "); say_dec(g_tls_idx); say(" is past the 64 in the thread block (other programs' DLLs took them"); if (g_tls_burned) { say("; --test-tls-burn: "); say_dec(g_tls_burned); say(" taken on purpose"); }
+               say("): "); say_dec(n); say(" fs:[0] reads go through TEB.TlsExpansionSlots + "); say_hex(disp & 0x7FFFFFFFu); say(" (stubs, "); say_dec((i64)(w - (m->base + m->size)) >> 10); say(" KB)\n"); }
+    else { say("  TLS: patched "); say_dec(n); say(" fs:[0] reads to gs:["); say_hex(disp); say("] (slot "); say_dec(g_tls_idx); if (g_tls_burned) { say("; --test-tls-burn: "); say_dec(g_tls_burned); say(" taken"); } say(")\n"); }
     return n;
 }
 
@@ -435,7 +558,6 @@ static u8 *make_thread_block(void) {
    red zone the game keeps below rsp is never touched, emulates EXTRQ with integer ops, re-executes
    the displaced position-independent instruction(s) and jumps back. */
 static int g_extrq_patched;
-static u8 *g_stub_w;
 static const ExtrqSite *g_test_sites;
 static int patch_extrq(Module *m) {
     const ExtrqSite *tabs[2] = {g_test_sites ? g_test_sites : v103_extrq_sites, v100_extrq_sites}, *sites = 0;
@@ -448,7 +570,7 @@ static int patch_extrq(Module *m) {
         if (ok) sites = tabs[k];
     }
     if (!sites) { say("  SSE4a: no matching site table for this eboot - relying on trap emulation\n"); return 0; }
-    u8 *w = m->base + m->size;   /* slack area allocated with the image, within rel32 range */
+    u8 *w = g_stub_w ? g_stub_w : m->base + m->size;   /* slack area allocated with the image, within rel32 range (after the TLS stubs, issue #9) */
     for (const ExtrqSite *s = sites; s->va; s++) {
         u8 *site = m->base + s->va, *st = w;
         int D = s->dst, S = s->src;
@@ -498,14 +620,14 @@ static void patch_cast_cap(Module *m) {
     u8 *w = g_stub_w;
     /* entry stub: counter = 0, the displaced prologue, back */
     u8 *se = w;
-    *w++ = 0x65; *w++ = 0x48; *w++ = 0xc7; *w++ = 0x04; *w++ = 0x25; *(u32 *)w = disp; w += 4; *(u32 *)w = 0; w += 4;   /* mov qword gs:[disp],0 */
+    w = emit_slot_op(w, disp, 0, 0);   /* mov qword gs:[disp],0 (issue #9: or the expansion-slot form) */
     mem_copy(w, entry, 6); w += 6;
     *w++ = 0xe9; *(i32 *)w = (i32)((fe + 6) - (w + 4)); w += 4;
     w = (u8 *)(((u64)w + 15) & ~15ull);
     /* loop stub: count; over the cap -> the no-hit exit; else the displaced load, back */
     u8 *sl = w;
-    *w++ = 0x65; *w++ = 0x48; *w++ = 0xff; *w++ = 0x04; *w++ = 0x25; *(u32 *)w = disp; w += 4;                          /* inc qword gs:[disp] */
-    *w++ = 0x65; *w++ = 0x48; *w++ = 0x81; *w++ = 0x3c; *w++ = 0x25; *(u32 *)w = disp; w += 4; *(u32 *)w = CAST_CAP; w += 4; /* cmp qword gs:[disp],CAP */
+    w = emit_slot_op(w, disp, 1, 0);          /* inc qword gs:[disp] */
+    w = emit_slot_op(w, disp, 2, CAST_CAP);   /* cmp qword gs:[disp],CAP */
     *w++ = 0x73; u8 *jb = w++;                                                                                          /* jae bail */
     mem_copy(w, loop, 7); w += 7;
     *w++ = 0xe9; *(i32 *)w = (i32)((fl + 7) - (w + 4)); w += 4;
@@ -1806,6 +1928,73 @@ static void skp_img_probe(u64 *P, u32 id) {
     g[14] = id == 1 ? (u64)g_skp_gnf[k] : (u64)g_skp_gnf_len[k];   /* rax */
     if (id == 2 && g_opt_trace_movies) { say("  skip prompt: picture "); say(k ? SKP_IMG_CROSS : SKP_IMG_CIRCLE); say(" given to the engine\n"); }
 }
+/* w25_fix (--morph-log): the game's Morpheme (animation network) control parameters, set by name through the engine's
+   wrapper (eboot v1.03, found from the "No control parameter '%s' in morpheme network!" string at 0x1b2bbdf, used by
+   0x13679f0): 0x13c8e00 set float (rdi = component, rsi = name, xmm0 = value; 90 callers), 0x13c8ee0 set by pointer
+   (rdx = value; 16 callers), 0x13c87b0 a named request / message (rsi = name; 11 callers); all three look the name up
+   with 0x13c88f0 and lock the component at +0x38. Logged: the first call of every (component, name), then changes -
+   discrete ones (|delta| >= 0.5) always, small ones at most once per 120 flips per key; requests deduplicated per 60
+   flips. --morph-log-filter TEXT: only names containing TEXT. (Dr Hill book: which value moves part 2's pages.) */
+static int g_opt_morph_log; static const char *g_morph_filter; static volatile u32 g_morph_lines; static volatile int g_morph_lk;
+typedef struct { u64 comp, name; u32 v[4]; u64 last_flip; } MorphKey;
+static MorphKey g_morph_tab[8192];
+static int morph_name_ok(const char *t) { if (!g_morph_filter || !g_morph_filter[0]) return 1; return str_has(t, g_morph_filter); }
+static void morph_log(u64 *P, u32 id) {
+    u64 *g = P + 32; u64 comp = g[8], nm = g[9];
+    char t[160]; if (!vis_is_str(nm, t, sizeof t) || !morph_name_ok(t)) return;
+    u32 v[4] = {0, 0, 0, 0}; int nv = 1;
+    if (id == 1) v[0] = (u32)P[0];
+    else if (id == 2) { u64 vp = g[12]; if (vis_ptr_ok(vp) && plat_readable(vp, 16)) { for (int k = 0; k < 4; k++) v[k] = ((const u32 *)vp)[k]; nv = 4; } else nv = 0; }
+    else nv = 0;
+    u64 flip = g_plat_frame; int first = 0, log_ = 0;
+    while (__atomic_exchange_n(&g_morph_lk, 1, __ATOMIC_ACQUIRE)) { }
+    u64 h = (comp * 0x9E3779B97F4A7C15ull) ^ (nm * 0xC2B2AE3D27D4EB4Full) ^ id; u32 i = (u32)(h >> 51) & 8191; MorphKey *e = 0;
+    for (u32 q = 0; q < 64; q++) { MorphKey *c = &g_morph_tab[(i + q) & 8191]; if (c->comp == comp && c->name == (nm ^ ((u64)id << 60))) { e = c; break; } if (!c->comp) { e = c; e->comp = comp; e->name = nm ^ ((u64)id << 60); first = 1; break; } }
+    if (!e) log_ = 0;
+    else if (first) log_ = 1;
+    else if (id == 3) log_ = flip >= e->last_flip + 60;
+    else { int diff = 0, big = 0; for (int k = 0; k < nv; k++) if (e->v[k] != v[k]) { diff = 1; float a, b; mem_copy(&a, &e->v[k], 4); mem_copy(&b, &v[k], 4); float d = a - b; if (d < 0) d = -d; if (d >= 0.5f || d != d) big = 1; }
+        log_ = diff && (big || flip >= e->last_flip + 120); }
+    if (e && log_) { for (int k = 0; k < 4; k++) e->v[k] = v[k]; e->last_flip = flip; }
+    __atomic_store_n(&g_morph_lk, 0, __ATOMIC_RELEASE);
+    if (!log_ || __atomic_add_fetch(&g_morph_lines, 1, __ATOMIC_RELAXED) > 40000) return;
+    say("  morph-log (w25_fix): flip "); say_dec((i64)flip); say(id == 1 ? " set " : id == 2 ? " set* " : " request "); say(t); say(" comp "); say_hex(comp);
+    for (int k = 0; k < nv; k++) { float f; mem_copy(&f, &v[k], 4); say(k ? ", " : " = "); say_dec((i64)(f * 1000.0f)); say("e-3"); }
+    if (id == 2 && nv) { say(" (raw "); say_hex(v[0]); say(")"); }
+    say(first ? " (first)" : ""); say(" ["); say(cur_thread_name()); say("]\n");
+}
+static void patch_morph(Module *m) {
+    static const u8 e2[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};   /* push rbp; mov rbp,rsp; push r15 */
+    static const u32 va[3] = {0x13c8e00, 0x13c8ee0, 0x13c87b0};
+    if (!g_stub_w || m->size < 0x1400000) return;
+    for (int k = 0; k < 3; k++) for (int i = 0; i < 6; i++) if (m->base[va[k] + i] != e2[i]) { say("  morph-log: the code does not match this eboot (01.03 expected) - not applied\n"); return; }
+    for (int k = 0; k < 3; k++) { u8 *s = m->base + va[k], *st = g_stub_w; g_stub_w = probe_emit_stub(g_stub_w, (u32)(k + 1), e2, 6, s + 6, (void *)&morph_log); s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); s[5] = 0x90; }
+    say("  morph-log (w25_fix): Morpheme control-parameter sets / requests are logged"); if (g_morph_filter) { say(" (names containing \""); say(g_morph_filter); say("\")"); } say("\n");
+}
+/* w28_int (--no-depth-of-field / settings depth_of_field = 0): the game's blur stages off (eboot 01.03). Four on/off tests of
+   the post-process code, each "lea rax, [rip + flags]; test byte [rax], MASK; je skip"; MASK -> 0 makes the je always taken,
+   so the stage is skipped:
+     eboot+0xd64980  f6 00 01  motion blur          eboot+0xd65300  f6 00 02  shared blur stage
+     eboot+0xd64afa  f6 00 03  depth of field       eboot+0xd69b29  f6 00 80  bokeh
+   (offsets in the loaded eboot image)
+   (each test follows lea rax, [rip + flags]; at the bokeh site an xor ecx, ecx sits between them.)
+   All four sites (lea + test + mask) are verified first; if any differs, none is applied. */
+static int g_opt_no_dof;
+static void patch_dof(Module *m) {
+    static const u32 va[4] = {0xd64980, 0xd64afa, 0xd65300, 0xd69b29};
+    static const u8 mask[4] = {0x01, 0x03, 0x02, 0x80};
+    static const char *const what[4] = {"motion blur", "depth of field", "shared blur stage", "bokeh"};
+    static const u8 lea_back[4] = {7, 7, 7, 9};   /* the lea is right before the test, except at the bokeh site (xor ecx, ecx between) */
+    if (m->size < 0xd70000) { say("  depth of field off: the eboot is too small (01.03 expected) - not applied\n"); return; }
+    for (int k = 0; k < 4; k++) {
+        const u8 *s = m->base + va[k];
+        const u8 *l = s - lea_back[k];
+        if (l[0] != 0x48 || l[1] != 0x8d || l[2] != 0x05 || (lea_back[k] == 9 && (s[-2] != 0x31 || s[-1] != 0xc9)) || s[0] != 0xf6 || s[1] != 0x00 || s[2] != mask[k]) {
+            say("  depth of field off: the code at eboot+"); say_hex(va[k]); say(" ("); say(what[k]); say(") does not match eboot 01.03 - NONE of the 4 patches applied\n"); return; }
+    }
+    for (int k = 0; k < 4; k++) m->base[va[k] + 2] = 0x00;   /* test byte [rax], MASK -> test byte [rax], 0 */
+    say("  depth of field off: 4 of 4 blur-stage tests patched (motion blur, depth of field, shared blur stage, bokeh skipped)\n");
+}
 static void patch_movies(Module *m) {
     static const u8 e1[5] = {0xc5, 0xfa, 0x11, 0x45, 0xdc};               /* vmovss [rbp-0x24],xmm0 */
     static const u8 e2[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};         /* push rbp; mov rbp,rsp; push r15 */
@@ -2217,7 +2406,158 @@ static void patch_cloth_src(Module *m) {
         s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); for (int i = 5; i < site[k].n; i++) s[i] = 0x90; }
     say("  cloth source checks on (w5_cloth): the pose of every skinned mesh is checked where its update job ends (eboot+0x13be555) and the world matrix, pose and step where the game's cloth job starts (eboot+0x13c2b60); --no-cloth-source-checks turns them off\n");
 }
+/* ------------------------------------------------------------------ w35_crash: the cloth world's object list
+   N230_c6_a2 (21 Nov) aborted in the game's allocator (eboot+0xacbce0, from mspace_free 0x9542a0's "chunk not in use"
+   check) freeing the OLD buffer of a list being grown: eboot+0x741f80 (add an object to a world: push_back on
+   [this+0x10] {ptr, size, cap}, grown by 0x4960e0 -> realloc 0x486390 = allocate, copy, free old) called from
+   SkinnedMeshComponent::HavokClothUpdateJob (eboot+0x13be580 -> 0xcbbb50, this = [[eboot+0xd740e10]+0x18]) which holds
+   only its own component's mutex. The freed chunk sat at the head of its free bin with consistent links (a second free
+   of the same pointer, not a scribble) -> suspected: two cloth jobs adding at once on two threads. Remove (0x742140,
+   from 0xcbbb60) writes the same list. --cloth-world-check counts overlapping add / remove calls on the same object
+   from different threads (entry probes at 0x741f80 / 0x742140, exit probes at 0x74206c / 0x7422ac; nothing changed).
+   --cloth-world-lock (implies the check) also serialises them with one lock (recursive per thread). The lock is ON by default
+   (w28i_15; --no-cloth-world-lock turns it off for troubleshooting); --cloth-world-check / -widen / -audit are diagnostics, off. */
+static u32 g_opt_cw_widen_ms = 3; static int g_opt_cw_check, g_opt_cw_lock = 1, g_opt_cw_widen;   /* w35_crash: the lock is ON by default (a confirmed game race); --no-cloth-world-lock turns it off */   /* widen (w35c_3, diagnostic): 3 ms sleep inside each grow of the list, before the old buffer is freed */
+enum { CW_N = 16 };
+typedef struct { volatile u64 obj, buf; volatile u32 inflight, owner, tids[4]; } CwSlot;
+static CwSlot g_cw[CW_N]; static volatile u32 g_cwl_owner, g_cwl_depth;
+static u64 g_cw_lock_timeouts; static u64 g_cw_adds, g_cw_removes, g_cw_overlaps, g_cw_nested, g_cw_lock_waits, g_cw_grows; static u32 g_cw_said;
+static u64 g_cw_frees_own, g_cw_frees_foreign; static u32 g_cw_calls_said, g_cw_free_said;   /* w35c_2 */
+static void cw_say_ea(u64 a) { u64 b = (u64)g_eboot.base; if (a >= b && a < b + g_eboot.size) { say("eboot+"); say_hex(a - b); } else say_hex(a); }
+static void cw_tid_add(CwSlot *S, u32 me) { for (int i = 0; i < 4; i++) { u32 z = 0; if (__atomic_compare_exchange_n(&S->tids[i], &z, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return; } }
+static void cw_tid_del(CwSlot *S, u32 me) { for (int i = 0; i < 4; i++) { u32 t = me; if (__atomic_compare_exchange_n(&S->tids[i], &t, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return; } }
+static void cw_free_probe(u64 *P, u32 id) {   /* entry of mspace_free (eboot+0x9542a0): rsi = the block */
+    (void)id; u64 mem = P[41]; if (!mem) return;
+    for (int i = 0; i < CW_N; i++) { CwSlot *S = &g_cw[i]; if (!S->obj || S->buf != mem) continue;
+        u32 me = GetCurrentThreadId(); int own = 0; for (int k = 0; k < 4; k++) if (S->tids[k] == me) own = 1;
+        if (own) { __atomic_add_fetch(&g_cw_frees_own, 1, __ATOMIC_RELAXED); if (g_opt_cw_widen) Sleep(g_opt_cw_widen_ms); return; }   /* --cloth-world-widen: hold the grow window open (old buffer read, new not stored) */
+        __atomic_add_fetch(&g_cw_frees_foreign, 1, __ATOMIC_RELAXED);
+        if (__atomic_add_fetch(&g_cw_free_said, 1, __ATOMIC_RELAXED) > 10) return;
+        const u64 *sp = (const u64 *)((const u8 *)P + 0x200);
+        say("  cloth world list (w35_crash): flip "); say_dec((i64)g_plat_frame); say(" ["); say(cur_thread_name()); say("] FOREIGN FREE of the list buffer "); say_hex(mem); say(" of world "); say_hex(S->obj);
+        say(" (not inside an add on it; adders in flight "); for (int k = 0; k < 4; k++) if (S->tids[k]) { say_dec(S->tids[k]); say(" "); } say("); return "); cw_say_ea(sp[0]); say("; eboot addresses on the stack:");
+        u64 b = (u64)g_eboot.base; int n = 0; for (int k = 1; k < 96 && n < 14; k++) { u64 v = sp[k]; if (v >= b && v < b + g_eboot.size) { say(" "); cw_say_ea(v); n++; } } say("\n");
+        return; } }
+static CwSlot *cw_slot(u64 obj) {
+    for (int i = 0; i < CW_N; i++) if (g_cw[i].obj == obj) return &g_cw[i];
+    for (int i = 0; i < CW_N; i++) { u64 z = 0; if (__atomic_compare_exchange_n(&g_cw[i].obj, &z, obj, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || z == obj) return &g_cw[i]; }
+    return 0; }
+/* w35c_6 --cloth-world-audit (diagnostic, off; implies the lock): what runs while the lock is held - game mutexes taken inside
+   (via e4_threads.c mx_take), mutexes the thread already holds when it takes the lock, blocking waits inside, hold time,
+   nesting depth, and the world's listeners (the vtable functions the game calls inside). A lock-order cycle needs a mutex
+   both taken inside and held by a thread that is taking the lock: that intersection is counted and must stay 0. */
+static int g_opt_cw_audit;
+enum { CWA_TH = 64, CWA_HELD = 8, CWA_SET = 64 };
+typedef struct { volatile u32 tid, n; void *m[CWA_HELD]; } CwaTh;
+static CwaTh g_cwa_th[CWA_TH];
+typedef struct { void *m; u32 n; char name[24]; } CwaM;
+static CwaM g_cwa_in[CWA_SET], g_cwa_held[CWA_SET]; static u32 g_cwa_in_n, g_cwa_held_n; static volatile int g_cwa_sl;
+static u64 g_cwa_in_takes, g_cwa_in_waits, g_cwa_held_ovf, g_cwa_acq, g_cwa_hold_sum, g_cwa_hold_max, g_cwa_hold_1ms, g_cwa_hold_100us, g_cwa_t0; static u32 g_cwa_depth_max, g_cwa_wait_said, g_cwa_hold_max_flip;
+static u64 g_cwa_lf[32]; static u32 g_cwa_lf_n, g_cwa_lmax;
+static CwaTh *cwa_th(u32 me, int make) {
+    for (int i = 0; i < CWA_TH; i++) if (g_cwa_th[i].tid == me) return &g_cwa_th[i];
+    if (!make) return 0;
+    for (int i = 0; i < CWA_TH; i++) { u32 z = 0; if (__atomic_compare_exchange_n(&g_cwa_th[i].tid, &z, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return &g_cwa_th[i]; }
+    return 0; }
+static void cwa_set_add(CwaM *set, u32 *n, void *m) {
+    while (__atomic_exchange_n(&g_cwa_sl, 1, __ATOMIC_ACQUIRE)) { }
+    u32 i; for (i = 0; i < *n; i++) if (set[i].m == m) { set[i].n++; break; }
+    if (i == *n && *n < CWA_SET) { set[i].m = m; set[i].n = 1; const char *nm = ((PSMutex *)m)->name; int k = 0; for (; k < 23 && nm[k]; k++) set[i].name[k] = nm[k]; set[i].name[k] = 0; (*n)++; }
+    __atomic_store_n(&g_cwa_sl, 0, __ATOMIC_RELEASE); }
+static void cwa_taken(void *m) {
+    u32 me = GetCurrentThreadId(); CwaTh *T = cwa_th(me, 1);
+    if (T) { if (T->n < CWA_HELD) T->m[T->n] = m; else __atomic_add_fetch(&g_cwa_held_ovf, 1, __ATOMIC_RELAXED); T->n++; }
+    if (__atomic_load_n(&g_cwl_owner, __ATOMIC_ACQUIRE) == me) { __atomic_add_fetch(&g_cwa_in_takes, 1, __ATOMIC_RELAXED); cwa_set_add(g_cwa_in, &g_cwa_in_n, m); } }
+static void cwa_released(void *m) {
+    CwaTh *T = cwa_th(GetCurrentThreadId(), 0); if (!T || !T->n) return;
+    u32 n = T->n < CWA_HELD ? T->n : CWA_HELD;
+    for (int i = (int)n - 1; i >= 0; i--) if (T->m[i] == m) { for (u32 j = (u32)i; j + 1 < n; j++) T->m[j] = T->m[j + 1]; break; }
+    T->n--; }
+static void cwa_wait(const char *what) {
+    if (__atomic_load_n(&g_cwl_owner, __ATOMIC_ACQUIRE) != GetCurrentThreadId()) return;
+    __atomic_add_fetch(&g_cwa_in_waits, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&g_cwa_wait_said, 1, __ATOMIC_RELAXED) <= 10) { say("  cloth world audit (w35_crash): flip "); say_dec((i64)g_plat_frame); say(" ["); say(cur_thread_name()); say("] BLOCKING WAIT while holding the cloth world lock: "); say(what); say("\n"); } }
+static void cwa_on_acquire(u64 obj) {   /* depth 0 -> 1 */
+    g_cwa_acq++; g_cwa_t0 = plat_ticks();
+    CwaTh *T = cwa_th(GetCurrentThreadId(), 0); if (T) { u32 n = T->n < CWA_HELD ? T->n : CWA_HELD; for (u32 i = 0; i < n; i++) cwa_set_add(g_cwa_held, &g_cwa_held_n, T->m[i]); }
+    if (mem_ok(obj, 0x50)) { u32 ln = *(const u32 *)(obj + 0x48); u64 la = *(const u64 *)(obj + 0x40); if (ln > g_cwa_lmax) g_cwa_lmax = ln;
+        if (ln && ln <= 16 && mem_ok(la, 8ull * ln)) for (u32 k = 0; k < ln; k++) { u64 L = ((const u64 *)la)[k]; if (!mem_ok(L, 8)) continue; u64 vt = *(const u64 *)L; if (!mem_ok(vt + 0x10, 0x20)) continue;
+            for (int f = 0; f < 4; f++) { u64 fn = ((const u64 *)(vt + 0x10))[f]; u32 j; for (j = 0; j < g_cwa_lf_n; j++) if (g_cwa_lf[j] == fn) break; if (j == g_cwa_lf_n && g_cwa_lf_n < 32) g_cwa_lf[g_cwa_lf_n++] = fn; } } } }
+static void cwa_on_release(void) {   /* depth 1 -> 0 */
+    u64 d = (plat_ticks() - g_cwa_t0) * 1000000ull / plat_ticks_per_sec(); g_cwa_hold_sum += d;
+    if (d > g_cwa_hold_max) { g_cwa_hold_max = d; g_cwa_hold_max_flip = (u32)g_plat_frame; } if (d >= 1000) g_cwa_hold_1ms++; if (d >= 100) g_cwa_hold_100us++; }
+static void cwa_report(void) {
+    if (!g_opt_cw_audit) return;
+    say("  cloth world audit (w35_crash): lock taken "); say_dec((i64)g_cwa_acq); say(" times, hold us max "); say_dec((i64)g_cwa_hold_max); say(" (flip "); say_dec(g_cwa_hold_max_flip); say(") mean "); say_dec(g_cwa_acq ? (i64)(g_cwa_hold_sum / g_cwa_acq) : 0);
+    say(", >= 100 us "); say_dec((i64)g_cwa_hold_100us); say(", >= 1 ms "); say_dec((i64)g_cwa_hold_1ms); say("; nesting depth max "); say_dec(g_cwa_depth_max);
+    say("; blocking waits inside "); say_dec((i64)g_cwa_in_waits); say("; game mutexes taken inside "); say_dec((i64)g_cwa_in_takes); say(" ("); say_dec(g_cwa_in_n); say(" distinct)");
+    u32 x = 0; for (u32 i = 0; i < g_cwa_in_n; i++) for (u32 j = 0; j < g_cwa_held_n; j++) if (g_cwa_in[i].m == g_cwa_held[j].m) x++;
+    say("; mutexes held when taking the lock "); say_dec(g_cwa_held_n); say(" distinct; LOCK-ORDER CYCLE CANDIDATES (taken inside AND held at entry) "); say_dec(x); say("; held-set overflow "); say_dec((i64)g_cwa_held_ovf); say("\n");
+    for (u32 i = 0; i < g_cwa_in_n && i < 16; i++) { say("    taken inside: mutex "); say_hex((u64)g_cwa_in[i].m); say(" \""); say(g_cwa_in[i].name); say("\" x"); say_dec(g_cwa_in[i].n); say("\n"); }
+    for (u32 i = 0; i < g_cwa_held_n && i < 16; i++) { say("    held at entry: mutex "); say_hex((u64)g_cwa_held[i].m); say(" \""); say(g_cwa_held[i].name); say("\" x"); say_dec(g_cwa_held[i].n); say("\n"); }
+    say("    world listeners: most "); say_dec(g_cwa_lmax); say(", their functions (vtable +0x10..+0x28):"); for (u32 i = 0; i < g_cwa_lf_n; i++) { say(" "); cw_say_ea(g_cwa_lf[i]); } say("\n"); }
+static void cw_entry(u64 *P, u32 id) {   /* id 1: add (0x741f80), 2: remove (0x742140); rdi = the world object */
+    u64 obj = P[40], item = P[41], ra = *(const u64 *)((const u8 *)P + 0x200); u32 me = GetCurrentThreadId();
+    if (g_opt_cw_lock) {
+        if (__atomic_load_n(&g_cwl_owner, __ATOMIC_ACQUIRE) == me) { g_cwl_depth++; if (g_cwl_depth > g_cwa_depth_max) g_cwa_depth_max = g_cwl_depth; }
+        else { int waited = 0; u32 z; u64 tw = 0;
+               for (;;) { z = 0; if (__atomic_compare_exchange_n(&g_cwl_owner, &z, me, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+                   if (!waited) { waited = 1; tw = plat_ticks(); }
+                   else if ((plat_ticks() - tw) * 1000ull / plat_ticks_per_sec() >= 250) {   /* w35c_7: never wait for ever - after 250 ms go on WITHOUT the lock
+                       (the game's own unlocked behaviour) and say so: a lock-order cycle could then cost 250 ms once, never a hang */
+                       if (__atomic_add_fetch(&g_cw_lock_timeouts, 1, __ATOMIC_RELAXED) <= 5) { say("  cloth world lock (w35_crash): flip "); say_dec((i64)g_plat_frame); say(" ["); say(cur_thread_name()); say("] waited 250 ms for thread "); say_dec(__atomic_load_n(&g_cwl_owner, __ATOMIC_RELAXED)); say(" - going on WITHOUT the lock ("); say(id == 1 ? "add" : "remove"); say(")\n"); }
+                       goto unlocked; }
+                   pt_yield(); }
+               g_cwl_depth = 1; if (!g_cwa_depth_max) g_cwa_depth_max = 1; if (waited) __atomic_add_fetch(&g_cw_lock_waits, 1, __ATOMIC_RELAXED); if (g_opt_cw_audit) cwa_on_acquire(obj); } }
+    unlocked:
+    __atomic_add_fetch(id == 1 ? &g_cw_adds : &g_cw_removes, 1, __ATOMIC_RELAXED);
+    if (id == 1 && mem_ok(obj, 0x20)) { u32 sz = *(const u32 *)(obj + 0x18), cap = *(const u32 *)(obj + 0x1c) & 0x3fffffff; if (sz == cap) __atomic_add_fetch(&g_cw_grows, 1, __ATOMIC_RELAXED); }
+    CwSlot *S = cw_slot(obj); if (!S) return;
+    if (id == 1) { cw_tid_add(S, me); if (mem_ok(obj, 0x20)) S->buf = *(const u64 *)(obj + 0x10); }
+    if (g_opt_cw_check && __atomic_add_fetch(&g_cw_calls_said, 1, __ATOMIC_RELAXED) <= 40) { u32 sz = mem_ok(obj, 0x20) ? *(const u32 *)(obj + 0x18) : 0, cap = mem_ok(obj, 0x20) ? *(const u32 *)(obj + 0x1c) & 0x3fffffff : 0;
+        say("  cloth world list (w35_crash): flip "); say_dec((i64)g_plat_frame); say(" us "); say_dec((i64)(plat_ticks() * 1000000ull / plat_ticks_per_sec() % 1000000000ull)); say(" ["); say(cur_thread_name()); say(" "); say_dec(me); say("] "); say(id == 1 ? "add" : "remove");
+        say(" world "); say_hex(obj); say(" item "); say_hex(item); say(" size "); say_dec(sz); say(" cap "); say_dec(cap); say(" buffer "); say_hex(S->buf); say(" from "); cw_say_ea(ra); say("\n"); }
+    u32 prev_owner = S->owner, n = __atomic_add_fetch(&S->inflight, 1, __ATOMIC_ACQ_REL);
+    if (n > 1) {
+        if (prev_owner == me) { __atomic_add_fetch(&g_cw_nested, 1, __ATOMIC_RELAXED); return; }
+        __atomic_add_fetch(&g_cw_overlaps, 1, __ATOMIC_RELAXED);
+        if (__atomic_add_fetch(&g_cw_said, 1, __ATOMIC_RELAXED) <= 20) {
+            u32 sz = mem_ok(obj, 0x20) ? *(const u32 *)(obj + 0x18) : 0, cap = mem_ok(obj, 0x20) ? *(const u32 *)(obj + 0x1c) & 0x3fffffff : 0;
+            say("  cloth world list (w35_crash): flip "); say_dec((i64)g_plat_frame); say(" ["); say(cur_thread_name()); say("] "); say(id == 1 ? "add" : "remove");
+            say(" on world "); say_hex(obj); say(" (item "); say_hex(item); say(", from "); say_hex(ra); say(") while thread "); say_dec(prev_owner); say(" is inside an add / remove on it; list size "); say_dec(sz); say(" capacity "); say_dec(cap);
+            say(g_opt_cw_lock ? " - cannot happen with the lock: CHECK\n" : (sz == cap ? " - a GROW now would free the same buffer twice\n" : "\n")); } }
+    S->owner = me; }
+static void cw_exit(u64 *P, u32 id) {   /* 3: add returns (r12 = object), 4: remove returns (r15 = object) */
+    u64 obj = id == 3 ? P[35] : P[32]; CwSlot *S = 0;
+    for (int i = 0; i < CW_N; i++) if (g_cw[i].obj == obj) { S = &g_cw[i]; break; }
+    if (S && S->inflight) __atomic_sub_fetch(&S->inflight, 1, __ATOMIC_ACQ_REL);
+    if (S && id == 3) { cw_tid_del(S, GetCurrentThreadId()); if (mem_ok(obj, 0x20)) S->buf = *(const u64 *)(obj + 0x10); }
+    if (g_opt_cw_lock && __atomic_load_n(&g_cwl_owner, __ATOMIC_ACQUIRE) == GetCurrentThreadId()) { if (--g_cwl_depth == 0) { if (g_opt_cw_audit) cwa_on_release(); __atomic_store_n(&g_cwl_owner, 0, __ATOMIC_RELEASE); } } }
+static void patch_cloth_world(Module *m) {
+    static const u8 e[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};                  /* push rbp; mov rbp,rsp; push r15 */
+    static const u8 xa[5] = {0x48, 0x83, 0xc4, 0x08, 0x5b};                        /* 0x74206c: add rsp,8; pop rbx */
+    static const u8 xr[7] = {0x4c, 0x89, 0xf7, 0x48, 0x83, 0xc4, 0x18};            /* 0x7422ac: mov rdi,r14; add rsp,0x18 */
+    static const struct { u32 va; const u8 *b; int n; void *h; } site[5] = {{0x741f80, e, 6, (void *)&cw_entry}, {0x742140, e, 6, (void *)&cw_entry}, {0x74206c, xa, 5, (void *)&cw_exit}, {0x7422ac, xr, 7, (void *)&cw_exit}, {0x9542a0, e, 6, (void *)&cw_free_probe}};
+    if (!g_stub_w || m->size < 0x2000000) return;
+    for (int k = 0; k < 5; k++) for (int i = 0; i < site[k].n; i++) if (m->base[site[k].va + i] != site[k].b[i]) { say("  cloth world check (w35_crash): the code does not match this eboot - not applied\n"); g_opt_cw_check = g_opt_cw_lock = 0; return; }
+    int nsite = g_opt_cw_check ? 5 : 4;   /* w35c_4: the free probe (every free in the game) only with the check, not for the lock alone */
+    for (int k = 0; k < nsite; k++) { u8 *s = m->base + site[k].va, *st = g_stub_w;
+        g_stub_w = probe_emit_stub(g_stub_w, (u32)(k + 1), site[k].b, site[k].n, s + site[k].n, site[k].h);
+        s[0] = 0xe9; *(i32 *)(s + 1) = (i32)(st - (s + 5)); for (int i = 5; i < site[k].n; i++) s[i] = 0x90; }
+    if (g_opt_cw_widen) say("  --cloth-world-widen (w35_crash, diagnostic): each grow of the list sleeps 3 ms before freeing its old buffer (repro aid)\n");
+    say(g_opt_cw_lock ? "  --cloth-world-lock (w35_crash): adds / removes on the cloth world's object list (eboot+0x741f80 / 0x742140) serialised by one lock, overlaps counted\n"
+                      : "  --cloth-world-check (w35_crash): overlapping adds / removes on the cloth world's object list (eboot+0x741f80 / 0x742140) from different threads are counted; nothing changed\n");
+}
+static void cloth_world_report(void) {
+    cwa_report();
+    if (!g_opt_cw_check && !g_opt_cw_lock) return;
+    say("  cloth world list (w35_crash): adds "); say_dec((i64)g_cw_adds); say(" (of them growing the list "); say_dec((i64)g_cw_grows); say("), removes "); say_dec((i64)g_cw_removes);
+    say(", OVERLAPS from another thread "); say_dec((i64)g_cw_overlaps); say(", nested on the same thread "); say_dec((i64)g_cw_nested);
+    say(", frees of a list buffer by its own grow "); say_dec((i64)g_cw_frees_own); say(", FOREIGN frees of a live list buffer "); say_dec((i64)g_cw_frees_foreign);
+    if (g_opt_cw_lock) { say(", lock waits "); say_dec((i64)g_cw_lock_waits); say(", lock TIMEOUTS (went on unlocked) "); say_dec((i64)g_cw_lock_timeouts); }
+    say("\n"); }
 static void cloth_src_report(void) {
+    cloth_world_report();
     if (!g_ps_calls && !g_cj_calls) return;
     say("  cloth source checks (w5_cloth): pose update jobs checked "); say_dec((i64)g_ps_calls); say(", left bad values "); say_dec((i64)g_ps_bad); say(" (of those in the local transforms "); say_dec((i64)g_ps_bad_local);
     say("); cloth jobs checked "); say_dec((i64)g_cj_calls); say(", with a bad world matrix / pose / step "); say_dec((i64)g_cj_bad); say(", reading a pose not marked valid "); say_dec((i64)g_cj_notvalid); say(", with a changed model-matrix buffer "); say_dec((i64)g_cj_realloc); say("; cloth resets requested "); say_dec((i64)g_cj_resets); say("\n");
@@ -3249,6 +3589,9 @@ static void crash_dump(const u64 *g, u64 rip, u64 fault) {
     plat_close(f);
     say("    register and memory dump written to e6_crash_dump.txt\n");
 }
+static const char *cur_thread_name(void);
+static void ol_where(u64 a) { where(a); }   /* w25_fix */
+static const char *ol_thread_name(void) { return cur_thread_name(); }
 static void where(u64 a) {
     if (a >= (u64)g_eboot.base && a < (u64)g_eboot.base + g_eboot.size) { say("eboot+"); say_hex(a - (u64)g_eboot.base); }
     else if (g_prx_loaded && a >= (u64)g_prx.base && a < (u64)g_prx.base + g_prx.size) { say("all_programs+"); say_hex(a - (u64)g_prx.base); }
@@ -3353,6 +3696,8 @@ static void print_summary(void) {
     { u64 tf = plat_ticks_per_sec() / 1000; if (!tf) tf = 1; say("\nlog writes (t145b): "); say_dec((i64)g_pw_n); say(", over 20 ms "); say_dec((i64)g_pw_slow_n); say(" ("); say_dec((i64)(g_pw_slow_ticks / tf)); say(" ms in all, longest "); say_dec((i64)(g_pw_slow_max / tf)); say(" ms); t146: queued "); say_dec((i64)g_lw_queued); say(", dropped (ring full) "); say_dec((i64)g_lw_dropped); say(" bytes\n"); }
     say("\n"); mnan_report(1); rsq_summary(); vbw_report(); cloth_onset_report(); phys_report();
     if (g_fp_trap) { say("\nFP exceptions recorded (invalid / divide-by-zero): "); say_dec((i64)g_fp_total); say(" at "); say_dec(g_nfps); say(" places (t145: noisy-site pauses "); say_dec((i64)g_fp_disarms); say(", re-arms at flips "); say_dec((i64)g_fp_rearms); say("; t148: compare sites made quiet "); say_dec((i64)g_fp_quieted); say("):\n"); fp_report(1); }
+    isa_report();   /* w24_compat */
+    if (g_lov_n) { say("\nlanguage overlay (w33_lang): "); say_dec(g_lov_hits); say(" lookups served from an overlay, "); say_dec(g_lov_miss); say(" lookups found nowhere"); }
     say("\nall_programs.prx loaded: "); say(g_prx_loaded ? "yes" : "no");
     say("\ngame threads started: "); say_dec(g_threads_started);
     for (int i = 1; i < g_nthreads; i++) { say(i == 1 ? " (" : ", "); say(g_threads[i]->name); if (g_threads[i]->done) say(" [exited]"); if (i == g_nthreads - 1) say(")"); }
@@ -3402,7 +3747,164 @@ static void e3_fatal_summary(void) {
         "The details were written to Logs\\UntilDawn.log (next to UntilDawn.exe). Please keep that file for the bug report.");
 }
 
+
+/* w33_lang: with a language overlay, a text / speech language override that needs files the primary edition lacks is kept
+   only if EVERY file of that language (01.03 size, in the game folder or an overlay) is there; otherwise the override is
+   dropped and the game uses its own default (English, as without the option) - the CUSA02636 languages are never touched.
+   Checked at every start (with or without an overlay). Dutch = slot Z, Turkish = slot X (P10, measured): text-only
+   languages need only their own 70 text files; they have no speech set, so a Dutch / Turkish speech override is dropped
+   and the game keeps its own (English) voices - as on a PS4 with that edition. */
+#include "ud_langpack.h"
+static int g_lp_exp_active;   /* w33_lang: an EXPERIMENTAL pack is in use (chosen by the player) */
+static int lang_slot_complete(int slot, int *nok, int *nall) {
+    char rel[200], p[1100]; *nok = *nall = 0;
+    for (int f = 0; f < (int)(sizeof k_lp_files / sizeof k_lp_files[0]); f++) {
+        const LpFile *L = &k_lp_files[f]; if (L->slot != slot) continue;   /* w38_rel: slots are unique across both editions */
+        (*nall)++;
+        Sb s = {rel, 0, sizeof rel}; sb_s(&s, "localcachepink/lumps/levels.game.thegame.leveldescription_lump_"); sb_s(&s, L->guid); sb_s(&s, ".core");
+        path_join(p, g_game_dir, rel); i64 sz = plat_file_size(p);
+        if (sz < 0) for (int k = 0; k < g_lov_n && sz < 0; k++) { path_join(p, g_lov_dir[k], rel); sz = plat_file_size(p); }
+        if (sz == (i64)L->size) (*nok)++;
+    }
+    return *nall && *nok == *nall;
+}
+static int lang_check_one(int idx, int speech) {   /* 1 = keep the override */
+    static const char *const nm[21] = {"", "English", "French", "Spanish", "German", "Italian", "Dutch", "Portuguese", "Chinese (Traditional)", "Korean", "Russian", "Polish",
+                                       "Danish", "Finnish", "Norwegian", "Swedish", "Japanese", "Spanish (Latin America)", "Portuguese (Brazil)", "Turkish", "Chinese (Simplified)"};
+    if (idx <= 0 || idx > 20 || idx == 1) return 1;
+    /* w38_rel: no longer tied to CUSA02636 - a language is usable when ALL its files (our metadata, 01.03 sizes) are in the game
+       folder (the player's own edition) or in an installed pack, whichever edition they came from. P10 (measured): the game
+       picks a dubbed language's speech lumps by the TEXT language, so a text choice needs the speech set too. */
+    const LpPack *P = lp_pack_by_idx(idx);
+    say("language check (w38_rel): "); say(speech ? "speech " : "text "); say(nm[idx]);
+    if (!P) {
+        if ((idx == 17 || idx == 18) && g_ud_edition && str_eq(g_ud_edition->title, "CUSA00359")) { say(": part of CUSA00359 (EXPERIMENTAL edition, no file metadata) -> used\n"); return 1; }
+        if (g_lp_exp_active) { say(": EXPERIMENTAL pack selected by the player (unverified, not checked against our metadata) -> used\n"); return 1; }
+        say(": no files for it in any measured edition -> override dropped, the game's default is used\n"); return 0;
+    }
+    if (speech && !P->speech) { say(": text-only language (no voice recordings exist) -> the game keeps English voices\n"); return 0; }
+    int ok = 1, a = 0, b = 0;
+    for (int k = 0; k < P->nslot; k++) {
+        if (speech && k == 0 && P->speech) continue;   /* speech choice: the speech slot only */
+        int x, y; ok &= lang_slot_complete(P->slot[k], &x, &y); a += x; b += y;
+    }
+    say(": "); say_dec(a); say(" / "); say_dec(b); say(" files (from "); say(k_lp_sku_name[P->sku]); say(")");
+    say(ok ? " -> complete, used\n" : " -> INCOMPLETE -> override dropped, the game's default is used\n");
+    return ok;
+}
+/* w33_lang: language packs made once by ud_langscan (ud_langpack.h). --lang-pack CODE (settings: language = <name>, no
+   language_overlay): only <Languages>\CODE enters the search path, after its manifest and files pass the check
+   (--lang-verify size|quick|full, default quick); otherwise English, CUSA02636 untouched. --lang-experimental
+   <edition>\<lang> (settings language_experimental): an EXPERIMENTAL pack, used only when chosen explicitly. */
+static char g_lp_dir[1024], g_lp_code[8], g_lp_exp[512]; static int g_lp_verify = 1;
+static void lp_overlay_front(const char *d) {
+    if (g_lov_n == 4) g_lov_n = 3;
+    for (int k = g_lov_n; k > 0; k--) mem_copy(g_lov_dir[k], g_lov_dir[k - 1], sizeof g_lov_dir[0]);
+    int n = str_len(d); if (n > 1023) n = 1023; mem_copy(g_lov_dir[0], d, (u64)n); g_lov_dir[0][n] = 0; g_lov_n++;
+}
+static void lang_pack_resolve(void) {
+    char base[1100], dir[1100], why[160];
+    if (g_lp_dir[0]) { int n = str_len(g_lp_dir); mem_copy(base, g_lp_dir, (u64)n + 1); } else { plat_exe_dir(base, sizeof base); path_join(base, base, "Languages"); }
+    if (g_lp_code[0]) {
+        const LpPack *P = lp_pack_by_code(g_lp_code);
+        say("language pack (w33_lang): "); say(g_lp_code);
+        if (!P) { say(" is not a known pack -> English\n"); }
+        else {
+            path_join(dir, base, P->code); u64 t0 = plat_ticks(); int nbad = 0;
+            int ok = lp_pack_check(dir, P, g_lp_verify, why, sizeof why, &nbad);
+            u64 ms = (plat_ticks() - t0) * 1000 / plat_ticks_per_sec();
+            say(" ("); say(P->name); say(", VERIFIED pack from "); say(k_lp_sku_name[P->sku]); say(" 01.03) in "); say(dir); say(": ");
+            if (ok) { say("complete, "); say(g_lp_verify == 2 ? "full SHA-256" : g_lp_verify ? "sizes + quick hashes" : "sizes"); say(" checked in "); say_dec((i64)ms); say(" ms -> used");
+                lp_overlay_front(dir);
+                if (!g_opt_text_lang) g_opt_text_lang = P->game_idx;
+                if (P->speech && !g_opt_speech_lang) g_opt_speech_lang = P->game_idx;
+                say(P->speech ? " (text and voices)\n" : " (text only; voices stay English)\n"); }
+            else { say(why); say(" -> NOT used, English (the game's own languages are unchanged)\n"); }
+        }
+    }
+    if (g_lp_exp[0]) {
+        path_join(dir, base, "experimental"); path_join(dir, dir, g_lp_exp);
+        LpManifest m; int ok = lp_manifest_read(dir, &m) && str_eq(m.status, "EXPERIMENTAL") && m.nf > 0, bad = 0; char rel[1100], h[65];
+        for (int i = 0; ok && i < m.nf; i++) { path_join(rel, dir, m.f[i].rel); if (plat_file_size(rel) != (i64)m.f[i].size || !lp_quick_hash(rel, h) || !str_eq(h, m.f[i].quick)) bad++; }
+        say("language pack (w33_lang): EXPERIMENTAL "); say(dir); say(": ");
+        if (ok && !bad) { say_dec(m.nf); say(" files intact (UNVERIFIED content: chosen by the player) -> searched\n"); lp_overlay_front(dir); g_lp_exp_active = 1; }
+        else { say(ok ? "files missing or changed" : "no valid EXPERIMENTAL manifest"); say(" -> NOT used\n"); }
+    }
+}
+static void lang_overlay_check(void) {
+    if (g_opt_text_lang && !lang_check_one(g_opt_text_lang, 0)) g_opt_text_lang = 0;
+    if (g_opt_speech_lang && !lang_check_one(g_opt_speech_lang, 1)) g_opt_speech_lang = 0;
+}
 #ifndef E3_NO_MAIN
+/* w26_update: the updater, ud_update.exe next to UntilDawn.exe (design: NOTES.md of w26_update). Player starts (no arguments)
+   only, before the game folder is checked (an update can fix a program problem even when the game would not start).
+   update_check = on: "--check" (GitHub's latest release; at most ~6 s when offline; the player is asked; Install replaces the
+   program files - this running exe too, by renaming it - and we start the new one). An install interrupted earlier (a journal
+   in Cache\update) is always rolled back first ("--recover"), whatever update_check says. 0 = go on with the game. */
+#ifdef _WIN32
+__declspec(dllimport) u32 WINAPI GetEnvironmentVariableA(const char *, char *, u32);
+static int ud_getenv(const char *k, char *o, u32 n) { u32 r = GetEnvironmentVariableA(k, o, n); if (!r || r >= n) { o[0] = 0; return 0; } return 1; }
+static int ud_start_detached(const char *exe, const char *dir) {
+    static char cl[1300]; Sb s = {cl, 0, sizeof cl}; sb_s(&s, "\""); sb_s(&s, exe); sb_s(&s, "\"");
+    __attribute__((aligned(8))) u8 si[104] = {0}, pi[24] = {0}; *(u32 *)si = 104;
+    if (!CreateProcessA(exe, cl, 0, 0, 0, 0, 0, dir, si, pi)) return 0;
+    CloseHandle(*(void **)(pi + 8)); CloseHandle(*(void **)pi); return 1;
+}
+#else
+static int ud_getenv(const char *k, char *o, u32 n) { const char *v = getenv(k); if (!v || str_len(v) >= (int)n) { o[0] = 0; return 0; } mem_copy(o, v, (u64)str_len(v) + 1); return 1; }
+static int ud_start_detached(const char *exe, const char *dir) { (void)exe; (void)dir; return 0; }
+#endif
+static int ud_update_hook(const char *base) {
+    static char upd[1200], jr[1200], cmd[3000], res[1200], me[1200], ev[1000];
+    path_join(upd, base, "ud_update.exe"); path_join(jr, base, "Cache/update/journal.txt");
+    int pending = plat_file_size(jr) >= 0;
+    if (!pending && !g_uds.update_check) return 0;
+#if UD_DEV_BUILD
+    if (g_uds.update_check) {   /* w28_int: a development build never asks for updates (ud_update.exe refuses too); UD_UPDATE_DEV_TEST=1 (tests) passes the call on */
+        if (!ud_getenv("UD_UPDATE_DEV_TEST", ev, sizeof ev)) {
+            say("update: update_check = 1 is ignored - this is a development build (v" UD_VERSION "), which is never updated\n");
+            g_uds.update_check = 0; if (!pending) return 0; }
+        else say("update: TEST UD_UPDATE_DEV_TEST - development build, the call goes to ud_update.exe (which must refuse)\n");
+    }
+#endif
+#ifdef UD_EMBED_UPDATER
+    {   /* w38_rel: the updater travels inside UntilDawn.exe (identical bytes to the tested ud_update.exe). It is written to
+           Cache\updater\ud_update.exe (its own folder: the updater cleans Cache\update) and run from there, so it can replace
+           UntilDawn.exe. Written again whenever the copy there differs in size (a new version brings a new updater). */
+        static char ud_dir[1200];
+        path_join(ud_dir, base, "Cache"); plat_mkdir(ud_dir); path_join(ud_dir, base, "Cache/updater"); plat_mkdir(ud_dir);
+        path_join(upd, base, "Cache/updater/ud_update.exe");
+        if (plat_file_size(upd) != (i64)ud_update_exe_len) {
+            void *f = plat_open_write(upd); if (f) { plat_write_bin(f, ud_update_exe, ud_update_exe_len); plat_close(f); }
+            say(plat_file_size(upd) == (i64)ud_update_exe_len ? "update: the built-in updater was written to Cache\\updater\\ud_update.exe\n" : "update: COULD NOT write the built-in updater to Cache\\updater\n");
+        }
+    }
+#endif
+    if (plat_file_size(upd) < 0 && pending) path_join(upd, base, "Cache/update/backup/ud_update.exe");   /* (interrupted while ud_update.exe itself was being replaced) */
+    if (plat_file_size(upd) < 0) { say("update: ud_update.exe not found next to UntilDawn.exe - "); say(pending ? "an interrupted install could not be checked\n" : "no update check\n"); return 0; }
+    Sb s = {cmd, 0, sizeof cmd}; sb_s(&s, "\""); sb_s(&s, upd); sb_s(&s, g_uds.update_check ? "\" --check" : "\" --recover");
+    sb_s(&s, " --dir \""); sb_s(&s, base); sb_s(&s, "\" --current " UD_VERSION);
+    if (g_uds.update_skip[0]) { sb_s(&s, " --skip "); sb_s(&s, g_uds.update_skip); }
+    if (ud_getenv("UD_UPDATE_TEST_ARGS", ev, sizeof ev)) { sb_s(&s, " "); sb_s(&s, ev); }   /* tests: --update-source DIR --answer ... --quiet */
+    say("update: "); say(pending && !g_uds.update_check ? "an interrupted install was found - " : ""); say(cmd); say("\n");
+    u64 t0 = plat_ticks(); int ec = plat_run_child(cmd);
+    say("update: ud_update.exe exit code "); say_dec(ec); say(" after "); say_dec((i64)((plat_ticks() - t0) * 1000 / plat_ticks_per_sec())); say(" ms (details: Logs\\update.log)\n");
+    if (ec == 2) {   /* "Skip version": remembered in the settings (this program writes settings.ini, the updater never does) */
+        path_join(res, base, "Cache/update/result.txt"); u64 n = 0; char *t = (char *)plat_read_file(res, &n);
+        if (t && n > 5 && n < 64 && str_starts(t, "skip ")) { char v[32]; int k = 0; while (k < 31 && 5 + k < (int)n && t[5 + k] > ' ') { v[k] = t[5 + k]; k++; } v[k] = 0;
+            ud_ini_set("update_skip_version", v, "; (written by the program) A release you chose to skip: the update check does not ask about it again.\r\n");
+            say("update: version "); say(v); say(" will not be offered again (update_skip_version)\n"); }
+        return 0;
+    }
+    if (ec == 3) {   /* program files changed: the new UntilDawn.exe starts, this one ends */
+        path_join(me, base, "UntilDawn.exe");
+        if (ud_getenv("UD_UPDATE_NO_RESTART", ev, sizeof ev)) { say("update: TEST UD_UPDATE_NO_RESTART - not restarting\n"); return 30; }
+        say(ud_start_detached(me, base) ? "update: the updated program was started\n" : "update: COULD NOT START the updated program - please start UntilDawn.exe again\n");
+        return 30;
+    }
+    if (ec == 4) return 31;   /* failed install, not fully restored: the updater told the player; the game does not start */
+    return 0;
+}
 /* UntilDawn.exe started without arguments (double-clicked): folders, settings, validation, then the game.
    Returns 0 to go on with the arguments it put in *pargc / *pargv, otherwise the exit code. */
 static int ud_player_start(int *pargc, char ***pargv) {
@@ -3425,9 +3927,14 @@ static int ud_player_start(int *pargc, char ***pargv) {
     if (lf) plat_set_log(lf);
     g_ud_release = 1;
     ud_load_settings(cfg);
+    ud_lang_doc_migrate();   /* w38_rel: new language notes, values kept */
+    ud_ldm_migrate();   /* w28_int (w28i_10): an old automatic low_driver_memory = 0 -> auto; a possible own choice is kept */
     if (g_uds.game_dir[0]) { int n = str_len(g_uds.game_dir); mem_copy(game, g_uds.game_dir, (u64)n + 1); }
     else path_join(game, base, "Game");
-    say("Until Dawn v" UD_VERSION " - native PC build, started "); say(__DATE__ " " __TIME__); say("\nprogram folder: "); say(base); say("\ngame folder: "); say(game); say("\n");
+    say("Until Dawn v" UD_VERSION " - native PC build, started "); say(__DATE__ " " __TIME__); say(UD_DEV_BUILD ? " (" UD_BUILD_KIND_MARK ")" : ""); say("\nprogram folder: "); say(base); say("\ngame folder: "); say(game); say("\n");
+    if (*pargc <= 1) { int ur = ud_update_hook(base); static char tst[8];   /* w26_update (player starts only, not --player test runs) */
+        if (!ur && ud_getenv("UD_UPDATE_TEST_STOP", tst, sizeof tst)) { say("update: TEST UD_UPDATE_TEST_STOP - ending after the update step\n"); ur = 32; }   /* (tests: no game-files dialog) */
+        if (ur) return ur; }
     static char mb[4096]; UdMsg msg = {mb, 0, sizeof mb}; mb[0] = 0;
     u64 t0 = plat_ticks();
     int bad = ud_validate(game, &msg);
@@ -3438,7 +3945,11 @@ static int ud_player_start(int *pargc, char ***pargv) {
         plat_message_box("Until Dawn - game files required", mb);
         return 10 + bad;
     }
-    say("ok (CUSA02636 01.03, "); say_dec((i64)(sizeof g_ud_manifest / sizeof g_ud_manifest[0])); say(" files)\n");
+    say("ok ("); say(g_ud_edition ? g_ud_edition->title : "unlisted edition"); say(" 01.03, "); say_dec((i64)g_ud_nfiles_checked); say(" files)\n");
+    say("  game edition (w38_rel): "); say(g_ud_edition ? g_ud_edition->title : "not in our list"); say(" - ");
+    say(g_ud_edition ? g_ud_edition->region : "?");
+    say(g_ud_edition && g_ud_edition->status == 2 ? "; SUPPORTED (tested)" : "; EXPERIMENTAL (not tested by us: please report problems)");
+    say(g_ud_edition_code_checked ? "; program code identical to the 01.03 build (code check)\n" : "; eboot.bin SHA-256 listed\n");
     if (g_uds.disp_auto) g_dopt_on = 1;   /* w6_disp: OFF unless the settings ask for it (or --display-auto) */
     if (g_dopt_save && g_uds.disp_auto && !g_uds.seen_rr) {   /* w6_disp: a settings file of an earlier version. Its display lines were that version's defaults unless changed: untouched
                                               defaults (windowed 1280x720) become the new default, borderless; anything else is the player's choice and stays. */
@@ -3460,6 +3971,37 @@ static int ud_player_start(int *pargc, char ***pargv) {
         ud_ini_set("gpu_optimisations", "1", "; (added by version 0.4.0) 1 = the graphics optimisations of version 0.4.0 (same picture). 0 = off, only for\r\n"
                    "; troubleshooting (some shaders may be prepared again after a change).\r\n");
         say("settings: gpu_optimisations = 1 added to Config\\settings.ini (new in 0.4.0)\n"); }
+    if (g_dopt_save) {   /* w28_int: a file of an earlier version gets the new settings with their defaults (its own values stay) */
+        int added = 0;
+        if (!g_uds.seen_alr) { added++; ud_ini_set("audio_late_read", "1", "; (added by this version) Sound: 1 = the game's sound is read when it is played, as on the PS4 (no repeated\r\n"
+                   "; sound buffers: removes the crackle / spikes heard mostly at 4K) (default). 0 = as version 0.4.1.\r\n"); }
+        if (!g_uds.seen_alim) { added++; ud_ini_set("audio_limiter", "1", "; (added by this version) Sound: 1 = a limiter keeps loud moments from clipping (default). 0 = hard clipping as in\r\n"
+                   "; version 0.4.1.\r\n"); }
+        if (!g_uds.seen_gyro) { added++; ud_ini_set("gyro_calibration", "1", "; (added by this version) DualShock 4 / DualSense motion sensors: 1 = the gyro offset is removed while the controller\r\n"
+                   "; is still, so the \"Don't Move\" moments do not drift (default). 0 = raw sensor values as in version 0.4.1.\r\n"); }
+        if (!g_uds.seen_lvt) { added++; ud_ini_set("low_vram_textures", "auto", "; (added by this version) Graphics cards under 12 GB: auto (default) = texture memory in smaller blocks, recently\r\n"
+                   "; used textures kept (fewer texture reloads on 6-8 GB cards); no effect on 12 GB+ cards. 0 = off.\r\n"); }
+        if (!g_uds.seen_ldm) { added++; ud_ini_set("low_driver_memory", "auto", "; (added by this version) auto (default) = on only when the graphics driver's budget for system memory is small\r\n"
+                   "; (PCs with little RAM): game memory only the processor uses is then not handed to the driver (about 1.5 GB less\r\n"
+                   "; driver memory). 1 = always on, 0 = always off. Restart after changing.\r\n"); }
+        if (!g_uds.seen_lang) { added++; ud_ini_set("language", "auto", "; (added by this version) Language of menus, subtitles and voices, chosen by the game as on a PS4 set to it: auto\r\n"
+                   "; (English) or english, russian, polish, spanish, portuguese, swedish, norwegian, finnish, danish. Languages this\r\n"
+                   "; edition does not contain fall back to English. text_language / speech_language: auto = as language.\r\n");
+                   ud_ini_set("text_language", "auto", 0); ud_ini_set("speech_language", "auto", 0); }
+        if (!g_uds.seen_rdm) { added++; ud_ini_set("rs_depth_max", "auto", "; (added by this version) Thin dark lines on faces at resolutions above 1080p: auto (default) = the game's\r\n"
+                   "; tiled-lighting depth bounds include every pixel whenever the picture is rendered at another size than 1920x1080.\r\n; 1 = always, 0 = off.\r\n"); }
+        if (!g_uds.seen_dof) { added++; ud_ini_set("depth_of_field", "1", "; (added by this version) 1 = depth of field as on the PS4 (default). 0 = off: the game's blur stages are skipped -\r\n"
+                   "; depth of field, bokeh and motion blur. Restart after changing.\r\n"); }
+        if (!g_uds.seen_cpuc) { added++; ud_ini_set("cpu_compat", "0", "; (added by this version) 1 = support for older processors without BMI1 / LZCNT / MOVBE / F16C (the game's\r\n"
+                   "; instructions are replaced). Only needed if the program says the processor is not supported. 0 = off (default).\r\n"); }
+        if (!g_uds.seen_upd) { added++; ud_ini_set("update_check", "1", "; (added by this version) 1 = check GitHub for a newer release at start (default; you are asked before anything\r\n"
+                   "; is installed, and your game files, saves, settings and language packs are never touched). 0 = off.\r\n"); }
+        if (added && !g_uds.fresh) { say("settings: "); say_dec(added); say(" setting(s) of this version added to Config\\settings.ini with their defaults\n"); }
+    }
+#ifdef _WIN32
+    if (!g_uds.guard_fixed && g_guard_fixed) { plat_guard_release(0x1000000000ull, 0x200000000ull); g_guard_fixed = 0;   /* w28_int: guard_fixed_maps = 0 (troubleshooting): the v0.4.1 guard window */
+        say("settings: guard_fixed_maps = 0 - the address guard's part over the game's early fixed mappings (0x1000000000-0x1200000000) released\n"); }
+#endif
     /* settings -> the existing switches */
     g_opt_fps = g_uds.fps_limit > 0 ? g_uds.fps_limit : -1;
     g_win_borderless = g_uds.borderless; g_win_cw = g_uds.window_w; g_win_ch = g_uds.window_h;
@@ -3476,6 +4018,10 @@ static int ud_player_start(int *pargc, char ***pargv) {
     say(", display "); say(g_uds.borderless ? "borderless" : "windowed"); say(", developer mode "); say(g_uds.developer ? "on" : "off");
     say(", renderer thread "); say(g_uds.renderer_thread ? "on" : "off (renderer_thread = 0)");
     say(", gpu coherence "); say(g_uds.gpu_coherence ? "on" : "off (gpu_coherence = 0)"); say(", halloween hunt "); say(g_uds.halloween_hunt ? "on" : "off");
+    say(", audio late read "); say(g_uds.audio_late_read ? "on" : "off"); say(", audio limiter "); say(g_uds.audio_limiter ? "on" : "off");   /* w28_int */
+    say(", gyro calibration "); say(g_uds.gyro_cal ? "on" : "off"); say(", low-VRAM textures "); say(g_uds.low_vram_tex < 0 ? "auto" : g_uds.low_vram_tex ? "on" : "off");
+    say(", low driver memory "); say(g_uds.low_driver_mem < 0 ? "auto" : g_uds.low_driver_mem ? "on" : "off"); { int cl_nodof = 0; for (int k = 1; k < *pargc; k++) if (str_eq((*pargv)[k], "--no-depth-of-field")) cl_nodof = 1;   /* w28_int: the effective value (a --player test run's own options count too) */
+      say(", depth of field "); say(cl_nodof ? "off (command line)" : g_uds.dof ? "on" : "off (depth_of_field = 0)"); } say(", tile depth bounds "); say(g_uds.rs_depth_max < 0 ? "auto" : g_uds.rs_depth_max ? "on" : "off (rs_depth_max = 0)"); say(", cpu compat "); say(g_uds.cpu_compat ? "on" : "off"); say(", update check "); say(g_uds.update_check ? "on" : "off");
     say(", gpu "); say(g_uds.gpu[0] ? g_uds.gpu : "auto"); say(", present mode "); say(g_uds.present_mode == 1 ? "fifo" : g_uds.present_mode == 2 ? "mailbox" : g_uds.present_mode == 3 ? "immediate" : "auto"); say("\n");
     (void)fpsbuf;
     int n = 0;
@@ -3483,6 +4029,31 @@ static int ud_player_start(int *pargc, char ***pargv) {
     av[n++] = "--watch-heap"; av[n++] = "--lump-repair";   /* the two containments every good test run used (STATUS 40, 47); the skin check is on by default (STATUS 68) */
     if (!g_uds.gpu_coherence) av[n++] = "--no-gpu-coherence";   /* t165x */
     if (g_uds.halloween_hunt) av[n++] = "--halloween-hunt";   /* t167 */
+    if (g_uds.cpu_compat) { av[n++] = "--cpu-compat"; av[n++] = "auto"; }   /* w24_compat */
+    if (!g_uds.audio_late_read) av[n++] = "--no-audio-late-read";   /* w28_int (default on) */
+    if (!g_uds.audio_limiter) av[n++] = "--no-audio-limiter";   /* w28_int (default on) */
+    if (!g_uds.gyro_cal) av[n++] = "--no-gyro-cal";   /* w28_int (default on) */
+    if (g_uds.low_vram_tex == 0) av[n++] = "--no-lowvram-tex"; else if (g_uds.low_vram_tex == 1) av[n++] = "--lowvram-tex";   /* w28_int (default auto: cards under 12 GB) */
+    g_opt_imp_gpu_only = g_uds.low_driver_mem < 0 ? 2 : g_uds.low_driver_mem ? 1 : 0; g_ldm_src = g_uds.seen_ldm && !g_uds.fresh ? 1 : 0;   /* w34_mem: auto (default) / 1 / 0; the command line can still change it */
+    if (!g_uds.dof) av[n++] = "--no-depth-of-field";   /* w28_int (default 1 = as on the PS4) */
+    if (g_uds.rs_depth_max == 0) av[n++] = "--no-rs-depth-max"; else if (g_uds.rs_depth_max == 1) av[n++] = "--rs-depth-max";   /* w30_visual (default auto: on with a render scale) */
+    if (g_uds.sys_lang1 > 0) { static char lb[8]; fmt_dec(lb, g_uds.sys_lang1 - 1); av[n++] = "--sys-language"; av[n++] = lb; }   /* w24_compat */
+    if (g_uds.text_lang > 0) { static char tb[8]; fmt_dec(tb, g_uds.text_lang); av[n++] = "--text-language"; av[n++] = tb; }
+    if (g_uds.speech_lang > 0) { static char sb2[8]; fmt_dec(sb2, g_uds.speech_lang); av[n++] = "--speech-language"; av[n++] = sb2; }
+    if (g_uds.lang_overlay[0]) { av[n++] = "--lang-overlay"; av[n++] = g_uds.lang_overlay; }   /* w33_lang (default: none) */
+    /* w33_lang: language = french|german|italian|dutch|turkish with a language_overlay: the game's combined choice (text, and
+       for the dubbed ones the voices) through its own override; the start-up check drops it if any file is missing */
+    if (g_uds.languages_dir[0]) { av[n++] = "--languages-dir"; av[n++] = g_uds.languages_dir; }   /* w33_lang packs */
+    if (g_uds.lang_verify) { av[n++] = "--lang-verify"; av[n++] = g_uds.lang_verify == 3 ? "full" : g_uds.lang_verify == 2 ? "quick" : "size"; }
+    if (g_uds.lang_experimental[0]) { av[n++] = "--lang-experimental"; av[n++] = g_uds.lang_experimental; }
+    /* w38_rel: a language the player's own edition contains is used directly (the game's own choice, as on a PS4); a language
+       from the OTHER edition goes through its pack (or the legacy language_overlay folders). */
+    { const LpPack *LP = lp_pack_by_idx(g_uds.lang_game); int builtin = LP && lp_pack_in_game(game, LP);
+      if (LP) { say("language (w38_rel): "); say(LP->name); say(builtin ? " is part of this game edition - used directly\n" : " is not part of this game edition - needs its imported pack\n"); }
+      if (!g_uds.lang_overlay[0] && !g_uds.text_lang && LP && !builtin) { av[n++] = "--lang-pack"; av[n++] = (char *)LP->code; }
+      if (!g_uds.text_lang && LP && !builtin && g_uds.lang_overlay[0]) {   /* legacy language_overlay folders: the game's own override */
+          static char lt[8]; fmt_dec(lt, g_uds.lang_game); av[n++] = "--text-language"; av[n++] = lt;
+          if (LP->speech && !g_uds.speech_lang) { av[n++] = "--speech-language"; av[n++] = lt; } } }
     if (!g_uds.renderer_thread) av[n++] = "--sync-submit";   /* 0.1.4: renderer_thread = 0 -> the submits run on the game's thread, as in 0.1.3 */
     if (g_uds.gpu[0] && !ud_key_is(g_uds.gpu, "auto")) { av[n++] = "--gpu"; av[n++] = g_uds.gpu; }   /* t121 */
     if (g_uds.present_mode) { av[n++] = "--present-mode"; av[n++] = g_uds.present_mode == 1 ? "fifo" : g_uds.present_mode == 2 ? "mailbox" : "immediate"; }   /* t121 */
@@ -3513,16 +4084,28 @@ static const char *g_replay_path; static int g_replay_bisect;
 /* ------------------------------------------------------------------ system check (STATUS 88: hardware compatibility)
    The game's own code runs natively, so the CPU must have every instruction set it uses (e3_syscheck.h). A missing one
    would otherwise end in an illegal-instruction crash somewhere in play. --skip-cpu-check runs anyway (for tests). */
-static int g_opt_skip_cpu_check;
+static int g_opt_skip_cpu_check; static int g_sim_cpus_ok;
 static SysCpu g_cpu;
 static int sys_check(int release) {
     sys_cpu_detect(&g_cpu);
+    if (g_isa_mode) {   /* w24_compat: the sets the stubs replace no longer stop the start */
+        g_isa_kinds = g_isa_mode == 2 ? (ISA_NEED_BMI1 | ISA_NEED_LZCNT | ISA_NEED_MOVBE | ISA_NEED_F16C) : isa_kinds_needed();
+        g_isa_slack = g_isa_kinds ? 0x100000 : 0;
+        static const char *rep[4] = {"F16C ", "BMI1 ", "LZCNT ", "MOVBE "};
+        char out[160]; out[0] = 0; const char *q = g_cpu.missing;
+        while (*q) { const char *e = q; while (*e && *e != ' ') e++; int skip = 0;
+            for (int r = 0; r < 4; r++) { int L = str_len(rep[r]) - 1; if (e - q == L) { int eq = 1; for (int c = 0; c < L; c++) if (q[c] != rep[r][c]) eq = 0; if (eq) skip = 1; } }
+            if (!skip) { int o = str_len(out); for (const char *c = q; c < e && o < 150; c++) out[o++] = *c; out[o++] = ' '; out[o] = 0; }
+            q = *e ? e + 1 : e; }
+        mem_copy(g_cpu.missing, out, (u64)str_len(out) + 1); g_cpu.ok = out[0] == 0;
+    }
     char d[400]; sys_cpu_describe(&g_cpu, d, sizeof d);
     u32 maj = 0, mn = 0, bld = 0; int hv = plat_os_version(&maj, &mn, &bld);
     u64 ram = plat_phys_mem(), commit = plat_commit_avail(); u32 ncpu = plat_ncpu();
     say("system: CPU "); say(d); say("\n        "); say_dec(ncpu); say(" logical processors, "); say_dec((i64)(ram >> 20)); say(" MB memory ("); say_dec((i64)(commit >> 20)); say(" MB commit available)");
     if (hv) { say(", Windows "); say_dec(maj); say("."); say_dec(mn); say(" build "); say_dec(bld); }
     say("\n");
+    if (g_sim_ncpu) { say("  --sim-cpus "); say_dec(g_sim_ncpu); say(" (w21_perf low-end profile): our thread rules see "); say_dec(g_sim_ncpu); say(" logical processors, no hybrid-core placement; process affinity 0.."); say_dec(g_sim_ncpu - 1); say(g_sim_cpus_ok ? " set\n" : " NOT set\n"); }
     if (!g_cpu.has_invariant_tsc) say("  WARNING: this CPU does not report an invariant time-stamp counter; the game clock (scaled RDTSC) may drift with the CPU clock\n");
     if (ram && ram < (12ull << 30)) say("  WARNING: less than 12 GB of memory; the game maps about 7 GB and the renderer needs more. 16 GB is recommended\n");
     if (g_cpu.ok || g_opt_skip_cpu_check) { if (!g_cpu.ok) say("  --skip-cpu-check: running without "); if (!g_cpu.ok) { say(g_cpu.missing); say("\n"); } return 0; }
@@ -3532,11 +4115,142 @@ static int sys_check(int release) {
         sb_s(&b, "Until Dawn cannot run on this processor.\n\nIt lacks instruction sets the game's code needs: "); sb_s(&b, g_cpu.missing);
         sb_s(&b, "\n\nProcessor: "); sb_s(&b, g_cpu.brand[0] ? g_cpu.brand : g_cpu.vendor);
         sb_s(&b, "\n\nAny Intel Core from 2013 (Haswell) or AMD Ryzen processor has them. Pentium and Celeron processors before 2022 do not have AVX.");
+        if (!g_isa_mode && g_cpu.has_avx && g_cpu.ymm_enabled && g_cpu.has_sse42 && g_cpu.has_popcnt)   /* w24_compat */
+            sb_s(&b, "\n\nThis processor may run the game with cpu_compat = 1 in Config\\settings.ini (the missing instructions are replaced).");
         plat_message_box("Until Dawn - processor not supported", mb);
     }
     return 1;
 }
 
+/* w20_mem v0.5 --mem-timeline S (diagnostic, default off): every S seconds from the start (also during shader preparation and loading,
+   which the flip-driven 10 s reports do not cover) one line on its own thread: RAM in use (working set), committed private memory,
+   page faults since the last line, system RAM / commit available, game memory imported for the GPU, the driver's system-heap and
+   VRAM use, our image memory, pipelines made, flip; every 6th line the address space by state (committed / reserved, private /
+   mapped / image). --alloc-log adds the big C-heap allocations by place (every 12th line and at exit). */
+static u32 g_opt_memtl;
+static void alloc_report(const char *why) {
+    if (!g_opt_alloclog) return;
+    static AlSite top[AL_SITES]; int nt = 0; u64 live = 0, peak = 0, drop = 0; int ns = 0;
+    al_lock();
+    nt = g_nals; for (int i = 0; i < nt; i++) top[i] = g_als[i];
+    live = g_al_live; peak = g_al_peak; drop = g_al_dropped; ns = g_nals;
+    al_unlock();
+    for (int i = 1; i < nt; i++) { AlSite t = top[i]; int j = i; while (j > 0 && top[j - 1].live < t.live) { top[j] = top[j - 1]; j--; } top[j] = t; }   /* by live bytes */
+    if (nt > 20) nt = 20;
+    say("    big C-heap allocations (w20_mem --alloc-log, "); say(why); say("): live "); say_dec((i64)(live >> 20)); say(" MB (peak "); say_dec((i64)(peak >> 20)); say(") at "); say_dec(ns); say(" places");
+    if (drop) { say(", not tracked "); say_dec((i64)drop); } say("; by place, MB live (blocks) / peak / made in all:");
+    for (int i = 0; i < nt; i++) { const char *f = top[i].f, *b = f; for (const char *q = f; *q; q++) if (*q == '/' || *q == '\\') b = q + 1;
+        say(i ? "; " : " "); say(b); say(":"); say_dec(top[i].l); say(" "); say_dec((i64)(top[i].live >> 20)); say(" ("); say_dec((i64)top[i].nlive); say(") / "); say_dec((i64)(top[i].peak >> 20)); say(" / "); say_dec((i64)(top[i].bytes >> 20)); }
+    say("\n");
+}
+static void gram_scan_exit(void);   /* w34_mem (below) */
+static void alloc_report_exit(void) { alloc_report("at exit"); gram_scan_exit(); }
+static void memtl_walk(u64 *cpriv, u64 *rpriv, u64 *cmap, u64 *rmap, u64 *cimg, u64 *rimg) {
+    *cpriv = *rpriv = *cmap = *rmap = *cimg = *rimg = 0;
+#ifdef _WIN32
+    struct { u64 base, abase; u32 aprot; u16 part, pad; u64 size; u32 state, prot, type, pad2; } mi;
+    for (u64 a = 0x10000; a < 0x7FFFFFFF0000ull; ) {
+        if (VirtualQuery((const void *)a, &mi, sizeof mi) != sizeof mi || !mi.size) break;
+        if (mi.state == 0x1000 || mi.state == 0x2000) { int c = mi.state == 0x1000; u64 n = mi.size;
+            if (mi.type == 0x20000) { if (c) *cpriv += n; else *rpriv += n; } else if (mi.type == 0x40000) { if (c) *cmap += n; else *rmap += n; } else { if (c) *cimg += n; else *rimg += n; } }
+        a = mi.base + mi.size;
+    }
+#endif
+}
+/* w34_mem --game-ram-scan N (diagnostic, default off; with --mem-timeline: every N-th timeline line, and at exit): how much of the
+   game's memory is in RAM, page by page (K32QueryWorkingSetEx, all pages, no sampling), and how much of what is in RAM is all zero
+   (read only for pages already in RAM, through ReadProcessMemory: no new page is brought in, a range unmapped meanwhile only fails
+   the read). Split by imported for the GPU / not imported (low_driver_memory), by kind (pool / arena / large mapping), with the
+   pages the working-set query calls locked or shared, and the ranges with the most zero pages in RAM. An all-zero page in RAM was
+   never written (or written with zeros): the upper bound of what is in RAM only because something (the GPU import pins every page
+   it covers) made it present. Costs a read of the game memory in RAM per scan (diagnostic runs only; no timing comparisons). */
+static u32 g_opt_gramscan;
+typedef struct { u64 map, res, zero, lock, shr; } GrsSum;
+static void gram_scan(const char *why) {
+#ifdef _WIN32
+    static int (WINAPI *qws)(void *, void *, u32); static int looked;
+    if (!looked) { looked = 1; void *k = GetModuleHandleA("kernel32.dll"); if (k) qws = (int (WINAPI *)(void *, void *, u32))GetProcAddress(k, "K32QueryWorkingSetEx"); }
+    if (!qws) { say("    game memory RAM scan (w34_mem): K32QueryWorkingSetEx not available\n"); return; }
+    enum { QN = 16384 };
+    static struct { u64 va, attr; } q[QN]; static u8 page[4096] __attribute__((aligned(64)));
+    static struct { u64 lo, hi, res, zero; int noimp; } top[6];
+    GrsSum all = {0}, imp = {0}, noi = {0}, kind[3] = {{0}}; u64 t0 = plat_ticks(), rdfail = 0;
+    for (int k = 0; k < 6; k++) top[k].zero = 0;
+    int nm = (int)__atomic_load_n(&g_nmem, __ATOMIC_ACQUIRE); int imported_any = __atomic_load_n(&g_imp_bytes, __ATOMIC_RELAXED) != 0;
+    for (int i = 0; i < nm; i++) {
+        u64 lo = g_mem[i].lo & ~0xFFFull, hi = (g_mem[i].hi + 0xFFF) & ~0xFFFull; if (hi <= lo) continue;
+        int ni = __atomic_load_n(&g_mem_noimp[i], __ATOMIC_ACQUIRE) != 0;
+        int kd = lo >= POOL_LO && lo < POOL_HI ? 0 : 2; for (int a = 0; a < g_narena && kd == 2; a++) if (lo >= g_arena[a].lo && lo < g_arena[a].hi) kd = 1;
+        GrsSum r = {hi - lo, 0, 0, 0, 0};
+        for (u64 a = lo; a < hi; ) {
+            u32 n = (u32)((hi - a) >> 12); if (n > QN) n = QN;
+            for (u32 j = 0; j < n; j++) { q[j].va = a + ((u64)j << 12); q[j].attr = 0; }
+            if (!qws((void *)(i64)-1, q, n * 16)) { a += (u64)n << 12; continue; }
+            for (u32 j = 0; j < n; j++) { u64 at = q[j].attr; if (!(at & 1)) continue;
+                r.res += 4096; if ((at >> 22) & 1) r.lock += 4096; if ((at >> 15) & 1) r.shr += 4096;
+                if (!plat_read_safe(page, (const void *)q[j].va, 4096)) { rdfail++; continue; }
+                const u64 *w = (const u64 *)page; u64 o = 0; for (int x = 0; x < 512; x++) o |= w[x]; if (!o) r.zero += 4096; }
+            a += (u64)n << 12;
+        }
+        GrsSum *d[3] = {&all, ni || !imported_any ? &noi : &imp, &kind[kd]};
+        for (int k = 0; k < 3; k++) { d[k]->map += r.map; d[k]->res += r.res; d[k]->zero += r.zero; d[k]->lock += r.lock; d[k]->shr += r.shr; }
+        int m = 6; while (m > 0 && top[m - 1].zero < r.zero) m--;
+        if (m < 6 && r.zero) { for (int k = 5; k > m; k--) top[k] = top[k - 1]; top[m].lo = lo; top[m].hi = hi; top[m].res = r.res; top[m].zero = r.zero; top[m].noimp = ni; }
+    }
+    u64 ms = (plat_ticks() - t0) * 1000 / plat_ticks_per_sec();
+    #define GRS(lbl, S) do { say(lbl); say_dec((i64)((S).map >> 20)); say(" MB: in RAM "); say_dec((i64)((S).res >> 20)); say(" (all-zero pages "); say_dec((i64)((S).zero >> 20)); say(")"); } while (0)
+    say("    game memory RAM scan (w34_mem, "); say(why); say(", flip "); say_dec((i64)g_plat_frame); say("): ranges "); say_dec(nm);
+    GRS(", mapped ", all); say(", locked "); say_dec((i64)(all.lock >> 20)); say(", shared "); say_dec((i64)(all.shr >> 20));
+    GRS("; imported for the GPU ", imp); GRS("; not imported ", noi);
+    if (!imported_any) say(" (nothing imported yet)");
+    GRS("; pools ", kind[0]); GRS("; arenas ", kind[1]); GRS("; large mappings ", kind[2]);
+    say("; most all-zero MB in RAM:"); for (int k = 0; k < 6 && top[k].zero; k++) { say(" "); say_hex(top[k].lo); say("+"); say_dec((i64)((top[k].hi - top[k].lo) >> 20)); say(" MB "); say_dec((i64)(top[k].res >> 20)); say("/"); say_dec((i64)(top[k].zero >> 20)); if (top[k].noimp) say(" n/i"); }
+    if (rdfail) { say("; reads failed "); say_dec((i64)rdfail); }
+    say("; took "); say_dec((i64)ms); say(" ms\n");
+    #undef GRS
+#else
+    (void)why;
+#endif
+}
+static void gram_scan_exit(void) { if (g_opt_gramscan) gram_scan("at exit"); if (g_opt_zerolog) { say("    at exit"); zl_say(); say("\n"); } }
+static u32 WINAPI memtl_thread(void *arg) {
+    (void)arg; u64 t0 = plat_ticks(), last_faults = 0; u32 k = 0;
+    for (;;) {
+        PlatProcMem pm; int ok = plat_proc_mem(&pm);
+        u64 su = 0, sb = 0, ss = 0, vu = 0, vb = 0, vs = 0; int hs = 0, hv = 0;
+        if (g_vk_on && V.dev) { hs = sysheap_query(&su, &sb, &ss); hv = vramheap_query(&vu, &vb, &vs); }
+        u64 sec = (plat_ticks() - t0) / plat_ticks_per_sec();
+        say("    memory timeline (w20_mem) t="); say_dec((i64)sec); say(" s flip "); say_dec((i64)g_plat_frame);
+        if (ok) { say(": in RAM "); say_dec((i64)(pm.ws >> 20)); say(" MB, committed "); say_dec((i64)(pm.priv >> 20)); say(" MB, page faults +"); say_dec((i64)(pm.faults - last_faults)); last_faults = pm.faults;
+            say("; PC: RAM free "); say_dec((i64)(pm.sys_avail >> 20)); say(" MB, commit free "); say_dec((i64)(pm.commit_avail >> 20)); say(" MB"); }
+        say("; game memory imported "); say_dec((i64)(__atomic_load_n(&g_imp_bytes, __ATOMIC_RELAXED) >> 20)); say(" MB");
+        if (hs) { say("; driver system heap "); say_dec((i64)(su >> 20)); say(" of "); say_dec((i64)(sb >> 20)); }
+        if (hv) { say("; VRAM "); say_dec((i64)(vu >> 20)); say(" of "); say_dec((i64)(vb >> 20)); }
+        if (g_vk_on && V.dev) {   /* v5_2: image memory by kind - Vulkan allocations (pool blocks + dedicated), live images, reusable pool space */
+            u64 blk = (u64)g_imp_live * IMP_BLOCK_MB << 20, live = V.img_bytes, pooled = g_imp_bytes_pooled, ded = live > pooled ? live - pooled : 0;
+            say("; image memory: Vulkan allocations "); say_dec((i64)((blk + ded) >> 20)); say(" MB (pool blocks "); say_dec(g_imp_live); say(" x "); say_dec(IMP_BLOCK_MB); say(" MB + dedicated ");
+            say_dec((i64)(ded >> 20)); say(" MB), live images "); say_dec((i64)(live >> 20)); say(" MB, reusable pool space "); say_dec((i64)(blk > pooled ? (blk - pooled) >> 20 : 0));
+            say(" MB, budget "); say_dec((i64)(V.img_budget >> 20)); say(" MB; blocks given back "); say_dec((i64)g_imp_blocks_freed); say(", evictions age / budget / card full "); say_dec((i64)g_n_age_evict);
+            say(" / "); say_dec((i64)g_n_real_evict); say(" / "); say_dec((i64)g_n_vram_pressure); say("; VRAM copies "); say_dec((i64)(g_sh_bytes >> 20)); say(" MB, read mirror "); say_dec((i64)((u64)g_rm_nblk * RM_BLK >> 20));
+            say(" MB; pipelines "); say_dec(V.npipe); }
+        if (g_opt_alloclog) { say("; big C-heap blocks "); say_dec((i64)(g_al_live >> 20)); say(" MB"); }
+        if (g_opt_lean_tables) { say("; lean tables "); say_dec(g_nlean); say(" reserving "); say_dec((i64)(g_lean_bytes >> 20)); say(" MB, committed "); say_dec((i64)(g_lean_commits * 64 >> 10)); say(" MB"); if (g_lean_fail) { say(", commit failures "); say_dec((i64)g_lean_fail); } }
+        if (k % 6 == 0) { u64 cp, rp, cm, rm, ci, ri; memtl_walk(&cp, &rp, &cm, &rm, &ci, &ri);
+            say("; address space committed / reserved MB: private "); say_dec((i64)(cp >> 20)); say(" / "); say_dec((i64)(rp >> 20)); say(", mapped "); say_dec((i64)(cm >> 20)); say(" / "); say_dec((i64)(rm >> 20));
+            say(", images "); say_dec((i64)(ci >> 20)); say(" / "); say_dec((i64)(ri >> 20)); }
+        zl_say();   /* w34_mem --zero-log */
+        say("\n");
+        if (g_opt_alloclog && k % 12 == 11) alloc_report("every 12th timeline line");
+        if (g_opt_gramscan && k % g_opt_gramscan == 0) gram_scan("timeline");   /* w34_mem */
+        k++;
+        Sleep(g_opt_memtl * 1000u);
+    }
+    return 0;
+}
+static void memtl_start(void) {
+    if (!g_opt_memtl) return;
+    if (!CreateThread(0, 256u << 10, (void *)memtl_thread, 0, 0, 0)) say("    --mem-timeline: no thread\n");
+}
 int e3_main(int argc, char **argv) {
     g_fr_crash_fn = fr_crash_report;   /* w16_rel rc2 (device loss, fatal stops) */
     /* w16_rel rc3: "--relaunched N:ADDR" (internal, always first) = this process is new start N because the game's fixed-address
@@ -3548,7 +4262,13 @@ int e3_main(int argc, char **argv) {
         if (str_eq(argv[k], "--test-occupy") || (str_eq(argv[k], "--test-occupy-once") && !g_relaunched)) { u64 v = 0; const char *q = argv[k + 1]; if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) q += 2;
             for (; *q; q++) { int d = *q >= '0' && *q <= '9' ? *q - '0' : (*q | 0x20) >= 'a' && (*q | 0x20) <= 'f' ? (*q | 0x20) - 'a' + 10 : -1; if (d < 0) break; v = v * 16 + (u64)d; }
             g_test_occupied = v && plat_test_occupy(v); }
-    plat_guard_init(0x1200000000ull, 0x4C80000000ull);   /* t148: before any thread or allocation of ours (heap slots, t130 layout) */
+    /* w20_mem --guard-fixed-maps (default off): the guard also covers the game's early fixed mappings below the heap slots -
+       0x1000000000 (256 MB), 0x1010000000 (90 MB flexible) and the RenderData pool 0x1015a00000 (3152 MB; up to 0x1200000000 with
+       --direct-memory-mb) - so host memory cannot take them (i6_w20m3_igo: the pool's address was taken, FIXED stop, exit 24), and host
+       memory found there at start makes a new start like the heap slots do (rc4) */
+    int guard_fixed_ = 1; for (int k = 1; k < argc; k++) { if (str_eq(argv[k], "--guard-fixed-maps")) guard_fixed_ = 1; if (str_eq(argv[k], "--no-guard-fixed-maps")) guard_fixed_ = 0; }   /* w28_int: ON by default (w20_mem build 8); --no-guard-fixed-maps = v0.4.1 window (settings guard_fixed_maps = 0 releases the extra part after the settings are read) */
+    g_guard_fixed = guard_fixed_;
+    plat_guard_init(guard_fixed_ ? 0x1000000000ull : 0x1200000000ull, 0x4C80000000ull);   /* t148: before any thread or allocation of ours (heap slots, t130 layout) */
     /* w16_rel rc3: part of the window already taken (host memory placed there before our first instruction - v040b_clean:
        private reservations at 0x1300000000 / 0x137fc00000): a fixed mapping of the game could land there and move (a sure crash).
        Start again (new address-space layout) - at most twice; nothing has been opened or written yet. */
@@ -3567,7 +4287,7 @@ int e3_main(int argc, char **argv) {
     if (g_guard_busy_low && g_relaunched >= 2) say("address guard (w16_rel): the game's heap slots are still partly taken after 2 new starts - going on; should one of the game's fixed mappings not get its address, the game stops with a message (instead of crashing later)\n");
     if (g_relaunch_failed) say("address guard (w16_rel): a new start could not be made - going on\n");
     if (g_guard_busy && !g_guard_busy_low) say("address guard (w16_rel): host memory only above the game's heap slots (0x1a00000000 and up) - no new start needed\n");
-    say("address guard (t148): "); say_dec(g_guard_held); say(" blocks of 512 MB reserved over the game's fixed-address window 0x1200000000-0x4c80000000");
+    say("address guard (t148): "); say_dec(g_guard_held); say(" blocks of 512 MB reserved over the game's fixed-address window "); say(g_guard_fixed ? "0x1000000000 (the game's early fixed mappings included; --no-guard-fixed-maps: off)" : "0x1200000000"); say("-0x4c80000000");
     if (g_guard_busy) { say(", "); say_dec(g_guard_busy); say(" already taken by host memory");
 #ifdef _WIN32
         for (int k = 0; k < g_guard_busy && k < 4; k++) { say(k ? "; " : " ("); say_hex(g_guard_busy_at[k]); say(": allocation at "); say_hex(g_guard_busy_what[k]); say(" type/state "); say_hex(g_guard_busy_type[k]); say(" size "); say_hex(g_guard_busy_size[k]); say(g_guard_busy_type[k] >> 32 == 0x2000 ? " reserved" : " committed"); say((g_guard_busy_type[k] & 0xFFFFFFFF) == 0x1000000 ? " image (a DLL)" : (g_guard_busy_type[k] & 0xFFFFFFFF) == 0x40000 ? " mapped (file / section)" : " private (heap, stack or VirtualAlloc)"); }
@@ -3611,6 +4331,13 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--strict-imports")) g_opt_strict_imports = 1;
         else if (str_eq(argv[i], "--recursive-mutexes")) g_opt_recursive_mutexes = 1;
         else if (str_eq(argv[i], "--no-audio-out")) g_opt_no_audio_out = 1;
+        else if (str_eq(argv[i], "--audio-diag")) { g_ad_on = 1; if (i + 1 < argc && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9') g_ad_period = (u32)str_to_u64(argv[++i]); }   /* w27_audio: audio delivery records + summary every N s */
+        else if (str_eq(argv[i], "--audio-wav")) g_ad_wav = 1;   /* w27_audio: Logs\captures\audio_raw.wav / audio_played.wav */
+        else if (str_eq(argv[i], "--audio-late-read")) g_opt_audio_late_read = 1;   /* w27_audio: read the game's buffer after the wait (PS4: read while it plays), not at the call */
+        else if (str_eq(argv[i], "--no-audio-late-read")) g_opt_audio_late_read = 0;   /* w28_int: late read is the default (w27_audio); this turns it off (v0.4.1 behaviour) */
+        else if (str_eq(argv[i], "--audio-limiter")) g_opt_audio_limiter = 1;   /* w27_audio: peak limiter instead of hard clipping after the 7.1 -> stereo fold-down */
+        else if (str_eq(argv[i], "--no-audio-limiter")) g_opt_audio_limiter = 0;   /* w28_int: the limiter is the default (w27_audio); this turns it off (hard clipping, v0.4.1 behaviour) */
+        else if (str_eq(argv[i], "--audio-test-gain") && i + 1 < argc) { g_opt_audio_test_gain = str_to_f(argv[++i]); if (!(g_opt_audio_test_gain > 0 && g_opt_audio_test_gain <= 8)) g_opt_audio_test_gain = 1.0f; }   /* w27_audio: TEST ONLY - output x X before the limiter / clip */
 #ifdef _WIN32
         else if (str_eq(argv[i], "--sync-pipelines")) g_opt_sync_pipes = 1;
         else if (str_eq(argv[i], "--sync-compute")) g_opt_sync_compute = 1;
@@ -3669,6 +4396,12 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--cloth-log")) g_opt_cloth_log = 1;   /* w2_cloth: diagnostic */
         else if (str_eq(argv[i], "--no-cloth-checks")) g_opt_no_cl_checks = 1;   /* w3_cloth */
         else if (str_eq(argv[i], "--no-cloth-source-checks")) g_opt_no_cl_src = 1;   /* w5_cloth */
+        else if (str_eq(argv[i], "--cloth-world-check")) g_opt_cw_check = 1;   /* w35_crash: diagnostic */
+        else if (str_eq(argv[i], "--cloth-world-lock")) g_opt_cw_lock = 1;   /* w35_crash: fix (default on) */
+        else if (str_eq(argv[i], "--no-cloth-world-lock")) g_opt_cw_lock = 0;   /* w35_crash */
+        else if (str_eq(argv[i], "--cloth-world-audit")) { g_opt_cw_audit = g_opt_cw_lock = 1; g_cwa_on = 1; }   /* w35_crash: diagnostic */
+        else if (str_eq(argv[i], "--cloth-world-widen-ms") && i + 1 < argc) { g_opt_cw_widen_ms = (u32)str_to_u64(argv[++i]); g_opt_cw_widen = g_opt_cw_check = 1; }   /* w35_crash: diagnostic */
+        else if (str_eq(argv[i], "--cloth-world-widen")) g_opt_cw_widen = g_opt_cw_check = 1;   /* w35_crash: repro aid, diagnostic only */
         else if (str_eq(argv[i], "--no-cloth-wind-guard")) g_opt_no_wind_guard = 1;   /* w5_cloth */
         else if (str_eq(argv[i], "--cloth-test-wind") && i + 1 < argc) {   /* w5_cloth test: FLIP:HEXBITS[:COUNT] */
             const char *q = argv[++i]; u64 f = 0, b = 0, c = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0'); if (*q == ':') q++;
@@ -3735,6 +4468,20 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--low-sys-mem")) g_opt_lowsys = 1;   /* w17_mem: low system memory mode whatever the driver's budget */
         else if (str_eq(argv[i], "--no-low-sys-mem")) g_opt_lowsys = -1;   /* w17_mem: never */
         else if (str_eq(argv[i], "--sim-sys-budget") && i + 1 < argc) g_sim_sys_budget = str_to_u64(argv[++i]) << 20;   /* w17_mem (tests): the driver's system-memory budget as if it were N MB */
+        else if (str_eq(argv[i], "--guard-fixed-maps") || str_eq(argv[i], "--no-guard-fixed-maps")) {}   /* w20_mem / w28_int (read at the very start, see e3_main) */
+        else if (str_eq(argv[i], "--import-gpu-only")) { g_opt_imp_gpu_only = 1; g_ldm_src = 2; }   /* w20_mem: CPU-only game memory (no PS4 GPU access bits) not imported for the GPU */
+        else if (str_eq(argv[i], "--no-import-gpu-only")) { g_opt_imp_gpu_only = 0; g_ldm_src = 2; }   /* w34_mem: low_driver_memory forced off */
+        else if (str_eq(argv[i], "--low-driver-memory") && i + 1 < argc) { const char *v = argv[++i]; g_opt_imp_gpu_only = str_eq(v, "auto") ? 2 : str_eq(v, "1") || str_eq(v, "on") ? 1 : 0; g_ldm_src = 2; }   /* w34_mem: auto / 1 / 0 as the setting */
+        else if (str_eq(argv[i], "--mem-touch-map")) { g_opt_mtm = 1; g_opt_sysheap_log = 1; }   /* w20_mem: which game memory the GPU uses (diagnostic) */
+        else if (str_eq(argv[i], "--mem-touch-scan") && i + 1 < argc) g_mtm_scan_s = (u32)str_to_u64(argv[++i]);   /* w20_mem: seconds between reads of all imported memory (0 = none) */
+        else if (str_eq(argv[i], "--mem-timeline") && i + 1 < argc) g_opt_memtl = (u32)str_to_u64(argv[++i]);   /* w20_mem v0.5: memory every N s from the start (diagnostic) */
+        else if (str_eq(argv[i], "--alloc-log")) g_opt_alloclog = 1;
+        else if (str_eq(argv[i], "--zero-log")) g_opt_zerolog = 1;
+        else if (str_eq(argv[i], "--zero-decommit")) g_opt_zero_decommit = 1;   /* w34_mem: in-place zeroing of CPU-only (left-out) memory by decommit + commit (8 GB) */
+        else if (str_eq(argv[i], "--watch-heap-resident")) g_opt_hw_res = 1;   /* w34_mem: the heap watch reads only pages in RAM */
+        else if (str_eq(argv[i], "--no-watch-heap")) g_hw_on = 0;   /* w34_mem (tests): the heap watch off (the player start turns it on) */   /* w34_mem: zero-fills by our code and the pages they bring into RAM (diagnostic) */
+        else if (str_eq(argv[i], "--game-ram-scan") && i + 1 < argc) { g_opt_gramscan = (u32)str_to_u64(argv[++i]); if (!g_opt_gramscan) g_opt_gramscan = 1; }   /* w34_mem: game memory in RAM / all-zero, page by page (diagnostic) */
+        else if (str_eq(argv[i], "--lean-tables")) g_opt_lean_tables = 1;   /* w20_mem v0.5: page tables committed piece by piece on first use */   /* w20_mem v0.5: our C-heap allocations >= 1 MB by place (diagnostic) */
         else if (str_eq(argv[i], "--sys-heap-log")) g_opt_sysheap_log = 1;   /* w17_mem: system memory for the GPU every 10 s */
         else if (str_eq(argv[i], "--no-image-pool-trim")) g_opt_no_pool_trim = 1;   /* t196 */
         else if (str_eq(argv[i], "--mem-saver")) { g_img_max_age = 1800; g_opt_vram_fit = 1; g_stage_small_req = 1; }   /* t196 */
@@ -3757,6 +4504,8 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-sync-pitch")) g_opt_sync_pitch = 0;
         else if (str_eq(argv[i], "--no-dsync-cs")) g_opt_dsync_cs = 0;
         else if (str_eq(argv[i], "--no-dsync-draw")) g_opt_dsync_draw = 0;
+        else if (str_eq(argv[i], "--dsync-diag")) g_opt_dsy_diag = 1;   /* w34_mem: a counter slot per R32 -> depth pass; the tripping pass named (diagnostic) */
+        else if (str_eq(argv[i], "--dsync-trip-at") && i + 1 < argc) g_opt_dsy_force = (int)str_to_u64(argv[++i]);   /* w34_mem (tests): --dsync-draw turned off at flip N as if it had tripped */
         else if (str_eq(argv[i], "--no-pc-save-early")) g_pc_early = 0;
         else if (str_eq(argv[i], "--no-rs-generic")) g_opt_rs_gen = 0;
         else if (str_eq(argv[i], "--no-display-auto")) g_dopt_on = 0;
@@ -3776,6 +4525,22 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--scripted-input-strict")) g_opt_scripted_input = 2;   /* t199f: the controller is ignored too */
         else if (str_eq(argv[i], "--record-input") && i + 1 < argc) g_inrec_path = argv[++i];   /* t199d (e5_system.c) */
         else if (str_eq(argv[i], "--replay-input") && i + 1 < argc) g_inrep_path = argv[++i];
+        else if (str_eq(argv[i], "--sim-cpus") && i + 1 < argc) { u32 n = (u32)str_to_u64(argv[++i]); g_sim_cpus_ok = plat_sim_cpus(n); }   /* w21_perf: low-end CPU profile (e3_platform.h) */
+        else if (str_eq(argv[i], "--img-protect") && i + 1 < argc) { u64 v = str_to_u64(argv[++i]); g_opt_img_protect = (u32)(v > 600 ? 600 : v); }   /* w21_perf (e6_vk.c vimg_create) */
+        else if (str_eq(argv[i], "--img-protect-margin") && i + 1 < argc) g_img_protect_margin = str_to_u64(argv[++i]) << 20;   /* w21_perf: MB kept free in the driver's VRAM budget (default 768) */
+        else if (str_eq(argv[i], "--tex-ws-log")) g_opt_tex_ws_log = 1;
+        else if (str_eq(argv[i], "--img-block-mb") && i + 1 < argc) { u64 v = str_to_u64(argv[++i]); if (v >= 16 && v <= 256) { IMP_BLOCK_MB = (u32)v; IMP_DEDICATED_MIN = v >= 128 ? (64ull << 20) : (v << 19); } }   /* w21_perf */
+        else if (str_eq(argv[i], "--img-evict-block")) g_opt_img_evict_block = 1;   /* w21_perf */
+        else if (str_eq(argv[i], "--vram-log")) g_opt_vram_log = 1;
+        else if (str_eq(argv[i], "--sim-vram-driver-mb") && i + 1 < argc) { g_sim_vram_drv = str_to_u64(argv[++i]) << 20; g_opt_vram_log = 1; }   /* w21_perf (tests; a model of the driver's own VRAM) */
+        else if (str_eq(argv[i], "--sim-vram-budget-mb") && i + 1 < argc) g_sim_vram_bud = str_to_u64(argv[++i]) << 20;   /* w21_perf (tests) */
+        else if (str_eq(argv[i], "--no-flashback")) g_opt_no_flashback = 1;
+        else if (str_eq(argv[i], "--no-lowvram-tex")) g_opt_lowvram_tex = 0;   /* w28_int: the low-VRAM texture set is automatic on cards under 12 GB; this turns it off */
+        else if (str_eq(argv[i], "--lowvram-tex")) g_opt_lowvram_tex = 1;   /* w21_perf: under --vram-fit (cards < 12 GB) = --img-block-mb 64 --img-evict-block --img-protect 60 */   /* w21_perf: no F11 flashback frames in developer mode (210 MB of VRAM) */   /* w21_perf: VRAM by allocation site (e6_vk.c va_alloc_) */
+        else if (str_eq(argv[i], "--sim-vram-overhead-mb") && i + 1 < argc) g_sim_vram_over = str_to_u64(argv[++i]) << 20;   /* w21_perf (tests) */   /* w21_perf: texture working-set line in the perf windows */
+        else if (str_eq(argv[i], "--input-anchor") && i + 1 < argc) { const char *q = argv[++i];   /* w21_perf (e5_system.c): recap | input | flip:N */
+            if (str_eq(q, "input")) g_in_mode = 1; else if (str_eq(q, "recap")) g_in_mode = 0;
+            else if (q[0] == 'f' && q[1] == 'l' && q[2] == 'i' && q[3] == 'p' && q[4] == ':') { g_in_mode = 2; g_in_flip = str_to_u64(q + 5); g_in_flip_set = 1; } }
         else if (str_eq(argv[i], "--lum-log")) g_opt_lumlog = 1;   /* t198: flicker detector on the game's luminance target (UntilDawn.log, every 600 flips) */
         else if (str_eq(argv[i], "--label-audit-from") && i + 1 < argc) g_wbg_audit_from = str_to_u64(argv[++i]);
         else if (str_eq(argv[i], "--depth-ro-direct")) g_opt_depth_ro_direct = 1;   /* t193c (A/B) */
@@ -3807,6 +4572,7 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--rs-down") && i + 1 < argc) g_opt_rs_down = (int)str_to_u64(argv[++i]);
         else if (str_eq(argv[i], "--rs-const-log")) g_opt_rs_constlog = 1;
         else if (str_eq(argv[i], "--rs-ui-log")) g_opt_rs_uilog = 1;
+        else if (str_eq(argv[i], "--rt-clear-log")) g_opt_rt_clear_log = 1;   /* w25_fix: credits text trails */
         else if (str_eq(argv[i], "--sample-offsets")) g_opt_sample_offsets = 1;   /* w5: IMAGE_SAMPLE*_O texel offsets applied without a render scale too (changes the anti-aliasing pass's picture at 100 percent) */
         else if (str_eq(argv[i], "--rs-movie-point")) g_opt_rs_movie = 0;   /* w3 (A/B): Bink movie frames on a scaled screen are enlarged by nearest neighbour (as before), not filtered */
         else if (str_eq(argv[i], "--rs-keep-window")) g_opt_rs_keep_window = 1;   /* w2: with --render-scale the window stays as the settings say (the scaled picture is filtered down to it) */
@@ -3861,6 +4627,7 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--gw-why") && i + 1 < argc) g_opt_gw_why = (int)str_to_u64(argv[++i]);   /* w2 diagnostic */
         else if (str_eq(argv[i], "--no-replay-mem-sync")) g_rc_memsync = 0;
         else if (str_eq(argv[i], "--bk-delay-us") && i + 1 < argc) g_opt_bk_delay_us = (int)str_to_u64(argv[++i]);   /* w2 test */
+#ifndef UD_NO_NATIVE
         else if (str_eq(argv[i], "--renderer") && i + 1 < argc) { i++; if (str_eq(argv[i], "native")) { g_rnative = 1; g_win_title = "Until Dawn - native renderer (test build)"; } else if (str_eq(argv[i], "e6")) g_rnative = 0; else say("--renderer: native or e6\n"); }   /* RENDERER_PLAN 12 */
         else if (str_eq(argv[i], "--native-e6-equiv")) g_nv_e6equiv = 1;      /* native renderer: E6's behaviour, for step-by-step comparisons */
         else if (str_eq(argv[i], "--native-tess-real")) g_nv_tess_real = 1;
@@ -3868,6 +4635,7 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--native-quad-branch")) g_nv_quad_branch = 1;
         else if (str_eq(argv[i], "--native-verbose")) g_nv_verbose = 1;
         else if (str_eq(argv[i], "--native-present")) g_nv_present = 1;     /* native replay: show the frame in a window and check what reached it (N2) */
+#endif
 #ifdef _WIN32
         else if (str_eq(argv[i], "--no-chunk")) g_opt_nochunk = 1;
         else if (str_eq(argv[i], "--gpu-dma")) g_opt_gpu_dma = 1;
@@ -3959,6 +4727,7 @@ int e3_main(int argc, char **argv) {
         }
         else if (str_eq(argv[i], "--cap-dir") && i + 1 < argc) g_cap_dir = argv[++i];
         else if (str_eq(argv[i], "--no-gpu-diag")) g_opt_no_gpu_diag = 1;
+        else if (str_eq(argv[i], "--gpu-markers-amd")) g_opt_amd_markers = 1;   /* w32_issues (GitHub #15): VK_AMD_buffer_marker GPU breadcrumbs where NV checkpoints are missing; diagnostics, default off */
         else if (str_eq(argv[i], "--no-predication")) g_opt_no_pred = 1;
         else if ((str_eq(argv[i], "--fps-after") || str_eq(argv[i], "--fps-after-ms")) && i + 1 < argc) { int ms_ = str_eq(argv[i], "--fps-after-ms"); const char *q = argv[++i]; u64 f = 0, v = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0'); if (*q == ':') q++; while (*q >= '0' && *q <= '9') v = v * 10 + (u64)(*q++ - '0');
             if (!ms_ && !g_fps_after_flip) { g_fps_after_flip = f; g_fps_after_val = v > 0 ? (int)v : -1; }
@@ -3969,6 +4738,8 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--shots-ms") && i + 1 < argc) {   /* w14_speed */
             const char *q = argv[++i];
             while (*q && g_nshotms < 64) { g_shotms[g_nshotms++] = str_to_u64(q); while (*q && *q != ',') q++; if (*q) q++; } }
+        else if (str_eq(argv[i], "--frame-log")) g_opt_flog = 1;
+        else if (str_eq(argv[i], "--unwatch-index")) g_opt_uwix = 1;
         else if (str_eq(argv[i], "--fps") && i + 1 < argc) { int v = (int)str_to_u64(argv[++i]); g_opt_fps = v > 0 ? v : -1; g_fps_src = 2; }
         else if (str_eq(argv[i], "--trace-image") && i + 1 < argc && g_ntrace < 4) {   /* ADDR (hex) */
             const char *t = argv[++i]; u64 v = 0; if (t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) t += 2;
@@ -4000,6 +4771,11 @@ int e3_main(int argc, char **argv) {
             u32 bt = str_eq(q, "x") ? PAD_CROSS : str_eq(q, "o") ? PAD_CIRCLE : str_eq(q, "up") ? PAD_UP : str_eq(q, "down") ? PAD_DOWN :
                      str_eq(q, "left") ? PAD_LEFT : str_eq(q, "right") ? PAD_RIGHT : str_eq(q, "options") ? PAD_OPTIONS : str_eq(q, "r2") ? PAD_R2 : str_eq(q, "square") ? PAD_SQUARE : str_eq(q, "triangle") ? PAD_TRIANGLE : 0;
             if (bt) { g_pressms_at[g_npressms] = f; g_pressms_btn[g_npressms] = bt; g_npressms++; } }
+        else if (str_eq(argv[i], "--swipe") && i + 1 < argc) {   /* w25_fix (test): FLIP:DIR[,FLIP:DIR...] (left right up down) */
+            const char *q = argv[++i];
+            while (*q && g_nswipe < 32) { u64 f = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0'); if (*q == ':') q++;
+                int k = *q == 'l' ? 0 : *q == 'r' ? 1 : *q == 'u' ? 2 : *q == 'd' ? 3 : -1; while (*q && *q != ',') q++; if (*q) q++;
+                if (k >= 0) { g_swipe_at[g_nswipe] = f; g_swipe_dir[g_nswipe] = (u8)k; g_nswipe++; } } }
         else if (str_eq(argv[i], "--press") && i + 1 < argc && g_npress < 64) {   /* FLIP:BUTTON */
             const char *q = argv[++i]; u64 f = 0; while (*q >= '0' && *q <= '9') f = f * 10 + (u64)(*q++ - '0');
             if (*q == ':') q++;
@@ -4058,7 +4834,7 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-par-lookups")) g_opt_spec = 0;   /* t181: no shader-setup lookups ahead of time */
         else if (str_eq(argv[i], "--par-workers") && i + 1 < argc) g_opt_spec_workers = (int)str_to_u64(argv[++i]);   /* t194: helper threads for the look-ahead lookups (0: as t181) */
         else if (str_eq(argv[i], "--par-ce-gate")) g_opt_spec_cegate = 1;   /* t198: the look-ahead thread does not run past constant-engine dumps the renderer has not made */
-        else if (str_eq(argv[i], "--batch-slots") && i + 1 < argc) { g_nslot = (int)str_to_u64(argv[++i]); if (g_nslot < 8) g_nslot = 8; if (g_nslot > NSLOT) g_nslot = NSLOT; }   /* t198 */
+        else if (str_eq(argv[i], "--batch-slots") && i + 1 < argc) { g_nslot_req = (int)str_to_u64(argv[++i]); if (g_nslot_req < 8) g_nslot_req = 8; if (g_nslot_req > NSLOT) g_nslot_req = NSLOT; g_nslot = g_nslot_req; }   /* t198 */
         else if (str_eq(argv[i], "--pm4-prefetch")) g_opt_pm4_pf = 1;   /* w5_perf: e5_gpu.c pm4_prefetch */
         else if (str_eq(argv[i], "--pm4-runs")) g_opt_pm4_runs = 1;   /* t198: collected packets that follow each other in memory are executed in one parser call */
         else if (str_eq(argv[i], "--ce-ahead")) g_opt_ce_ahead = 1;   /* t198: the constant engine keeps its full lead over the draw engine */
@@ -4090,6 +4866,18 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--no-controllers")) g_pad_no_controllers = 1;   /* STATUS 49: keyboard only */
         else if (str_eq(argv[i], "--no-dlc")) g_opt_no_dlc = 1;
         else if (str_eq(argv[i], "--skip-cpu-check")) g_opt_skip_cpu_check = 1;   /* STATUS 88 */
+        else if (str_eq(argv[i], "--test-tls-burn") && i + 1 < argc) i++;   /* issue #9: handled at entry (plat_tls_reserve) */
+        else if (str_eq(argv[i], "--cpu-compat") && i + 1 < argc) { i++; g_isa_mode = str_eq(argv[i], "force") ? 2 : str_eq(argv[i], "auto") || str_eq(argv[i], "1") ? 1 : 0; }   /* w24_compat */
+        else if (str_eq(argv[i], "--cpu-compat-count")) g_isa_count = 1;   /* w24_compat: hit counters per replaced site */
+        else if (str_eq(argv[i], "--sys-language") && i + 1 < argc) { int x = (int)str_to_u64(argv[++i]); if (x >= 0 && x <= 30) g_opt_sys_lang = x; }   /* w24_compat (e5_system.c) */
+        else if (str_eq(argv[i], "--text-language") && i + 1 < argc) { int x = (int)str_to_u64(argv[++i]); if (x >= 1 && x <= 20) g_opt_text_lang = x; }
+        else if (str_eq(argv[i], "--speech-language") && i + 1 < argc) { int x = (int)str_to_u64(argv[++i]); if (x >= 1 && x <= 20) g_opt_speech_lang = x; }
+        else if (str_eq(argv[i], "--languages-dir") && i + 1 < argc) { const char *v = argv[++i]; int n = str_len(v); if (n < 1023) mem_copy(g_lp_dir, v, (u64)n + 1); }   /* w33_lang */
+        else if (str_eq(argv[i], "--lang-pack") && i + 1 < argc) { const char *v = argv[++i]; int n = str_len(v); if (n < 7) mem_copy(g_lp_code, v, (u64)n + 1); }
+        else if (str_eq(argv[i], "--lang-verify") && i + 1 < argc) { i++; g_lp_verify = str_eq(argv[i], "full") ? 2 : str_eq(argv[i], "size") ? 0 : 1; }
+        else if (str_eq(argv[i], "--lang-experimental") && i + 1 < argc) { const char *v = argv[++i]; int n = str_len(v); if (n < 511) mem_copy(g_lp_exp, v, (u64)n + 1); }
+        else if (str_eq(argv[i], "--lump-open-log")) g_lump_open_log = 1;   /* w33_lang: diagnostic, a line per lump file opened */
+        else if (str_eq(argv[i], "--lang-overlay") && i + 1 < argc) lov_add_list(argv[++i]);   /* w33_lang: read-only fallback folders (e3_hle.c map_path) */
         else if (str_eq(argv[i], "--float-controls")) g_opt_float_controls = 1;   /* STATUS 88: declare each shader's fp32 rounding / denormal mode */
         else if (str_eq(argv[i], "--replay-watch-size") && i + 1 < argc) { const char *v = argv[++i]; u32 w = 0, h = 0; while (*v >= '0' && *v <= '9') w = w * 10 + (u32)(*v++ - '0'); if (*v) v++; while (*v >= '0' && *v <= '9') h = h * 10 + (u32)(*v++ - '0'); g_rw_w = w; g_rw_h = h; }   /* t107b */
         else if (str_eq(argv[i], "--replay-watch") && i + 1 < argc && g_nrw < 16) { const char *v = argv[++i]; u64 a = 0; if (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) v += 2;
@@ -4137,10 +4925,30 @@ int e3_main(int argc, char **argv) {
         else if (str_eq(argv[i], "--compute-check")) { g_csck_from = 0; g_csck_frame = 0xFFFFFFFFu; g_csck_n = 0; }   /* t105: as F8, from the first frame (replays) */
         else if (str_eq(argv[i], "--diag-mode") && i + 1 < argc) { i++; g_diag_mode = (int)str_to_u64(argv[i]); if (g_diag_mode < 0 || g_diag_mode >= DIAG_N) g_diag_mode = 0; }   /* t105: start in a diagnostic mode (F7 changes it) */
         else if (str_eq(argv[i], "--vote-borrow-all")) g_opt_force_borrow = 1;      /* t104 test: wave votes in the last LDS dword everywhere */
+        else if (str_eq(argv[i], "--no-rs-depth-max")) g_opt_rs_depth_max = 0;   /* w30_visual: off (rs_depth_max = 0) */
+        else if (str_eq(argv[i], "--mip-selfcheck")) g_opt_mipchk = 1;   /* w31_perf / w28i_15: diagnostic, off by default (log-only BC1/BC3 mip layout check; costs 52-61 ms in the prologue area-entry frame) */
+        else if (str_eq(argv[i], "--no-mip-selfcheck")) g_opt_mipchk = 0;   /* w31_perf (test option of w31_13): now the default; accepted so older scripts still start */
+        else if (str_eq(argv[i], "--rs-depth-max")) g_opt_rs_depth_max = 1;   /* w30_visual (forced on; default auto = on with a render scale other than 1): with a render scale, game-resolution compute passes that only take maxima read the max over a scaled texel's physical footprint (tiled-lighting tile depth bounds: the thin lines at 1440p / 4K) */
         else if (str_eq(argv[i], "--quad-branch-all")) g_opt_quad_branch_all = 1;      /* t103: every E6 pixel shader branches per 2x2 quad */
         else if (str_eq(argv[i], "--no-quad-branch-all")) g_opt_quad_branch_all = 0;
         else if (str_eq(argv[i], "--exact-mad")) g_opt_exact_mad = 1;             /* STATUS 88: GCN rounding of V_MAD / V_FMA (no driver contraction) */   /* STATUS 87: the bonus chapter add-on counts as not owned */
         else if (str_eq(argv[i], "--no-motion")) g_no_motion = 1;
+        else if (str_eq(argv[i], "--gyro-cal")) g_opt_gyro_cal = 1;
+        else if (str_eq(argv[i], "--no-gyro-cal")) g_opt_gyro_cal = 0;
+        else if (str_eq(argv[i], "--no-depth-of-field")) g_opt_no_dof = 1;   /* w28_int: the game's blur stages skipped (settings depth_of_field = 0) */   /* w28_int: calibration is the default; raw gyro as in v0.4.1 */   /* w25_fix: remove the gyro zero-rate offset (Don't Move drift) */
+        else if (str_eq(argv[i], "--gyro-deadband") && i + 1 < argc) g_gyro_deadband_deg = str_to_f(argv[++i]);   /* w25_fix: deg/s, with --gyro-cal */
+        else if (str_eq(argv[i], "--gyro-log")) g_opt_gyro_log = 1;
+        else if (str_eq(argv[i], "--exit-terminate")) g_opt_exit_terminate = 1;
+        else if (str_eq(argv[i], "--no-copy-fastpath")) g_opt_no_copy_fast = 1;   /* w25_fix (Dr Hill book A/B): the typed buffer copy shader is translated and run, not done by vkCmdCopyBuffer */
+        else if (str_eq(argv[i], "--copy-log") && i + 1 < argc) { const char *x = argv[++i]; u64 a = 0, b = 0; if (x[0] == '0' && (x[1] | 0x20) == 'x') x += 2;
+            for (; *x && *x != '-'; x++) a = a * 16 + (u64)(*x <= '9' ? *x - '0' : (*x | 0x20) - 'a' + 10); if (*x == '-') x++; if (x[0] == '0' && (x[1] | 0x20) == 'x') x += 2;
+            for (; *x; x++) b = b * 16 + (u64)(*x <= '9' ? *x - '0' : (*x | 0x20) - 'a' + 10); g_cl_lo = a; g_cl_hi = b; }   /* w25_fix */
+        else if (str_eq(argv[i], "--exit-watchdog") && i + 1 < argc) g_opt_exit_wd = (int)str_to_u64(argv[++i]);   /* w25_fix */
+        else if (str_eq(argv[i], "--open-log") && i + 1 < argc) g_open_log_pat = argv[++i];
+        else if (str_eq(argv[i], "--open-log-fail-all")) g_open_log_fail_all = 1;
+        else if (str_eq(argv[i], "--open-log-chain")) g_open_log_chain = 1;
+        else if (str_eq(argv[i], "--morph-log")) g_opt_morph_log = 1;   /* w25_fix: Morpheme control parameters (Dr Hill book) */
+        else if (str_eq(argv[i], "--morph-log-filter") && i + 1 < argc) { g_opt_morph_log = 1; g_morph_filter = argv[++i]; }   /* w25_fix: each logged open with its thread and call chain */   /* w25_fix: with --open-log, every failed open / stat is logged */   /* w25_fix: Dr Hill book page-set loads */   /* w25_fix: unattended runs - no hang in ExitProcess */   /* w25_fix: mean raw gyro every 2 s + offset, orientation resets with flips */
         else if (str_eq(argv[i], "--motion-scale") && i + 1 < argc) g_motion_scale = str_to_f(argv[++i]);
         else if (str_eq(argv[i], "--mouse-sens") && i + 1 < argc) g_mouse_sens = str_to_f(argv[++i]);
         else if (str_eq(argv[i], "--depth-whole")) g_opt_depth_whole = 1;   /* STATUS 48 A/B */
@@ -4165,6 +4973,7 @@ int e3_main(int argc, char **argv) {
     if (!g_replay_path && g_fr_req == 1) { g_opt_early_labels = 4; g_opt_wbg = 1; g_opt_lbl_trail = 1; g_lbl_dn_fn = lbl_dn; g_opt_rdg = 2; g_opt_wbg_big = 1; }   /* w16_rel rc2: Optimised Rendering (Fast Mode) = --label-policy 4 --label-trailing --label-read-guard 2 --label-guard-big */
     else if (!g_replay_path && g_fr_req == 0) { g_opt_early_labels = 0; g_opt_wbg = 0; g_opt_wbg_strict = 0; g_opt_lbl_trail = 0; g_lbl_dn_fn = 0; g_opt_rdg = 0; g_opt_wbg_big = 0; g_wbg_after = 0; }   /* (off: labels at the batch end, as policy 0) */
     if (g_replay_path) g_exp_div = 2;   /* --exp in replays: the variant changes at every repeat */   /* replays: no raw command-buffer files (writing ~200 files per submit slowed the first 5 repeats) */
+    memtl_start(); g_alloc_report_fn = alloc_report_exit;   /* w20_mem v0.5 (diagnostics, off without their options) */
     disp_setup(g_replay_path != 0);   /* w6_disp */
     if (g_rs_pct > 100 && !g_opt_rs_keep_window && !g_disp.on) {   /* w2: the window follows the scaled picture (see plat_window_thread) */
         u64 n_ = (u64)g_rs_pct, d_ = 100; if (g_rs_pct == 133) { n_ = 4; d_ = 3; }
@@ -4187,11 +4996,21 @@ int e3_main(int argc, char **argv) {
         plat_exit(r);
     }
     if (!g_game_dir) { plat_write(0, "usage: e5_loader <game_dir containing eboot.bin> [--main] [--timeout seconds] [--frames N] [--dump N] [--dump-frames a,b,c] [--no-window] [--shot N] [--no-cull]\n"); return 2; }
+    ud_detect_edition(g_game_dir);   /* w38_rel: developer runs - edition from param.sfo (a player start already set it) */
+#ifdef _WIN32
+    { u64 t0 = plat_ticks(); plat_mkdir("Cache"); ic_from_game(g_game_dir, "Cache/UntilDawn.ico");
+      say("window icon (w38_rel): "); say(g_ic_state); say(" ("); say_dec((i64)((plat_ticks() - t0) * 1000 / plat_ticks_per_sec())); say(" ms)\n"); }
+#endif
     pm_init(&g_log_lock);
     g_trace = plat_open_write(g_ud_release ? "Logs/os_calls.txt" : "e3_trace.txt");
     say("Until Dawn PC runtime v" UD_VERSION " (build " __DATE__ " " __TIME__ "): the game's own x86-64 code runs directly on this CPU; "
         "the PS4 system libraries and the GPU are provided by this program's compatibility layer (Windows + Vulkan)\n");
     say("game dir: "); say(g_game_dir); say("\n");
+    for (int k = 0; k < g_lov_n; k++) { say("language overlay "); say_dec(k + 1); say(" (w33_lang, read-only, only for files missing in the game folder): "); say(g_lov_dir[k]); say(plat_is_dir(g_lov_dir[k]) ? "\n" : "  - NOT A FOLDER\n"); }   /* w33_lang */
+    lang_pack_resolve();    /* w33_lang: Languages\<code> packs (only when one is chosen) */
+    for (int k = 0; k < g_lov_n; k++) { say("language search folder "); say_dec(k + 1); say(": "); say(g_lov_dir[k]); say("\n"); }
+    lang_overlay_check();   /* w33_lang: a text / speech override for a language CUSA02636 lacks is used only when ALL its files are present
+                               (game folder or --lang-overlay), else dropped: without this the game's Lump Loader crashes at start (P10 p2) */
     plat_install_handlers();
     g_lz_fault_fn = lz_fault;   /* t111 */
     say(g_opt_lazy_mem ? "  game memory: large mappings committed on first use (--lazy-memory, experiment)\n" : "  game memory: large mappings committed at once\n");
@@ -4218,6 +5037,7 @@ int e3_main(int argc, char **argv) {
     if (!g_opt_no_bend_fix) patch_cloth_bend(&g_eboot);   /* w2_cloth */
     if (!g_opt_no_cl_checks) patch_cloth_ops(&g_eboot);   /* w3_cloth */
     if (!g_opt_no_cl_src) { patch_cloth_src(&g_eboot); patch_cloth_wind(&g_eboot); }   /* w5_cloth */
+    if (g_opt_cw_check || g_opt_cw_lock) patch_cloth_world(&g_eboot);   /* w35_crash */
     if (!g_opt_fixed_phys) patch_phys_step(&g_eboot);   /* t192 */
     fr_log_start();   /* w16_rel rc2: "Optimised Rendering: ...", "Early GPU handover: ...", "Frame-rate limit: ..." (e6_vk.c) */
     if (g_opt_fps < 0 && g_opt_uncapped_max > 0) { say("  no frame-rate limit: at most "); say_dec(g_opt_uncapped_max); say(" frames a second (w14_speed: physics and cloth keep real time; --uncapped-max 0 = none)\n"); }
@@ -4231,9 +5051,12 @@ int e3_main(int argc, char **argv) {
     patch_heap_slot_reuse(&g_eboot);   /* t131 */
     if (!g_opt_no_movie_skip) patch_movie_skip(&g_eboot);
     if (!g_opt_no_movie_skip || g_opt_trace_movies) patch_movies(&g_eboot);
+    if (g_opt_morph_log) patch_morph(&g_eboot);   /* w25_fix */
+    if (g_opt_no_dof) patch_dof(&g_eboot);   /* w28_int: depth_of_field = 0 */
     if (g_opt_trace_ui) patch_ui_trace(&g_eboot);
     if (g_opt_trace_sound) patch_sound_trace(&g_eboot);   /* t132 */
     if (relocate(&g_eboot, 1)) say("  (continuing despite unresolved imports)\n");
+    patch_isa(&g_eboot, 0);   /* w24_compat: after every other code patch and the relocations (the stubs copy displaced bytes) */
     if (g_opt_rsq_trap || g_opt_prop_probe || g_opt_ik_probe) { g_rsq_bp_fn = dbg_bp; g_rsq_ss_fn = dbg_ss; rsq_arm_module(0); ik_arm(); }   /* t149 / t150 / t151 */
     if (g_fp_full && !g_fpl) g_fpl = (FpLite (*)[4])calloc(FP_MAXS, sizeof *g_fpl);   /* t151 */
     setup_malloc_replace(&g_eboot);
