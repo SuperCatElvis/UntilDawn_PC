@@ -31,11 +31,11 @@ The download includes the program (with its built-in updater), shader list, Lang
 
 ### What's new in v0.5.0
 
-- **Cleaner sound:** no more crackling and spikes (mostly heard at 4K); a limiter prevents clipping.
-- **More languages:** the new **Language Importer** (`UDLanguageImporter.exe`) adds the languages of a second PS4 edition you own, and `Config\settings.ini` lists all 20 languages with their codes. Changing language is one line: `language = french` (or `fr`).
-- **CUSA00194 (Europe 1) supported** as well as CUSA02636, with update 1.03. CUSA00359 (Americas) is experimental.
-- **Fixed:** Dr Hill's book pages, motion-control drift in "Don't Move" moments, thin bright lines above 1080p, the "TlsAlloc" start-up stop (issue #9), a rare cloth crash in Chapter 5.
 - **Automatic updater** built into `UntilDawn.exe` (on by default; `update_check = 0` turns it off).
+- **CUSA00194 (Europe 1) supported** as well as CUSA02636, with update 1.03. CUSA00359 (Americas) is experimental.
+- **More languages:** the new **Language Importer** (`UDLanguageImporter.exe`) adds the languages of a second PS4 edition you own, and `Config\settings.ini` lists all 20 languages with their codes. Changing language is one line: `language = french` (or `fr`).
+- **Cleaner sound:** no more crackling and spikes (mostly heard at 4K); a limiter prevents clipping.
+- **Fixed:** Dr Hill's book pages, motion-control drift in "Don't Move" moments, thin bright lines above 1080p, the "TlsAlloc" start-up stop (issue #9), a rare cloth crash in Chapter 5.
 - **New settings:** `depth_of_field` (turns depth of field, bokeh and motion blur off) and `cpu_compat` (older processors).
 - **Less memory** handed to the graphics driver on PCs where it is tight, and fewer texture reloads on graphics cards under 12 GB.
 
@@ -79,7 +79,7 @@ See the [v0.4.0 changelog](docs/releases/v0.4.0.md) for details (also `CHANGELOG
 - Custom Vulkan renderer running the game's original graphics.
 - Renders at your monitor's own resolution (1920×1080, 2560×1440, 3840×2160 and others) in borderless full screen by default; Alt+Enter switches to a window. A fixed resolution can be chosen instead.
 - Optimised Rendering (Fast Mode), on by default.
-- Frame-rate limit of 30, 60 (default), 120, 240 or uncapped (uncapped stops at 240 FPS so physics and cloth stay correct).
+- Frame-rate limit of 30, 60 (default), 120, 240 or uncapped.
 - Shader preparation before gameplay to reduce stuttering.
 - Shader caching so previously compiled shaders don't need to be compiled again.
 - GPU memory coherence to prevent certain graphical issues, enabled by default.
